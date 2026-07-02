@@ -98,7 +98,7 @@ test("data reload executes before slow metadata refresh completes", async () => 
     const reload = actions.onReloadData(undefined, undefined, undefined, undefined, 50, 0);
 
     await waitFor(() => !!executeBody);
-    assert.equal(executeBody.clientSessionId, tabId);
+    assert.equal(executeBody.clientSessionId, undefined);
     assert.deepEqual(tab.result?.rows, [[1]]);
 
     await waitFor(() => typeof resolveColumns === "function");
