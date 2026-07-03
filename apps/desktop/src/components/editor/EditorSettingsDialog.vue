@@ -3,7 +3,7 @@ import { ref, watch, shallowRef, computed, onMounted, onUnmounted, nextTick } fr
 import type { Ref } from "vue";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, GripVertical, Loader2, Moon, PackageSearch, Pencil, Plus, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, FolderOpen, GripVertical, Loader2, Moon, PackageSearch, Pencil, Plus, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -53,8 +53,11 @@ import {
   checkMcpServerStatus,
   installMcpServer,
   forgetWebdavSavedPassword,
+  clearDataDirConfig,
   listSystemFonts,
+  loadDataDirConfig,
   saveWebdavSavedPassword,
+  setDataDirConfig,
   webdavPasswordStatus,
   webdavSyncDownload,
   webdavSyncTest,
@@ -63,6 +66,7 @@ import {
   type McpServerStatus,
   type WebDavConfig,
 } from "@/lib/api";
+import type { DataDirConfig } from "@/lib/tauri";
 import { eventToShortcut } from "@/lib/keyboardShortcuts";
 import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/shortcutRegistry";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDisplay";
@@ -1091,6 +1095,12 @@ function setSidebarActivation(value: "single" | "double") {
 const activeSettingsTab = ref("editor");
 const isWeb = !isTauriRuntime();
 const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
+const dataDirConfig = ref<DataDirConfig | null>(null);
+const dataDirLoading = ref(false);
+const dataDirError = ref("");
+const dataDirSaved = ref(false);
+const displayedDataDir = computed(() => dataDirConfig.value?.configuredDataDir || dataDirConfig.value?.currentDataDir || "");
+const dataDirControlsDisabled = computed(() => dataDirLoading.value || dataDirConfig.value?.envLocked === true);
 type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "editor", label: t("settings.editorTab") },
@@ -1121,6 +1131,56 @@ function openExternalUrl(url: string) {
     import("@tauri-apps/plugin-shell").then(({ open }) => open(url));
   } else {
     window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
+async function refreshDataDirConfig() {
+  if (isWeb) return;
+  dataDirLoading.value = true;
+  dataDirError.value = "";
+  try {
+    dataDirConfig.value = await loadDataDirConfig();
+  } catch (error: any) {
+    dataDirError.value = error?.message || String(error);
+  } finally {
+    dataDirLoading.value = false;
+  }
+}
+
+async function chooseDataDir() {
+  if (dataDirControlsDisabled.value) return;
+  dataDirLoading.value = true;
+  dataDirError.value = "";
+  dataDirSaved.value = false;
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: displayedDataDir.value || undefined,
+    });
+    if (typeof selected !== "string") return;
+    dataDirConfig.value = await setDataDirConfig(selected);
+    dataDirSaved.value = dataDirConfig.value.restartRequired;
+  } catch (error: any) {
+    dataDirError.value = error?.message || String(error);
+  } finally {
+    dataDirLoading.value = false;
+  }
+}
+
+async function resetDataDirConfig() {
+  if (dataDirControlsDisabled.value) return;
+  dataDirLoading.value = true;
+  dataDirError.value = "";
+  dataDirSaved.value = false;
+  try {
+    dataDirConfig.value = await clearDataDirConfig();
+    dataDirSaved.value = dataDirConfig.value.restartRequired;
+  } catch (error: any) {
+    dataDirError.value = error?.message || String(error);
+  } finally {
+    dataDirLoading.value = false;
   }
 }
 
@@ -1413,6 +1473,7 @@ watch(
       confirmNewPassword.value = "";
       await settingsStore.initAiConfig();
       await settingsStore.initDesktopSettings();
+      await refreshDataDirConfig();
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
       editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
@@ -2288,6 +2349,40 @@ onUnmounted(cleanupPreviewEditor);
             </section>
 
             <section v-else-if="activeSettingsTab === 'appearance'" class="flex flex-col gap-5 py-2">
+              <div v-if="!isWeb" class="space-y-2">
+                <div class="flex items-center justify-between gap-3">
+                  <Label>{{ t("settings.dataDirTitle") }}</Label>
+                  <span v-if="dataDirConfig?.source" class="text-xs text-muted-foreground">{{ t(`settings.dataDirSource.${dataDirConfig.source}`) }}</span>
+                </div>
+                <div class="flex flex-col gap-2 md:flex-row">
+                  <Input :model-value="displayedDataDir" readonly class="h-8 min-w-0 flex-1 font-mono text-xs" />
+                  <div class="flex shrink-0 gap-2">
+                    <Button type="button" variant="outline" size="sm" class="h-8 gap-1.5" :disabled="dataDirControlsDisabled" @click="chooseDataDir">
+                      <Loader2 v-if="dataDirLoading" class="h-3.5 w-3.5 animate-spin" />
+                      <FolderOpen v-else class="h-3.5 w-3.5" />
+                      {{ t("settings.dataDirChange") }}
+                    </Button>
+                    <Button type="button" variant="outline" size="sm" class="h-8 gap-1.5" :disabled="dataDirControlsDisabled || !dataDirConfig?.configuredDataDir" @click="resetDataDirConfig">
+                      <RotateCcw class="h-3.5 w-3.5" />
+                      {{ t("settings.dataDirReset") }}
+                    </Button>
+                  </div>
+                </div>
+                <p v-if="dataDirConfig?.envLocked" class="text-xs text-muted-foreground">
+                  {{ t("settings.dataDirEnvLocked", { path: dataDirConfig.envDataDir }) }}
+                </p>
+                <p v-else-if="dataDirConfig?.restartRequired || dataDirSaved" class="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+                  <AlertTriangle class="h-3.5 w-3.5 shrink-0" />
+                  <span>{{ t("settings.dataDirRestartRequired") }}</span>
+                </p>
+                <p v-else class="text-xs text-muted-foreground">
+                  {{ t("settings.dataDirDescription", { path: dataDirConfig?.defaultDataDir || "" }) }}
+                </p>
+                <p v-if="dataDirError" class="text-xs text-destructive">{{ dataDirError }}</p>
+              </div>
+
+              <Separator v-if="!isWeb" />
+
               <div class="grid gap-4 md:grid-cols-[minmax(220px,280px)_minmax(260px,1fr)]">
                 <div class="space-y-2 min-w-0">
                   <Label>{{ t("settings.languageTitle") }}</Label>

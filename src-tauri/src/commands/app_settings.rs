@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager, State, Window};
 use super::connection::AppState;
 use crate::{
     apply_debug_log_level, apply_desktop_settings, hide_main_window_for_close, request_app_close, CloseBehaviorState,
+    DataDirState,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -20,6 +21,18 @@ pub struct DriverStoreMigrationResult {
     pub agents_dir: String,
     pub migrated_plugins: bool,
     pub migrated_agents: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataDirConfig {
+    pub current_data_dir: String,
+    pub default_data_dir: String,
+    pub configured_data_dir: Option<String>,
+    pub env_data_dir: Option<String>,
+    pub source: String,
+    pub restart_required: bool,
+    pub env_locked: bool,
 }
 
 #[tauri::command]
@@ -39,6 +52,66 @@ pub async fn save_desktop_settings(
         eprintln!("Failed to apply desktop settings: {err}");
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn load_data_dir_config(app: AppHandle, state: State<'_, DataDirState>) -> Result<DataDirConfig, String> {
+    data_dir_config(&app, &state)
+}
+
+#[tauri::command]
+pub fn set_data_dir_config(
+    app: AppHandle,
+    state: State<'_, DataDirState>,
+    data_dir: String,
+) -> Result<DataDirConfig, String> {
+    if std::env::var_os("DBX_DATA_DIR").filter(|value| !value.is_empty()).is_some() {
+        return Err("DBX_DATA_DIR is set in the environment".to_string());
+    }
+    let trimmed = data_dir.trim();
+    if trimmed.is_empty() {
+        return Err("data_dir is required".to_string());
+    }
+    let target = PathBuf::from(trimmed);
+    std::fs::create_dir_all(&target).map_err(|e| format!("Failed to create data dir: {e}"))?;
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    crate::data_dir::save_configured_data_dir(&config_dir, &target)?;
+    data_dir_config(&app, &state)
+}
+
+#[tauri::command]
+pub fn clear_data_dir_config(app: AppHandle, state: State<'_, DataDirState>) -> Result<DataDirConfig, String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    crate::data_dir::clear_configured_data_dir(&config_dir)?;
+    data_dir_config(&app, &state)
+}
+
+fn data_dir_config(app: &AppHandle, state: &DataDirState) -> Result<DataDirConfig, String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let configured_data_dir = crate::data_dir::load_configured_data_dir(&config_dir);
+    let env_data_dir = std::env::var_os("DBX_DATA_DIR").filter(|value| !value.is_empty()).map(PathBuf::from);
+    let source = match &state.mode {
+        crate::data_dir::DataDirMode::Default => "default",
+        crate::data_dir::DataDirMode::EnvOverride => "env",
+        crate::data_dir::DataDirMode::ConfiguredOverride => "configured",
+        crate::data_dir::DataDirMode::Portable { .. } => "portable",
+    };
+    let configured_matches_current = configured_data_dir.as_ref().is_some_and(|path| path == &state.data_dir);
+    let restart_required = match &state.mode {
+        crate::data_dir::DataDirMode::ConfiguredOverride => !configured_matches_current,
+        crate::data_dir::DataDirMode::EnvOverride => false,
+        _ => configured_data_dir.as_ref().is_some_and(|path| path != &state.data_dir),
+    };
+
+    Ok(DataDirConfig {
+        current_data_dir: state.data_dir.to_string_lossy().to_string(),
+        default_data_dir: state.default_data_dir.to_string_lossy().to_string(),
+        configured_data_dir: configured_data_dir.map(|path| path.to_string_lossy().to_string()),
+        env_data_dir: env_data_dir.map(|path| path.to_string_lossy().to_string()),
+        source: source.to_string(),
+        restart_required,
+        env_locked: std::env::var_os("DBX_DATA_DIR").filter(|value| !value.is_empty()).is_some(),
+    })
 }
 
 #[tauri::command]
@@ -201,12 +274,16 @@ fn default_store_dirs(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
 
 fn default_plugin_store_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let default_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(crate::data_dir::resolve_data_dir_with_mode(default_data_dir).data_dir.join("plugins"))
+    let app_config_dir = app.path().app_config_dir().ok();
+    Ok(crate::data_dir::resolve_data_dir_with_mode(default_data_dir, app_config_dir.as_deref())
+        .data_dir
+        .join("plugins"))
 }
 
 fn default_agent_store_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let default_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let data_dir_resolution = crate::data_dir::resolve_data_dir_with_mode(default_data_dir);
+    let app_config_dir = app.path().app_config_dir().ok();
+    let data_dir_resolution = crate::data_dir::resolve_data_dir_with_mode(default_data_dir, app_config_dir.as_deref());
     Ok(if data_dir_resolution.uses_custom_data_dir() {
         data_dir_resolution.data_dir.join("agents")
     } else {

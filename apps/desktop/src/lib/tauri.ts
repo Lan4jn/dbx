@@ -151,6 +151,16 @@ export interface DesktopSettings {
   sidebar_table_page_size?: number | null;
 }
 
+export interface DataDirConfig {
+  currentDataDir: string;
+  defaultDataDir: string;
+  configuredDataDir?: string | null;
+  envDataDir?: string | null;
+  source: "default" | "env" | "configured" | "portable";
+  restartRequired: boolean;
+  envLocked: boolean;
+}
+
 export interface SavedSqlSyncEntry {
   folderName?: string;
   fileName: string;
@@ -368,6 +378,18 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   return invoke("save_desktop_settings", { settings });
+}
+
+export async function loadDataDirConfig(): Promise<DataDirConfig> {
+  return invoke("load_data_dir_config");
+}
+
+export async function setDataDirConfig(dataDir: string): Promise<DataDirConfig> {
+  return invoke("set_data_dir_config", { dataDir });
+}
+
+export async function clearDataDirConfig(): Promise<DataDirConfig> {
+  return invoke("clear_data_dir_config");
 }
 
 export async function completeAppClose(action: "quit" | "hide"): Promise<void> {

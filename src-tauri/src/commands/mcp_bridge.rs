@@ -275,10 +275,7 @@ mod tests {
 
         assert_eq!(legacy_port_file, root.join("mcp-bridge-port"));
         assert_eq!(std::fs::read_to_string(&legacy_port_file).unwrap(), "49153");
-        assert_eq!(
-            std::fs::read_to_string(root.join(instance_port_file_name("session-a"))).unwrap(),
-            "49153"
-        );
+        assert_eq!(std::fs::read_to_string(root.join(instance_port_file_name("session-a"))).unwrap(), "49153");
 
         let _ = std::fs::remove_dir_all(root);
     }

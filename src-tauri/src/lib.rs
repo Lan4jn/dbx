@@ -30,6 +30,13 @@ pub struct CloseBehaviorState {
     confirmed_exit: AtomicBool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DataDirState {
+    pub data_dir: std::path::PathBuf,
+    pub default_data_dir: std::path::PathBuf,
+    pub mode: data_dir::DataDirMode,
+}
+
 impl CloseBehaviorState {
     fn new() -> Self {
         Self { confirmed_exit: AtomicBool::new(false) }
@@ -599,7 +606,8 @@ pub fn run() {
 
             let default_data_dir =
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
-            let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir);
+            let app_config_dir = app.path().app_config_dir().ok();
+            let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir, app_config_dir.as_deref());
             let data_dir = data_dir_resolution.data_dir.clone();
             std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
             let alternative_data_dir = data_dir::alternative_data_dir(&data_dir_resolution);
@@ -640,6 +648,11 @@ pub fn run() {
             } else {
                 Arc::new(AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION")))
             };
+            app.manage(DataDirState {
+                data_dir: data_dir.clone(),
+                default_data_dir: data_dir_resolution.default_data_dir.clone(),
+                mode: data_dir_resolution.mode.clone(),
+            });
             app.manage(state.clone());
             commands::redis_pubsub_server::start_pubsub_server(state.clone());
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
@@ -707,6 +720,9 @@ pub fn run() {
             commands::app_settings::save_desktop_settings,
             commands::app_settings::complete_app_close,
             commands::app_settings::request_app_close_from_window_controls,
+            commands::app_settings::load_data_dir_config,
+            commands::app_settings::set_data_dir_config,
+            commands::app_settings::clear_data_dir_config,
             commands::app_settings::set_driver_store_dir,
             commands::app_settings::set_plugin_store_dir,
             commands::app_settings::set_agent_store_dir,

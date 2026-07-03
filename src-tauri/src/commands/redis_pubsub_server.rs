@@ -179,7 +179,7 @@ pub fn start_pubsub_server(state: Arc<AppState>) {
                     log::warn!("Failed to bind PubSub server on {addr}: {error}");
                 }
             }
-        };
+        }
         let Some(listener) = listener else {
             log::warn!("Failed to bind PubSub server on requested port {requested_port} and fallback port");
             return;

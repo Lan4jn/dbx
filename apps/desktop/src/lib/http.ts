@@ -44,6 +44,7 @@ import type {
   DriverRuntimeSummary,
   UpgradeAllAgentDriversResult,
   AgentUpdateBlocker,
+  DataDirConfig,
   DesktopSettings,
   SavedSqlSyncRequest,
   DriverInstallProgress,
@@ -1020,6 +1021,18 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   safeLocalStorageSet(DESKTOP_SETTINGS_STORAGE_KEY, JSON.stringify({ ...DEFAULT_DESKTOP_SETTINGS, ...settings }));
+}
+
+export async function loadDataDirConfig(): Promise<DataDirConfig> {
+  throw new Error("Data directory configuration is only available in the desktop app.");
+}
+
+export async function setDataDirConfig(_dataDir: string): Promise<DataDirConfig> {
+  throw new Error("Data directory configuration is only available in the desktop app.");
+}
+
+export async function clearDataDirConfig(): Promise<DataDirConfig> {
+  throw new Error("Data directory configuration is only available in the desktop app.");
 }
 
 export async function completeAppClose(_action: "quit" | "hide"): Promise<void> {
