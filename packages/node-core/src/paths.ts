@@ -16,7 +16,7 @@ export function appDataDirFromInputs(options: { platform: NodeJS.Platform; home:
     return options.envDataDir;
   }
 
-  return options.platform === "win32" ? win32.join(options.home, ".drx") : posix.join(options.home, ".drx");
+  return options.platform === "win32" ? win32.join(options.home, ".dbx") : posix.join(options.home, ".dbx");
 }
 
 export function dbPath(): string {

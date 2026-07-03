@@ -74,7 +74,7 @@ fn home_dir_from_env() -> Option<PathBuf> {
 }
 
 pub fn default_home_data_dir(home_dir: PathBuf) -> PathBuf {
-    home_dir.join(".drx")
+    home_dir.join(".dbx")
 }
 
 pub fn alternative_data_dir(resolution: &DataDirResolution) -> Option<PathBuf> {
@@ -193,10 +193,10 @@ mod tests {
     use super::{alternative_data_dir, default_home_data_dir, resolve_data_dir_from_inputs, DataDirMode};
 
     #[test]
-    fn default_data_dir_is_home_drx_on_all_platforms() {
-        assert_eq!(default_home_data_dir(PathBuf::from(r"C:\Users\alice")), PathBuf::from(r"C:\Users\alice\.drx"));
-        assert_eq!(default_home_data_dir(PathBuf::from("/Users/alice")), PathBuf::from("/Users/alice/.drx"));
-        assert_eq!(default_home_data_dir(PathBuf::from("/home/alice")), PathBuf::from("/home/alice/.drx"));
+    fn default_data_dir_is_home_dbx_on_all_platforms() {
+        assert_eq!(default_home_data_dir(PathBuf::from(r"C:\Users\alice")), PathBuf::from(r"C:\Users\alice\.dbx"));
+        assert_eq!(default_home_data_dir(PathBuf::from("/Users/alice")), PathBuf::from("/Users/alice/.dbx"));
+        assert_eq!(default_home_data_dir(PathBuf::from("/home/alice")), PathBuf::from("/home/alice/.dbx"));
     }
 
     #[test]
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn configured_override_wins_over_portable_mode_when_env_is_not_set() {
-        let default_dir = PathBuf::from(r"C:\Users\Administrator\.drx");
+        let default_dir = PathBuf::from(r"C:\Users\Administrator\.dbx");
         let exe_dir = PathBuf::from(r"D:\Apps\DBX");
         let configured_dir = PathBuf::from(r"E:\DBXData");
 
