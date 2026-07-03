@@ -217,10 +217,19 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
 }
 
 fn write_port_file(data_dir: &Path, actual_port: u16) -> std::io::Result<PathBuf> {
+    write_port_file_for_instance(data_dir, actual_port, &std::process::id().to_string())
+}
+
+fn write_port_file_for_instance(data_dir: &Path, actual_port: u16, instance_id: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join(MCP_BRIDGE_PORT_FILE);
     std::fs::write(&path, actual_port.to_string())?;
+    std::fs::write(data_dir.join(instance_port_file_name(instance_id)), actual_port.to_string())?;
     Ok(path)
+}
+
+fn instance_port_file_name(instance_id: &str) -> String {
+    format!("{MCP_BRIDGE_PORT_FILE}-{instance_id}")
 }
 
 fn find_config_by_name<'a>(
@@ -232,7 +241,7 @@ fn find_config_by_name<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::write_port_file;
+    use super::{instance_port_file_name, write_port_file, write_port_file_for_instance};
 
     #[test]
     fn writes_bridge_port_file_to_resolved_data_dir() {
@@ -250,6 +259,26 @@ mod tests {
         assert_eq!(port_file, resolved_data_dir.join("mcp-bridge-port"));
         assert_eq!(std::fs::read_to_string(port_file).unwrap(), "49152");
         assert!(!default_data_dir.join("mcp-bridge-port").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writes_instance_bridge_port_file_without_removing_legacy_file() {
+        let root = std::env::temp_dir().join(format!(
+            "dbx-mcp-bridge-instance-port-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let legacy_port_file = write_port_file_for_instance(&root, 49153, "session-a").unwrap();
+
+        assert_eq!(legacy_port_file, root.join("mcp-bridge-port"));
+        assert_eq!(std::fs::read_to_string(&legacy_port_file).unwrap(), "49153");
+        assert_eq!(
+            std::fs::read_to_string(root.join(instance_port_file_name("session-a"))).unwrap(),
+            "49153"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

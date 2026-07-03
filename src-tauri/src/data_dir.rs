@@ -32,6 +32,7 @@ impl DataDirResolution {
 
 pub fn resolve_data_dir_with_mode(default_app_data_dir: PathBuf) -> DataDirResolution {
     let env_data_dir = std::env::var_os("DBX_DATA_DIR").filter(|value| !value.is_empty()).map(PathBuf::from);
+    let default_data_dir = default_data_dir(default_app_data_dir);
 
     #[cfg(target_os = "windows")]
     let exe_dir = current_exe_dir();
@@ -42,12 +43,34 @@ pub fn resolve_data_dir_with_mode(default_app_data_dir: PathBuf) -> DataDirResol
     let installer_marker_exists = exe_dir.as_deref().is_some_and(installer_marker_exists);
 
     resolve_data_dir_from_inputs(
-        default_app_data_dir,
+        default_data_dir,
         exe_dir,
         portable_marker_exists,
         installer_marker_exists,
         env_data_dir,
     )
+}
+
+fn default_data_dir(fallback: PathBuf) -> PathBuf {
+    home_dir_from_env().map(default_home_data_dir).unwrap_or(fallback)
+}
+
+fn home_dir_from_env() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").filter(|value| !value.is_empty()).map(PathBuf::from)
+    }
+}
+
+pub fn default_home_data_dir(home_dir: PathBuf) -> PathBuf {
+    home_dir.join(".drx")
 }
 
 pub fn alternative_data_dir(resolution: &DataDirResolution) -> Option<PathBuf> {
@@ -128,7 +151,14 @@ fn resolve_data_dir_from_inputs(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{alternative_data_dir, resolve_data_dir_from_inputs, DataDirMode};
+    use super::{alternative_data_dir, default_home_data_dir, resolve_data_dir_from_inputs, DataDirMode};
+
+    #[test]
+    fn default_data_dir_is_home_drx_on_all_platforms() {
+        assert_eq!(default_home_data_dir(PathBuf::from(r"C:\Users\alice")), PathBuf::from(r"C:\Users\alice\.drx"));
+        assert_eq!(default_home_data_dir(PathBuf::from("/Users/alice")), PathBuf::from("/Users/alice/.drx"));
+        assert_eq!(default_home_data_dir(PathBuf::from("/home/alice")), PathBuf::from("/home/alice/.drx"));
+    }
 
     #[test]
     fn uses_portable_data_dir_when_marker_exists_without_installer_marker() {

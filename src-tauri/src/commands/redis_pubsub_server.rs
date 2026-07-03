@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -11,6 +12,7 @@ use serde::Deserialize;
 use dbx_core::connection::AppState;
 
 const DEFAULT_PUBSUB_PORT: u16 = 4224;
+static ACTUAL_PUBSUB_PORT: OnceLock<AtomicU16> = OnceLock::new();
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,7 +30,24 @@ fn pubsub_server_port() -> u16 {
 
 #[tauri::command]
 pub fn redis_pubsub_server_port() -> u16 {
-    pubsub_server_port()
+    actual_pubsub_port().unwrap_or_else(pubsub_server_port)
+}
+
+fn actual_pubsub_port() -> Option<u16> {
+    let port = ACTUAL_PUBSUB_PORT.get().map(|value| value.load(Ordering::Relaxed)).unwrap_or(0);
+    (port > 0).then_some(port)
+}
+
+fn set_actual_pubsub_port(port: u16) {
+    ACTUAL_PUBSUB_PORT.get_or_init(|| AtomicU16::new(0)).store(port, Ordering::Relaxed);
+}
+
+fn pubsub_bind_ports(requested: u16) -> Vec<u16> {
+    if requested == 0 {
+        vec![0]
+    } else {
+        vec![requested, 0]
+    }
 }
 
 async fn ws_handler(
@@ -147,18 +166,46 @@ async fn handle_command(sink: &mut redis::aio::PubSubSink, text: &str) -> Result
 pub fn start_pubsub_server(state: Arc<AppState>) {
     let router = build_pubsub_router(state);
     tauri::async_runtime::spawn(async move {
-        let port = pubsub_server_port();
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                log::warn!("Failed to bind PubSub server on {addr}: {error}");
-                return;
+        let requested_port = pubsub_server_port();
+        let mut listener = None;
+        for port in pubsub_bind_ports(requested_port) {
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(error) => {
+                    log::warn!("Failed to bind PubSub server on {addr}: {error}");
+                }
             }
         };
-        log::info!("PubSub WebSocket server listening on {addr}");
+        let Some(listener) = listener else {
+            log::warn!("Failed to bind PubSub server on requested port {requested_port} and fallback port");
+            return;
+        };
+        let addr = listener.local_addr().ok();
+        if let Some(addr) = addr {
+            set_actual_pubsub_port(addr.port());
+            log::info!("PubSub WebSocket server listening on {addr}");
+        }
         if let Err(error) = axum::serve(listener, router).await {
             log::warn!("PubSub server stopped with error: {error}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pubsub_bind_ports;
+
+    #[test]
+    fn pubsub_bind_ports_fall_back_to_ephemeral_for_default_port() {
+        assert_eq!(pubsub_bind_ports(4224), vec![4224, 0]);
+    }
+
+    #[test]
+    fn pubsub_bind_ports_do_not_duplicate_ephemeral_request() {
+        assert_eq!(pubsub_bind_ports(0), vec![0]);
+    }
 }

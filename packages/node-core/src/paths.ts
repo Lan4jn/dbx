@@ -16,14 +16,7 @@ export function appDataDirFromInputs(options: { platform: NodeJS.Platform; home:
     return options.envDataDir;
   }
 
-  switch (options.platform) {
-    case "darwin":
-      return posix.join(options.home, "Library", "Application Support", "com.dbx.app");
-    case "win32":
-      return win32.join(options.appData || win32.join(options.home, "AppData", "Roaming"), "com.dbx.app");
-    default:
-      return posix.join(options.home, ".local", "share", "com.dbx.app");
-  }
+  return options.platform === "win32" ? win32.join(options.home, ".drx") : posix.join(options.home, ".drx");
 }
 
 export function dbPath(): string {

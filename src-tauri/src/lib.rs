@@ -578,27 +578,6 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            let links = commands::deep_link::connection_deep_links_from_args(args.clone());
-            open_connection_deep_links(app, links);
-
-            let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
-            if !paths.is_empty() {
-                if let Some(state) = app.try_state::<commands::external_sql::ExternalSqlOpenState>() {
-                    state.push(paths.clone());
-                }
-                let _ = app.emit("dbx-open-sql-files", paths);
-            }
-
-            let db_paths = commands::external_db::db_file_paths_from_args(args, std::path::Path::new(&cwd));
-            if !db_paths.is_empty() {
-                if let Some(state) = app.try_state::<commands::external_db::ExternalDbOpenState>() {
-                    state.push(db_paths.clone());
-                }
-                let _ = app.emit("dbx-open-db-files", db_paths);
-            }
-            show_main_window(app);
-        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
