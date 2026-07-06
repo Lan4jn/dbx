@@ -354,9 +354,9 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Database, colorClass: "text-yellow-500" };
     case "mongo-gridfs":
     case "mongo-buckets":
-      return { icon: Archive, colorClass: "text-amber-500" };
+      return { icon: Archive, colorClass: "text-cyan-500" };
     case "mongo-bucket":
-      return { icon: Archive, colorClass: "text-amber-400" };
+      return { icon: Archive, colorClass: "text-cyan-400" };
     case "mongo-collection":
       return { icon: Table, colorClass: "text-green-400" };
     case "vector-collection":
