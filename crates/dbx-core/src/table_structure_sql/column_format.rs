@@ -143,6 +143,11 @@ pub(super) fn normalize_column_data_type(dialect: StructureDialect, data_type: &
         return base_type.to_string();
     }
 
+    if dialect == StructureDialect::SqlServer && is_sqlserver_lengthless_type(base_type) {
+        // SQL Server exact integer and legacy LOB types do not accept MySQL-style display widths.
+        return base_type.to_string();
+    }
+
     if is_temporal_precision_type(dialect, base_type) {
         return if is_valid_temporal_precision(params, dialect) {
             format!("{base_type}({params})")
@@ -177,6 +182,32 @@ fn is_oracle_lengthless_type(base_type: &str) -> bool {
             | "smallint"
             | "text"
             | "tinyint"
+    )
+}
+
+fn is_sqlserver_lengthless_type(base_type: &str) -> bool {
+    let normalized = base_type.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "bigint"
+            | "bit"
+            | "date"
+            | "datetime"
+            | "image"
+            | "int"
+            | "integer"
+            | "money"
+            | "ntext"
+            | "real"
+            | "smalldatetime"
+            | "smallint"
+            | "smallmoney"
+            | "sql_variant"
+            | "text"
+            | "timestamp"
+            | "tinyint"
+            | "uniqueidentifier"
+            | "xml"
     )
 }
 

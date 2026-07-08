@@ -1270,6 +1270,28 @@ fn builds_sql_server_quoted_column_and_index_statements() {
 }
 
 #[test]
+fn sqlserver_strips_mysql_display_width_from_fixed_integer_types() {
+    let mut id = column("id");
+    id.data_type = "int(11)".to_string();
+    id.is_nullable = false;
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::SqlServer),
+        schema: Some("dbo".to_string()),
+        table_name: "users".to_string(),
+        columns: vec![id],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE [dbo].[users] ADD [id] int NOT NULL;"]);
+}
+
+#[test]
 fn sqlserver_default_changes_drop_old_constraints_with_isolated_batches() {
     let mut sku = column("sku");
     sku.data_type = "nvarchar(64)".to_string();
