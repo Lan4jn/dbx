@@ -8,17 +8,17 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useConnectionStore } from "@/stores/connectionStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
-import * as api from "@/lib/api";
-import { DIAGRAM_SQL_TYPES, isSchemaAware as isSchemaAwareDatabase } from "@/lib/databaseCapabilities";
+import * as api from "@/lib/backend/api";
+import { DIAGRAM_SQL_TYPES, isSchemaAware as isSchemaAwareDatabase } from "@/lib/database/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, layoutDiagramTables, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramRelationship, type DiagramTable } from "@/lib/erDiagram";
-import { buildEngineeringDiagram } from "@/lib/engineeringDiagram";
-import { buildEngineeringDiagramSvg, buildTableDiagramSvg, diagramSvgFileName } from "@/lib/diagramSvgExport";
-import { clampDiagramZoom, zoomFromGestureScale, zoomFromWheelDelta } from "@/lib/diagramZoom";
+import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, layoutDiagramTables, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramRelationship, type DiagramTable } from "@/lib/diagram/erDiagram";
+import { buildEngineeringDiagram } from "@/lib/diagram/engineeringDiagram";
+import { buildEngineeringDiagramSvg, buildTableDiagramSvg, diagramSvgFileName } from "@/lib/export/diagramSvgExport";
+import { clampDiagramZoom, zoomFromGestureScale, zoomFromWheelDelta } from "@/lib/diagram/diagramZoom";
 import { Copy, Download, KeyRound, Link2, Loader2, Maximize2, Network, Plus, RefreshCw, Search, Table2, Trash2, X, ZoomIn, ZoomOut } from "@lucide/vue";
 import { useToast } from "@/composables/useToast";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { copyToClipboard } from "@/lib/clipboard";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { copyToClipboard } from "@/lib/common/clipboard";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -30,6 +30,18 @@ const props = defineProps<{
   prefillDatabase?: string;
   prefillSchema?: string;
   focusTableName?: string;
+}>();
+
+const emit = defineEmits<{
+  "open-target": [
+    value: {
+      connectionId: string;
+      database: string;
+      schema?: string;
+      tableName: string;
+      tableType?: string;
+    },
+  ];
 }>();
 
 const CARD_WIDTH = 270;
@@ -181,6 +193,17 @@ function isRelationshipColumn(table: DiagramTable, columnName: string): boolean 
 
 function relationshipTitle(relationship: DiagramRelationship): string {
   return `${relationship.sourceTable}.${relationship.sourceColumn} (${relationship.sourceCardinality}:${relationship.targetCardinality}) -> ${relationship.targetTable}.${relationship.targetColumn}`;
+}
+
+function openTableData(tableName: string) {
+  if (!connectionId.value || !database.value || !tableName) return;
+  emit("open-target", {
+    connectionId: connectionId.value,
+    database: database.value,
+    schema: isSchemaAware.value ? schema.value || undefined : undefined,
+    tableName,
+    tableType: "TABLE",
+  });
 }
 
 function relationshipStorageKey(): string {
@@ -1015,6 +1038,7 @@ onUnmounted(stopDrag);
                       width: `${CARD_WIDTH}px`,
                       transform: `translate(${positions[table.name]?.x ?? 0}px, ${positions[table.name]?.y ?? 0}px)`,
                     }"
+                    @dblclick.stop="openTableData(table.name)"
                   >
                     <div class="flex h-11 cursor-grab items-center gap-2 border-b bg-muted/40 px-3 active:cursor-grabbing" @mousedown="startDrag(table.name, $event)">
                       <Table2 class="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1103,13 +1127,14 @@ onUnmounted(stopDrag);
                   <div
                     v-for="entity in engineeringDiagram.entities"
                     :key="entity.id"
-                    class="absolute flex items-center justify-center border border-blue-500/70 bg-blue-100/80 px-3 text-center text-sm font-semibold text-blue-950 shadow-sm dark:bg-blue-950/35 dark:text-blue-100"
+                    class="absolute flex cursor-pointer items-center justify-center border border-blue-500/70 bg-blue-100/80 px-3 text-center text-sm font-semibold text-blue-950 shadow-sm dark:bg-blue-950/35 dark:text-blue-100"
                     :class="entity.name === focusTableName ? 'ring-2 ring-primary/40' : ''"
                     :style="{
                       width: `${entity.width}px`,
                       height: `${entity.height}px`,
                       transform: `translate(${entity.x}px, ${entity.y}px)`,
                     }"
+                    @dblclick.stop="openTableData(entity.name)"
                   >
                     <span class="truncate">{{ entity.name }}</span>
                   </div>

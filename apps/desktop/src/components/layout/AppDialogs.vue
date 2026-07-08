@@ -19,7 +19,8 @@ const DatabaseExportDialog = defineAsyncComponent(() => import("@/components/exp
 const DataGenerateDialog = defineAsyncComponent(() => import("@/components/generate/DataGenerateDialog.vue"));
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDialogSources } from "@/composables/useDialogSources";
-import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
+import type { ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
+import type { SqlParameterDescriptor } from "@/lib/sql/sqlParameters";
 import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
 
 const props = defineProps<{
@@ -31,7 +32,7 @@ const props = defineProps<{
   suppressDangerConfirm: boolean;
   showSqlParameterDialog: boolean;
   sqlParameterSourceSql: string;
-  sqlParameterNames: string[];
+  sqlParameterNames: SqlParameterDescriptor[];
 }>();
 
 const emit = defineEmits<{
@@ -51,6 +52,7 @@ const emit = defineEmits<{
       database: string;
       schema?: string;
       tableName: string;
+      tableType?: string;
       columnName?: string;
     },
   ];
@@ -60,7 +62,17 @@ const emit = defineEmits<{
       database: string;
       schema?: string;
       tableName: string;
+      tableType?: string;
       whereInput?: string;
+    },
+  ];
+  openDiagramTarget: [
+    target: {
+      connectionId: string;
+      database: string;
+      schema?: string;
+      tableName: string;
+      tableType?: string;
     },
   ];
 }>();
@@ -132,7 +144,7 @@ watch(
     :prefill-schema="dialogs.dataComparePrefillSchema.value"
     :prefill-table="dialogs.dataComparePrefillTable.value"
   />
-  <SqlFileExecutionDialog v-model:open="dialogs.showSqlFileDialog.value" :prefill-connection-id="dialogs.sqlFilePrefillConnectionId.value" :prefill-database="dialogs.sqlFilePrefillDatabase.value" />
+  <SqlFileExecutionDialog v-model:open="dialogs.showSqlFileDialog.value" :prefill-connection-id="dialogs.sqlFilePrefillConnectionId.value" :prefill-database="dialogs.sqlFilePrefillDatabase.value" :prefill-file-path="dialogs.sqlFilePrefillFilePath.value" />
   <SchemaDiagramDialog
     v-if="dialogs.showDiagramDialog.value"
     v-model:open="dialogs.showDiagramDialog.value"
@@ -140,6 +152,7 @@ watch(
     :prefill-database="dialogs.diagramPrefillDatabase.value"
     :prefill-schema="dialogs.diagramPrefillSchema.value"
     :focus-table-name="dialogs.diagramFocusTableName.value"
+    @open-target="emit('openDiagramTarget', $event)"
   />
   <TableImportDialog
     v-if="dialogs.showTableImportDialog.value"

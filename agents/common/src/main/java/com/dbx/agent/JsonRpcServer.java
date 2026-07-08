@@ -1,15 +1,20 @@
 package com.dbx.agent;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSerializer;
 import com.google.gson.reflect.TypeToken;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Type;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Connection;
 import java.util.Collections;
 import java.util.List;
@@ -18,7 +23,17 @@ public final class JsonRpcServer {
     private static final long CONNECTION_VALIDATION_INTERVAL_MILLIS = 5_000L;
 
     private final DatabaseAgent agent;
-    private final Gson gson = new Gson();
+    private final Gson gson = new GsonBuilder()
+        // JDBC DECIMAL/NUMERIC values can exceed JavaScript Number precision after JSON-RPC parsing.
+        .registerTypeAdapter(
+            BigDecimal.class,
+            (JsonSerializer<BigDecimal>) (value, type, context) -> new JsonPrimitive(value.toPlainString())
+        )
+        .registerTypeAdapter(
+            BigInteger.class,
+            (JsonSerializer<BigInteger>) (value, type, context) -> new JsonPrimitive(value.toString())
+        )
+        .create();
     private ConnectParams lastConnectParams;
     private long lastConnectionValidationTimeMillis;
 
@@ -109,11 +124,11 @@ public final class JsonRpcServer {
         }
         if (AgentProtocol.METHOD_LIST_TABLES.equals(method)) {
             switchCatalog(params);
-            return agent.listTables(params.get("schema").getAsString(), stringListOrNull(params, "object_types"));
+            return agent.listTables(params.get("schema").getAsString(), metadataListConstraints(params));
         }
         if (AgentProtocol.METHOD_LIST_OBJECTS.equals(method)) {
             switchCatalog(params);
-            return agent.listObjects(params.get("schema").getAsString());
+            return agent.listObjects(params.get("schema").getAsString(), metadataListConstraints(params));
         }
         if (AgentProtocol.METHOD_LIST_DATA_TYPES.equals(method)) {
             switchCatalog(params);
@@ -339,6 +354,15 @@ public final class JsonRpcServer {
             return null;
         }
         return element.getAsInt();
+    }
+
+    private MetadataListConstraints metadataListConstraints(JsonObject params) {
+        return new MetadataListConstraints(
+            stringOrNull(params, "filter"),
+            intOrNull(params, "limit"),
+            intOrNull(params, "offset"),
+            stringListOrNull(params, "object_types")
+        );
     }
 
     private static int intOrDefault(JsonObject object, String key, int defaultValue) {

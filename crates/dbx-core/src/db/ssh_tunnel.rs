@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+
+use crate::path_utils::expand_tilde;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -10,7 +12,7 @@ use russh::keys::agent::client::AgentClient;
 #[cfg(not(feature = "legacy-russh-054"))]
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{decode_secret_key, key::PrivateKeyWithHashAlg, PrivateKey};
-use russh::{kex, ChannelMsg, Preferred};
+use russh::{kex, mac, ChannelMsg, Preferred};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -55,6 +57,15 @@ fn ssh_client_config() -> Config {
     }
     preferred.kex = Cow::Owned(kex);
 
+    let mut mac = preferred.mac.into_owned();
+    // Keep SHA-1 MAC variants as last-resort fallbacks for legacy SSH proxies.
+    for algorithm in [mac::HMAC_SHA1_ETM, mac::HMAC_SHA1] {
+        if !mac.contains(&algorithm) {
+            mac.push(algorithm);
+        }
+    }
+    preferred.mac = Cow::Owned(mac);
+
     Config { nodelay: true, keepalive_interval: Some(Duration::from_secs(30)), preferred, ..Default::default() }
 }
 
@@ -68,6 +79,7 @@ async fn connect_and_authenticate(
     ssh_key_passphrase: &str,
     use_ssh_agent: bool,
     ssh_agent_sock_path: &str,
+    auth_method: &str,
     connect_timeout_secs: u64,
 ) -> Result<Handle<SshClient>, String> {
     let config = Arc::new(ssh_client_config());
@@ -90,8 +102,19 @@ async fn connect_and_authenticate(
         return Ok(session);
     }
 
+    // When auth_method is "none" and the probe was rejected, fail early
+    // instead of falling back to other credential methods.
+    if auth_method == "none" {
+        return Err("SSH authentication failed: server rejected the connection without credentials".to_string());
+    }
+
     // "none" was rejected — fall back to the configured credential method.
-    if !ssh_key_path.is_empty() {
+    // When auth_method is set, only try the matching method.
+    let try_key = auth_method.is_empty() && !ssh_key_path.is_empty() || auth_method == "key";
+    let try_password = auth_method.is_empty() && !ssh_password.is_empty() || auth_method == "password";
+    let try_agent = auth_method.is_empty() && use_ssh_agent || auth_method == "agent";
+
+    if try_key {
         // Validate SSH key file path
         validate_file_path(ssh_key_path, |_| false)?;
 
@@ -114,7 +137,7 @@ async fn connect_and_authenticate(
         if !auth_res.success() {
             return Err("SSH public key authentication failed".to_string());
         }
-    } else if !ssh_password.is_empty() {
+    } else if try_password {
         let auth_res = tokio::time::timeout(connect_timeout, session.authenticate_password(ssh_user, ssh_password))
             .await
             .map_err(|_| format!("SSH password auth timed out ({connect_timeout_secs}s)"))?
@@ -122,7 +145,7 @@ async fn connect_and_authenticate(
         if !auth_res.success() {
             return Err("SSH password authentication failed".to_string());
         }
-    } else if use_ssh_agent {
+    } else if try_agent {
         match try_authenticate_with_agent(&mut session, ssh_user, ssh_agent_sock_path, &connect_timeout).await {
             Ok(()) => {}
             Err(agent_err) => return Err(agent_err),
@@ -238,7 +261,8 @@ async fn try_authenticate_with_agent(
 }
 
 fn load_ssh_private_key(path: &str, passphrase: Option<&str>) -> Result<PrivateKey, String> {
-    let secret = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let expanded = expand_tilde(path);
+    let secret = fs::read_to_string(&expanded).map_err(|e| e.to_string())?;
     match decode_secret_key(&secret, passphrase) {
         Ok(key) => Ok(key),
         Err(err) if is_ssh_key_character_encoding_error(&err.to_string()) => {
@@ -483,6 +507,7 @@ async fn tunnel_reconnect_loop(
     ssh_key_passphrase: String,
     use_ssh_agent: bool,
     ssh_agent_sock_path: String,
+    auth_method: String,
     connect_timeout_secs: u64,
     listener: TcpListener,
     remote_host: String,
@@ -518,6 +543,7 @@ async fn tunnel_reconnect_loop(
                 &ssh_key_passphrase,
                 use_ssh_agent,
                 &ssh_agent_sock_path,
+                &auth_method,
                 connect_timeout_secs,
             )
             .await
@@ -588,6 +614,7 @@ impl TunnelManager {
         ssh_key_passphrase: &str,
         use_ssh_agent: bool,
         ssh_agent_sock_path: &str,
+        auth_method: &str,
         connect_timeout_secs: u64,
         remote_host: &str,
         remote_port: u16,
@@ -611,6 +638,7 @@ impl TunnelManager {
             ssh_key_passphrase,
             use_ssh_agent,
             ssh_agent_sock_path,
+            auth_method,
             connect_timeout_secs,
             remote_host,
             remote_port,
@@ -681,6 +709,7 @@ impl TunnelManager {
                 &hop.key_passphrase,
                 hop.use_ssh_agent,
                 &hop.ssh_agent_sock_path,
+                &hop.auth_method,
                 effective_hop_timeout(hop),
                 &target_host,
                 target_port,
@@ -741,6 +770,7 @@ async fn spawn_tunnel(
     ssh_key_passphrase: &str,
     use_ssh_agent: bool,
     ssh_agent_sock_path: &str,
+    auth_method: &str,
     connect_timeout_secs: u64,
     remote_host: &str,
     remote_port: u16,
@@ -762,6 +792,7 @@ async fn spawn_tunnel(
         ssh_key_passphrase,
         use_ssh_agent,
         ssh_agent_sock_path,
+        auth_method,
         connect_timeout_secs,
     )
     .await?;
@@ -776,6 +807,7 @@ async fn spawn_tunnel(
         ssh_key_passphrase.to_string(),
         use_ssh_agent,
         ssh_agent_sock_path.to_string(),
+        auth_method.to_string(),
         connect_timeout_secs,
         listener,
         remote_host.to_string(),
@@ -874,6 +906,7 @@ mod tests {
             expose_lan: false,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
+            auth_method: "password".to_string(),
         }
     }
 
@@ -920,6 +953,18 @@ mod tests {
 
         assert!(curve25519_index < ecdh_index);
         assert!(ecdh_index < group14_sha1_index);
+    }
+
+    #[test]
+    fn ssh_client_config_keeps_legacy_mac_after_safe_defaults() {
+        let config = ssh_client_config();
+        let mac = config.preferred.mac;
+        let sha2_etm_index = mac.iter().position(|algorithm| *algorithm == russh::mac::HMAC_SHA256_ETM).unwrap();
+        let sha1_etm_index = mac.iter().position(|algorithm| *algorithm == russh::mac::HMAC_SHA1_ETM).unwrap();
+        let sha1_index = mac.iter().position(|algorithm| *algorithm == russh::mac::HMAC_SHA1).unwrap();
+
+        assert!(sha2_etm_index < sha1_etm_index);
+        assert!(sha1_etm_index < sha1_index);
     }
 
     #[test]

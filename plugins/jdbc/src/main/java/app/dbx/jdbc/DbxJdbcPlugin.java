@@ -9,6 +9,7 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.math.BigDecimal;
 import java.net.URL;
@@ -44,6 +45,7 @@ import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.UUID;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 public final class DbxJdbcPlugin {
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -261,12 +263,18 @@ public final class DbxJdbcPlugin {
                 optionalText(params, "database"),
                 optionalText(params, "schema"),
                 optionalText(params, "filter"),
-                nonNegativeInt(params, "limit", 0)
+                nonNegativeInt(params, "limit", 0),
+                nonNegativeInt(params, "offset", 0),
+                optionalStringList(params, "object_types")
             );
             case "listObjects", "list_objects" -> listObjects(
                 connection,
                 optionalText(params, "database"),
-                optionalText(params, "schema")
+                optionalText(params, "schema"),
+                optionalText(params, "filter"),
+                nonNegativeInt(params, "limit", 0),
+                nonNegativeInt(params, "offset", 0),
+                optionalStringList(params, "object_types")
             );
             case "listDataTypes", "list_data_types" -> listDataTypes(connection, optionalText(params, "database"));
             case "getObjectSource", "get_object_source" -> getObjectSource(
@@ -346,9 +354,17 @@ public final class DbxJdbcPlugin {
         }
         closeSharedConnection();
 
+        JdbcUrlCredentials urlCredentials = extractJdbcUrlCredentials(url);
+        url = urlCredentials.url;
         Properties properties = new Properties();
         String username = optionalText(connection, "username");
         String password = optionalText(connection, "password");
+        if (username == null) {
+            username = urlCredentials.username;
+        }
+        if (password == null) {
+            password = urlCredentials.password;
+        }
         if (username != null) {
             properties.setProperty("user", username);
         }
@@ -1111,45 +1127,82 @@ public final class DbxJdbcPlugin {
         return result;
     }
 
-    private static JsonNode listTables(JsonNode connection, String database, String schema, String filter, int limit) throws SQLException {
+    private static JsonNode listTables(
+        JsonNode connection,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
         JdbcDriverQuirks quirks = driverQuirks(connection);
         if (quirks.useOracleMetadata()) {
-            return oracleListTables(conn, oracleEffectiveSchema(conn, schema));
+            return filterMetadataNodes(
+                (ArrayNode) oracleListTables(conn, oracleEffectiveSchema(conn, schema)),
+                filter,
+                limit,
+                offset,
+                objectTypes,
+                "table_type",
+                true
+            );
         }
         if (usePrestoInformationSchemaTables(connection)) {
-            return prestoListTables(conn, database, schema, filter, limit);
+            return prestoListTables(conn, database, schema, filter, limit, offset, objectTypes);
         }
         DatabaseMetaData meta = conn.getMetaData();
-        String[] types = jdbcTableTypes(meta);
+        String[] types = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
+        if (types.length == 0) {
+            return result;
+        }
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
         appendTables(result, meta, catalog, schemaPattern, types);
         if (result.isEmpty() && catalog != null) {
             appendTables(result, meta, null, schemaPattern, types);
         }
-        return result;
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "table_type", true);
     }
 
-    private static JsonNode listObjects(JsonNode connection, String database, String schema) throws SQLException {
+    private static JsonNode listObjects(
+        JsonNode connection,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
-            return oracleListObjects(conn, oracleEffectiveSchema(conn, schema), schema);
+            return filterMetadataNodes(
+                (ArrayNode) oracleListObjects(conn, oracleEffectiveSchema(conn, schema), schema),
+                filter,
+                limit,
+                offset,
+                objectTypes,
+                "object_type",
+                false
+            );
         }
         if (usePrestoInformationSchemaTables(connection)) {
-            return prestoListObjects(conn, database, schema);
+            return prestoListObjects(conn, database, schema, filter, limit, offset, objectTypes);
         }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
 
-        String[] tableTypes = jdbcTableTypes(meta);
-        appendTableObjects(result, meta, catalog, schemaPattern, schema, tableTypes);
-        if (result.isEmpty() && catalog != null) {
-            appendTableObjects(result, meta, null, schemaPattern, schema, tableTypes);
+        String[] tableTypes = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
+        if (tableTypes.length > 0) {
+            appendTableObjects(result, meta, catalog, schemaPattern, schema, tableTypes);
+            if (result.isEmpty() && catalog != null) {
+                appendTableObjects(result, meta, null, schemaPattern, schema, tableTypes);
+            }
         }
 
         try (ResultSet rs = meta.getProcedures(catalog, schemaPattern, "%")) {
@@ -1185,7 +1238,7 @@ public final class DbxJdbcPlugin {
         } catch (SQLException ignored) {
         }
 
-        return result;
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
     }
 
     private static JsonNode listDataTypes(JsonNode connection, String database) throws SQLException {
@@ -1368,6 +1421,111 @@ public final class DbxJdbcPlugin {
         return DEFAULT_TABLE_TYPES;
     }
 
+    private static String[] constrainedJdbcTableTypes(String[] tableTypes, List<String> objectTypes) {
+        Set<String> allowed = normalizedObjectTypes(objectTypes);
+        if (allowed.isEmpty()) {
+            return tableTypes;
+        }
+        List<String> result = new ArrayList<>();
+        for (String tableType : tableTypes) {
+            if (allowed.contains(normalizeTableObjectType(tableType))) {
+                result.add(tableType);
+            }
+        }
+        return result.toArray(new String[0]);
+    }
+
+    private static ArrayNode filterMetadataNodes(
+        ArrayNode source,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes,
+        String typeField,
+        boolean defaultBlankTypeToTable
+    ) {
+        ArrayNode result = MAPPER.createArrayNode();
+        Set<String> allowedTypes = normalizedObjectTypes(objectTypes);
+        String normalizedFilter = filter == null ? "" : filter.trim().toLowerCase(Locale.ROOT);
+        int start = Math.max(0, offset);
+        int max = limit <= 0 ? Integer.MAX_VALUE : limit;
+        int skipped = 0;
+        for (JsonNode item : source) {
+            if (!metadataNameMatches(item.path("name").asText(""), normalizedFilter)) {
+                continue;
+            }
+            String type = item.path(typeField).asText("");
+            String normalizedType = defaultBlankTypeToTable ? normalizeTableObjectType(type) : normalizeObjectType(type);
+            if (!allowedTypes.isEmpty() && (normalizedType.isEmpty() || !allowedTypes.contains(normalizedType))) {
+                continue;
+            }
+            if (skipped++ < start) {
+                continue;
+            }
+            if (result.size() >= max) {
+                break;
+            }
+            result.add(item);
+        }
+        return result;
+    }
+
+    private static boolean metadataNameMatches(String name, String filter) {
+        if (filter == null || filter.isEmpty()) {
+            return true;
+        }
+        String candidate = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        return candidate.contains(filter) || (filter.length() >= 2 && fuzzySubsequenceMatches(candidate, filter));
+    }
+
+    private static boolean fuzzySubsequenceMatches(String candidate, String expected) {
+        int cursor = 0;
+        for (int i = 0; i < expected.length(); i++) {
+            cursor = candidate.indexOf(expected.charAt(i), cursor);
+            if (cursor < 0) {
+                return false;
+            }
+            cursor++;
+        }
+        return true;
+    }
+
+    private static Set<String> normalizedObjectTypes(List<String> objectTypes) {
+        Set<String> result = new HashSet<>();
+        if (objectTypes == null) {
+            return result;
+        }
+        for (String objectType : objectTypes) {
+            String normalized = normalizeObjectType(objectType);
+            if (!normalized.isEmpty()) {
+                result.add(normalized);
+            }
+        }
+        return result;
+    }
+
+    private static String normalizeTableObjectType(String value) {
+        String normalized = normalizeObjectType(value);
+        return normalized.isEmpty() ? "TABLE" : normalized;
+    }
+
+    private static String normalizeObjectType(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String upper = value.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+        if (upper.contains("MATERIALIZED") && upper.contains("VIEW")) {
+            return "MATERIALIZED_VIEW";
+        }
+        if ("BASE_TABLE".equals(upper) || upper.contains("TABLE")) {
+            return "TABLE";
+        }
+        if (upper.contains("VIEW")) {
+            return "VIEW";
+        }
+        return upper;
+    }
+
     private static void appendTableObjects(
         ArrayNode result,
         DatabaseMetaData meta,
@@ -1393,9 +1551,18 @@ public final class DbxJdbcPlugin {
         return urlMatchesPrefix(url, "jdbc:presto:") || urlMatchesPrefix(url, "jdbc:trino:");
     }
 
-    private static JsonNode prestoListTables(Connection conn, String database, String schema, String filter, int limit) throws SQLException {
+    private static JsonNode prestoListTables(
+        Connection conn,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
-        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database, filter, limit))) {
+        int queryLimit = limit > 0 ? Math.max(1, limit + Math.max(0, offset)) : 0;
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database, filter, queryLimit))) {
             ps.setString(1, schema);
             if (emptyToNull(filter) != null) {
                 ps.setString(2, escapeLikePattern(filter.toLowerCase(Locale.ROOT)) + "%");
@@ -1410,13 +1577,25 @@ public final class DbxJdbcPlugin {
                 }
             }
         }
-        return result;
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "table_type", true);
     }
 
-    private static JsonNode prestoListObjects(Connection conn, String database, String schema) throws SQLException {
+    private static JsonNode prestoListObjects(
+        Connection conn,
+        String database,
+        String schema,
+        String filter,
+        int limit,
+        int offset,
+        List<String> objectTypes
+    ) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
-        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database, null, 0))) {
+        int queryLimit = limit > 0 ? Math.max(1, limit + Math.max(0, offset)) : 0;
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database, filter, queryLimit))) {
             ps.setString(1, schema);
+            if (emptyToNull(filter) != null) {
+                ps.setString(2, escapeLikePattern(filter.toLowerCase(Locale.ROOT)) + "%");
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     ObjectNode item = MAPPER.createObjectNode();
@@ -1428,7 +1607,7 @@ public final class DbxJdbcPlugin {
                 }
             }
         }
-        return result;
+        return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
     }
 
     private static JsonNode prestoGetColumns(Connection conn, String database, String schema, String table) throws SQLException {
@@ -1761,6 +1940,84 @@ public final class DbxJdbcPlugin {
     static String jdbcUrl(JsonNode connection) {
         String url = appendJdbcUrlParams(optionalText(connection, "connection_string"), optionalText(connection, "url_params"));
         return jdbcUrlWithPasswordKey(url, optionalText(connection, "password"));
+    }
+
+    private record JdbcUrlCredentials(String url, String username, String password) {}
+
+    static JdbcUrlCredentials extractJdbcUrlCredentials(String url) {
+        if (url == null) {
+            return new JdbcUrlCredentials(null, null, null);
+        }
+        int queryStart = url.indexOf('?');
+        if (queryStart < 0) {
+            return new JdbcUrlCredentials(url, null, null);
+        }
+
+        int fragmentStart = url.indexOf('#', queryStart + 1);
+        String base = url.substring(0, queryStart);
+        String query = fragmentStart < 0 ? url.substring(queryStart + 1) : url.substring(queryStart + 1, fragmentStart);
+        String fragment = fragmentStart < 0 ? "" : url.substring(fragmentStart);
+
+        String username = null;
+        String password = null;
+        boolean foundCredential = false;
+        List<String> keptParams = new ArrayList<>();
+        for (String part : splitJdbcUrlParams(query)) {
+            String name = partName(part);
+            String key = decodeQueryPart(name).trim().toLowerCase(Locale.ROOT);
+            if ("user".equals(key)) {
+                username = decodeQueryPart(partValue(part));
+                foundCredential = true;
+            } else if ("password".equals(key)) {
+                password = decodeQueryPart(partValue(part));
+                foundCredential = true;
+            } else {
+                keptParams.add(part);
+            }
+        }
+
+        if (!foundCredential) {
+            return new JdbcUrlCredentials(url, null, null);
+        }
+        String sanitizedQuery = joinJdbcUrlParams(keptParams);
+        String sanitizedUrl = sanitizedQuery.isEmpty() ? base + fragment : base + "?" + sanitizedQuery + fragment;
+        return new JdbcUrlCredentials(sanitizedUrl, username, password);
+    }
+
+    private static List<String> splitJdbcUrlParams(String query) {
+        List<String> result = new ArrayList<>();
+        int start = 0;
+        for (int i = 0; i < query.length(); i++) {
+            char ch = query.charAt(i);
+            if (ch == '&') {
+                result.add(query.substring(start, i));
+                start = i + 1;
+            }
+        }
+        result.add(query.substring(start));
+        return result;
+    }
+
+    private static String joinJdbcUrlParams(List<String> params) {
+        return params.stream().filter(param -> !param.isEmpty()).collect(Collectors.joining("&"));
+    }
+
+    private static String partName(String part) {
+        int equals = part.indexOf('=');
+        return equals < 0 ? part : part.substring(0, equals);
+    }
+
+    private static String partValue(String part) {
+        int equals = part.indexOf('=');
+        return equals < 0 ? "" : part.substring(equals + 1);
+    }
+
+    private static String decodeQueryPart(String value) {
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException ignored) {
+            return value;
+        }
     }
 
     private static boolean isSqliteUrl(String url) {
@@ -2220,6 +2477,34 @@ public final class DbxJdbcPlugin {
         }
         String text = value.asText("").trim();
         return text.isEmpty() ? null : text;
+    }
+
+    private static List<String> optionalStringList(JsonNode node, String field) {
+        JsonNode value = node.path(field);
+        if (value.isMissingNode() || value.isNull()) {
+            return null;
+        }
+        List<String> result = new ArrayList<>();
+        if (value.isArray()) {
+            for (JsonNode item : value) {
+                String text = item.asText("").trim();
+                if (!text.isEmpty()) {
+                    result.add(text);
+                }
+            }
+            return result;
+        }
+        String text = value.asText("").trim();
+        if (text.isEmpty()) {
+            return null;
+        }
+        for (String part : text.split(",")) {
+            String item = part.trim();
+            if (!item.isEmpty()) {
+                result.add(item);
+            }
+        }
+        return result;
     }
 
     private static int positiveInt(JsonNode node, String field, int defaultValue) {

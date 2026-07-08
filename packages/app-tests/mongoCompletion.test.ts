@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { buildMongoCompletionItems, getMongoCompletionContext, inferMongoCompletionFields, shouldAutoOpenMongoCompletion } from "../../apps/desktop/src/lib/mongoCompletion.ts";
+import { buildMongoCompletionItems, getMongoCompletionContext, inferMongoCompletionFields, shouldAutoOpenMongoCompletion } from "../../apps/desktop/src/lib/mongo/mongoCompletion.ts";
 
 const collections = ["users", "user_events", "order-items"];
 const fields = [
@@ -39,6 +39,15 @@ test("uses getCollection apply text for unsafe collection names", () => {
 test("suggests collection methods after direct and getCollection references", () => {
     assert.ok(labels("db.users.").includes("find"));
     assert.ok(labels('db.getCollection("users").ag').includes("aggregate"));
+});
+
+test("suggests collection stats methods after a collection reference", () => {
+    const methodLabels = labels("db.users.");
+    for (const method of ["stats", "dataSize", "storageSize", "totalIndexSize"]) {
+        assert.ok(methodLabels.includes(method), `expected completion to include ${method}`);
+    }
+    const item = buildMongoCompletionItems("db.users.stat", "db.users.stat".length).find((candidate) => candidate.label === "stats");
+    assert.equal(item?.apply, "stats()");
 });
 
 test("suggests cursor methods after find result chains", () => {

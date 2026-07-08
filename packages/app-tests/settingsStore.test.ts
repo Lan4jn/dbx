@@ -1,14 +1,15 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
 import { createPinia, setActivePinia } from "pinia";
-import { DEFAULT_SQL_FORMATTER_SETTINGS } from "../../apps/desktop/src/lib/sqlFormatterConfig.ts";
-import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS } from "../../apps/desktop/src/lib/tableColumnTemplates.ts";
-import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "../../apps/desktop/src/lib/appFonts.ts";
+import { DEFAULT_SQL_FORMATTER_SETTINGS } from "../../apps/desktop/src/lib/sql/sqlFormatterConfig.ts";
+import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS } from "../../apps/desktop/src/lib/table/tableColumnTemplates.ts";
+import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "../../apps/desktop/src/lib/app/appFonts.ts";
+import { tableOpenPageLimit } from "../../apps/desktop/src/lib/table/tableOpenPageLimit.ts";
 import { AI_PROVIDER_PRESETS, DEFAULT_EDITOR_SETTINGS, normalizeAiConfig, normalizeEditorSettings, useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
 
 const OLD_FONT_SIZE_KEY = "dbx-query-editor-font-size";
 
-function withMockLocalStorage(initial: Record<string, string>, run: () => void) {
+async function withMockLocalStorage(initial: Record<string, string>, run: () => void | Promise<void>) {
   const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   const values = new Map(Object.entries(initial));
   const localStorageMock = {
@@ -30,7 +31,7 @@ function withMockLocalStorage(initial: Record<string, string>, run: () => void) 
   });
 
   try {
-    run();
+    await run();
   } finally {
     if (previousDescriptor) {
       Object.defineProperty(globalThis, "localStorage", previousDescriptor);
@@ -47,32 +48,40 @@ test("normalizes saved query result page size", () => {
   assert.equal(normalizeEditorSettings({ pageSize: 0 }).pageSize, 100);
 });
 
+test("uses saved rows-per-page for table opens", () => {
+  assert.equal(tableOpenPageLimit(), 100);
+  assert.equal(tableOpenPageLimit(500), 500);
+  assert.equal(tableOpenPageLimit(0), 100);
+});
+
 test("defaults export batch size to 2000 rows", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.exportBatchSize, 2000);
   assert.equal(normalizeEditorSettings({}).exportBatchSize, 2000);
   assert.equal(normalizeEditorSettings({ exportBatchSize: 2000 }).exportBatchSize, 2000);
 });
 
-test("migrates the legacy saved export batch default to 2000 once", () => {
-  withMockLocalStorage({ "dbx-editor-settings": JSON.stringify({ exportBatchSize: 10000 }) }, () => {
+test("migrates the legacy saved export batch default to 2000 once", async () => {
+  await withMockLocalStorage({ "dbx-editor-settings": JSON.stringify({ exportBatchSize: 10000 }) }, async () => {
     setActivePinia(createPinia());
     const store = useSettingsStore();
+    await store.initEditorSettings();
 
     assert.equal(store.editorSettings.exportBatchSize, 2000);
-    assert.equal(localStorage.getItem("dbx-export-batch-size-default-migrated-v1"), "1");
-    assert.equal(JSON.parse(localStorage.getItem("dbx-editor-settings") || "{}").exportBatchSize, 2000);
+    assert.equal(localStorage.getItem("dbx-editor-settings"), null);
+    assert.equal(JSON.parse(localStorage.getItem("dbx-app-state:editor_settings") || "{}").exportBatchSize, 2000);
   });
 });
 
-test("keeps a manually saved 10000 export batch size after migration", () => {
-  withMockLocalStorage(
+test("keeps a manually saved 10000 export batch size after migration", async () => {
+  await withMockLocalStorage(
     {
       "dbx-editor-settings": JSON.stringify({ exportBatchSize: 10000 }),
       "dbx-export-batch-size-default-migrated-v1": "1",
     },
-    () => {
+    async () => {
       setActivePinia(createPinia());
       const store = useSettingsStore();
+      await store.initEditorSettings();
 
       assert.equal(store.editorSettings.exportBatchSize, 10000);
     },
@@ -120,16 +129,54 @@ test("defaults dangerous SQL confirmation to enabled", () => {
   assert.equal(normalizeEditorSettings({ confirmDangerousSqlExecution: false }).confirmDangerousSqlExecution, false);
 });
 
+test("defaults statement run buttons to enabled and preserves saved booleans", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.showStatementRunButtons, true);
+  assert.equal(normalizeEditorSettings({}).showStatementRunButtons, true);
+  assert.equal(normalizeEditorSettings({ showStatementRunButtons: false }).showStatementRunButtons, false);
+  assert.equal(normalizeEditorSettings({ showStatementRunButtons: "nope" as any }).showStatementRunButtons, true);
+});
+
+test("normalizes SQL snippet enabled state", () => {
+  const settings = normalizeEditorSettings({
+    snippets: [
+      { id: "legacy", label: "legacy", prefix: "leg", body: "SELECT 1;" },
+      { id: "disabled", label: "disabled", prefix: "dis", body: "SELECT 2;", enabled: false },
+      { id: "invalid", label: "invalid", prefix: "inv", body: "SELECT 3;", enabled: "nope" },
+    ],
+  } as any);
+
+  assert.deepEqual(settings.snippets, [
+    { id: "legacy", label: "legacy", prefix: "leg", body: "SELECT 1;", enabled: true },
+    { id: "disabled", label: "disabled", prefix: "dis", body: "SELECT 2;", enabled: false },
+    { id: "invalid", label: "invalid", prefix: "inv", body: "SELECT 3;", enabled: true },
+  ]);
+});
+
 test("defaults unsaved SQL close confirmation to enabled", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose, true);
   assert.equal(normalizeEditorSettings({}).confirmUnsavedSqlClose, true);
   assert.equal(normalizeEditorSettings({ confirmUnsavedSqlClose: false }).confirmUnsavedSqlClose, false);
 });
 
+test("defaults Vim mode to off and preserves saved booleans", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.vimModeEnabled, false);
+  assert.equal(normalizeEditorSettings({}).vimModeEnabled, false);
+  assert.equal(normalizeEditorSettings({ vimModeEnabled: true }).vimModeEnabled, true);
+  assert.equal(normalizeEditorSettings({ vimModeEnabled: "yes" as any }).vimModeEnabled, false);
+});
+
 test("defaults update notifications to enabled", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, true);
   assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, true);
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).updateNotificationsEnabled, false);
+});
+
+test("defaults sidebar table search to disabled and preserves saved booleans", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarTableSearchEnabled, false);
+  assert.equal(normalizeEditorSettings({}).sidebarTableSearchEnabled, false);
+  assert.equal(normalizeEditorSettings({ sidebarTableSearchEnabled: true }).sidebarTableSearchEnabled, true);
+  assert.equal(normalizeEditorSettings({ sidebarTableSearchEnabled: false }).sidebarTableSearchEnabled, false);
+  assert.equal(normalizeEditorSettings({ sidebarTableSearchEnabled: "yes" as any }).sidebarTableSearchEnabled, false);
 });
 
 test("defaults shortcut settings", () => {
@@ -147,6 +194,9 @@ test("defaults shortcut settings", () => {
   assert.equal(settings.shortcuts.resetUiZoom, "Mod+0");
   assert.equal(settings.shortcuts.refreshData, "F5");
   assert.equal(settings.shortcuts.toggleTranspose, "Tab");
+  assert.equal(settings.shortcuts.copySidebarSelection, "Mod+C");
+  assert.equal(settings.shortcuts.pasteSidebarSelection, "Mod+V");
+  assert.equal(settings.shortcuts.editSidebarConnection, "Mod+E");
 });
 
 test("keeps saved shortcut overrides", () => {
@@ -158,6 +208,7 @@ test("keeps saved shortcut overrides", () => {
       newQuery: "Shift+Mod+N",
       openSettings: "Shift+Mod+P",
       zoomInUi: "Alt+Mod+=",
+      editSidebarConnection: "Alt+E",
     } as any,
   });
 
@@ -167,6 +218,7 @@ test("keeps saved shortcut overrides", () => {
   assert.equal(settings.shortcuts.newQuery, "Shift+Mod+N");
   assert.equal(settings.shortcuts.openSettings, "Shift+Mod+P");
   assert.equal(settings.shortcuts.zoomInUi, "Alt+Mod+=");
+  assert.equal(settings.shortcuts.editSidebarConnection, "Alt+E");
   assert.equal(settings.shortcuts.saveSql, "Mod+S");
 });
 
@@ -422,8 +474,8 @@ test("keeps SQL formatter default objects distinct", () => {
   assert.notEqual(normalized.sqlFormatter, DEFAULT_SQL_FORMATTER_SETTINGS);
 });
 
-test("does not leak default-loaded SQL formatter mutations into defaults", () => {
-  withMockLocalStorage({}, () => {
+test("does not leak default-loaded SQL formatter mutations into defaults", async () => {
+  await withMockLocalStorage({}, async () => {
     setActivePinia(createPinia());
     const store = useSettingsStore();
     const editorDefaultKeywordCase = DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase;
@@ -443,10 +495,11 @@ test("does not leak default-loaded SQL formatter mutations into defaults", () =>
   });
 });
 
-test("does not leak migrated SQL formatter mutations into defaults", () => {
-  withMockLocalStorage({ [OLD_FONT_SIZE_KEY]: "18" }, () => {
+test("does not leak migrated SQL formatter mutations into defaults", async () => {
+  await withMockLocalStorage({ [OLD_FONT_SIZE_KEY]: "18" }, async () => {
     setActivePinia(createPinia());
     const store = useSettingsStore();
+    await store.initEditorSettings();
     const editorDefaultKeywordCase = DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase;
     const formatterDefaultKeywordCase = DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase;
 

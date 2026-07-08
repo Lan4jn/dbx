@@ -18,21 +18,21 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import RedisValueViewer from "./RedisValueViewer.vue";
 import RedisPubSubPanel from "./RedisPubSubPanel.vue";
 import RedisSlowlogPanel from "./RedisSlowlogPanel.vue";
-import * as api from "@/lib/api";
-import type { RedisKeyInfo, RedisScanResult, RedisValue, HistoryEntry } from "@/lib/api";
-import { uuid } from "@/lib/utils";
+import * as api from "@/lib/backend/api";
+import type { RedisKeyInfo, RedisScanResult, RedisValue, HistoryEntry } from "@/lib/backend/api";
+import { uuid } from "@/lib/common/utils";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { buildRedisKeyTree, collectExpandedGroupIds, collectRedisGroupKeyRaws, flattenVisibleRedisKeyTree, mergeKeysIntoRedisKeyTree, redisKeyNameCopyText, redisKeyToFlatTreeRow, type RedisKeyTreeNode } from "@/lib/redisKeyTree";
-import { classifyRedisCommandSafety } from "@/lib/redisCommandSafety";
-import { isRedisMutatingCommand } from "@/lib/redisCommandTable";
-import { isRedisClearScreenCommand, nextRedisCommandDb, redisKeyTextToRaw } from "@/lib/redisCommandSession";
-import { formatRedisConsoleValue, formatRedisStringValue } from "@/lib/redisValuePresentation";
-import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
-import { copyToClipboard } from "@/lib/clipboard";
+import { buildRedisKeyTree, collectExpandedGroupIds, collectRedisGroupKeyRaws, flattenVisibleRedisKeyTree, mergeKeysIntoRedisKeyTree, redisKeyNameCopyText, redisKeyToFlatTreeRow, type RedisKeyTreeNode } from "@/lib/redis/redisKeyTree";
+import { classifyRedisCommandSafety } from "@/lib/redis/redisCommandSafety";
+import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
+import { isRedisClearScreenCommand, nextRedisCommandDb, redisKeyTextToRaw } from "@/lib/redis/redisCommandSession";
+import { formatRedisConsoleValue, redisValuePreview, redisValueSize } from "@/lib/redis/redisValuePresentation";
+import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
 import { useToast } from "@/composables/useToast";
-import { redisKeySearchPattern } from "@/lib/redisKeyPattern";
-import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redisKeyPattern";
+import { redisKeySearchPattern } from "@/lib/redis/redisKeyPattern";
+import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -388,10 +388,10 @@ function redisValueToKeyInfo(value: RedisValue): RedisKeyInfo {
   return {
     key_display: value.key_display,
     key_raw: value.key_raw,
-    key_type: value.key_type,
+    key_type: value.redis_type,
     ttl: value.ttl,
-    size: typeof value.value === "string" ? value.value.length : (value.total ?? 0),
-    value_preview: createdKeyPreview(value.value),
+    size: redisValueSize(value),
+    value_preview: redisValuePreview(value),
   };
 }
 
@@ -642,23 +642,14 @@ function openCreateKeyDialog() {
   showCreateKeyDialog.value = true;
 }
 
-function createdKeyPreview(value: any): string {
-  if (typeof value === "string") {
-    const text = formatRedisStringValue(value).replace(/\s+/g, " ").trim();
-    return text.length > 160 ? `${text.slice(0, 160)}…` : text;
-  }
-  if (Array.isArray(value) && value.length > 0) return String(value.length);
-  return "";
-}
-
-function upsertCreatedKey(value: any) {
+function upsertCreatedKey(value: RedisValue) {
   const keyInfo: RedisKeyInfo = {
     key_display: value.key_display,
     key_raw: value.key_raw,
-    key_type: value.key_type,
+    key_type: value.redis_type,
     ttl: value.ttl,
-    size: typeof value.value === "string" ? value.value.length : (value.total ?? 0),
-    value_preview: createdKeyPreview(value.value),
+    size: redisValueSize(value),
+    value_preview: redisValuePreview(value),
   };
   const existingIndex = flatKeys.value.findIndex((key) => key.key_raw === keyInfo.key_raw);
   if (existingIndex >= 0) {

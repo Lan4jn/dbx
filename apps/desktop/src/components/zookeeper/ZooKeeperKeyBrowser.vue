@@ -2,8 +2,8 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import KvKeyBrowser from "@/components/kv/KvKeyBrowser.vue";
-import * as api from "@/lib/api";
-import type { KvCreateMode } from "@/lib/api";
+import * as api from "@/lib/backend/api";
+import type { KvCreateMode } from "@/lib/backend/api";
 
 const props = defineProps<{ connectionId: string }>();
 
@@ -39,6 +39,7 @@ const labels = computed(() => ({
   deleteTitle: t("zookeeper.deleteTitle"),
   keyPlaceholder: t("zookeeper.keyPlaceholder"),
   keyRequired: t("zookeeper.keyRequired"),
+  rootReadonly: t("zookeeper.rootReadonly"),
   saved: t("zookeeper.saved"),
   deleted: t("zookeeper.deleted"),
   base64Readonly: t("zookeeper.base64Readonly"),

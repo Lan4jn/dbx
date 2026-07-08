@@ -44,6 +44,11 @@ impl MySqlQueryDialect {
     }
 }
 
+pub enum MySqlQueryStreamItem {
+    Columns { columns: Vec<String>, column_types: Vec<String> },
+    Row(Vec<serde_json::Value>),
+}
+
 fn quote_value(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
@@ -426,16 +431,43 @@ pub async fn connect_with_ca_cert_pool_limit_idle_and_setup(
     idle_timeout_secs: Option<u64>,
     extra_setup_queries: &[String],
 ) -> Result<MySqlPool, String> {
+    connect_with_ca_cert_pool_limit_idle_and_setup_database(
+        url,
+        ca_cert_path,
+        fallback_timeout,
+        max_connections,
+        idle_timeout_secs,
+        None,
+        extra_setup_queries,
+    )
+    .await
+}
+
+pub async fn connect_with_ca_cert_pool_limit_idle_and_setup_database(
+    url: &str,
+    ca_cert_path: Option<&str>,
+    fallback_timeout: Duration,
+    max_connections: usize,
+    idle_timeout_secs: Option<u64>,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+) -> Result<MySqlPool, String> {
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let pool = create_pool(url, ca_cert_path, max_connections, idle_timeout_secs, extra_setup_queries)?;
+    let pool = create_pool(url, ca_cert_path, max_connections, idle_timeout_secs, setup_database, extra_setup_queries)?;
     let result = verify_pool_connection(&pool, timeout).await;
 
     if let Err(ref e) = result {
         if mysql_error_should_retry_without_ssl(e) {
             if let Some(fallback_url) = ssl_fallback_url(url) {
                 log::info!("SSL handshake failed, retrying with ssl-mode=disabled");
-                let fallback_pool =
-                    create_pool(&fallback_url, None, max_connections, idle_timeout_secs, extra_setup_queries)?;
+                let fallback_pool = create_pool(
+                    &fallback_url,
+                    None,
+                    max_connections,
+                    idle_timeout_secs,
+                    setup_database,
+                    extra_setup_queries,
+                )?;
                 return match verify_pool_connection(&fallback_pool, timeout).await {
                     Ok(()) => Ok(fallback_pool),
                     Err(e) => Err(e),
@@ -458,11 +490,13 @@ fn create_pool(
     ca_cert_path: Option<&str>,
     max_connections: usize,
     idle_timeout_secs: Option<u64>,
+    setup_database: Option<&str>,
     extra_setup_queries: &[String],
 ) -> Result<MySqlPool, String> {
     let tls_url = mysql_tls_url(url)?;
     let opts =
         mysql_async::Opts::from_url(&mysql_async_url(&tls_url.url)).map_err(|e| format!("Invalid MySQL URL: {e}"))?;
+    let tcp_host = mysql_async_tcp_host(opts.ip_or_hostname()).to_string();
     let base_ssl_opts = opts.ssl_opts().cloned();
     let max_connections = max_connections.max(1);
     // Single-connection pools (max_connections == 1) are client session pools that
@@ -474,16 +508,32 @@ fn create_pool(
         .with_constraints(mysql_async::PoolConstraints::new(1, max_connections).unwrap())
         .with_inactive_connection_ttl(inactive_ttl)
         .with_reset_connection(max_connections > 1);
+    let setup_queries = match setup_database {
+        Some(database) => mysql_setup_queries_for_database(url, Some(database), extra_setup_queries),
+        None => mysql_setup_queries(url, extra_setup_queries),
+    };
     let mut builder = mysql_async::OptsBuilder::from_opts(opts)
+        .ip_or_hostname(tcp_host)
         .stmt_cache_size(0)
         .prefer_socket(false)
         .pool_opts(Some(pool_opts))
         .tcp_keepalive(Some(MYSQL_TCP_KEEPALIVE_MS))
-        .setup(mysql_setup_queries(url, extra_setup_queries));
+        .setup(setup_queries);
     if let Some(ssl_opts) = mysql_ssl_opts(base_ssl_opts, url, ca_cert_path, &tls_url.files)? {
         builder = builder.ssl_opts(ssl_opts);
     }
     Ok(MySqlPool::new(builder))
+}
+
+fn mysql_async_tcp_host(host: &str) -> &str {
+    if let Some(inner) = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+        // mysql_async preserves IPv6 brackets when converting URL opts into an
+        // OptsBuilder, but the builder TCP path resolves host strings directly.
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return inner;
+        }
+    }
+    host
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,12 +606,12 @@ fn mysql_ssl_opts(
 ) -> Result<Option<mysql_async::SslOpts>, String> {
     let ca_cert_path = ca_cert_path.map(str::trim).filter(|path| !path.is_empty());
     let has_client_identity = files.sslcert.as_deref().is_some() || files.sslkey.as_deref().is_some();
-    if !mysql_url_requires_ssl(url) && !has_client_identity {
+    if !mysql_url_attempts_ssl(url) && !has_client_identity {
         return Ok(None);
     }
 
     let mut ssl_opts = base_ssl_opts.unwrap_or_default();
-    if let Some(ca_cert_path) = ca_cert_path.filter(|_| mysql_url_requires_ssl(url) || has_client_identity) {
+    if let Some(ca_cert_path) = ca_cert_path.filter(|_| mysql_url_attempts_ssl(url) || has_client_identity) {
         #[cfg(feature = "legacy-mysql-032")]
         {
             ssl_opts = ssl_opts.with_root_cert_path(Some(PathBuf::from(ca_cert_path)));
@@ -601,9 +651,17 @@ fn mysql_ssl_opts(
 }
 
 fn mysql_setup_queries(url: &str, extra_setup_queries: &[String]) -> Vec<String> {
+    mysql_setup_queries_for_database(url, None, extra_setup_queries)
+}
+
+fn mysql_setup_queries_for_database(
+    url: &str,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+) -> Vec<String> {
     let charset = mysql_connection_charset(url).unwrap_or("utf8mb4");
     let catalog = mysql_connection_catalog(url);
-    let database = mysql_connection_database(url);
+    let database = setup_database.map(ToOwned::to_owned).or_else(|| mysql_connection_database(url));
     let mut queries = Vec::new();
     if let Some(database) = database.as_deref() {
         queries.push(format!("USE {}", quote_identifier(database)));
@@ -612,6 +670,10 @@ fn mysql_setup_queries(url: &str, extra_setup_queries: &[String]) -> Vec<String>
         queries.push(format!("SET time_zone = {}", quote_value(&time_zone)));
     }
     queries.push(format!("SET NAMES {charset}"));
+    // MySQL defaults group_concat_max_len to 1024, which silently truncates
+    // GROUP_CONCAT results. Use @@ syntax because Manticore accepts it as a
+    // compatibility no-op while `SET SESSION` fails during connection setup.
+    queries.push("SET @@group_concat_max_len = 1048576".to_string());
     // StarRocks/Doris expose external storage (Paimon, Hive, ...) through a
     // catalog. `SET catalog` must run *before* `USE <database>` (the database
     // lives in the external catalog and is unknown to the default one).
@@ -841,6 +903,9 @@ fn mysql_error_should_retry_without_ssl(error: &str) -> bool {
         || error.contains("handshake")
         || error.contains("tls connection")
         || error.contains("server closed session")
+        // Some MySQL-compatible servers report a preferred-TLS attempt as a
+        // normal server error instead of a TLS handshake error.
+        || (error.contains("client asked for ssl") && error.contains("server does not have this capability"))
 }
 
 fn mysql_error_should_retry_with_text_protocol(error: &str) -> bool {
@@ -858,11 +923,62 @@ fn ssl_fallback_url(url: &str) -> Option<String> {
     if mysql_url_requires_ssl(url) {
         return None;
     }
-    if url.contains("ssl-mode=preferred") {
-        Some(url.replace("ssl-mode=preferred", "ssl-mode=disabled"))
-    } else if !url.contains("ssl-mode=") {
-        let sep = if url.contains('?') { "&" } else { "?" };
-        Some(format!("{url}{sep}ssl-mode=disabled"))
+
+    let (base_url, fragment) = url.split_once('#').map_or((url, ""), |(base, fragment)| (base, fragment));
+    let Some(query_start) = base_url.find('?') else {
+        let mut fallback = format!("{base_url}?ssl-mode=disabled");
+        if !fragment.is_empty() {
+            fallback.push('#');
+            fallback.push_str(fragment);
+        }
+        return Some(fallback);
+    };
+    let prefix = &base_url[..query_start];
+    let query_string = &base_url[query_start + 1..];
+    let mut changed = false;
+    let mut kept_params = Vec::new();
+
+    for param in query_string.split('&') {
+        if param.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = param.split_once('=') else {
+            kept_params.push(param.to_string());
+            continue;
+        };
+        if (key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
+            && matches!(value.to_ascii_lowercase().replace('-', "_").as_str(), "preferred" | "prefer")
+        {
+            if !changed {
+                kept_params.push("ssl-mode=disabled".to_string());
+            }
+            changed = true;
+        } else {
+            kept_params.push(param.to_string());
+        }
+    }
+
+    if !changed
+        && !kept_params.iter().any(|part| {
+            part.split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
+        })
+    {
+        kept_params.push("ssl-mode=disabled".to_string());
+        changed = true;
+    }
+
+    if changed {
+        let mut fallback = prefix.to_string();
+        if !kept_params.is_empty() {
+            fallback.push('?');
+            fallback.push_str(&kept_params.join("&"));
+        }
+        if !fragment.is_empty() {
+            fallback.push('#');
+            fallback.push_str(fragment);
+        }
+        Some(fallback)
     } else {
         None
     }
@@ -886,6 +1002,25 @@ fn mysql_url_requires_ssl(url: &str) -> bool {
                     value.to_ascii_lowercase().replace('-', "_").as_str(),
                     "required" | "require" | "verify_ca" | "verify_identity"
                 ))
+    })
+}
+
+fn mysql_url_attempts_ssl(url: &str) -> bool {
+    if mysql_url_requires_ssl(url) {
+        return true;
+    }
+
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|segment| {
+        let Some((key, value)) = segment.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        (key.eq_ignore_ascii_case("ssl-mode") || key.eq_ignore_ascii_case("sslmode"))
+            && matches!(value.to_ascii_lowercase().replace('-', "_").as_str(), "preferred" | "prefer")
     })
 }
 
@@ -969,6 +1104,14 @@ fn is_dbx_handled_mysql_url_param(key: &str) -> bool {
     )
 }
 
+fn is_mysql_cleartext_password_param(key: &str) -> bool {
+    matches!(key.to_ascii_lowercase().as_str(), "allowcleartextpasswords" | "enable_cleartext_plugin")
+}
+
+fn mysql_url_param_value_is_true(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+}
+
 /// Strips the database path from a `mysql://[user[:pass]@]host[:port][/path]`
 /// URL, returning only the scheme and authority. Used so mysql_async does not
 /// send the database as the schema during the MySQL handshake (StarRocks would
@@ -992,6 +1135,7 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
     let mut filtered: Vec<String> = Vec::new();
     let mut changed = false;
     let mut has_catalog = false;
+    let mut enable_cleartext_plugin = false;
     for segment in query.split('&') {
         let segment = segment.trim();
         if segment.is_empty() {
@@ -1006,6 +1150,11 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
         if key.eq_ignore_ascii_case("catalog") {
             has_catalog = true;
         }
+        if is_mysql_cleartext_password_param(key) {
+            changed = true;
+            enable_cleartext_plugin |= mysql_url_param_value_is_true(value);
+            continue;
+        }
         if is_dbx_handled_mysql_url_param(key) {
             changed = true;
             continue;
@@ -1014,6 +1163,11 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
             changed = true;
             match value.to_ascii_lowercase().replace('-', "_").as_str() {
                 "disabled" | "disable" => filtered.push("require_ssl=false".to_string()),
+                "preferred" | "prefer" => {
+                    filtered.push("require_ssl=true".to_string());
+                    filtered.push("verify_ca=false".to_string());
+                    filtered.push("verify_identity=false".to_string());
+                }
                 "required" | "require" => {
                     filtered.push("require_ssl=true".to_string());
                     filtered.push("verify_ca=false".to_string());
@@ -1033,6 +1187,9 @@ fn mysql_async_url(url: &str) -> Cow<'_, str> {
             continue;
         }
         filtered.push(segment.to_string());
+    }
+    if enable_cleartext_plugin {
+        filtered.push("enable_cleartext_plugin=true".to_string());
     }
 
     // When a catalog is configured, the database in the URL path must not be
@@ -1067,8 +1224,19 @@ pub async fn connect_bare_with_pool_limit_and_setup(
     max_connections: usize,
     extra_setup_queries: &[String],
 ) -> Result<MySqlPool, String> {
+    connect_bare_with_pool_limit_and_setup_database(url, fallback_timeout, max_connections, None, extra_setup_queries)
+        .await
+}
+
+pub async fn connect_bare_with_pool_limit_and_setup_database(
+    url: &str,
+    fallback_timeout: Duration,
+    max_connections: usize,
+    setup_database: Option<&str>,
+    extra_setup_queries: &[String],
+) -> Result<MySqlPool, String> {
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let pool = create_pool(url, None, max_connections, None, extra_setup_queries)?;
+    let pool = create_pool(url, None, max_connections, None, setup_database, extra_setup_queries)?;
     verify_pool_connection(&pool, timeout).await.map(|_| pool)
 }
 
@@ -2352,29 +2520,55 @@ pub async fn stream_query_rows(
     mut on_row: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut conn = get_conn_with_health_check(pool).await?;
+    stream_query_result_on_conn(&mut conn, sql, bare, max_rows, dialect, cancelled, |item| {
+        if let MySqlQueryStreamItem::Row(row) = item {
+            on_row(&row)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn stream_query_result_on_conn(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    bare: bool,
+    max_rows: Option<usize>,
+    dialect: MySqlQueryDialect,
+    cancelled: &AtomicBool,
+    mut on_item: impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
+) -> Result<u64, String> {
     let row_limit = max_rows.unwrap_or(usize::MAX);
 
     if bare || prefers_text_protocol_query(sql, dialect) {
-        stream_query_rows_text(&mut conn, sql, row_limit, cancelled, &mut on_row).await
+        stream_query_result_text(conn, sql, row_limit, cancelled, &mut on_item).await
     } else {
-        match stream_query_rows_prepared(&mut conn, sql, row_limit, cancelled, &mut on_row).await {
+        match stream_query_result_prepared(conn, sql, row_limit, cancelled, &mut on_item).await {
             Ok(rows) => Ok(rows),
             Err(err) if mysql_error_should_retry_with_text_protocol(&err) => {
-                stream_query_rows_text(&mut conn, sql, row_limit, cancelled, &mut on_row).await
+                stream_query_result_text(conn, sql, row_limit, cancelled, &mut on_item).await
             }
             Err(err) => Err(err),
         }
     }
 }
 
-async fn stream_query_rows_text(
+async fn stream_query_result_text(
     conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
     cancelled: &AtomicBool,
-    on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+    on_item: &mut impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
+    if !advance_to_result_set_with_columns(&mut result).await? {
+        return Ok(0);
+    }
+    let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+    let column_types: Vec<String> =
+        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    on_item(MySqlQueryStreamItem::Columns { columns, column_types })?;
+
     let mut stream = result
         .stream::<mysql_async::Row>()
         .await
@@ -2391,21 +2585,29 @@ async fn stream_query_rows_text(
         }
         let row = row.map_err(|e| e.to_string())?;
         let values: Vec<serde_json::Value> = (0..row.len()).map(|i| mysql_value_to_json(&row, i)).collect();
-        on_row(&values)?;
+        on_item(MySqlQueryStreamItem::Row(values))?;
         rows_exported += 1;
     }
 
     Ok(rows_exported)
 }
 
-async fn stream_query_rows_prepared(
+async fn stream_query_result_prepared(
     conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
     cancelled: &AtomicBool,
-    on_row: &mut impl FnMut(&[serde_json::Value]) -> Result<(), String>,
+    on_item: &mut impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut result = conn.exec_iter(sql, ()).await.map_err(|e| e.to_string())?;
+    let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+    if columns.is_empty() {
+        return Ok(0);
+    }
+    let column_types: Vec<String> =
+        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    on_item(MySqlQueryStreamItem::Columns { columns, column_types })?;
+
     let mut stream = result
         .stream::<mysql_async::Row>()
         .await
@@ -2422,7 +2624,7 @@ async fn stream_query_rows_prepared(
         }
         let row = row.map_err(|e| e.to_string())?;
         let values: Vec<serde_json::Value> = (0..row.len()).map(|i| mysql_value_to_json(&row, i)).collect();
-        on_row(&values)?;
+        on_item(MySqlQueryStreamItem::Row(values))?;
         rows_exported += 1;
     }
 
@@ -3530,9 +3732,38 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_server_without_ssl_capability_retries_without_ssl() {
+        let error =
+            "MySQL connection failed: Driver error: `Client asked for SSL but server does not have this capability'";
+
+        assert!(mysql_error_should_retry_without_ssl(error));
+    }
+
+    #[test]
     fn mysql_tcp_keepalive_uses_milliseconds_not_seconds() {
         assert_eq!(MYSQL_TCP_KEEPALIVE_MS, 30_000);
         assert!(MYSQL_TCP_KEEPALIVE_MS >= 1_000);
+    }
+
+    #[test]
+    fn mysql_async_builder_host_strips_ipv6_url_brackets() {
+        let opts = mysql_async::Opts::from_url("mysql://root:secret@[2001:db8::1]:3306/app").unwrap();
+
+        assert_eq!(opts.ip_or_hostname(), "[2001:db8::1]");
+        assert_eq!(mysql_async_tcp_host(opts.ip_or_hostname()), "2001:db8::1");
+
+        let builder_opts = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::from_opts(opts).ip_or_hostname(mysql_async_tcp_host("[2001:db8::1]").to_string()),
+        );
+        assert_eq!(builder_opts.ip_or_hostname(), "2001:db8::1");
+        assert_eq!(builder_opts.tcp_port(), 3306);
+    }
+
+    #[test]
+    fn mysql_async_builder_host_only_strips_valid_ipv6_literals() {
+        assert_eq!(mysql_async_tcp_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(mysql_async_tcp_host("[mysql.example.com]"), "[mysql.example.com]");
+        assert_eq!(mysql_async_tcp_host("mysql.example.com"), "mysql.example.com");
     }
 
     #[test]
@@ -3573,6 +3804,35 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_preferred_tls_attempts_ssl_without_requiring_it() {
+        let url = "mysql://root@localhost/db?ssl-mode=preferred&charset=utf8mb4";
+
+        assert!(!mysql_url_requires_ssl(url));
+        assert!(mysql_url_attempts_ssl(url));
+        assert_eq!(
+            ssl_fallback_url(url),
+            Some("mysql://root@localhost/db?ssl-mode=disabled&charset=utf8mb4".to_string())
+        );
+        assert!(mysql_ssl_opts(None, url, None, &MySqlTlsFiles::default()).unwrap().is_some());
+    }
+
+    #[test]
+    fn mysql_preferred_tls_handles_sslmode_prefer_alias() {
+        let url = "mysql://root@localhost/db?sslmode=prefer&charset=utf8mb4#session";
+
+        assert!(!mysql_url_requires_ssl(url));
+        assert!(mysql_url_attempts_ssl(url));
+        assert_eq!(
+            ssl_fallback_url(url),
+            Some("mysql://root@localhost/db?ssl-mode=disabled&charset=utf8mb4#session".to_string())
+        );
+        assert_eq!(
+            ssl_fallback_url("mysql://root@localhost/db#session"),
+            Some("mysql://root@localhost/db?ssl-mode=disabled#session".to_string())
+        );
+    }
+
+    #[test]
     fn mysql_unknown_error_can_retry_with_text_protocol() {
         let error = "error returned from database: 1105 (HY000): Unknown error";
 
@@ -3597,21 +3857,32 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_select_requested_database_before_session_init() {
         let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/app?charset=utf8mb4", &[]);
 
-        assert_eq!(queries, vec!["USE `app`", "SET NAMES utf8mb4"]);
+        assert_eq!(queries, vec!["USE `app`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]);
     }
 
     #[test]
     fn mysql_setup_queries_skip_use_when_database_missing() {
         let queries = mysql_setup_queries("mysql://root:secret@localhost:3306?charset=utf8mb4", &[]);
 
-        assert_eq!(queries, vec!["SET NAMES utf8mb4"]);
+        assert_eq!(queries, vec!["SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]);
     }
 
     #[test]
     fn mysql_setup_queries_decode_database_name_from_url() {
         let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/db%2Fname?charset=utf8mb4", &[]);
 
-        assert_eq!(queries, vec!["USE `db/name`", "SET NAMES utf8mb4"]);
+        assert_eq!(queries, vec!["USE `db/name`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]);
+    }
+
+    #[test]
+    fn mysql_setup_queries_can_select_database_without_url_path() {
+        let queries = mysql_setup_queries_for_database(
+            "mysql://root:secret@localhost:3306?charset=utf8mb4",
+            Some("app`proxy"),
+            &[],
+        );
+
+        assert_eq!(queries, vec!["USE `app``proxy`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]);
     }
 
     #[test]
@@ -3702,6 +3973,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_async_url_translates_preferred_ssl_mode_to_tls_attempt() {
+        let url = "mysql://host:3306/db?ssl-mode=preferred&charset=utf8mb4";
+
+        assert_eq!(
+            mysql_async_url(url).as_ref(),
+            "mysql://host:3306/db?require_ssl=true&verify_ca=false&verify_identity=false"
+        );
+    }
+
+    #[test]
     fn mysql_async_url_translates_disabled_ssl_mode_even_when_param_count_matches() {
         let url = "mysql://host:3306/db?ssl-mode=disabled";
 
@@ -3724,6 +4005,24 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     #[test]
     fn mysql_async_url_keeps_valid_params_while_stripping_jdbc() {
         let url = "mysql://host:3306/db?useUnicode=true&characterEncoding=utf8&require_ssl=true&charset=utf8mb4&autoReconnect=true";
+        assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?require_ssl=true");
+    }
+
+    #[test]
+    fn mysql_async_url_normalizes_cleartext_password_auth_alias() {
+        let url = "mysql://host:3306/db?allowCleartextPasswords=true&charset=utf8mb4";
+        assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?enable_cleartext_plugin=true");
+    }
+
+    #[test]
+    fn mysql_async_url_deduplicates_cleartext_password_auth_params() {
+        let url = "mysql://host:3306/db?allowCleartextPasswords=true&enable_cleartext_plugin=true&require_ssl=true";
+        assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?require_ssl=true&enable_cleartext_plugin=true");
+    }
+
+    #[test]
+    fn mysql_async_url_omits_disabled_cleartext_password_auth_params() {
+        let url = "mysql://host:3306/db?allowCleartextPasswords=false&enable_cleartext_plugin=&require_ssl=true";
         assert_eq!(mysql_async_url(url).as_ref(), "mysql://host:3306/db?require_ssl=true");
     }
 
@@ -3765,18 +4064,21 @@ UNIQUE KEY(`tenant_id`, `name``part`)
 
     #[test]
     fn mysql_setup_queries_default_to_utf8mb4() {
-        assert_eq!(mysql_setup_queries("mysql://host:3306/db", &[]), vec!["USE `db`", "SET NAMES utf8mb4"]);
+        assert_eq!(
+            mysql_setup_queries("mysql://host:3306/db", &[]),
+            vec!["USE `db`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
+        );
     }
 
     #[test]
     fn mysql_setup_queries_use_safe_custom_charset() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?ssl-mode=preferred&charset=gbk", &[]),
-            vec!["USE `db`", "SET NAMES gbk"]
+            vec!["USE `db`", "SET NAMES gbk", "SET @@group_concat_max_len = 1048576"]
         );
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?charset=utf8mb4;DROP TABLE users", &[]),
-            vec!["USE `db`", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
     }
 
@@ -3786,7 +4088,12 @@ UNIQUE KEY(`tenant_id`, `name``part`)
 
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db", &extra),
-            vec!["USE `db`", "SET NAMES utf8mb4", "SET ob_query_timeout = 30000000"]
+            vec![
+                "USE `db`",
+                "SET NAMES utf8mb4",
+                "SET @@group_concat_max_len = 1048576",
+                "SET ob_query_timeout = 30000000"
+            ]
         );
     }
 
@@ -3794,11 +4101,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_apply_explicit_time_zone() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?time_zone=%2B08%3A00&charset=utf8mb4", &[]),
-            vec!["USE `db`", "SET time_zone = '+08:00'", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET time_zone = '+08:00'", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?time-zone=Asia%2FShanghai", &[]),
-            vec!["USE `db`", "SET time_zone = 'Asia/Shanghai'", "SET NAMES utf8mb4"]
+            vec![
+                "USE `db`",
+                "SET time_zone = 'Asia/Shanghai'",
+                "SET NAMES utf8mb4",
+                "SET @@group_concat_max_len = 1048576"
+            ]
         );
     }
 
@@ -3806,11 +4118,11 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_apply_jdbc_time_zone_aliases() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?serverTimezone=GMT%2B8", &[]),
-            vec!["USE `db`", "SET time_zone = '+08:00'", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET time_zone = '+08:00'", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?connectionTimeZone=UTC", &[]),
-            vec!["USE `db`", "SET time_zone = '+00:00'", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET time_zone = '+00:00'", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
     }
 
@@ -3818,11 +4130,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_apply_go_loc_when_no_explicit_time_zone_exists() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?loc=Asia%2FShanghai", &[]),
-            vec!["USE `db`", "SET time_zone = 'Asia/Shanghai'", "SET NAMES utf8mb4"]
+            vec![
+                "USE `db`",
+                "SET time_zone = 'Asia/Shanghai'",
+                "SET NAMES utf8mb4",
+                "SET @@group_concat_max_len = 1048576"
+            ]
         );
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?time_zone=%2B08%3A00&loc=UTC", &[]),
-            vec!["USE `db`", "SET time_zone = '+08:00'", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET time_zone = '+08:00'", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
     }
 
@@ -3830,7 +4147,7 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_ignore_unsafe_time_zone_values() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?time_zone=%2B08%3A00%27%3BDROP%20TABLE%20users", &[]),
-            vec!["USE `db`", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
     }
 
@@ -3840,7 +4157,12 @@ UNIQUE KEY(`tenant_id`, `name``part`)
         // execution (Vec::pop) runs it before `USE <database>`.
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/clip?catalog=paimon_catalog", &[]),
-            vec!["USE `clip`", "SET NAMES utf8mb4", "SET catalog = `paimon_catalog`"]
+            vec![
+                "USE `clip`",
+                "SET NAMES utf8mb4",
+                "SET @@group_concat_max_len = 1048576",
+                "SET catalog = `paimon_catalog`"
+            ]
         );
     }
 
@@ -3848,7 +4170,7 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_switch_catalog_without_database() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/?catalog=paimon_catalog", &[]),
-            vec!["SET NAMES utf8mb4", "SET catalog = `paimon_catalog`"]
+            vec!["SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576", "SET catalog = `paimon_catalog`"]
         );
     }
 
@@ -3856,7 +4178,7 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_decodes_catalog_parameter() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?catalog=my%5Fcatalog", &[]),
-            vec!["USE `db`", "SET NAMES utf8mb4", "SET catalog = `my_catalog`"]
+            vec!["USE `db`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576", "SET catalog = `my_catalog`"]
         );
     }
 
@@ -3864,7 +4186,7 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     fn mysql_setup_queries_omits_catalog_when_absent() {
         assert_eq!(
             mysql_setup_queries("mysql://host:3306/db?charset=utf8mb4", &[]),
-            vec!["USE `db`", "SET NAMES utf8mb4"]
+            vec!["USE `db`", "SET NAMES utf8mb4", "SET @@group_concat_max_len = 1048576"]
         );
     }
 }

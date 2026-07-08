@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, defineAsyncComponent, watch, nextTick, onMounted, onUnmounted } from "vue";
-import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Check, Columns3, EyeOff, Loader2, Search, Bot, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Wrench, Toolbox, ListChecks, Database, FileUp, Download, X, Pin, Rows3, SquareDashed, Minus, Plus } from "@lucide/vue";
+import { Check, Columns3, EyeOff, Loader2, Search, Bot, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Timer, Wrench, Toolbox, ListChecks, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus } from "@lucide/vue";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { Button } from "@/components/ui/button";
@@ -39,6 +39,8 @@ const RedisDashboard = defineAsyncComponent(() => import("@/components/redis/Red
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
 const ZooKeeperKeyBrowser = defineAsyncComponent(() => import("@/components/zookeeper/ZooKeeperKeyBrowser.vue"));
 const DocumentBrowser = defineAsyncComponent(() => import("@/components/document/DocumentBrowser.vue"));
+const MongoGridFsBrowser = defineAsyncComponent(() => import("@/components/document/MongoGridFsBrowser.vue"));
+const MongoBucketBrowser = defineAsyncComponent(() => import("@/components/document/MongoBucketBrowser.vue"));
 const VectorBrowser = defineAsyncComponent(() => import("@/components/vector/VectorBrowser.vue"));
 const MqAdminConsole = defineAsyncComponent(() => import("@/components/mq/MqAdminConsole.vue"));
 const NacosAdminConsole = defineAsyncComponent(() => import("@/components/nacos/NacosAdminConsole.vue"));
@@ -49,25 +51,27 @@ const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explai
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 import { useQueryStore } from "@/stores/queryStore";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore } from "@/stores/settingsStore";
+import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridSearchMode } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
-import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/queryExecutionState";
-import { databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, tabularResultItems } from "@/lib/tabPresentation";
-import { defaultQueryResultArchiveFileName } from "@/lib/queryResultArchive";
-import { saveQueryResultArchiveFile } from "@/lib/queryResultArchiveFile";
-import { isTableDataEditable } from "@/lib/tableEditing";
-import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
-import { formatShortcut } from "@/lib/shortcutRegistry";
-import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
-import { chartableColumnIndexes } from "@/lib/chartData";
-import * as api from "@/lib/api";
-import { buildMongoUpdateDocument, formatMongoShellLiteral, type MongoInputValue } from "@/lib/mongoDocumentValues";
-import type { SqlExecutionOverride } from "@/lib/sqlExecutionTarget";
-import type { DataGridSortMode } from "@/lib/dataGridSort";
+import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
+import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
+import { databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
+import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
+import { isTableDataEditable } from "@/lib/table/tableEditing";
+import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
+import { formatShortcut } from "@/lib/editor/shortcutRegistry";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { chartableColumnIndexes } from "@/lib/dataGrid/chartData";
+import * as api from "@/lib/backend/api";
+import { buildMongoUpdateDocument, formatMongoShellLiteral, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
+import type { SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
+import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import { useTabScroll } from "@/composables/useTabScroll";
+import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta } from "@/types/database";
-import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sqlFormatter";
+import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 
 type DataGridHandle = {
   onToolbarRefresh: () => Promise<void> | void;
@@ -134,7 +138,7 @@ const emit = defineEmits<{
   viewTableData: [tableName: string];
   viewTableDdl: [tableName: string];
   editTableStructure: [tableName: string];
-  openObjectTable: [target: { tableName: string; schema?: string }];
+  openObjectTable: [target: { tableName: string; schema?: string; tableType?: string }];
   objectSchemaChange: [schema: string | undefined];
   structureEditorSaved: [commentChanged: boolean];
   structureEditorClose: [];
@@ -178,13 +182,10 @@ const resultTabsScrollerRef = ref<HTMLElement | null>(null);
 const columnVisibilitySearch = ref("");
 const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
 const dataGridRenderMode = computed(() => settingsStore.editorSettings.dataGridRenderMode);
+const dataGridSearchMode = computed(() => settingsStore.editorSettings.dataGridSearchMode);
 const tableFontSize = computed(() => settingsStore.editorSettings.tableFontSize);
 const redisKeyBrowserRef = ref<SearchableBrowserHandle>();
 
-function isQueryTimeoutError(message: string): boolean {
-  const lower = message.toLowerCase();
-  return lower.includes("query timed out") || lower.includes("查询超时");
-}
 const etcdKeyBrowserRef = ref<SearchableBrowserHandle>();
 const zookeeperKeyBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
@@ -207,6 +208,10 @@ function setDataGridRenderMode(value: "canvas" | "dom") {
   settingsStore.updateEditorSettings({ dataGridRenderMode: value });
 }
 
+function setDataGridSearchMode(value: DataGridSearchMode) {
+  settingsStore.updateEditorSettings({ dataGridSearchMode: value });
+}
+
 function setTableFontSize(value: number) {
   settingsStore.updateEditorSettings({ tableFontSize: value });
 }
@@ -222,7 +227,9 @@ function increaseTableFontSize() {
 const activeTabDimension = computed(() => {
   const tab = props.activeTab;
   if (!tab.connectionId || tab.mode !== "vector") return undefined;
-  const nodeId = `${tab.connectionId}:__vector_collection:${tab.sql}`;
+  const isMilvus = connectionStore.getConfig(tab.connectionId)?.db_type === "milvus";
+  const suffix = isMilvus && tab.database ? `${tab.database}:${tab.sql}` : tab.sql;
+  const nodeId = `${tab.connectionId}:__vector_collection:${suffix}`;
   const meta = findNodeInTree(connectionStore.treeNodes, nodeId)?.meta;
   return meta && "dimension" in meta ? (meta as VectorCollectionMeta).dimension : undefined;
 });
@@ -287,9 +294,15 @@ const allResultExportSheets = computed(() =>
 const resultRuns = computed(() => resultRunItems(props.activeTab));
 const activeResultRunItem = computed(() => resultRuns.value.find((run) => run.active));
 const activeResultGridCacheKey = computed(() => resultGridCacheKey(props.activeTab));
+const activeResultSql = computed(() => resultSqlForGrid(props.activeTab));
 const resultArchiveExporting = ref(false);
 const canExportResultArchive = computed(() => props.activeTab.mode === "query" && (!!props.activeTab.result || !!props.activeTab.results?.length || !!props.activeTab.resultRuns?.length));
 const resultAutoSave = computed(() => props.activeTab.resultAutoSave === true);
+const QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS = [5, 10, 30, 60, 300];
+const queryResultAutoRefreshIntervalSeconds = ref(10);
+const queryResultAutoRefreshEnabled = ref(false);
+let queryResultAutoRefreshTimer: ReturnType<typeof setInterval> | undefined;
+const queryResultAutoRefreshLabel = computed(() => (queryResultAutoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: queryResultAutoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
 watch(
   () => visibleResultItems.value.map((item) => item.index).join(","),
   () => {
@@ -361,6 +374,7 @@ const resultsPaneOpen = ref(false);
 const resultsPaneSize = ref(Number(safeLocalStorageGet("dbx-results-pane-size")) || DEFAULT_QUERY_RESULTS_PANE_SIZE);
 const editorPaneSize = computed(() => (resultsPaneOpen.value ? 100 - resultsPaneSize.value : 100));
 const queryRunningElapsed = ref(0);
+const canAutoRefreshQueryResult = computed(() => props.activeTab.mode === "query" && props.activeOutputView === "result" && resultsPaneOpen.value && hasTabularResult.value && !props.activeTab.isExecuting);
 
 function onResultsResized(payload: { panes: { size: number }[] }) {
   const resultsPane = payload.panes[1];
@@ -369,11 +383,13 @@ function onResultsResized(payload: { panes: { size: number }[] }) {
     safeLocalStorageSet("dbx-results-pane-size", String(resultsPane.size));
   }
 }
-let queryRunningElapsedTimer: ReturnType<typeof setInterval> | undefined;
+let queryRunningElapsedFrame: number | undefined;
 
 function stopQueryRunningElapsedTimer() {
-  clearInterval(queryRunningElapsedTimer);
-  queryRunningElapsedTimer = undefined;
+  if (queryRunningElapsedFrame !== undefined) {
+    window.cancelAnimationFrame(queryRunningElapsedFrame);
+    queryRunningElapsedFrame = undefined;
+  }
 }
 
 function updateQueryRunningElapsed() {
@@ -385,16 +401,42 @@ function startQueryRunningElapsedTimer() {
   stopQueryRunningElapsedTimer();
   updateQueryRunningElapsed();
   if (!props.activeTab.isExecuting || !props.activeTab.queryExecutionStartedAt) return;
-  queryRunningElapsedTimer = setInterval(updateQueryRunningElapsed, 100);
+  const updateOnNextFrame = () => {
+    updateQueryRunningElapsed();
+    if (props.activeTab.isExecuting && props.activeTab.queryExecutionStartedAt) {
+      queryRunningElapsedFrame = window.requestAnimationFrame(updateOnNextFrame);
+    }
+  };
+  queryRunningElapsedFrame = window.requestAnimationFrame(updateOnNextFrame);
 }
 
-const queryRunningElapsedSeconds = computed(() => (queryRunningElapsed.value / 1000).toFixed(1));
+const queryRunningElapsedSeconds = computed(() => formatElapsedSeconds(queryRunningElapsed.value));
 
 watch(() => [props.activeTab.id, props.activeTab.isExecuting, props.activeTab.queryExecutionStartedAt] as const, startQueryRunningElapsedTimer, { immediate: true });
 
 onUnmounted(() => {
   stopQueryRunningElapsedTimer();
+  stopQueryResultAutoRefreshTimer();
   window.removeEventListener("dbx-refresh-active-kv-browser", onRefreshActiveKvBrowser);
+});
+
+watch(() => props.activeTab.id, stopQueryResultAutoRefresh);
+
+watch(
+  () => [props.activeOutputView, resultsPaneOpen.value] as const,
+  ([outputView, paneOpen]) => {
+    if (outputView !== "result" || !paneOpen) stopQueryResultAutoRefresh();
+  },
+);
+
+watch(canAutoRefreshQueryResult, (canRefresh) => {
+  if (!queryResultAutoRefreshEnabled.value) return;
+  if (canRefresh) restartQueryResultAutoRefreshTimer();
+  else stopQueryResultAutoRefreshTimer();
+});
+
+watch(activeQueryError, (message) => {
+  if (message && queryResultAutoRefreshEnabled.value) stopQueryResultAutoRefresh();
 });
 
 watch(
@@ -507,7 +549,7 @@ async function onHandleClickColumn(matchedCols: Array<{ name: string; table: str
 
   try {
     // Fetch full column details from API
-    const apiModule = await import("@/lib/api");
+    const apiModule = await import("@/lib/backend/api");
     const results: ColumnInfo[] = [];
 
     for (const matchedCol of matchedCols) {
@@ -581,6 +623,37 @@ function focusSearch(): boolean {
   return dataGridRef.value?.focusSearch() ?? false;
 }
 
+function stopQueryResultAutoRefreshTimer() {
+  clearInterval(queryResultAutoRefreshTimer);
+  queryResultAutoRefreshTimer = undefined;
+}
+
+function runQueryResultAutoRefreshTick() {
+  if (!queryResultAutoRefreshEnabled.value || !canAutoRefreshQueryResult.value) return;
+  refreshData();
+}
+
+function restartQueryResultAutoRefreshTimer() {
+  stopQueryResultAutoRefreshTimer();
+  if (!queryResultAutoRefreshEnabled.value || !canAutoRefreshQueryResult.value) return;
+  queryResultAutoRefreshTimer = setInterval(runQueryResultAutoRefreshTick, queryResultAutoRefreshIntervalSeconds.value * 1000);
+}
+
+function setQueryResultAutoRefreshInterval(seconds: number) {
+  queryResultAutoRefreshIntervalSeconds.value = seconds;
+  if (queryResultAutoRefreshEnabled.value) restartQueryResultAutoRefreshTimer();
+}
+
+function toggleQueryResultAutoRefresh() {
+  queryResultAutoRefreshEnabled.value = !queryResultAutoRefreshEnabled.value;
+  restartQueryResultAutoRefreshTimer();
+}
+
+function stopQueryResultAutoRefresh() {
+  queryResultAutoRefreshEnabled.value = false;
+  stopQueryResultAutoRefreshTimer();
+}
+
 function refreshData(): boolean {
   if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.refresh?.() ?? false;
@@ -651,7 +724,11 @@ function requestQueryEditorExecute() {
   return queryEditorRef.value?.requestExecute();
 }
 
-defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExecute });
+function pasteClipboardAsSqlInCondition() {
+  return queryEditorRef.value?.pasteClipboardAsSqlInCondition();
+}
+
+defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExecute, pasteClipboardAsSqlInCondition });
 </script>
 
 <template>
@@ -759,7 +836,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                       size="sm"
                       :variant="activeOutputView === 'result' && (activeTab.activeResultIndex ?? 0) === item.index ? 'default' : 'ghost'"
                       class="h-6 max-w-48 shrink-0 overflow-hidden text-ellipsis whitespace-nowrap px-2 text-xs"
-                      :title="item.label || t('tabs.resultN', { n: item.n })"
+                      :title="item.title || item.label || t('tabs.resultN', { n: item.n })"
                       @click="
                         queryStore.setActiveResultIndex(activeTab.id, item.index);
                         emit('update:activeOutputView', 'result');
@@ -786,7 +863,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 </Button>
                 <Button v-if="canExportResultArchive" variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" :disabled="resultArchiveExporting" @click="exportResultArchive">
                   <Loader2 v-if="resultArchiveExporting" class="h-3.5 w-3.5 animate-spin" />
-                  <Download v-else class="h-3.5 w-3.5" />
+                  <Upload v-else class="h-3.5 w-3.5" />
                   {{ t("tabs.exportResultArchive") }}
                 </Button>
                 <Popover v-if="activeOutputView === 'result' && activeTab.result">
@@ -799,7 +876,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                     <div class="border-b bg-muted/40 px-3 py-2">
                       <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
                     </div>
-                    <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+                    <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                       <div class="min-w-0 flex items-center gap-2 font-medium">
                         <SquareDashed class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                         <span>{{ t("grid.renderMode") }}</span>
@@ -808,7 +885,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
                           <button
                             type="button"
-                            class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                            class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                             :class="dataGridRenderMode === 'canvas' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                             @click="setDataGridRenderMode('canvas')"
                           >
@@ -816,7 +893,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                           </button>
                           <button
                             type="button"
-                            class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                            class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                             :class="dataGridRenderMode === 'dom' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                             @click="setDataGridRenderMode('dom')"
                           >
@@ -825,15 +902,15 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         </div>
                       </LightTooltip>
                     </div>
-                    <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+                    <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                       <div class="min-w-0 flex items-center gap-2 font-medium">
                         <span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[11px] font-semibold text-muted-foreground">A</span>
                         <span>{{ t("grid.tableFontSize") }}</span>
                       </div>
-                      <div class="flex h-7 w-32 items-center rounded-md border bg-muted/40 p-0.5">
+                      <div class="flex h-6 w-32 items-center rounded-md border bg-muted/40 p-0.5">
                         <button
                           type="button"
-                          class="flex h-6 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
+                          class="flex h-5 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
                           :disabled="tableFontSize <= TABLE_FONT_SIZE_MIN"
                           :aria-label="t('common.decrease')"
                           @click="decreaseTableFontSize"
@@ -843,7 +920,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         <span class="flex-1 text-center text-xs font-semibold tabular-nums">{{ tableFontSize }}</span>
                         <button
                           type="button"
-                          class="flex h-6 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
+                          class="flex h-5 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
                           :disabled="tableFontSize >= TABLE_FONT_SIZE_MAX"
                           :aria-label="t('common.increase')"
                           @click="increaseTableFontSize"
@@ -852,7 +929,33 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         </button>
                       </div>
                     </div>
-                    <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+                    <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
+                      <div class="min-w-0 flex items-center gap-2 font-medium">
+                        <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <span>{{ t("grid.searchMode") }}</span>
+                      </div>
+                      <LightTooltip :text="t('grid.searchModeHint')" side="left" :side-offset="6" :delay="0" :open-on-focus="false">
+                        <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
+                          <button
+                            type="button"
+                            class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                            :class="dataGridSearchMode === 'filter' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                            @click="setDataGridSearchMode('filter')"
+                          >
+                            {{ t("grid.searchModeFilter") }}
+                          </button>
+                          <button
+                            type="button"
+                            class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                            :class="dataGridSearchMode === 'highlight' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                            @click="setDataGridSearchMode('highlight')"
+                          >
+                            {{ t("grid.searchModeHighlight") }}
+                          </button>
+                        </div>
+                      </LightTooltip>
+                    </div>
+                    <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                       <div class="min-w-0 flex items-center gap-2 font-medium">
                         <Rows3 class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                         <span>{{ t("grid.transposeMultiRowToggle") }}</span>
@@ -861,7 +964,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
                           <button
                             type="button"
-                            class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                            class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                             :class="!dataGridRef?.multiRowTranspose ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                             @click="dataGridRef?.setMultiRowTranspose(false)"
                           >
@@ -869,7 +972,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                           </button>
                           <button
                             type="button"
-                            class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                            class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                             :class="dataGridRef?.multiRowTranspose ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                             @click="dataGridRef?.setMultiRowTranspose(true)"
                           >
@@ -878,7 +981,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         </div>
                       </LightTooltip>
                     </div>
-                    <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs" :class="{ 'opacity-60': !dataGridRef?.canToggleAllNullColumns }">
+                    <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs" :class="{ 'opacity-60': !dataGridRef?.canToggleAllNullColumns }">
                       <span class="min-w-0 flex items-center gap-2 font-medium">
                         <EyeOff class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                         {{ t("grid.hideNullColumns") }}
@@ -888,11 +991,41 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                     </div>
                   </PopoverContent>
                 </Popover>
-                <Button v-if="activeOutputView === 'result' && hasTabularResult" variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" :disabled="activeTab.isExecuting" @click="refreshData">
-                  <Loader2 v-if="activeTab.isExecuting" class="h-3.5 w-3.5 animate-spin" />
-                  <RefreshCcw v-else class="h-3.5 w-3.5" />
-                  {{ t("grid.refresh") }}
-                </Button>
+                <div v-if="activeOutputView === 'result' && hasTabularResult" class="flex h-6 shrink-0 items-center">
+                  <Button variant="ghost" size="sm" class="h-6 rounded-r-none gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" :disabled="activeTab.isExecuting" @click="refreshData">
+                    <Loader2 v-if="activeTab.isExecuting" class="h-3.5 w-3.5 animate-spin" />
+                    <RefreshCcw v-else class="h-3.5 w-3.5" />
+                    {{ t("grid.refresh") }}
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger as-child>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        class="h-6 rounded-l-none border-l border-border/60 px-1.5 text-xs"
+                        :class="queryResultAutoRefreshEnabled ? 'bg-primary/10 text-primary hover:bg-primary/15' : 'text-muted-foreground hover:text-foreground'"
+                        :title="queryResultAutoRefreshLabel"
+                        :aria-label="queryResultAutoRefreshLabel"
+                        :aria-pressed="queryResultAutoRefreshEnabled"
+                      >
+                        <Timer class="h-3.5 w-3.5" />
+                        <span class="tabular-nums">{{ queryResultAutoRefreshEnabled ? `${queryResultAutoRefreshIntervalSeconds}s` : t("tabs.autoRefreshShort") }}</span>
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" class="w-40">
+                      <DropdownMenuItem class="gap-2" @select="toggleQueryResultAutoRefresh">
+                        <Check v-if="queryResultAutoRefreshEnabled" class="h-3.5 w-3.5" />
+                        <span v-else class="h-3.5 w-3.5" />
+                        {{ queryResultAutoRefreshEnabled ? t("tabs.stopAutoRefresh") : t("tabs.startAutoRefresh") }}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem v-for="seconds in QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setQueryResultAutoRefreshInterval(seconds)">
+                        <Check v-if="queryResultAutoRefreshIntervalSeconds === seconds" class="h-3.5 w-3.5" />
+                        <span v-else class="h-3.5 w-3.5" />
+                        {{ t("tabs.autoRefreshEvery", { seconds }) }}
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
                 <Button variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground" @click="resultsPaneOpen = false">
                   <ChevronDown class="h-3.5 w-3.5" />
                   {{ t("editor.hideResultsPane") }}
@@ -952,7 +1085,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :sort-direction="activeTab.resultSortDirection"
                 :sort-mode="activeTab.resultSortMode"
                 :initial-order-by-input="activeTab.orderByInput"
-                :sql="activeTab.lastExecutedSql || activeTab.sql"
+                :sql="activeResultSql"
                 :loading="activeTab.isExecuting"
                 :editable="!!activeTab.queryAnalysis || !!mongoQueryResultSaveHandler"
                 :source-columns="activeTab.querySourceColumns"
@@ -980,7 +1113,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
               >
                 <template v-if="activeTab.result?.columns.includes('Error')" #error-actions="{ errorMessage }">
-                  <Button v-if="activeTab.connectionId && isQueryTimeoutError(String(errorMessage))" variant="outline" size="sm" class="h-7 gap-1.5 px-2.5 text-xs" @click="emit('openConnectionSettings', activeTab.connectionId, 'advanced')">
+                  <Button v-if="activeTab.connectionId && isQueryTimeoutErrorMessage(String(errorMessage))" variant="outline" size="sm" class="h-7 gap-1.5 px-2.5 text-xs" @click="emit('openConnectionSettings', activeTab.connectionId, 'advanced')">
                     <Wrench class="h-3.5 w-3.5" />
                     {{ t("editor.changeQueryTimeout") }}
                   </Button>
@@ -1083,12 +1216,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   {{ t("tableToolbox.generateData") }}
                 </DropdownMenuItem>
                 <DropdownMenuItem class="gap-2" @click="handleTableImport">
-                  <FileUp class="h-4 w-4" />
+                  <Download class="h-4 w-4" />
                   {{ t("tableToolbox.importData") }}
                 </DropdownMenuItem>
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger class="gap-2">
-                    <Download class="h-4 w-4" />
+                    <Upload class="h-4 w-4" />
                     {{ t("tableToolbox.exportData") }}
                   </DropdownMenuSubTrigger>
                   <DropdownMenuPortal>
@@ -1113,7 +1246,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
               <div class="border-b bg-muted/40 px-3 py-2">
                 <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
               </div>
-              <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+              <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                 <div class="min-w-0 flex items-center gap-2 font-medium">
                   <SquareDashed class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   <span>{{ t("grid.renderMode") }}</span>
@@ -1122,7 +1255,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
                     <button
                       type="button"
-                      class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                      class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                       :class="dataGridRenderMode === 'canvas' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                       @click="setDataGridRenderMode('canvas')"
                     >
@@ -1130,7 +1263,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                     </button>
                     <button
                       type="button"
-                      class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                      class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                       :class="dataGridRenderMode === 'dom' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                       @click="setDataGridRenderMode('dom')"
                     >
@@ -1139,15 +1272,15 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   </div>
                 </LightTooltip>
               </div>
-              <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+              <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                 <div class="min-w-0 flex items-center gap-2 font-medium">
                   <span class="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[11px] font-semibold text-muted-foreground">A</span>
                   <span>{{ t("grid.tableFontSize") }}</span>
                 </div>
-                <div class="flex h-7 w-32 items-center rounded-md border bg-muted/40 p-0.5">
+                <div class="flex h-6 w-32 items-center rounded-md border bg-muted/40 p-0.5">
                   <button
                     type="button"
-                    class="flex h-6 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
+                    class="flex h-5 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
                     :disabled="tableFontSize <= TABLE_FONT_SIZE_MIN"
                     :aria-label="t('common.decrease')"
                     @click="decreaseTableFontSize"
@@ -1157,7 +1290,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   <span class="flex-1 text-center text-xs font-semibold tabular-nums">{{ tableFontSize }}</span>
                   <button
                     type="button"
-                    class="flex h-6 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
+                    class="flex h-5 w-8 items-center justify-center rounded-[5px] bg-background text-foreground shadow-sm transition-colors hover:text-foreground disabled:pointer-events-none disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-50 disabled:shadow-none"
                     :disabled="tableFontSize >= TABLE_FONT_SIZE_MAX"
                     :aria-label="t('common.increase')"
                     @click="increaseTableFontSize"
@@ -1166,7 +1299,33 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   </button>
                 </div>
               </div>
-              <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+              <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
+                <div class="min-w-0 flex items-center gap-2 font-medium">
+                  <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span>{{ t("grid.searchMode") }}</span>
+                </div>
+                <LightTooltip :text="t('grid.searchModeHint')" side="left" :side-offset="6" :delay="0" :open-on-focus="false">
+                  <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
+                    <button
+                      type="button"
+                      class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                      :class="dataGridSearchMode === 'filter' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                      @click="setDataGridSearchMode('filter')"
+                    >
+                      {{ t("grid.searchModeFilter") }}
+                    </button>
+                    <button
+                      type="button"
+                      class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                      :class="dataGridSearchMode === 'highlight' ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                      @click="setDataGridSearchMode('highlight')"
+                    >
+                      {{ t("grid.searchModeHighlight") }}
+                    </button>
+                  </div>
+                </LightTooltip>
+              </div>
+              <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
                 <div class="min-w-0 flex items-center gap-2 font-medium">
                   <Rows3 class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   <span>{{ t("grid.transposeMultiRowToggle") }}</span>
@@ -1175,7 +1334,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
                     <button
                       type="button"
-                      class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                      class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                       :class="!dataGridRef?.multiRowTranspose ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                       @click="dataGridRef?.setMultiRowTranspose(false)"
                     >
@@ -1183,7 +1342,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                     </button>
                     <button
                       type="button"
-                      class="h-6 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
+                      class="h-5 min-w-0 truncate whitespace-nowrap rounded-[5px] px-2 text-xs transition-colors"
                       :class="dataGridRef?.multiRowTranspose ? 'bg-background font-semibold text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
                       @click="dataGridRef?.setMultiRowTranspose(true)"
                     >
@@ -1192,7 +1351,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   </div>
                 </LightTooltip>
               </div>
-              <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs" :class="{ 'opacity-60': !dataGridRef?.canToggleAllNullColumns }">
+              <div class="flex items-center justify-between gap-3 px-3 py-1.5 text-xs" :class="{ 'opacity-60': !dataGridRef?.canToggleAllNullColumns }">
                 <span class="min-w-0 flex items-center gap-2 font-medium">
                   <EyeOff class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   {{ t("grid.hideNullColumns") }}
@@ -1288,6 +1447,18 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
       </div>
     </template>
 
+    <template v-else-if="activeTab.mode === 'mongo-gridfs'">
+      <div class="flex-1 min-h-0">
+        <MongoGridFsBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" />
+      </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'mongo-bucket'">
+      <div class="flex-1 min-h-0">
+        <MongoBucketBrowser :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" :bucket="activeTab.mongoBucket?.bucketName || activeTab.sql" />
+      </div>
+    </template>
+
     <!-- Vector mode: Qdrant and Milvus collections -->
     <template v-else-if="activeTab.mode === 'vector'">
       <div class="flex-1 min-h-0">
@@ -1332,6 +1503,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
         :table-name="activeTab.structureTableName || ''"
         :initial-tab="activeTab.structureInitialTab"
         :initial-tab-request-id="activeTab.structureInitialTabRequestId"
+        :initial-target="activeTab.structureInitialTarget"
         :draft="activeTab.structureDraft"
         @update:draft="(draft) => (activeTab.structureDraft = draft)"
         @saved="(commentChanged) => emit('structureEditorSaved', commentChanged)"

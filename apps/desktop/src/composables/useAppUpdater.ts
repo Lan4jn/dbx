@@ -1,11 +1,12 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
-import * as api from "@/lib/api";
+import * as api from "@/lib/backend/api";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { UpdateDownloadSource as SettingsUpdateDownloadSource } from "@/stores/settingsStore";
-import type { UpdateDownloadProgress } from "@/lib/tauri";
+import type { UpdateDownloadProgress } from "@/lib/backend/tauri";
+import { currentLocale } from "@/i18n";
 
 export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
   return options.silent !== true;
@@ -16,6 +17,7 @@ export function canDownloadAndInstallUpdate(info: api.UpdateInfo | null, isDeskt
 }
 
 export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
+  if (value === "atomgit") return "atomgit";
   return value === "cnb" ? "cnb" : "official";
 }
 
@@ -28,6 +30,9 @@ export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unk
   const normalizedSource = normalizeUpdateDownloadSource(source);
   if (normalizedSource === "cnb" && info?.latest_version) {
     return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
+  }
+  if (normalizedSource === "atomgit" && info?.latest_version) {
+    return `https://atomgit.com/t8y2/dbx/releases/${tagVersion(info.latest_version)}`;
   }
   return info?.release_url || fallbackUrl;
 }
@@ -70,7 +75,7 @@ export function useAppUpdater() {
     checkingUpdates.value = true;
     updateCheckMessage.value = "";
     try {
-      const info = await api.checkForUpdates();
+      const info = await api.checkForUpdates(currentLocale());
       updateInfo.value = info;
       if (info.update_available) {
         if (shouldOpenUpdateDialog({ silent: options.silent })) {

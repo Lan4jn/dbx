@@ -3,7 +3,7 @@ import type { SelectContentEmits, SelectContentProps } from "reka-ui";
 import type { HTMLAttributes } from "vue";
 import { reactiveOmit } from "@vueuse/core";
 import { SelectContent, SelectPortal, SelectViewport, useForwardPropsEmits } from "reka-ui";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/common/utils";
 import { SelectScrollDownButton, SelectScrollUpButton } from ".";
 
 defineOptions({
@@ -16,17 +16,19 @@ const props = withDefaults(
       class?: HTMLAttributes["class"];
       disablePortal?: boolean;
       disableOutsidePointerEvents?: boolean;
+      hideScrollButtons?: boolean;
     }
   >(),
   {
     position: "popper",
     disablePortal: false,
     disableOutsidePointerEvents: true,
+    hideScrollButtons: false,
   },
 );
 const emits = defineEmits<SelectContentEmits>();
 
-const delegatedProps = reactiveOmit(props, "class", "disablePortal");
+const delegatedProps = reactiveOmit(props, "class", "disablePortal", "hideScrollButtons");
 
 const forwarded = useForwardPropsEmits(delegatedProps, emits);
 </script>
@@ -45,11 +47,11 @@ const forwarded = useForwardPropsEmits(delegatedProps, emits);
         )
       "
     >
-      <SelectScrollUpButton />
+      <SelectScrollUpButton v-if="!hideScrollButtons" />
       <SelectViewport :data-position="position" :class="cn('data-[position=popper]:h-[var(--reka-select-trigger-height)] data-[position=popper]:w-full')">
         <slot />
       </SelectViewport>
-      <SelectScrollDownButton />
+      <SelectScrollDownButton v-if="!hideScrollButtons" />
     </SelectContent>
   </SelectPortal>
 </template>

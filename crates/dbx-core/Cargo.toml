@@ -4,14 +4,22 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[[bin]]
+name = "duckdb-worker-test-host"
+path = "tests/support/duckdb_worker_test_host.rs"
+required-features = ["duckdb-bundled"]
+test = false
+bench = false
+
 [features]
-default = ["duckdb-bundled", "mq-admin"]
+default = ["duckdb-bundled", "mq-admin", "sqlite-sqlcipher"]
 duckdb-bundled = ["duckdb/bundled"]
 legacy-ring-crypto = []
 legacy-russh-054 = []
 legacy-mysql-032 = []
 legacy-sqlparser-060 = []
 mq-admin = []
+sqlite-sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -32,7 +40,7 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 tokio-postgres-rustls = "0.13"
 webpki-roots = "0.26"
-rusqlite = { version = "0.32", features = ["bundled", "load_extension", "backup", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled", "load_extension", "backup", "functions", "column_decltype"] }
 mysql_async = { version = "0.36", default-features = false, features = ["default-rustls", "client_ed25519", "chrono", "rust_decimal"] }
 mysql_common = "0.35.5"
 sqlparser = { version = "0.62.0", features = ["visitor"] }

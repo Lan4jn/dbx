@@ -32,6 +32,8 @@ pub const MAX_ROWS: usize = 10000;
 pub const QUERY_CANCELED: &str = "Query canceled";
 #[cfg(feature = "duckdb-bundled")]
 const DUCKDB_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "duckdb-bundled")]
+const DUCKDB_DRAINING_MESSAGE: &str = "上一条 DuckDB 查询仍在停止，请稍后重试。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolErrorAction {
@@ -542,26 +544,51 @@ pub fn duckdb_execute_with_max_rows(
 }
 
 #[cfg(feature = "duckdb-bundled")]
-async fn wait_for_duckdb_task_with_interrupt(
+enum DuckDbTaskWait {
+    Finished(Result<db::QueryResult, String>),
+    Draining { error: String, task: JoinHandle<Result<db::QueryResult, String>> },
+}
+
+#[cfg(feature = "duckdb-bundled")]
+fn duckdb_join_result(
+    result: Result<Result<db::QueryResult, String>, tokio::task::JoinError>,
+) -> Result<db::QueryResult, String> {
+    result.map_err(|e| e.to_string())?
+}
+
+#[cfg(feature = "duckdb-bundled")]
+async fn interrupt_and_drain_duckdb_task(
+    interrupt_handle: std::sync::Arc<duckdb::InterruptHandle>,
+    mut task: JoinHandle<Result<db::QueryResult, String>>,
+    error: String,
+) -> DuckDbTaskWait {
+    interrupt_handle.interrupt();
+    match timeout(DUCKDB_INTERRUPT_DRAIN_TIMEOUT, &mut task).await {
+        Ok(result) => {
+            let _ = result;
+            DuckDbTaskWait::Finished(Err(error))
+        }
+        Err(_) => DuckDbTaskWait::Draining { error, task },
+    }
+}
+
+#[cfg(feature = "duckdb-bundled")]
+async fn wait_for_duckdb_task_with_interrupt_outcome(
     cancel_token: Option<CancellationToken>,
     timeout_duration: Option<Duration>,
     interrupt_handle: std::sync::Arc<duckdb::InterruptHandle>,
     mut task: JoinHandle<Result<db::QueryResult, String>>,
-) -> Result<db::QueryResult, String> {
+) -> DuckDbTaskWait {
     match (cancel_token, timeout_duration) {
         (Some(token), Some(duration)) => {
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    interrupt_handle.interrupt();
-                    drain_interrupted_duckdb_task(&mut task).await;
-                    Err(canceled_error())
+                    interrupt_and_drain_duckdb_task(interrupt_handle, task, canceled_error()).await
                 }
-                result = &mut task => result.map_err(|e| e.to_string())?,
+                result = &mut task => DuckDbTaskWait::Finished(duckdb_join_result(result)),
                 _ = sleep(duration) => {
-                    interrupt_handle.interrupt();
-                    drain_interrupted_duckdb_task(&mut task).await;
-                    Err(timeout_error())
+                    interrupt_and_drain_duckdb_task(interrupt_handle, task, timeout_error()).await
                 }
             }
         }
@@ -569,34 +596,38 @@ async fn wait_for_duckdb_task_with_interrupt(
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    interrupt_handle.interrupt();
-                    drain_interrupted_duckdb_task(&mut task).await;
-                    Err(canceled_error())
+                    interrupt_and_drain_duckdb_task(interrupt_handle, task, canceled_error()).await
                 }
-                result = &mut task => result.map_err(|e| e.to_string())?,
+                result = &mut task => DuckDbTaskWait::Finished(duckdb_join_result(result)),
             }
         }
         (None, Some(duration)) => {
             tokio::select! {
-                result = &mut task => result.map_err(|e| e.to_string())?,
+                result = &mut task => DuckDbTaskWait::Finished(duckdb_join_result(result)),
                 _ = sleep(duration) => {
-                    interrupt_handle.interrupt();
-                    drain_interrupted_duckdb_task(&mut task).await;
-                    Err(timeout_error())
+                    interrupt_and_drain_duckdb_task(interrupt_handle, task, timeout_error()).await
                 }
             }
         }
-        (None, None) => task.await.map_err(|e| e.to_string())?,
+        (None, None) => DuckDbTaskWait::Finished(duckdb_join_result(task.await)),
     }
 }
 
 #[cfg(feature = "duckdb-bundled")]
-async fn drain_interrupted_duckdb_task(task: &mut JoinHandle<Result<db::QueryResult, String>>) {
-    let _ = timeout(DUCKDB_INTERRUPT_DRAIN_TIMEOUT, task).await;
+async fn wait_for_duckdb_task_with_interrupt(
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+    interrupt_handle: std::sync::Arc<duckdb::InterruptHandle>,
+    task: JoinHandle<Result<db::QueryResult, String>>,
+) -> Result<db::QueryResult, String> {
+    match wait_for_duckdb_task_with_interrupt_outcome(cancel_token, timeout_duration, interrupt_handle, task).await {
+        DuckDbTaskWait::Finished(result) => result,
+        DuckDbTaskWait::Draining { error, .. } => Err(error),
+    }
 }
 
 #[cfg(feature = "duckdb-bundled")]
-fn duckdb_execute_for_database(
+pub(crate) fn duckdb_execute_for_database(
     con: &duckdb::Connection,
     attached_names: &[String],
     database: Option<&str>,
@@ -821,6 +852,11 @@ pub fn canceled_error() -> String {
     QUERY_CANCELED.to_string()
 }
 
+#[cfg(feature = "duckdb-bundled")]
+pub fn duckdb_draining_error() -> String {
+    DUCKDB_DRAINING_MESSAGE.to_string()
+}
+
 pub fn is_canceled(cancel_token: &Option<CancellationToken>) -> bool {
     cancel_token.as_ref().map(|token| token.is_cancelled()).unwrap_or(false)
 }
@@ -884,7 +920,7 @@ fn resolve_query_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
     }
 }
 
-async fn operation_budget_for_pool_key(
+pub async fn operation_budget_for_pool_key(
     state: &AppState,
     pool_key: &str,
     query_timeout: Option<Duration>,
@@ -899,6 +935,30 @@ async fn configured_operation_budget_for_pool_key(state: &AppState, pool_key: &s
     crate::connection::config_for_pool_key(pool_key, &configs)
         .map(DbOperationBudget::from_connection_config)
         .unwrap_or_else(DbOperationBudget::with_defaults)
+}
+
+fn oceanbase_mysql_session_timeout_sql(config: Option<&ConnectionConfig>, timeout_secs: Option<u64>) -> Option<String> {
+    let config = config?;
+    let timeout_secs = timeout_secs.unwrap_or(config.query_timeout_secs);
+    crate::connection::oceanbase_mysql_query_timeout_sql(config, timeout_secs)
+}
+
+async fn apply_oceanbase_mysql_session_timeout(
+    state: &AppState,
+    pool_key: &str,
+    conn: &mut mysql_async::Conn,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let sql = {
+        let configs = state.configs.read().await;
+        oceanbase_mysql_session_timeout_sql(crate::connection::config_for_pool_key(pool_key, &configs), timeout_secs)
+    };
+    if let Some(sql) = sql {
+        // OceanBase enforces query timeouts through a session variable; set it
+        // on the checked-out connection in case the pooled session was reset.
+        conn.query_drop(&sql).await.map_err(|err| format!("Failed to apply OceanBase query timeout: {err}"))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -940,7 +1000,11 @@ pub async fn do_execute(
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let con = con.clone();
-            let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
+            if con.is_draining() {
+                drop(connections);
+                return Err(duckdb_draining_error());
+            }
+            let interrupt_handle = con.interrupt_handle();
             if let Some(ref execution_id) = options.execution_id {
                 let cancel_interrupt_handle = interrupt_handle.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
@@ -952,15 +1016,56 @@ pub async fn do_execute(
             let attached_names = _duckdb_attached_names;
             let max_rows = options.max_rows;
             drop(connections);
+            let task_con = con.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let con = con.lock().map_err(|e| e.to_string())?;
+                let con = task_con.lock().map_err(|e| e.to_string())?;
                 duckdb_execute_for_database(&con, &attached_names, database.as_deref(), &sql, max_rows)
             });
-            wait_for_duckdb_task_with_interrupt(cancel_token, query_timeout, interrupt_handle, task).await
+            let result =
+                wait_for_duckdb_task_with_interrupt_outcome(cancel_token, query_timeout, interrupt_handle, task).await;
+            match result {
+                DuckDbTaskWait::Finished(result) => {
+                    if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED || is_dbx_query_timeout_error(&err.to_lowercase()))
+                    {
+                        con.mark_draining();
+                        state.spawn_duckdb_pool_cleanup(pool_key.to_string(), con);
+                    }
+                    result
+                }
+                DuckDbTaskWait::Draining { error, task } => {
+                    con.mark_draining();
+                    state.spawn_duckdb_draining_cleanup(pool_key.to_string(), con, task);
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => {
+            let client = client.clone();
+            if let Some(ref execution_id) = options.execution_id {
+                let cancel_client = client.clone();
+                state.running_queries.register_interrupt(execution_id, move || {
+                    let cancel_client = cancel_client.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = cancel_client.cancel().await {
+                            log::warn!("Failed to cancel DuckDB worker query: {error}");
+                        }
+                    });
+                });
+            }
+            let sql = sql.to_string();
+            let database = database.map(str::to_string);
+            let max_rows = options.max_rows;
+            drop(connections);
+            client.execute(database, sql, max_rows, cancel_token, query_timeout).await
         }
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDb(_) => {
             return Err("DuckDB support is not compiled in this build".to_string());
+        }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDbWorker(_) => {
+            return Err("DuckDB worker support is not compiled in this build".to_string());
         }
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
@@ -994,6 +1099,7 @@ pub async fn do_execute(
                     });
                 });
             }
+            apply_oceanbase_mysql_session_timeout(state, pool_key, &mut conn, options.timeout_secs).await?;
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1683,6 +1789,8 @@ async fn execute_multi_mysql(
     };
     let mut results = Vec::with_capacity(statements.len());
 
+    apply_oceanbase_mysql_session_timeout(state, pool_key, &mut conn, options.timeout_secs).await?;
+
     for stmt in statements {
         if is_canceled(&cancel_token) {
             results.push(error_query_result(canceled_error()));
@@ -1988,6 +2096,7 @@ pub async fn execute_statements_in_transaction(
             PoolKind::MessageQueue | PoolKind::Nacos => TxPath::None,
             #[cfg(feature = "duckdb-bundled")]
             PoolKind::DuckDb(_)
+            | PoolKind::DuckDbWorker(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
             | PoolKind::Elasticsearch(_)
@@ -1997,6 +2106,7 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::ExternalDriver { .. } => TxPath::None,
             #[cfg(not(feature = "duckdb-bundled"))]
             PoolKind::DuckDb(_)
+            | PoolKind::DuckDbWorker(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
             | PoolKind::Elasticsearch(_)
@@ -2013,7 +2123,7 @@ pub async fn execute_statements_in_transaction(
             exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
         }
         Some(TxPath::Mysql(pool, _bare)) => {
-            exec_tx_mysql_inner(pool, statements, start, operation_budget.clone()).await
+            exec_tx_mysql_inner(state, &pool_key, pool, statements, start, operation_budget.clone()).await
         }
         Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
         Some(TxPath::Explicit) => {
@@ -2138,12 +2248,15 @@ async fn exec_tx_pg_statements(
 }
 
 async fn exec_tx_mysql_inner(
+    state: &AppState,
+    pool_key: &str,
     pool: mysql_async::Pool,
     statements: &[String],
     start: std::time::Instant,
     budget: DbOperationBudget,
 ) -> Result<db::QueryResult, String> {
     let mut conn = db::mysql::get_conn_with_health_check_with_timeout(&pool, budget.checkout_timeout).await?;
+    apply_oceanbase_mysql_session_timeout(state, pool_key, &mut conn, None).await?;
     mysql_query_drop_with_timeout(
         &mut conn,
         "START TRANSACTION",
@@ -2767,6 +2880,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
 mod tests {
     use super::*;
     use crate::models::connection::{default_redis_key_separator, ConnectionConfig, DatabaseType};
+    use crate::storage::Storage;
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
@@ -2830,6 +2944,37 @@ mod tests {
         assert!(!is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_query"));
     }
 
+    #[test]
+    fn oceanbase_mysql_session_timeout_sql_uses_connection_timeout_by_default() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 300_000;
+
+        assert_eq!(
+            oceanbase_mysql_session_timeout_sql(Some(&config), None),
+            Some("SET ob_query_timeout = 300000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn oceanbase_mysql_session_timeout_sql_prefers_execution_timeout_override() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 30;
+
+        assert_eq!(
+            oceanbase_mysql_session_timeout_sql(Some(&config), Some(600)),
+            Some("SET ob_query_timeout = 600000000".to_string())
+        );
+    }
+
+    #[test]
+    fn oceanbase_mysql_session_timeout_sql_skips_plain_mysql() {
+        let config = test_connection_config(DatabaseType::Mysql);
+
+        assert_eq!(oceanbase_mysql_session_timeout_sql(Some(&config), Some(600)), None);
+    }
+
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
         let token = CancellationToken::new();
@@ -2877,34 +3022,182 @@ mod tests {
 
     #[cfg(feature = "duckdb-bundled")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn duckdb_timeout_interrupts_running_task_and_releases_connection() {
-        let con = std::sync::Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
-        let interrupt_handle = con.lock().unwrap().interrupt_handle();
+    async fn duckdb_timeout_interrupts_running_task_without_waiting_for_it_to_finish() {
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        let interrupt_handle = con.interrupt_handle();
         let running_con = con.clone();
         let task = tokio::task::spawn_blocking(move || {
             let con = running_con.lock().map_err(|e| e.to_string())?;
             duckdb_execute_with_max_rows(&con, "SELECT sum(sin(i::DOUBLE)) FROM range(10000000000) tbl(i)", None)
         });
 
+        let started = std::time::Instant::now();
         let result =
             wait_for_duckdb_task_with_interrupt(None, Some(Duration::from_millis(10)), interrupt_handle, task).await;
 
         assert_eq!(result.unwrap_err(), timeout_error());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
-        let follow_con = con.clone();
-        let follow_up = timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                let con = follow_con.lock().map_err(|e| e.to_string())?;
-                duckdb_execute_with_max_rows(&con, "SELECT 1", None)
-            }),
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_cancel_keeps_pool_draining_until_references_drop() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "duckdb-1";
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        let extra_reference = con.clone();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con));
+        state.configs.write().await.insert(pool_key.to_string(), test_connection_config(DatabaseType::DuckDb));
+
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_token.cancel();
+        });
+
+        let result = do_execute(
+            &state,
+            pool_key,
+            db::mysql::MySqlQueryDialect::default(),
+            Some("main"),
+            "SELECT sum(sin(i::DOUBLE)) FROM range(10000000000) tbl(i)",
+            None,
+            Some(token),
+            QueryExecutionOptions::default(),
         )
-        .await
-        .expect("DuckDB connection should be released after timeout")
-        .expect("follow-up task should not panic")
-        .expect("follow-up query should succeed");
+        .await;
 
-        assert_eq!(follow_up.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(result.unwrap_err(), QUERY_CANCELED);
+        let still_present = {
+            let conns = state.connections.read().await;
+            matches!(conns.get(pool_key), Some(PoolKind::DuckDb(current)) if current.is_draining())
+        };
+        assert!(still_present);
+
+        drop(extra_reference);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.connections.read().await.contains_key(pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("draining DuckDB pool should be removed after references drop");
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_draining_pool_rejects_follow_up_query() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-draining-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "duckdb-1";
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        con.mark_draining();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con));
+        state.configs.write().await.insert(pool_key.to_string(), test_connection_config(DatabaseType::DuckDb));
+
+        let result = do_execute(
+            &state,
+            pool_key,
+            db::mysql::MySqlQueryDialect::default(),
+            Some("main"),
+            "SELECT 1",
+            None,
+            None,
+            QueryExecutionOptions::default(),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), duckdb_draining_error());
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_draining_cleanup_removes_pool_after_task_finishes() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "duckdb-1";
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        con.mark_draining();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con.clone()));
+
+        let task_con = con.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _locked = task_con.lock().map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(empty_query_result(0))
+        });
+        state.spawn_duckdb_draining_cleanup(pool_key.to_string(), con.clone(), task);
+
+        assert!(state.connections.read().await.contains_key(pool_key));
+        drop(con);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.connections.read().await.contains_key(pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("draining cleanup should remove the DuckDB pool");
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_cleanup_keeps_draining_pool_while_extra_reference_exists() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-cleanup-ref-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "duckdb-1";
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        con.mark_draining();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con.clone()));
+
+        let extra_reference = con.clone();
+        let task = tokio::task::spawn_blocking(|| Ok(empty_query_result(0)));
+        state.spawn_duckdb_draining_cleanup(pool_key.to_string(), con.clone(), task);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let still_present = {
+            let conns = state.connections.read().await;
+            matches!(conns.get(pool_key), Some(PoolKind::DuckDb(current)) if current.is_draining())
+        };
+        assert!(still_present);
+
+        drop(extra_reference);
+        drop(con);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.connections.read().await.contains_key(pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("draining cleanup should remove the DuckDB pool after extra refs drop");
     }
 
     #[test]

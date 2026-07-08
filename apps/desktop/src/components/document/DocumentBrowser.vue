@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount } from "vue";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
-import { RefreshCw, RefreshCcw, Loader2, Trash2, Plus, Save, ChevronLeft, ChevronRight, Table2, Braces, X, Columns3, Check, Search, Wrench, Filter } from "@lucide/vue";
+import { RefreshCw, Trash2, Plus, Save, ChevronLeft, ChevronRight, Table2, Braces, X, Columns3, Check, Search, Wrench, Filter } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -12,13 +12,24 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ErrorBanner from "@/components/ui/ErrorBanner.vue";
 import DataGrid from "@/components/grid/DataGrid.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
-import * as api from "@/lib/api";
+import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
-import { documentViewerFontStyle } from "@/lib/documentViewerFontStyle";
-import { buildDocumentFilterCondition, combineDocumentFilterConditions, currentDocumentFilterJson, defaultDocumentFilterRule, documentFilterModeNeedsValue, documentFilterModeOptions, documentStoreProviderFor, type DocumentFilterMode, type DocumentFilterRule } from "@/lib/documentStoreProvider";
-import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, parseMongoDocumentInputValue, type MongoInputValue } from "@/lib/mongoDocumentValues";
-import { normalizeResultPageSize } from "@/lib/paginationPageSize";
+import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
+import { documentViewerFontStyle } from "@/lib/document/documentViewerFontStyle";
+import {
+  buildDocumentFilterCondition,
+  combineDocumentFilterConditions,
+  currentDocumentFilterJson,
+  currentDocumentSortJson,
+  defaultDocumentFilterRule,
+  documentFilterModeNeedsValue,
+  documentFilterModeOptions,
+  documentStoreProviderFor,
+  type DocumentFilterMode,
+  type DocumentFilterRule,
+} from "@/lib/app/documentStoreProvider";
+import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, parseMongoDocumentInputValue, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
+import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { useSettingsStore } from "@/stores/settingsStore";
 import JsonEditNode from "./JsonEditNode.vue";
 import type { EditNode } from "@/types/editor";
@@ -199,7 +210,7 @@ function resetDocumentFilterBuilder() {
 }
 
 function currentDocumentFilter(): string | undefined {
-  return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value);
+  return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value, documentStoreProvider.value.kind);
 }
 
 const documentQueryPreview = computed(() => {
@@ -219,7 +230,12 @@ const documentQueryPreview = computed(() => {
 });
 
 async function applyDocumentStructuredFilters() {
-  const items = documentFilterRules.value.map((rule) => ({ rule, condition: buildDocumentFilterCondition(rule) })).filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
+  const items = documentFilterRules.value
+    .map((rule) => ({
+      rule,
+      condition: buildDocumentFilterCondition(rule, { kind: documentStoreProvider.value.kind }),
+    }))
+    .filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
   const structured = combineDocumentFilterConditions(
     items.map((item) => item.condition),
     items.map((item) => item.rule),
@@ -433,7 +449,7 @@ async function load() {
   const previousSelectedId = previousSelectedIdx === null ? null : documentIdentity(documents.value[previousSelectedIdx]);
   try {
     const filter = currentDocumentFilter();
-    const sort = sortInput.value.trim() || undefined;
+    const sort = currentDocumentSortJson(sortInput.value);
     const result = await api.documentFindDocuments(props.connectionId, props.database, props.collection, page.value * pageSize.value, pageSize.value, filter, undefined, sort, executionId);
     if (documentLoadExecutionId.value !== executionId) return;
     const nextDocuments = result.documents.map(asRecord);
@@ -1107,13 +1123,6 @@ function resetTableSearchSplitWidth() {
               <X class="w-3 h-3" />
             </button>
           </div>
-        </div>
-        <div class="flex shrink-0 items-center gap-1 border-l px-1">
-          <Button variant="ghost" size="sm" class="h-5 shrink-0 gap-1 px-1.5 text-xs" :disabled="loading" @click="load">
-            <Loader2 v-if="loading" class="h-3 w-3 animate-spin" />
-            <RefreshCcw v-else class="h-3 w-3" />
-            {{ t("grid.refresh") }}
-          </Button>
         </div>
       </template>
     </DataGrid>

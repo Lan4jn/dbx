@@ -2,7 +2,8 @@ import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { isReactive } from "vue";
-import { decodeQueryResultArchive } from "../../apps/desktop/src/lib/queryResultArchive.ts";
+import { decodeQueryResultArchive } from "../../apps/desktop/src/lib/query/queryResultArchive.ts";
+import { resultSqlForGrid } from "../../apps/desktop/src/lib/tabs/tabPresentation.ts";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
 import { useQueryStore } from "../../apps/desktop/src/stores/queryStore.ts";
 import { useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
@@ -144,10 +145,11 @@ test("external SQL file paths persist with open query tabs", async () => {
     const tabId = store.createTab("conn-1", "db", "draft.sql");
     store.updateSql(tabId, "select 1;");
     store.linkExternalSqlPath(tabId, "/tmp/draft.sql", "draft.sql");
-    store.flushPendingPersist();
+    await store.flushPendingPersist();
 
     setActivePinia(createPinia());
     store = useQueryStore();
+    await store.initOpenTabs();
     const tab = store.tabs.find((item) => item.id === tabId);
 
     assert.equal(tab?.externalSqlPath, "/tmp/draft.sql");
@@ -177,13 +179,14 @@ test("clean saved SQL tabs persist without duplicating SQL text", async () => {
       createdAt: "2026-06-27T00:00:00.000Z",
       updatedAt: "2026-06-27T00:00:00.000Z",
     });
-    store.flushPendingPersist();
+    await store.flushPendingPersist();
 
-    const rawTabs = localStorage.getItem("dbx-open-tabs") ?? "";
+    const rawTabs = localStorage.getItem("dbx-app-state:open_tabs") ?? "";
     assert.equal(rawTabs.includes("large_table"), false);
 
     setActivePinia(createPinia());
     store = useQueryStore();
+    await store.initOpenTabs();
     const tab = store.tabs.find((item) => item.savedSqlId === "saved-1");
 
     assert.equal(tab?.sql, "");
@@ -209,13 +212,14 @@ test("dirty saved SQL tabs keep unsaved edits in open tab persistence", async ()
       updatedAt: "2026-06-27T00:00:00.000Z",
     });
     store.updateSql(tabId, "SELECT 2;");
-    store.flushPendingPersist();
+    await store.flushPendingPersist();
 
-    const rawTabs = localStorage.getItem("dbx-open-tabs") ?? "";
+    const rawTabs = localStorage.getItem("dbx-app-state:open_tabs") ?? "";
     assert.equal(rawTabs.includes("SELECT 2;"), true);
 
     setActivePinia(createPinia());
     store = useQueryStore();
+    await store.initOpenTabs();
     const tab = store.tabs.find((item) => item.savedSqlId === "saved-1");
 
     assert.equal(tab?.sql, "SELECT 2;");
@@ -452,7 +456,7 @@ test("close other fixed tabs does not close regular tabs", () => {
   );
 });
 
-test("close other tabs pauses on restored unsaved query tabs", () => {
+test("close other tabs pauses on restored unsaved query tabs", async () => {
   const restoreStorage = installMemoryStorage();
   try {
     localStorage.setItem(
@@ -479,6 +483,7 @@ test("close other tabs pauses on restored unsaved query tabs", () => {
     localStorage.setItem("dbx-active-tab", "b");
     setActivePinia(createPinia());
     const store = useQueryStore();
+    await store.initOpenTabs();
 
     store.closeOtherTabs("b");
 
@@ -1916,7 +1921,7 @@ test("data tab execution preserves pagination offset metadata", async () => {
   }
 });
 
-test("data tab default pagination is independent from query result page size", async () => {
+test("data tab default pagination follows persisted rows-per-page", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -1949,12 +1954,12 @@ test("data tab default pagination is independent from query result page size", a
   });
 
   try {
-    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 100;');
+    await store.executeTabSql(tabId, 'SELECT * FROM "users" LIMIT 1000;');
 
     assert.equal(preparedPagination, false);
-    assert.equal(executeBody.maxRows, 100);
-    assert.equal(executeBody.fetchSize, 100);
-    assert.equal(tab.resultPageLimit, 100);
+    assert.equal(executeBody.maxRows, 1000);
+    assert.equal(executeBody.fetchSize, 1000);
+    assert.equal(tab.resultPageLimit, 1000);
     assert.equal(tab.resultPageOffset, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2483,6 +2488,101 @@ test("mongo multi-command execution runs writes sequentially and keeps grouped r
     assert.equal(tab?.results?.length, 2);
     assert.equal(tab?.activeResultIndex, 0);
     assert.equal(tab?.result?.affected_rows, 1);
+    assert.deepEqual(
+      tab?.results?.map((result) => result.sourceStatement),
+      ['db.users.insertOne({ name: "Ada" })', 'db.users.insertOne({ name: "Grace" })'],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("redis multi-command execution records source statements for each result", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const commandBodies: any[] = [];
+
+  connectionStore.addEphemeralConnection({
+    ...conn("redis-1"),
+    db_type: "redis",
+    port: 6379,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/redis/execute-command") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      commandBodies.push(body);
+      if (body.command === "BAD") return new Response("bad command", { status: 500 });
+      return new Response(JSON.stringify({ command: body.command, safety: "allowed", value: body.command === "GET user:1" ? "Ada" : "OK" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("redis-1", "0", "Redis", "query", "");
+    await store.executeTabSql(tabId, "GET user:1\nBAD\nPING");
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    assert.deepEqual(
+      commandBodies.map((body) => body.command),
+      ["GET user:1", "BAD", "PING"],
+    );
+    assert.deepEqual(
+      tab?.results?.map((result) => result.sourceStatement),
+      ["GET user:1", "BAD", "PING"],
+    );
+    assert.deepEqual(tab?.results?.[1]?.columns, ["Error"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("mongo multi-command execution records source statements for error results", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let insertCount = 0;
+
+  connectionStore.addEphemeralConnection({
+    ...conn("mongo-1"),
+    db_type: "mongodb",
+    port: 27017,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input) => {
+    const url = String(input);
+    if (url === "/api/mongo/insert-documents") {
+      insertCount += 1;
+      if (insertCount === 2) return new Response("duplicate key", { status: 500 });
+      return new Response(JSON.stringify({ affected_rows: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("mongo-1", "accounting", "Query", "query", "");
+    await store.executeTabSql(tabId, 'db.users.insertOne({ name: "Ada" });\ndb.users.insertOne({ name: "Ada" });');
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    assert.deepEqual(
+      tab?.results?.map((result) => result.sourceStatement),
+      ['db.users.insertOne({ name: "Ada" })', 'db.users.insertOne({ name: "Ada" })'],
+    );
+    assert.deepEqual(tab?.results?.[1]?.columns, ["Error"]);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -3449,6 +3549,10 @@ test("query results keep readable table source labels with active database conte
       tab?.results?.map((result) => result.sourceStatement),
       ["select * from users", "select * from orders"],
     );
+    assert.equal(resultSqlForGrid(tab!), "select * from users");
+    store.setActiveResultIndex(tabId, 1);
+    tab = store.tabs.find((item) => item.id === tabId);
+    assert.equal(resultSqlForGrid(tab!), "select * from orders");
 
     await store.executeTabSql(defaultDatabaseTabId, "SELECT *\nFROM apis AS ap\nLIMIT 10;\n\nSELECT *\nFROM menus AS mn\nLIMIT 10;");
     tab = store.tabs.find((item) => item.id === defaultDatabaseTabId);
@@ -3469,6 +3573,7 @@ test("query results keep readable table source labels with active database conte
     await store.executeTabSql(tabId, "update users set active = true; select * from users");
     tab = store.tabs.find((item) => item.id === tabId);
     assert.equal(tab?.results?.[0]?.sourceLabel, undefined);
+    assert.equal(tab?.results?.[0]?.sourceStatement, "update users set active = true");
     assert.equal(tab?.results?.[1]?.sourceLabel, "db.users");
     assert.equal(tab?.results?.[1]?.sourceStatement, "select * from users");
   } finally {
@@ -3522,19 +3627,26 @@ test("reopening table structure tabs records the requested initial tab", () => {
     setActivePinia(createPinia());
     const store = useQueryStore();
 
-    const structureId = store.openTableStructure("conn-1", "db", "public", "users", "indexes");
+    const structureId = store.openTableStructure("conn-1", "db", "public", "users", "indexes", { kind: "index", name: "idx_users_email" });
     const firstTab = store.tabs.find((item) => item.id === structureId);
 
     assert.equal(firstTab?.structureInitialTab, "indexes");
     assert.equal(firstTab?.structureInitialTabRequestId, 1);
+    assert.deepEqual(firstTab?.structureInitialTarget, { kind: "index", name: "idx_users_email" });
 
-    const reusedStructureId = store.openTableStructure("conn-1", "db", "public", "users", "foreignKeys");
+    const reusedStructureId = store.openTableStructure("conn-1", "db", "public", "users", "columns", { kind: "column", name: "email" });
     const reusedTab = store.tabs.find((item) => item.id === reusedStructureId);
 
     assert.equal(reusedStructureId, structureId);
-    assert.equal(reusedTab?.structureInitialTab, "foreignKeys");
+    assert.equal(reusedTab?.structureInitialTab, "columns");
     assert.equal(reusedTab?.structureInitialTabRequestId, 2);
+    assert.deepEqual(reusedTab?.structureInitialTarget, { kind: "column", name: "email" });
     assert.equal(store.activeTabId, structureId);
+
+    store.openTableStructure("conn-1", "db", "public", "users", "foreignKeys");
+    assert.equal(reusedTab?.structureInitialTab, "foreignKeys");
+    assert.equal(reusedTab?.structureInitialTabRequestId, 3);
+    assert.equal(reusedTab?.structureInitialTarget, undefined);
   } finally {
     restoreStorage();
   }

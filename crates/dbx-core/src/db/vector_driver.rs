@@ -28,10 +28,13 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
 const QUERY_VALUE_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add(b'=').add(b'+');
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectionInfo {
     pub name: String,
     pub id: String,
     pub dimension: Option<u32>,
+    pub kind: Option<String>,
+    pub bucket_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +171,44 @@ pub(crate) async fn list_collections_with_db(
     }
 }
 
+/// List databases for a vector connection.
+/// Milvus supports multiple databases; other vector stores expose a single "default" namespace.
+pub async fn list_databases(client: &VectorClient) -> Result<Vec<String>, String> {
+    match client.kind {
+        VectorDbKind::Milvus => list_milvus_databases(client).await,
+        _ => Ok(vec!["default".to_string()]),
+    }
+}
+
+async fn list_milvus_databases(client: &VectorClient) -> Result<Vec<String>, String> {
+    // Older Milvus versions (pre-2.2) do not expose the databases endpoint; fall back to "default"
+    // so the connection stays browsable instead of failing the whole tree load.
+    //
+    // The endpoint rejects a bodyless POST with `{"code":1801,...}` (HTTP 200, no `data` field),
+    // so send an empty JSON object like every other Milvus v2 endpoint.
+    let body = match send_json(client.post("/v2/vectordb/databases/list").json(&serde_json::json!({})), "Milvus").await
+    {
+        Ok(body) => body,
+        Err(_) => return Ok(vec!["default".to_string()]),
+    };
+    let mut names: Vec<String> = match body.get("data") {
+        Some(Value::Array(items)) => items.iter().filter_map(milvus_database_name_from_item).collect(),
+        _ => Vec::new(),
+    };
+    if !names.iter().any(|name| name == "default") {
+        names.push("default".to_string());
+    }
+    names.sort_by(|a, b| a.cmp(b));
+    Ok(names)
+}
+
+fn milvus_database_name_from_item(item: &Value) -> Option<String> {
+    item.as_str()
+        .map(str::to_string)
+        .or_else(|| item.get("dbName").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| item.get("name").and_then(Value::as_str).map(str::to_string))
+}
+
 async fn list_qdrant_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
     let body = send_json(client.get("/collections"), "Qdrant").await?;
     let mut infos: Vec<CollectionInfo> = body
@@ -177,7 +218,13 @@ async fn list_qdrant_collections(client: &VectorClient) -> Result<Vec<Collection
         .flatten()
         .filter_map(|item| {
             let name = item.get("name").and_then(Value::as_str)?;
-            Some(CollectionInfo { name: name.to_string(), id: name.to_string(), dimension: None })
+            Some(CollectionInfo {
+                name: name.to_string(),
+                id: name.to_string(),
+                dimension: None,
+                kind: None,
+                bucket_name: None,
+            })
         })
         .collect();
     infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -196,7 +243,7 @@ async fn list_milvus_collections(client: &VectorClient, database: &str) -> Resul
             .iter()
             .filter_map(|item| {
                 let name = collection_name_from_milvus_item(item)?;
-                Some(CollectionInfo { name: name.clone(), id: name, dimension: None })
+                Some(CollectionInfo { name: name.clone(), id: name, dimension: None, kind: None, bucket_name: None })
             })
             .collect(),
         _ => Vec::new(),
@@ -216,7 +263,7 @@ async fn list_weaviate_collections(client: &VectorClient) -> Result<Vec<Collecti
     let body = send_json(client.get("/v1/schema"), "Weaviate").await?;
     let mut infos: Vec<CollectionInfo> = weaviate_collection_names_from_schema(&body)
         .into_iter()
-        .map(|name| CollectionInfo { name: name.clone(), id: name, dimension: None })
+        .map(|name| CollectionInfo { name: name.clone(), id: name, dimension: None, kind: None, bucket_name: None })
         .collect();
     infos.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(infos)
@@ -234,7 +281,13 @@ async fn list_chroma_collections(client: &VectorClient) -> Result<Vec<Collection
             let name = item.get("name").and_then(Value::as_str)?;
             let id = item.get("id").and_then(Value::as_str)?;
             let dimension = item.get("dimension").and_then(|v| v.as_u64()).map(|d| d as u32);
-            Some(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension })
+            Some(CollectionInfo {
+                name: name.to_string(),
+                id: id.to_string(),
+                dimension,
+                kind: None,
+                bucket_name: None,
+            })
         })
         .collect();
     infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -251,7 +304,13 @@ pub async fn get_collection_detail(
         VectorDbKind::Milvus => get_milvus_collection_detail(client, database, collection).await,
         VectorDbKind::Weaviate => {
             // Weaviate REST API does not expose vector dimension
-            Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension: None })
+            Ok(CollectionInfo {
+                name: collection.to_string(),
+                id: collection.to_string(),
+                dimension: None,
+                kind: None,
+                bucket_name: None,
+            })
         }
         VectorDbKind::ChromaDb => get_chroma_collection_detail(client, collection).await,
     }
@@ -268,7 +327,13 @@ async fn get_qdrant_collection_detail(client: &VectorClient, collection: &str) -
                 .and_then(|obj| obj.values().find_map(|v| v.get("size").and_then(|s| s.as_u64())))
         })
         .map(|d| d as u32);
-    Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension: dim })
+    Ok(CollectionInfo {
+        name: collection.to_string(),
+        id: collection.to_string(),
+        dimension: dim,
+        kind: None,
+        bucket_name: None,
+    })
 }
 
 fn milvus_vector_dim_from_field(field: &Value) -> Option<u32> {
@@ -319,7 +384,13 @@ async fn get_milvus_collection_detail(
             })
         })
         .and_then(milvus_vector_dim_from_field);
-    Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension: dim })
+    Ok(CollectionInfo {
+        name: collection.to_string(),
+        id: collection.to_string(),
+        dimension: dim,
+        kind: None,
+        bucket_name: None,
+    })
 }
 
 async fn get_chroma_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
@@ -334,7 +405,7 @@ async fn get_chroma_collection_detail(client: &VectorClient, collection: &str) -
     let name = body.get("name").and_then(Value::as_str).unwrap_or(collection);
     let id = body.get("id").and_then(Value::as_str).unwrap_or(collection);
     let dimension = body.get("dimension").and_then(|v| v.as_u64()).map(|d| d as u32);
-    Ok(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension })
+    Ok(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension, kind: None, bucket_name: None })
 }
 
 fn chroma_get_response_to_rows(body: &Value) -> Vec<Value> {
@@ -408,6 +479,7 @@ fn weaviate_collection_names_from_schema(body: &Value) -> Vec<String> {
 
 pub async fn find_documents(
     client: &VectorClient,
+    database: &str,
     collection: &str,
     skip: u64,
     limit: i64,
@@ -465,7 +537,7 @@ pub async fn find_documents(
         VectorDbKind::Milvus => format!(
             "POST /v2/vectordb/entities/query\n{}",
             serde_json::json!({
-                "dbName": "default",
+                "dbName": if database.is_empty() { "default" } else { database },
                 "collectionName": collection,
                 "filter": "",
                 "limit": limit.max(1) as u64,
@@ -773,7 +845,13 @@ mod tests {
             .filter_map(|item| {
                 let name = item.get("name").and_then(|v| v.as_str())?;
                 let id = item.get("id").and_then(|v| v.as_str())?;
-                Some(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension: None })
+                Some(CollectionInfo {
+                    name: name.to_string(),
+                    id: id.to_string(),
+                    dimension: None,
+                    kind: None,
+                    bucket_name: None,
+                })
             })
             .collect();
         assert_eq!(infos.len(), 2);

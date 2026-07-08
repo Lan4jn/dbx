@@ -246,6 +246,7 @@ async fn main() {
         .route("/jdbc/plugin/uninstall", post(routes::jdbc::uninstall_jdbc_plugin))
         // System
         .route("/system/fonts", get(routes::jdbc::list_system_fonts))
+        .route("/ssh/config-hosts", get(routes::ssh_config::list_ssh_config_hosts))
         // Agent drivers
         .route("/agents/installed-local", get(routes::agents::list_installed_agents_local))
         .route("/agents/installed", get(routes::agents::list_installed_agents))
@@ -288,6 +289,8 @@ async fn main() {
         .route("/schema/sequences", get(routes::schema::list_sequences))
         .route("/schema/rules", get(routes::schema::list_rules))
         .route("/schema/owners", get(routes::schema::list_owners))
+        .route("/schema/extensions", get(routes::schema::list_extensions))
+        .route("/schema/available-extensions", get(routes::schema::list_available_extensions))
         .route("/schema/ddl", get(routes::schema::get_ddl))
         .route("/schema-diff/prepare", post(routes::schema_diff::prepare_schema_diff))
         .route("/schema-diff/generate-sync-sql", post(routes::schema_diff::generate_schema_sync_sql))
@@ -329,6 +332,7 @@ async fn main() {
         .route("/query/build-truncate-table-sql", post(routes::query::build_truncate_table_sql))
         .route("/query/build-drop-database-sql", post(routes::query::build_drop_database_sql))
         .route("/query/build-create-schema-sql", post(routes::query::build_create_schema_sql))
+        .route("/query/build-update-database-properties-sql", post(routes::query::build_update_database_properties_sql))
         .route("/query/build-drop-schema-sql", post(routes::query::build_drop_schema_sql))
         .route("/query/build-duplicate-table-structure-sql", post(routes::query::build_duplicate_table_structure_sql))
         .route("/query/build-copy-table-data-sql", post(routes::query::build_copy_table_data_sql))
@@ -392,6 +396,7 @@ async fn main() {
         .route("/redis/scan-keys-batch", post(routes::redis::scan_keys_batch))
         .route("/redis/scan-values", post(routes::redis::scan_values))
         .route("/redis/get-value", post(routes::redis::get_value))
+        .route("/redis/load-more", post(routes::redis::load_more))
         .route("/redis/set-string", post(routes::redis::set_string))
         .route("/redis/delete-key", post(routes::redis::delete_key))
         .route("/redis/hash-set", post(routes::redis::hash_set))
@@ -449,11 +454,19 @@ async fn main() {
         .route("/document-store/list-databases", post(routes::document_store::list_databases))
         .route("/document-store/list-collections", post(routes::document_store::list_collections))
         .route("/document-store/find-documents", post(routes::document_store::find_documents))
+        .route("/document-store/list-gridfs-buckets", post(routes::document_store::list_gridfs_buckets))
+        .route("/document-store/create-gridfs-bucket", post(routes::document_store::create_gridfs_bucket))
+        .route("/document-store/delete-gridfs-bucket", post(routes::document_store::delete_gridfs_bucket))
+        .route("/document-store/list-gridfs-files", post(routes::document_store::list_gridfs_files))
+        .route("/document-store/download-gridfs-file", post(routes::document_store::download_gridfs_file))
+        .route("/document-store/upload-gridfs-file", post(routes::document_store::upload_gridfs_file))
+        .route("/document-store/delete-gridfs-file", post(routes::document_store::delete_gridfs_file))
         .route("/document-store/insert-document", post(routes::document_store::insert_document))
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
         .route("/mongo/server-version", post(routes::mongo::server_version))
+        .route("/mongo/collection-stats", post(routes::mongo::collection_stats))
         .route("/mongo/aggregate-documents", post(routes::mongo::aggregate_documents))
         .route("/mongo/create-index", post(routes::mongo::create_index))
         .route("/mongo/drop-indexes", post(routes::mongo::drop_indexes))
@@ -543,6 +556,15 @@ async fn main() {
         .route("/cloud-sync/webdav/password-status", post(routes::cloud_sync::webdav_password_status))
         .route("/cloud-sync/webdav/save-password", post(routes::cloud_sync::save_webdav_saved_password))
         .route("/cloud-sync/webdav/forget-password", post(routes::cloud_sync::forget_webdav_saved_password))
+        .route("/cloud-sync/webdav/sync-secrets-status", post(routes::cloud_sync::webdav_sync_secrets_status))
+        .route(
+            "/cloud-sync/webdav/save-sync-secrets-preference",
+            post(routes::cloud_sync::save_webdav_sync_secrets_preference),
+        )
+        .route(
+            "/cloud-sync/webdav/forget-sync-secrets-passphrase",
+            post(routes::cloud_sync::forget_webdav_sync_secrets_passphrase),
+        )
         .route("/cloud-sync/webdav/upload", post(routes::cloud_sync::webdav_sync_upload))
         .route("/cloud-sync/webdav/download", post(routes::cloud_sync::webdav_sync_download));
 

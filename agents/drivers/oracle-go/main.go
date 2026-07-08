@@ -11,16 +11,32 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/sijms/go-ora/v2"
 	go_ora "github.com/sijms/go-ora/v2"
+	"github.com/sijms/go-ora/v2/converters"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 const protocolVersion = 1
 const defaultMaxRows = 1000
+const oracleCharsetZHS32GB18030 = 854
+
+var (
+	oraclePlSQLBlockStartRegexp          = regexp.MustCompile(`(?is)^\s*(?:DECLARE|BEGIN|CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:EDITIONABLE|NONEDITIONABLE)\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?))\b`)
+	oraclePlSQLBlockEndRegexp            = regexp.MustCompile(`(?is)\bEND\s*;\s*$`)
+	oracleNamedPlSQLBlockEndRegexp       = regexp.MustCompile(`(?is)\bEND\s+([A-Z0-9_$#]+)\s*;\s*$`)
+	oracleUnsupportedServerCharsetRegexp = regexp.MustCompile(`server use charset with id: ([0-9]+).*not supported by the driver`)
+	oracleStringConverters               = map[int]converters.IStringConverter{
+		oracleCharsetZHS32GB18030: oracleGB18030Converter{},
+	}
+)
+
 const oracleListDatabasesSQL = `
 SELECT username AS owner
 FROM all_users
@@ -42,7 +58,7 @@ ORDER BY CASE
   WHEN username = SYS_CONTEXT('USERENV', 'SESSION_USER') THEN 1
   ELSE 2
 END, username`
-const oracleListTablesSQL = `
+const oracleListTablesBaseSQL = `
 SELECT OBJECT_NAME, TABLE_TYPE, COMMENTS
 FROM (
 SELECT t.TABLE_NAME AS OBJECT_NAME,
@@ -58,9 +74,10 @@ SELECT o.OBJECT_NAME,
 FROM ALL_OBJECTS o
 WHERE o.OWNER = :2
   AND o.OBJECT_TYPE = 'VIEW'
-)
-ORDER BY OBJECT_NAME`
-const oracleListObjectsSQL = `
+)`
+const oracleListTablesOrderSQL = `ORDER BY OBJECT_NAME`
+const oracleListTablesSQL = oracleListTablesBaseSQL + "\n" + oracleListTablesOrderSQL
+const oracleListObjectsBaseSQL = `
 SELECT OBJECT_NAME, OBJECT_TYPE, COMMENTS
 FROM (
 SELECT t.TABLE_NAME AS OBJECT_NAME,
@@ -71,19 +88,21 @@ WHERE t.OWNER = :1
   AND t.NESTED = 'NO'
 UNION ALL
 SELECT o.OBJECT_NAME,
-       o.OBJECT_TYPE,
+       CASE o.OBJECT_TYPE WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE o.OBJECT_TYPE END AS OBJECT_TYPE,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM ALL_OBJECTS o
 WHERE o.OWNER = :2
-  AND o.OBJECT_TYPE IN ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE')
-)
-ORDER BY CASE OBJECT_TYPE
+  AND o.OBJECT_TYPE IN ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY')
+)`
+const oracleListObjectsOrderSQL = `ORDER BY CASE OBJECT_TYPE
   WHEN 'TABLE' THEN 0
   WHEN 'VIEW' THEN 1
   WHEN 'PROCEDURE' THEN 2
   WHEN 'FUNCTION' THEN 3
-  ELSE 4
+  WHEN 'PACKAGE' THEN 4
+  ELSE 5
 END, OBJECT_NAME`
+const oracleListObjectsSQL = oracleListObjectsBaseSQL + "\n" + oracleListObjectsOrderSQL
 
 type request struct {
 	ID     json.RawMessage            `json:"id"`
@@ -186,6 +205,13 @@ type tableInfo struct {
 	Name      string  `json:"name"`
 	TableType string  `json:"table_type"`
 	Comment   *string `json:"comment"`
+}
+
+type metadataListConstraints struct {
+	Filter      string
+	Limit       int
+	Offset      int
+	ObjectTypes []string
 }
 
 type objectInfo struct {
@@ -317,16 +343,11 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		if err := decodeParams(params, &cp); err != nil {
 			return nil, false, err
 		}
-		db, err := openDB(cp)
+		db, err := openAndPingDB(cp, 5*time.Second)
 		if err != nil {
 			return nil, false, err
 		}
 		defer db.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			return nil, false, err
-		}
 		return map[string]bool{"ok": true}, false, nil
 	case "list_databases":
 		result, err := s.listDatabases()
@@ -336,11 +357,11 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		return result, false, err
 	case "list_tables":
 		schema := stringParam(params, "schema")
-		result, err := s.listTables(schema)
+		result, err := s.listTables(schema, metadataListConstraintsFromParams(params))
 		return result, false, err
 	case "list_objects":
 		schema := stringParam(params, "schema")
-		result, err := s.listObjects(schema)
+		result, err := s.listObjects(schema, metadataListConstraintsFromParams(params))
 		return result, false, err
 	case "get_columns":
 		schema := stringParam(params, "schema")
@@ -424,16 +445,12 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 
 func (s *server) connect(params connectParams) error {
 	_ = s.disconnect()
-	db, err := openDB(params)
+	db, err := openAndPingDB(params, 15*time.Second)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return err
-	}
 	if _, err := db.ExecContext(ctx, "ALTER SESSION SET NLS_LANGUAGE='AMERICAN'"); err != nil {
 		db.Close()
 		return err
@@ -454,15 +471,108 @@ func (s *server) disconnect() error {
 }
 
 func openDB(params connectParams) (*sql.DB, error) {
+	return openDBWithStringConverter(params, nil)
+}
+
+func openDBWithStringConverter(params connectParams, stringConverter converters.IStringConverter) (*sql.DB, error) {
 	dsn := buildDSN(params)
-	db, err := sql.Open("oracle", dsn)
-	if err != nil {
-		return nil, err
+	var db *sql.DB
+	if stringConverter == nil {
+		var err error
+		db, err = sql.Open("oracle", dsn)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		connector := go_ora.NewConnector(dsn)
+		go_ora.SetStringConverter(connector, stringConverter, nil)
+		db = sql.OpenDB(connector)
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	return db, nil
+}
+
+func openAndPingDB(params connectParams, timeout time.Duration) (*sql.DB, error) {
+	db, err := openDB(params)
+	if err != nil {
+		return nil, err
+	}
+	if err := pingDB(db, timeout); err != nil {
+		db.Close()
+		stringConverter, ok := oracleStringConverterForUnsupportedCharsetError(err)
+		if !ok {
+			return nil, err
+		}
+		// Retry only charsets with explicit converters. Guessing a converter
+		// can make the connection succeed while silently corrupting text.
+		db, err = openDBWithStringConverter(params, stringConverter)
+		if err != nil {
+			return nil, err
+		}
+		if retryErr := pingDB(db, timeout); retryErr != nil {
+			db.Close()
+			return nil, retryErr
+		}
+	}
+	return db, nil
+}
+
+func pingDB(db *sql.DB, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return db.PingContext(ctx)
+}
+
+func oracleStringConverterForUnsupportedCharsetError(err error) (converters.IStringConverter, bool) {
+	charsetID, ok := unsupportedOracleServerCharsetID(err)
+	if !ok {
+		return nil, false
+	}
+	stringConverter, ok := oracleStringConverters[charsetID]
+	return stringConverter, ok
+}
+
+func unsupportedOracleServerCharsetID(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	match := oracleUnsupportedServerCharsetRegexp.FindStringSubmatch(err.Error())
+	if len(match) != 2 {
+		return 0, false
+	}
+	charsetID, parseErr := strconv.Atoi(match[1])
+	if parseErr != nil {
+		return 0, false
+	}
+	return charsetID, true
+}
+
+type oracleGB18030Converter struct{}
+
+func (oracleGB18030Converter) Encode(input string) []byte {
+	output, _, err := transform.String(simplifiedchinese.GB18030.NewEncoder(), input)
+	if err != nil {
+		return []byte(input)
+	}
+	return []byte(output)
+}
+
+func (oracleGB18030Converter) Decode(input []byte) string {
+	output, _, err := transform.Bytes(simplifiedchinese.GB18030.NewDecoder(), input)
+	if err != nil {
+		return string(input)
+	}
+	return string(output)
+}
+
+func (oracleGB18030Converter) GetLangID() int {
+	return oracleCharsetZHS32GB18030
+}
+
+func (oracleGB18030Converter) Clone() converters.IStringConverter {
+	return oracleGB18030Converter{}
 }
 
 func buildDSN(params connectParams) string {
@@ -675,12 +785,145 @@ func (s *server) normalizeSchema(schema string) (string, error) {
 	return strings.ToUpper(schema), nil
 }
 
-func (s *server) listTables(schema string) ([]tableInfo, error) {
+type oracleMetadataListQuery struct {
+	SQL  string
+	Args []any
+}
+
+func metadataListConstraintsFromParams(params map[string]json.RawMessage) metadataListConstraints {
+	objectTypes := stringSliceParam(params, "object_types")
+	if len(objectTypes) == 0 {
+		objectTypes = stringSliceParam(params, "objectTypes")
+	}
+	limit := intParam(params, "limit")
+	offset := intParam(params, "offset")
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return metadataListConstraints{
+		Filter:      stringParam(params, "filter"),
+		Limit:       limit,
+		Offset:      offset,
+		ObjectTypes: objectTypes,
+	}
+}
+
+func oracleListTablesQuery(schema string, constraints metadataListConstraints) oracleMetadataListQuery {
+	return oracleConstrainedMetadataListQuery(
+		oracleListTablesBaseSQL,
+		"OBJECT_NAME, TABLE_TYPE, COMMENTS",
+		"TABLE_TYPE",
+		oracleListTablesOrderSQL,
+		[]any{schema, schema},
+		constraints,
+	)
+}
+
+func oracleListObjectsQuery(schema string, constraints metadataListConstraints) oracleMetadataListQuery {
+	return oracleConstrainedMetadataListQuery(
+		oracleListObjectsBaseSQL,
+		"OBJECT_NAME, OBJECT_TYPE, COMMENTS",
+		"OBJECT_TYPE",
+		oracleListObjectsOrderSQL,
+		[]any{schema, schema},
+		constraints,
+	)
+}
+
+func oracleConstrainedMetadataListQuery(baseSQL, selectList, typeColumn, orderSQL string, baseArgs []any, constraints metadataListConstraints) oracleMetadataListQuery {
+	args := append([]any{}, baseArgs...)
+	where := make([]string, 0, 2)
+	if filter := strings.TrimSpace(constraints.Filter); filter != "" {
+		args = append(args, strings.ToUpper(oracleFuzzyLikePattern(filter)))
+		where = append(where, fmt.Sprintf("UPPER(OBJECT_NAME) LIKE :%d ESCAPE '\\'", len(args)))
+	}
+	if objectTypes := normalizedMetadataObjectTypes(constraints.ObjectTypes); len(objectTypes) > 0 {
+		placeholders := make([]string, 0, len(objectTypes))
+		for _, objectType := range objectTypes {
+			args = append(args, objectType)
+			placeholders = append(placeholders, fmt.Sprintf(":%d", len(args)))
+		}
+		where = append(where, fmt.Sprintf("%s IN (%s)", typeColumn, strings.Join(placeholders, ",")))
+	}
+
+	sqlText := fmt.Sprintf("SELECT %s\nFROM (\n%s\n)", selectList, baseSQL)
+	if len(where) > 0 {
+		sqlText += "\nWHERE " + strings.Join(where, " AND ")
+	}
+	sqlText += "\n" + orderSQL
+
+	if constraints.Limit > 0 {
+		args = append(args, constraints.Offset+constraints.Limit)
+		maxRowParam := len(args)
+		args = append(args, constraints.Offset)
+		offsetParam := len(args)
+		sqlText = fmt.Sprintf(
+			"SELECT %s\nFROM (\n  SELECT DBX_Q.*, ROWNUM AS DBX_RN\n  FROM (\n%s\n  ) DBX_Q\n  WHERE ROWNUM <= :%d\n)\nWHERE DBX_RN > :%d",
+			selectList,
+			sqlText,
+			maxRowParam,
+			offsetParam,
+		)
+	} else if constraints.Offset > 0 {
+		args = append(args, constraints.Offset)
+		offsetParam := len(args)
+		sqlText = fmt.Sprintf(
+			"SELECT %s\nFROM (\n  SELECT DBX_Q.*, ROWNUM AS DBX_RN\n  FROM (\n%s\n  ) DBX_Q\n)\nWHERE DBX_RN > :%d",
+			selectList,
+			sqlText,
+			offsetParam,
+		)
+	}
+
+	return oracleMetadataListQuery{SQL: sqlText, Args: args}
+}
+
+func normalizedMetadataObjectTypes(values []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := strings.ToUpper(strings.TrimSpace(value))
+		normalized = strings.ReplaceAll(normalized, "-", "_")
+		normalized = strings.ReplaceAll(normalized, " ", "_")
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		result = append(result, normalized)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func oracleFuzzyLikePattern(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "%%"
+	}
+	var builder strings.Builder
+	builder.Grow(len(value)*2 + 2)
+	builder.WriteByte('%')
+	for _, ch := range value {
+		switch ch {
+		case '\\', '%', '_':
+			builder.WriteByte('\\')
+		}
+		builder.WriteRune(ch)
+		builder.WriteByte('%')
+	}
+	return builder.String()
+}
+
+func (s *server) listTables(schema string, constraints metadataListConstraints) ([]tableInfo, error) {
 	schema, err := s.normalizeSchema(schema)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryRows(oracleListTablesSQL, []any{schema, schema})
+	query := oracleListTablesQuery(schema, constraints)
+	rows, err := s.queryRows(query.SQL, query.Args)
 	if err != nil {
 		if isOraclePGALimitError(err) {
 			return []tableInfo{}, nil
@@ -699,12 +942,13 @@ func (s *server) listTables(schema string) ([]tableInfo, error) {
 	return emptyIfNil(result), rows.Err()
 }
 
-func (s *server) listObjects(schema string) ([]objectInfo, error) {
+func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
 	schema, err := s.normalizeSchema(schema)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.queryRows(oracleListObjectsSQL, []any{schema, schema})
+	query := oracleListObjectsQuery(schema, constraints)
+	rows, err := s.queryRows(query.SQL, query.Args)
 	if err != nil {
 		if isOraclePGALimitError(err) {
 			return []objectInfo{}, nil
@@ -1234,11 +1478,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 			HasMore:         false,
 		}, err
 	}
-	sqlText, err := s.rewriteXMLTypeSelectSQL(sqlText)
-	if err != nil {
-		return queryPageResult{}, err
-	}
-	rows, err := s.queryRows(sqlText, nil)
+	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText)
 	if err != nil {
 		return queryPageResult{}, err
 	}
@@ -1303,11 +1543,7 @@ func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResul
 	if !isQuerySQL(sqlText) {
 		return queryPageResult{}, errors.New("table read requires a SELECT query")
 	}
-	sqlText, err := s.rewriteXMLTypeSelectSQL(sqlText)
-	if err != nil {
-		return queryPageResult{}, err
-	}
-	rows, err := s.queryRows(sqlText, nil)
+	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText)
 	if err != nil {
 		return queryPageResult{}, err
 	}
@@ -1458,12 +1694,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 }
 
 func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error) {
-	var err error
-	sqlText, err = s.rewriteXMLTypeSelectSQL(sqlText)
-	if err != nil {
-		return queryResult{}, err
-	}
-	rows, err := s.queryRows(sqlText, nil)
+	rows, err := s.queryRowsWithXMLTypeRewriteIfNeeded(sqlText)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -1500,6 +1731,49 @@ func scanRow(rows *sql.Rows, columnCount int) ([]any, error) {
 		values[i] = normalizeValue(value)
 	}
 	return values, nil
+}
+
+func (s *server) queryRowsWithXMLTypeRewriteIfNeeded(sqlText string) (*sql.Rows, error) {
+	rows, err := s.queryRows(sqlText, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !rowsContainOracleXMLType(rows) {
+		return rows, nil
+	}
+	rewritten, err := s.rewriteXMLTypeSelectSQL(sqlText)
+	if err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if rewritten == sqlText {
+		return rows, nil
+	}
+	// Only pay the ALL_TAB_COLUMNS rewrite cost when the result metadata shows
+	// XMLTYPE. Ordinary Oracle queries should not run dictionary probes first.
+	rows.Close()
+	return s.queryRows(rewritten, nil)
+}
+
+func rowsContainOracleXMLType(rows *sql.Rows) bool {
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return false
+	}
+	typeNames := make([]string, 0, len(types))
+	for _, columnType := range types {
+		typeNames = append(typeNames, columnType.DatabaseTypeName())
+	}
+	return oracleColumnTypeNamesContainXMLType(typeNames)
+}
+
+func oracleColumnTypeNamesContainXMLType(typeNames []string) bool {
+	for _, typeName := range typeNames {
+		if isOracleXMLType(typeName) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) rewriteXMLTypeSelectSQL(sqlText string) (string, error) {
@@ -2152,7 +2426,52 @@ func parseURLParams(raw string) map[string]string {
 }
 
 func trimStatementSQL(sqlText string) string {
-	return strings.TrimRight(strings.TrimSpace(sqlText), "; \t\r\n")
+	trimmed := stripTrailingSlashDelimiter(strings.TrimSpace(sqlText))
+	if isOraclePlSQLBlock(trimmed) {
+		return trimmed
+	}
+	return strings.TrimRight(trimmed, "; \t\r\n")
+}
+
+func stripTrailingSlashDelimiter(sqlText string) string {
+	trimmed := strings.TrimSpace(sqlText)
+	if !strings.HasSuffix(trimmed, "/") {
+		return trimmed
+	}
+	slashStart := len(trimmed) - 1
+	lineStart := strings.LastIndex(trimmed[:slashStart], "\n") + 1
+	if strings.TrimSpace(trimmed[lineStart:slashStart]) != "" {
+		return trimmed
+	}
+	beforeSlash := strings.TrimSpace(trimmed[:lineStart])
+	// SQL*Plus uses a standalone slash to execute PL/SQL blocks; go-ora needs
+	// only the block text and not that client-side delimiter.
+	if isOraclePlSQLBlock(beforeSlash) {
+		return beforeSlash
+	}
+	return trimmed
+}
+
+func isOraclePlSQLBlock(sqlText string) bool {
+	trimmed := strings.TrimSpace(sqlText)
+	start := trimLeadingSQLComments(trimmed)
+	if !oraclePlSQLBlockStartRegexp.MatchString(start) {
+		return false
+	}
+	upper := strings.ToUpper(trimmed)
+	if oraclePlSQLBlockEndRegexp.MatchString(upper) {
+		return true
+	}
+	matches := oracleNamedPlSQLBlockEndRegexp.FindStringSubmatch(upper)
+	if len(matches) != 2 {
+		return false
+	}
+	switch matches[1] {
+	case "IF", "LOOP", "CASE":
+		return false
+	default:
+		return true
+	}
 }
 
 func isQuerySQL(sqlText string) bool {

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { formatError } from "@/lib/errorUtils";
+import { formatError } from "@/lib/backend/errorUtils";
 import { computed, ref } from "vue";
 import type { MqRawResponse, TopicInfo } from "@/types/mq";
-import { mqRawRequest } from "@/lib/api";
+import { mqRawRequest } from "@/lib/backend/api";
+import { safeJsonFormat } from "@/lib/common/safeJsonFormat";
 
 interface Props {
   connectionId: string;
@@ -156,7 +157,7 @@ function formatJsonBody() {
   const text = bodyText.value.trim();
   if (!text) return;
   try {
-    bodyText.value = JSON.stringify(JSON.parse(text), null, 2);
+    bodyText.value = safeJsonFormat(text, 2);
     error.value = undefined;
   } catch (e: unknown) {
     error.value = `JSON Body 格式错误: ${formatError(e)}`;

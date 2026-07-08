@@ -168,6 +168,55 @@ func TestIsQuerySQLRequiresKeywordBoundary(t *testing.T) {
 	}
 }
 
+func TestTrimStatementSQLPreservesAnonymousPLSQLBlockTerminator(t *testing.T) {
+	sqlText := `DECLARE
+   PRE_TRD_DATE   INTEGER ;
+BEGIN
+   SELECT 1 + 2 INTO PRE_TRD_DATE FROM DUAL;
+END;`
+
+	if got := trimStatementSQL(sqlText); got != sqlText {
+		t.Fatalf("trimStatementSQL() = %q, want full PL/SQL block %q", got, sqlText)
+	}
+}
+
+func TestTrimStatementSQLStripsSlashDelimiterAfterPLSQLBlock(t *testing.T) {
+	sqlText := "BEGIN\n  NULL;\nEND;\n/"
+	want := "BEGIN\n  NULL;\nEND;"
+
+	if got := trimStatementSQL(sqlText); got != want {
+		t.Fatalf("trimStatementSQL() = %q, want %q", got, want)
+	}
+}
+
+func TestTrimStatementSQLPreservesCreatePLSQLObjectTerminator(t *testing.T) {
+	tests := []string{
+		"CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;",
+		"CREATE OR REPLACE FUNCTION f RETURN NUMBER AS\nBEGIN\n  RETURN 1;\nEND;",
+		"CREATE OR REPLACE PACKAGE pkg_utils AS\n  FUNCTION get_version RETURN VARCHAR2;\nEND pkg_utils;",
+	}
+	for _, sqlText := range tests {
+		if got := trimStatementSQL(sqlText); got != sqlText {
+			t.Fatalf("trimStatementSQL() = %q, want full PL/SQL object %q", got, sqlText)
+		}
+	}
+}
+
+func TestTrimStatementSQLStripsSlashDelimiterAfterCreatePLSQLObject(t *testing.T) {
+	sqlText := "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;\n/"
+	want := "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;"
+
+	if got := trimStatementSQL(sqlText); got != want {
+		t.Fatalf("trimStatementSQL() = %q, want %q", got, want)
+	}
+}
+
+func TestTrimStatementSQLRemovesRegularStatementSemicolon(t *testing.T) {
+	if got := trimStatementSQL("SELECT 1 FROM DUAL;"); got != "SELECT 1 FROM DUAL" {
+		t.Fatalf("trimStatementSQL() = %q, want regular statement without semicolon", got)
+	}
+}
+
 func protocolContract(t *testing.T) struct {
 	ProtocolVersion int      `json:"protocolVersion"`
 	AllCapabilities []string `json:"allCapabilities"`
@@ -315,6 +364,47 @@ func TestBuildDSNAddsSysDbaOption(t *testing.T) {
 	}
 }
 
+func TestOracleGB18030ConverterRoundTrip(t *testing.T) {
+	converter := oracleGB18030Converter{}
+	input := "DBX \u4e2d\u6587 \U00020000"
+
+	encoded := converter.Encode(input)
+	if string(encoded) == input {
+		t.Fatalf("GB18030 converter should encode non-ASCII text away from UTF-8 bytes")
+	}
+	if decoded := converter.Decode(encoded); decoded != input {
+		t.Fatalf("GB18030 round trip = %q, want %q", decoded, input)
+	}
+	if converter.GetLangID() != oracleCharsetZHS32GB18030 {
+		t.Fatalf("GB18030 converter lang id = %d, want %d", converter.GetLangID(), oracleCharsetZHS32GB18030)
+	}
+	if clone := converter.Clone(); clone.GetLangID() != oracleCharsetZHS32GB18030 {
+		t.Fatalf("GB18030 converter clone lang id = %d, want %d", clone.GetLangID(), oracleCharsetZHS32GB18030)
+	}
+}
+
+func TestOracleStringConverterForUnsupportedCharsetError(t *testing.T) {
+	err := errors.New("the server use charset with id: 854 which is not supported by the driver")
+	converter, ok := oracleStringConverterForUnsupportedCharsetError(err)
+	if !ok {
+		t.Fatalf("expected GB18030 server charset error to have a converter")
+	}
+	if converter.GetLangID() != oracleCharsetZHS32GB18030 {
+		t.Fatalf("converter lang id = %d, want %d", converter.GetLangID(), oracleCharsetZHS32GB18030)
+	}
+	ncharsetErr := errors.New("the server use ncharset with id: 854 which is not supported by the driver")
+	if _, ok := oracleStringConverterForUnsupportedCharsetError(ncharsetErr); ok {
+		t.Fatalf("ncharset errors should not have a server charset converter")
+	}
+	otherCharsetErr := errors.New("the server use charset with id: 852 which is not supported by the driver")
+	if charsetID, ok := unsupportedOracleServerCharsetID(otherCharsetErr); !ok || charsetID != 852 {
+		t.Fatalf("other server charset should still be parsed, got id=%d ok=%v", charsetID, ok)
+	}
+	if _, ok := oracleStringConverterForUnsupportedCharsetError(otherCharsetErr); ok {
+		t.Fatalf("unknown charset ids should not get a guessed converter")
+	}
+}
+
 func TestListDatabasesSQLUsesUserDictionaryInsteadOfObjectDictionary(t *testing.T) {
 	sqlText := strings.ToUpper(oracleListDatabasesSQL)
 
@@ -358,6 +448,32 @@ func TestListTablesSQLUsesSplitDictionaryQuery(t *testing.T) {
 	}
 }
 
+func TestListTablesQueryAppliesMetadataConstraints(t *testing.T) {
+	query := oracleListTablesQuery("APP", metadataListConstraints{
+		Filter:      "u_r",
+		Limit:       501,
+		Offset:      10,
+		ObjectTypes: []string{"view", "TABLE", "TABLE"},
+	})
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE :3 ESCAPE '\\'") {
+		t.Fatalf("table listing should push filter predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "TABLE_TYPE IN (:4,:5)") {
+		t.Fatalf("table listing should push table type predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "ROWNUM <= :6") || !strings.Contains(sqlText, "DBX_RN > :7") {
+		t.Fatalf("table listing should use rownum pagination, got: %s", query.SQL)
+	}
+	if len(query.Args) != 7 {
+		t.Fatalf("unexpected args: %#v", query.Args)
+	}
+	if query.Args[0] != "APP" || query.Args[1] != "APP" || query.Args[2] != "%U%\\_%R%" || query.Args[3] != "TABLE" || query.Args[4] != "VIEW" || query.Args[5] != 511 || query.Args[6] != 10 {
+		t.Fatalf("constraints args were not normalized: %#v", query.Args)
+	}
+}
+
 func TestListObjectsSQLUsesSplitDictionaryQuery(t *testing.T) {
 	sqlText := strings.ToUpper(oracleListObjectsSQL)
 
@@ -369,6 +485,42 @@ func TestListObjectsSQLUsesSplitDictionaryQuery(t *testing.T) {
 	}
 	if strings.Contains(sqlText, "ALL_TAB_COMMENTS") {
 		t.Fatalf("object listing should not load comments during refresh, got: %s", oracleListObjectsSQL)
+	}
+	if !strings.Contains(sqlText, "'PACKAGE BODY'") || !strings.Contains(sqlText, "PACKAGE_BODY") {
+		t.Fatalf("object listing should include package bodies with normalized type, got: %s", oracleListObjectsSQL)
+	}
+}
+
+func TestListObjectsQueryAppliesMetadataConstraints(t *testing.T) {
+	query := oracleListObjectsQuery("APP", metadataListConstraints{
+		Filter:      "pkg%",
+		Limit:       25,
+		ObjectTypes: []string{"FUNCTION", "package"},
+	})
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE :3 ESCAPE '\\'") {
+		t.Fatalf("object listing should push filter predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "OBJECT_TYPE IN (:4,:5)") {
+		t.Fatalf("object listing should push object type predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "ROWNUM <= :6") || !strings.Contains(sqlText, "DBX_RN > :7") {
+		t.Fatalf("object listing should use rownum pagination, got: %s", query.SQL)
+	}
+	if len(query.Args) != 7 {
+		t.Fatalf("unexpected args: %#v", query.Args)
+	}
+	if query.Args[2] != "%P%K%G%\\%%" || query.Args[3] != "FUNCTION" || query.Args[4] != "PACKAGE" || query.Args[5] != 25 || query.Args[6] != 0 {
+		t.Fatalf("object constraints args were not normalized: %#v", query.Args)
+	}
+}
+
+func TestOracleFuzzyLikePatternEscapesSpecialCharacters(t *testing.T) {
+	got := oracleFuzzyLikePattern(`a_%\b`)
+	want := `%a%\_%\%%\\%b%`
+	if got != want {
+		t.Fatalf("oracleFuzzyLikePattern() = %q, want %q", got, want)
 	}
 }
 
@@ -449,6 +601,26 @@ func TestRewriteOracleXMLTypeSkipsJoins(t *testing.T) {
 	}
 	if sqlText != `SELECT * FROM TEST_LOBS l JOIN OTHER_TABLE o ON o.ID = l.ID` {
 		t.Fatalf("join query should not be rewritten, got: %s", sqlText)
+	}
+}
+
+func TestOracleColumnTypeNamesContainXMLType(t *testing.T) {
+	tests := []struct {
+		name      string
+		typeNames []string
+		want      bool
+	}{
+		{name: "plain xmltype", typeNames: []string{"NUMBER", "XMLTYPE"}, want: true},
+		{name: "qualified xmltype", typeNames: []string{"SYS.XMLTYPE"}, want: true},
+		{name: "case and spaces", typeNames: []string{" varchar2 ", "sys.xmltype"}, want: true},
+		{name: "ordinary columns", typeNames: []string{"NUMBER", "VARCHAR2", "DATE"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := oracleColumnTypeNamesContainXMLType(tt.typeNames); got != tt.want {
+				t.Fatalf("oracleColumnTypeNamesContainXMLType(%v) = %v, want %v", tt.typeNames, got, tt.want)
+			}
+		})
 	}
 }
 

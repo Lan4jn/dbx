@@ -48,8 +48,8 @@ describe("connectionStore completion assistant", () => {
       fallback_used: false,
     });
 
-    vi.doMock("@/lib/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/api", () => ({
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
       checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
       completionAssistantSearch,
       listSchemas: vi.fn().mockResolvedValue(["public"]),
@@ -72,8 +72,8 @@ describe("connectionStore completion assistant", () => {
     const completionAssistantSearch = vi.fn().mockRejectedValue(new Error("assistant unavailable"));
     const listTables = vi.fn().mockResolvedValue([{ name: "accounts", table_type: "BASE TABLE", comment: null }]);
 
-    vi.doMock("@/lib/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/api", () => ({
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
       checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
       completionAssistantSearch,
       listSchemas: vi.fn().mockResolvedValue(["public"]),
@@ -101,8 +101,8 @@ describe("connectionStore completion assistant", () => {
       return [];
     });
 
-    vi.doMock("@/lib/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/api", () => ({
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
       checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
       completionAssistantSearch,
       listSchemas: vi.fn().mockResolvedValue(["dim_game_base", "dws_game_sdk_base"]),
@@ -121,6 +121,32 @@ describe("connectionStore completion assistant", () => {
     expect(dwsTables).toEqual([]);
   });
 
+  it("preserves table filter casing for assistant searches", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "TEST_USERS", kind: "table", schema: "SYSDBA" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listSchemas: vi.fn().mockResolvedValue(["SYSDBA"]),
+      listTables: vi.fn().mockResolvedValue([]),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [postgresConnection()];
+    store.connectedIds.add("pg-1");
+
+    const tables = await store.listCompletionTables("pg-1", "app", "TEST_", 20, "SYSDBA");
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(expect.objectContaining({ mask: "TEST_", schema: "SYSDBA", parent_schema: "SYSDBA" }));
+    expect(tables).toEqual([{ name: "TEST_USERS", schema: "SYSDBA", type: "table" }]);
+  });
+
   it("limits concurrent completion column metadata requests per connection database", async () => {
     const gates = [deferred<any[]>(), deferred<any[]>(), deferred<any[]>(), deferred<any[]>()];
     let activeColumns = 0;
@@ -134,8 +160,8 @@ describe("connectionStore completion assistant", () => {
       });
     });
 
-    vi.doMock("@/lib/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/api", () => ({
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
       checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
       completionAssistantSearch: vi.fn().mockResolvedValue({ candidates: [], incomplete: false, fallback_used: false }),
       getColumns,

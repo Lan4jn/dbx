@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
 use crate::sql::find_statement_at_cursor;
-use crate::sql_dialect::{pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy};
+use crate::sql_dialect::{
+    firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
+};
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -187,6 +189,7 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
             .unwrap_or_else(|| err("unsupported")),
         TablePaginationStrategy::QuestDbLimit => ok(add_questdb_limit(&statement, safe_limit, safe_offset)),
         TablePaginationStrategy::InformixFirst => ok(add_informix_first_limit(&statement, safe_limit, safe_offset)),
+        TablePaginationStrategy::FirebirdRows => ok(add_firebird_rows_limit(&statement, safe_limit, safe_offset)),
         TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
             ok(add_fetch_first_limit(&statement, safe_limit, safe_offset))
         }
@@ -438,10 +441,10 @@ fn add_sql_server_existing_top_pagination(statement: &str, limit: usize, offset:
 }
 
 fn sql_server_default_pagination_order(statement: &str) -> String {
-    first_simple_sqlserver_projection(statement).unwrap_or_else(|| "(SELECT NULL)".to_string())
+    first_simple_sqlserver_projection_order_column(statement).unwrap_or_else(|| "(SELECT NULL)".to_string())
 }
 
-fn first_simple_sqlserver_projection(statement: &str) -> Option<String> {
+fn first_simple_sqlserver_projection_order_column(statement: &str) -> Option<String> {
     let sql = statement.trim();
     let sql = &sql[skip_leading_sql_comments(sql, 0)..];
     if sql.len() < 6 || !sql[..6].eq_ignore_ascii_case("SELECT") {
@@ -460,11 +463,7 @@ fn first_simple_sqlserver_projection(statement: &str) -> Option<String> {
     let projection_start = skip_sql_whitespace(sql, index);
     let projection_end = find_first_projection_end(sql, projection_start)?;
     let projection = sql[projection_start..projection_end].trim();
-    if is_simple_sqlserver_order_projection(projection) {
-        Some(projection.to_string())
-    } else {
-        None
-    }
+    sql_server_derived_order_column_from_projection(projection)
 }
 
 fn skip_leading_sql_comments(sql: &str, mut index: usize) -> usize {
@@ -602,6 +601,37 @@ fn is_simple_sqlserver_order_projection(projection: &str) -> bool {
         return false;
     }
     saw_part && !expect_part
+}
+
+fn sql_server_derived_order_column_from_projection(projection: &str) -> Option<String> {
+    if !is_simple_sqlserver_order_projection(projection) {
+        return None;
+    }
+
+    let last_part = last_sqlserver_identifier_part(projection);
+    if last_part.starts_with('[') {
+        return Some(last_part.to_string());
+    }
+    Some(quote_table_identifier(Some(DatabaseType::SqlServer), last_part))
+}
+
+fn last_sqlserver_identifier_part(projection: &str) -> &str {
+    let mut last_start = 0;
+    let mut index = 0;
+    while index < projection.len() {
+        let ch = next_char(projection, index);
+        if ch == '[' {
+            index = skip_sql_bracket_identifier(projection, index);
+            continue;
+        }
+        if ch == '.' {
+            last_start = index + 1;
+            index += 1;
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    projection[last_start..].trim()
 }
 
 fn skip_sql_whitespace(sql: &str, mut index: usize) -> usize {
@@ -792,6 +822,26 @@ fn has_top_level_informix_row_limit(sql: &str) -> bool {
     tokens[select_index + 1..from_index].iter().any(|token| token.text == "FIRST" || token.text == "SKIP")
 }
 
+fn has_top_level_firebird_row_limit(sql: &str) -> bool {
+    if has_top_level_fetch_first(sql) {
+        return true;
+    }
+    let tokens = top_level_sql_tokens(sql);
+    if tokens.iter().any(|token| token.text == "ROWS") {
+        return true;
+    }
+    let Some(select_index) = tokens.iter().position(|token| token.text == "SELECT") else {
+        return false;
+    };
+    let from_index = tokens
+        .iter()
+        .enumerate()
+        .find(|(index, token)| *index > select_index && token.text == "FROM")
+        .map(|(index, _)| index)
+        .unwrap_or(tokens.len());
+    tokens[select_index + 1..from_index].iter().any(|token| token.text == "FIRST" || token.text == "SKIP")
+}
+
 fn has_top_level_fetch_first(sql: &str) -> bool {
     let tokens = top_level_sql_tokens(sql);
     tokens.windows(2).any(|w| w[0].text == "FETCH" && w[1].text == "FIRST")
@@ -822,6 +872,14 @@ fn add_fetch_first_limit(statement: &str, limit: usize, offset: usize) -> String
     }
     let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
     append_sql_suffix(statement, &format!("{offset_sql} FETCH FIRST {limit} ROWS ONLY;"))
+}
+
+fn add_firebird_rows_limit(statement: &str, limit: usize, offset: usize) -> String {
+    if has_top_level_firebird_row_limit(statement) {
+        return format!("{statement};");
+    }
+    let rows = firebird_rows_clause(limit, offset);
+    append_sql_suffix(statement, &format!("{rows};"))
 }
 
 fn add_rownum_limit(statement: &str, limit: usize, offset: usize) -> String {
@@ -1402,6 +1460,50 @@ mod tests {
     }
 
     #[test]
+    fn paginates_sqlserver_top_query_with_qualified_first_projection_by_exposed_column() {
+        let sql = "select top 1  t1.FSUPPLIERID,  kh.FNAME gysnm   from  GDWORKOUT t1 join  SUPPLIER kh on t1.FSUPPLIERID=kh.FITEMID join GDWORKOUTS t2 on t1.fid=t2.fid";
+        let first_page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+        let second_page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+
+        assert!(first_page.ok);
+        assert!(second_page.ok);
+        assert_eq!(
+            first_page.sql.unwrap(),
+            "SELECT TOP (100) * FROM (select top 1  t1.FSUPPLIERID,  kh.FNAME gysnm   from  GDWORKOUT t1 join  SUPPLIER kh on t1.FSUPPLIERID=kh.FITEMID join GDWORKOUTS t2 on t1.fid=t2.fid) [dbx_page] ORDER BY [FSUPPLIERID];"
+        );
+        assert_eq!(
+            second_page.sql.unwrap(),
+            "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY [FSUPPLIERID]) AS [__dbx_row_num] FROM (select top 1  t1.FSUPPLIERID,  kh.FNAME gysnm   from  GDWORKOUT t1 join  SUPPLIER kh on t1.FSUPPLIERID=kh.FITEMID join GDWORKOUTS t2 on t1.fid=t2.fid) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
+        );
+    }
+
+    #[test]
+    fn paginates_sqlserver_top_query_with_dotted_bracket_identifier() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT TOP 1000 [order.id] FROM TicketInfo".to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT TOP (100) * FROM (SELECT TOP 1000 [order.id] FROM TicketInfo) [dbx_page] ORDER BY [order.id];"
+        );
+    }
+
+    #[test]
     fn paginates_sqlserver_top_query_after_leading_comment_by_first_column() {
         let sql = "-- 测试\nSELECT TOP (500) [id], [order_no], [store_id], [product_id], [customer_name], [quantity], [amount], [order_status], [created_at] FROM [sales].[orders_10k]";
         let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
@@ -1722,6 +1824,30 @@ WHERE u.id = picked.id;
         });
 
         assert_eq!(result.sql.unwrap(), "SELECT FIRST 20 id FROM users;");
+    }
+
+    #[test]
+    fn uses_rows_pagination_for_firebird() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users WHERE active = 1 ORDER BY id".to_string(),
+            database_type: Some(DatabaseType::Firebird),
+            limit: 50,
+            offset: 100,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT id FROM users WHERE active = 1 ORDER BY id ROWS 101 TO 150;");
+    }
+
+    #[test]
+    fn firebird_pagination_keeps_existing_rows_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users ROWS 20".to_string(),
+            database_type: Some(DatabaseType::Firebird),
+            limit: 50,
+            offset: 0,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT id FROM users ROWS 20;");
     }
 
     #[test]
@@ -2145,7 +2271,7 @@ WHERE u.id = picked.id;
         // `add_outer_standard_limit` always includes OFFSET clause.
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT * FROM (SELECT DISTINCT a, b, c FROM t LIMIT 500) \"dbx_page\" ORDER BY 1, 2, 3 LIMIT 100 OFFSET 0;"
+            "SELECT * FROM (SELECT DISTINCT a, b, c FROM t LIMIT 500) `dbx_page` ORDER BY 1, 2, 3 LIMIT 100 OFFSET 0;"
         );
     }
 

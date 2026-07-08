@@ -589,6 +589,12 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             let con = con.lock().map_err(|e| e.to_string())?;
             duckdb_list_databases_with_attached(&con, &duckdb_attached_names)
         }
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => {
+            let client = client.clone();
+            drop(connections);
+            client.list_databases().await
+        }
         _ => Ok(vec![]),
     }
 }
@@ -787,6 +793,16 @@ async fn list_schemas_once(
             let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
             let con = con.lock().map_err(|e| e.to_string())?;
             duckdb_list_schemas_with_attached(&con, database, &duckdb_attached_names)
+                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => {
+            let client = client.clone();
+            let database = database.to_string();
+            drop(connections);
+            client
+                .list_schemas(database)
+                .await
                 .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
         }
         _ => Ok(vec![]),
@@ -1440,10 +1456,18 @@ async fn list_tables_once(
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
             }
+            let mut params =
+                serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema });
+            if let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) {
+                params["filter"] = serde_json::json!(filter);
+            }
+            if let Some(object_types) = object_types {
+                params["object_types"] = serde_json::json!(object_types);
+            }
             return session
                 .invoke_with_timeout::<Vec<db::TableInfo>>(
                     "listTables",
-                    serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema }),
+                    params,
                     agent_metadata_timeout(Some(config.as_ref())),
                 )
                 .await
@@ -1454,6 +1478,16 @@ async fn list_tables_once(
             drop(connections);
             let con = con.lock().map_err(|e| e.to_string())?;
             return duckdb_query_tables_in_database_with_attached(&con, database, schema, &duckdb_attached_names)
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+            let database = database.to_string();
+            let schema = schema.to_string();
+            drop(connections);
+            return client
+                .list_tables(database, schema)
+                .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
@@ -1497,16 +1531,41 @@ async fn list_tables_once(
         try_sqlserver!(connections, &pool_key, list_tables, schema, filter, limit, offset);
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+            let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
+            let filter_locally_after_oracle_comments =
+                is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
+            let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
+            let agent_limit = if filter_locally_after_oracle_comments {
+                None
+            } else if use_oracle_agent_paging {
+                limit
+            } else {
+                None
+            };
+            let agent_offset = if filter_locally_after_oracle_comments {
+                None
+            } else if use_oracle_agent_paging {
+                offset
+            } else {
+                None
+            };
             match client
-                .list_tables_filtered::<Vec<db::TableInfo>>(database, schema, object_types, timeout_duration)
+                .list_tables_constrained::<Vec<db::TableInfo>>(
+                    database,
+                    schema,
+                    agent_filter,
+                    agent_limit,
+                    agent_offset,
+                    object_types,
+                    timeout_duration,
+                )
                 .await
             {
-                Ok(tables) if !tables.is_empty() => {
-                    let mut tables = filter_table_infos(tables, filter, limit, offset, object_types);
+                Ok(mut tables) if !tables.is_empty() => {
                     if is_oracle {
                         load_oracle_table_comments_for_tables(
                             &mut client,
@@ -1517,6 +1576,14 @@ async fn list_tables_once(
                         )
                         .await?;
                     }
+                    let final_offset = if filter_locally_after_oracle_comments {
+                        offset
+                    } else if oracle_agent_paging_likely_applied(use_oracle_agent_paging, limit, tables.len()) {
+                        Some(0)
+                    } else {
+                        offset
+                    };
+                    let tables = filter_table_infos(tables, filter, limit, final_offset, object_types);
                     return Ok(tables);
                 }
                 Ok(tables) => {
@@ -1655,11 +1722,63 @@ fn filter_table_infos(
     let offset = offset.unwrap_or(0);
     tables
         .into_iter()
-        .filter(|table| crate::sql::contains_or_fuzzy_match(&table.name, filter))
+        .filter(|table| metadata_name_or_comment_matches(&table.name, table.comment.as_deref(), filter))
         .filter(|table| table_info_matches_object_types(table, object_types))
         .skip(offset)
         .take(limit)
         .collect()
+}
+
+fn filter_object_infos(
+    objects: Vec<db::ObjectInfo>,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+) -> Vec<db::ObjectInfo> {
+    let filter = filter.unwrap_or("");
+    let limit = limit.unwrap_or(usize::MAX);
+    let offset = offset.unwrap_or(0);
+    objects
+        .into_iter()
+        .filter(|object| metadata_name_or_comment_matches(&object.name, object.comment.as_deref(), filter))
+        .filter(|object| object_info_matches_object_types(object, object_types))
+        .skip(offset)
+        .take(limit)
+        .collect()
+}
+
+fn metadata_name_or_comment_matches(name: &str, comment: Option<&str>, filter: &str) -> bool {
+    if filter.trim().is_empty() {
+        return true;
+    }
+    crate::sql::contains_or_fuzzy_match(name, filter)
+        || comment.is_some_and(|comment| crate::sql::contains_or_fuzzy_match(comment, filter))
+}
+
+fn object_info_matches_object_types(object: &db::ObjectInfo, object_types: Option<&[String]>) -> bool {
+    let Some(object_types) = object_types else {
+        return true;
+    };
+    if object_types.is_empty() {
+        return true;
+    }
+    let object_type = normalize_object_info_object_type(&object.object_type);
+    object_types.iter().any(|expected| normalize_object_info_object_type(expected) == object_type)
+}
+
+fn normalize_object_info_object_type(value: &str) -> String {
+    let upper = value.to_ascii_uppercase().replace(' ', "_");
+    if upper.contains("MATERIALIZED") && upper.contains("VIEW") {
+        return "MATERIALIZED_VIEW".to_string();
+    }
+    if upper == "BASE_TABLE" || upper.contains("TABLE") {
+        return "TABLE".to_string();
+    }
+    if upper.contains("VIEW") {
+        return "VIEW".to_string();
+    }
+    upper
 }
 
 fn table_info_matches_object_types(table: &db::TableInfo, object_types: Option<&[String]>) -> bool {
@@ -1727,8 +1846,12 @@ async fn external_driver_presto_like_objects(
     config: &ConnectionConfig,
     database: &str,
     schema: &str,
+    filter: Option<&str>,
+    object_types: Option<&[String]>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
-    let tables = external_driver_presto_like_tables(session, config, database, schema, None, None, None).await?;
+    let tables = external_driver_presto_like_tables(session, config, database, schema, filter, None, None)
+        .await
+        .map(|tables| filter_table_infos(tables, filter, None, None, object_types))?;
     Ok(tables
         .into_iter()
         .map(|table| db::ObjectInfo {
@@ -1905,8 +2028,12 @@ fn normalize_information_schema_table_type(table_type: &str) -> String {
     }
 }
 
-fn mysql_table_metadata_catalog<'a>(database: &'a str, _schema: &str) -> &'a str {
-    database
+fn mysql_table_metadata_catalog<'a>(database: &'a str, schema: &'a str) -> &'a str {
+    if schema.trim().is_empty() {
+        database
+    } else {
+        schema
+    }
 }
 
 fn quote_presto_like_identifier(identifier: &str) -> String {
@@ -1926,14 +2053,15 @@ mod tests {
     use super::db;
     use super::{
         clickhouse_metadata_database, deduplicate_column_infos, filter_mysql_system_databases_for_config,
-        filter_table_infos, filter_visible_schema_names, is_agent_postgres_metadata_fallback_config,
-        is_retryable_metadata_error, mysql_table_metadata_catalog, normalize_information_schema_table_type,
-        oracle_columns_from_query_result, oracle_columns_sql, oracle_object_statistics_dba_segments_sql,
-        oracle_object_statistics_from_query_result, oracle_object_statistics_rows_only_sql,
-        oracle_object_statistics_sql, oracle_object_statistics_user_segments_sql,
-        oracle_table_comment_from_query_result, oracle_table_comment_sql, oracle_table_comments_from_query_result,
-        oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
-        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result, visible_schema_filter,
+        filter_object_infos, filter_table_infos, filter_visible_schema_names,
+        is_agent_postgres_metadata_fallback_config, is_retryable_metadata_error, mysql_object_source_sql,
+        mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
+        oracle_columns_sql, oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
+        oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
+        oracle_object_statistics_user_segments_sql, oracle_table_comment_from_query_result, oracle_table_comment_sql,
+        oracle_table_comments_from_query_result, oracle_table_comments_sql, presto_like_columns_from_query_result,
+        presto_like_information_schema_columns_sql, presto_like_information_schema_tables_sql,
+        presto_like_tables_from_query_result, visible_schema_filter,
     };
     #[cfg(feature = "duckdb-bundled")]
     use super::{
@@ -2008,9 +2136,29 @@ mod tests {
     }
 
     #[test]
-    fn mysql_table_child_metadata_uses_database_not_schema() {
+    fn mysql_table_child_metadata_prefers_schema_when_present() {
         assert_eq!(mysql_table_metadata_catalog("app_db", ""), "app_db");
-        assert_eq!(mysql_table_metadata_catalog("app_db", "public"), "app_db");
+        assert_eq!(mysql_table_metadata_catalog("app_db", "tenant_db"), "tenant_db");
+    }
+
+    #[test]
+    fn mysql_object_source_sql_qualifies_cross_database_objects() {
+        assert_eq!(
+            mysql_object_source_sql("tenant_db", "users_view", &db::ObjectSourceKind::View),
+            "SHOW CREATE VIEW `tenant_db`.`users_view`"
+        );
+        assert_eq!(
+            mysql_object_source_sql("tenant_db", "sync_users", &db::ObjectSourceKind::Procedure),
+            "SHOW CREATE PROCEDURE `tenant_db`.`sync_users`"
+        );
+        assert_eq!(
+            mysql_object_source_sql("tenant_db", "calc_score", &db::ObjectSourceKind::Function),
+            "SHOW CREATE FUNCTION `tenant_db`.`calc_score`"
+        );
+        assert_eq!(
+            mysql_object_source_sql("", "users_view", &db::ObjectSourceKind::View),
+            "SHOW CREATE VIEW `users_view`"
+        );
     }
 
     #[test]
@@ -2036,6 +2184,30 @@ mod tests {
     }
 
     #[test]
+    fn default_oracle_agent_config_excludes_legacy_profiles() {
+        let mut config = test_connection_config(DatabaseType::Oracle);
+        assert!(super::is_default_oracle_agent_config(&config));
+
+        config.driver_profile = Some("oracle".to_string());
+        assert!(super::is_default_oracle_agent_config(&config));
+
+        config.driver_profile = Some("oracle-legacy".to_string());
+        assert!(!super::is_default_oracle_agent_config(&config));
+
+        config.driver_profile = Some("oracle-10g".to_string());
+        assert!(!super::is_default_oracle_agent_config(&config));
+    }
+
+    #[test]
+    fn oracle_agent_paging_detection_avoids_double_offset_only_when_page_sized() {
+        assert!(super::oracle_agent_paging_likely_applied(true, Some(500), 500));
+        assert!(super::oracle_agent_paging_likely_applied(true, Some(500), 120));
+        assert!(!super::oracle_agent_paging_likely_applied(true, Some(500), 501));
+        assert!(!super::oracle_agent_paging_likely_applied(false, Some(500), 120));
+        assert!(!super::oracle_agent_paging_likely_applied(true, None, 120));
+    }
+
+    #[test]
     fn filter_visible_schema_names_preserves_database_order() {
         let schemas = vec!["APP".to_string(), "SYS".to_string(), "REPORTING".to_string()];
         let visible = vec!["REPORTING".to_string(), "APP".to_string()];
@@ -2048,6 +2220,20 @@ mod tests {
             name: name.to_string(),
             table_type: "BASE TABLE".to_string(),
             comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }
+    }
+
+    fn test_object_info(name: &str, object_type: &str) -> super::db::ObjectInfo {
+        super::db::ObjectInfo {
+            name: name.to_string(),
+            object_type: object_type.to_string(),
+            schema: Some("app".to_string()),
+            signature: None,
+            comment: None,
+            created_at: None,
+            updated_at: None,
             parent_schema: None,
             parent_name: None,
         }
@@ -2127,6 +2313,19 @@ mod tests {
     }
 
     #[test]
+    fn filter_table_infos_matches_comments() {
+        let mut orders = test_table_info("orders");
+        orders.comment = Some("sales archive".to_string());
+        let mut profile = test_table_info("profile");
+        profile.comment = Some("customer account data".to_string());
+        let tables = vec![orders, profile, test_table_info("logs")];
+
+        let filtered = filter_table_infos(tables, Some("account"), None, None, None);
+
+        assert_eq!(filtered.into_iter().map(|table| table.name).collect::<Vec<_>>(), vec!["profile"]);
+    }
+
+    #[test]
     fn filter_table_infos_skips_fuzzy_for_single_character_filters() {
         let tables = vec![test_table_info("orders"), test_table_info("user_order")];
 
@@ -2170,6 +2369,36 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "active_users");
+    }
+
+    #[test]
+    fn filter_object_infos_filters_object_type_before_offset_and_limit() {
+        let objects = vec![
+            test_object_info("sync_user", "PROCEDURE"),
+            test_object_info("find_user", "FUNCTION"),
+            test_object_info("fetch_name", "FUNCTION"),
+            test_object_info("orders", "TABLE"),
+        ];
+        let object_types = vec!["FUNCTION".to_string()];
+
+        let filtered = filter_object_infos(objects, Some("fn"), Some(1), Some(1), Some(&object_types));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "fetch_name");
+    }
+
+    #[test]
+    fn filter_object_infos_matches_comments() {
+        let mut order_view = test_object_info("order_view", "VIEW");
+        order_view.comment = Some("monthly revenue summary".to_string());
+        let mut sync_user = test_object_info("sync_user", "PROCEDURE");
+        sync_user.comment = Some("sync account records".to_string());
+        let objects = vec![order_view, sync_user, test_object_info("audit_log", "TABLE")];
+
+        let object_types = vec!["VIEW".to_string()];
+        let filtered = filter_object_infos(objects, Some("revenue"), None, None, Some(&object_types));
+
+        assert_eq!(filtered.into_iter().map(|object| object.name).collect::<Vec<_>>(), vec!["order_view"]);
     }
 
     #[test]
@@ -2389,6 +2618,9 @@ mod tests {
     fn detects_unsupported_agent_completion_assistant_errors() {
         assert!(super::is_agent_completion_assistant_unsupported(
             "Agent RPC error (-1): Unknown method: completion_assistant_search_v1"
+        ));
+        assert!(super::is_agent_completion_assistant_unsupported(
+            "Agent RPC error (-1): unknown method: completion_assistant_search_v1"
         ));
         assert!(super::is_agent_completion_assistant_unsupported(
             "Agent RPC error (-1): Completion assistant search is not supported by this agent"
@@ -2742,9 +2974,30 @@ pub async fn list_objects_core(
     connection_id: &str,
     database: &str,
     schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
-    retry_metadata_connection(state, connection_id, Some(database), || {
-        list_objects_once(state, connection_id, database, schema)
+    let db_config = connection_config(state, connection_id).await;
+    let filter_locally_after_oracle_comments = db_config.as_ref().is_some_and(|config| {
+        config.db_type == DatabaseType::Oracle && filter.is_some_and(|filter| !filter.trim().is_empty())
+    });
+    let use_oracle_agent_paging =
+        db_config.as_ref().is_some_and(is_default_oracle_agent_config) && !filter_locally_after_oracle_comments;
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let objects = list_objects_once(state, connection_id, database, schema, filter, limit, offset, object_types)
+            .await
+            .map(|objects| {
+                let final_offset = if oracle_agent_paging_likely_applied(use_oracle_agent_paging, limit, objects.len())
+                {
+                    Some(0)
+                } else {
+                    offset
+                };
+                filter_object_infos(objects, filter, limit, final_offset, object_types)
+            })?;
+        Ok(objects)
     })
     .await
 }
@@ -2884,10 +3137,10 @@ pub async fn completion_assistant_search_core(
 }
 
 fn is_agent_completion_assistant_unsupported(error: &str) -> bool {
-    error.contains("Unknown method: completion_assistant_search_v1")
-        || error.contains("Method not found: completion_assistant_search_v1")
+    let error = error.to_ascii_lowercase();
+    error.contains("unknown method: completion_assistant_search_v1")
         || error.contains("method not found: completion_assistant_search_v1")
-        || error.contains("Completion assistant search is not supported")
+        || error.contains("completion assistant search is not supported")
 }
 
 async fn completion_assistant_fallback_core(
@@ -3058,6 +3311,10 @@ async fn list_objects_once(
     connection_id: &str,
     database: &str,
     schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
@@ -3093,12 +3350,28 @@ async fn list_objects_once(
             let session = session.clone();
             drop(connections);
             if uses_presto_like_information_schema_tables(&config.db_type) {
-                return external_driver_presto_like_objects(session, config.as_ref(), database, schema).await;
+                return external_driver_presto_like_objects(
+                    session,
+                    config.as_ref(),
+                    database,
+                    schema,
+                    filter,
+                    object_types,
+                )
+                .await;
+            }
+            let mut params =
+                serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema });
+            if let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) {
+                params["filter"] = serde_json::json!(filter);
+            }
+            if let Some(object_types) = object_types {
+                params["object_types"] = serde_json::json!(object_types);
             }
             return session
                 .invoke_with_timeout::<Vec<db::ObjectInfo>>(
                     "listObjects",
-                    serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema }),
+                    params,
                     agent_metadata_timeout(Some(config.as_ref())),
                 )
                 .await;
@@ -3106,18 +3379,56 @@ async fn list_objects_once(
         try_sqlserver!(connections, &pool_key, list_objects, schema);
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+            let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
+            let filter_locally_after_oracle_comments =
+                is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
+            let timeout_duration = agent_metadata_timeout(db_config.as_ref());
             let fallback_config = db_config.clone();
             drop(connections);
-            if is_oracle {
-                return oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref()))
-                    .await;
+            if is_oracle && !use_oracle_agent_paging {
+                return oracle_agent_list_objects(client, database, schema, timeout_duration).await;
             }
             let mut client = client.lock().await;
+            let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
+            let agent_limit = if filter_locally_after_oracle_comments {
+                None
+            } else if use_oracle_agent_paging {
+                limit
+            } else {
+                None
+            };
+            let agent_offset = if filter_locally_after_oracle_comments {
+                None
+            } else if use_oracle_agent_paging {
+                offset
+            } else {
+                None
+            };
             match client
-                .list_objects::<Vec<db::ObjectInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .list_objects_constrained::<Vec<db::ObjectInfo>>(
+                    database,
+                    schema,
+                    agent_filter,
+                    agent_limit,
+                    agent_offset,
+                    object_types,
+                    timeout_duration,
+                )
                 .await
             {
-                Ok(objects) if !objects.is_empty() => return Ok(objects),
+                Ok(mut objects) if !objects.is_empty() => {
+                    if is_oracle {
+                        load_oracle_table_comments_for_objects(
+                            &mut client,
+                            database,
+                            schema,
+                            &mut objects,
+                            timeout_duration,
+                        )
+                        .await?;
+                    }
+                    return Ok(objects);
+                }
                 Ok(objects) => {
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
@@ -3287,7 +3598,7 @@ async fn list_completion_objects_once(
         PoolKind::Postgres(p) => db::postgres::list_objects(p, schema).await.map(filter_completion_objects),
         PoolKind::SqlServer(_) => {
             drop(connections);
-            let objects = list_objects_once(state, connection_id, database, schema).await?;
+            let objects = list_objects_once(state, connection_id, database, schema, None, None, None, None).await?;
             Ok(filter_completion_objects(objects))
         }
         _ => Ok(Vec::new()),
@@ -3436,6 +3747,14 @@ pub async fn get_columns_core(
                     &duckdb_attached_names,
                 );
             }
+            #[cfg(feature = "duckdb-bundled")]
+            if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+                let database = database.to_string();
+                let schema = schema.to_string();
+                let table = table.to_string();
+                drop(connections);
+                return client.list_columns(database, schema, table).await;
+            }
             if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
                 drop(connections);
                 return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
@@ -3565,7 +3884,8 @@ pub async fn get_columns_core(
                 db::mysql::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
             }
             PoolKind::Mysql(p, mode) => {
-                dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, database, table)
+                let effective_db = mysql_table_metadata_catalog(database, schema);
+                dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, effective_db, table)
                     .map(deduplicate_column_infos)
             }
             PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => {
@@ -3826,6 +4146,43 @@ pub async fn list_rules_core(
     .await
 }
 
+pub async fn list_extensions_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ExtensionInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+
+        match pool {
+            PoolKind::Postgres(p) => db::postgres::list_extensions(p, schema).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
+}
+
+pub async fn list_available_extensions_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+) -> Result<Vec<db::ExtensionInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+
+        match pool {
+            PoolKind::Postgres(p) => db::postgres::list_available_extensions(p).await,
+            _ => Ok(vec![]),
+        }
+    })
+    .await
+}
+
 pub async fn list_owners_core(
     state: &AppState,
     connection_id: &str,
@@ -3962,6 +4319,16 @@ pub async fn get_table_ddl_core(
                 )
                 .await;
             }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Db2) {
+                return db2_agent_table_ddl(
+                    client,
+                    database,
+                    schema,
+                    table,
+                    agent_metadata_timeout(db_config.as_ref()),
+                )
+                .await;
+            }
             let mut client = client.lock().await;
             return client.get_table_ddl(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
@@ -3971,7 +4338,7 @@ pub async fn get_table_ddl_core(
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
     match pool {
-        PoolKind::Mysql(p, _) => mysql_ddl(p, table).await,
+        PoolKind::Mysql(p, _) => mysql_ddl(p, mysql_table_metadata_catalog(database, schema), table).await,
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_family_config) => {
             match opengauss_table_ddl(p, schema, table).await {
                 Ok(ddl) => Ok(ddl),
@@ -3998,6 +4365,16 @@ async fn connection_config(state: &AppState, connection_id: &str) -> Option<Conn
 fn is_opengauss_family_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::OpenGauss | DatabaseType::Gaussdb)
         || matches!(config.driver_profile.as_deref(), Some("opengauss" | "gaussdb"))
+}
+
+fn is_default_oracle_agent_config(config: &ConnectionConfig) -> bool {
+    // Only the default go-oracle agent handles filtered/paged metadata; legacy profiles keep Rust fallback paging.
+    matches!(config.db_type, DatabaseType::Oracle)
+        && !matches!(config.driver_profile.as_deref(), Some("oracle-legacy" | "oracle-10g"))
+}
+
+fn oracle_agent_paging_likely_applied(enabled: bool, limit: Option<usize>, returned_len: usize) -> bool {
+    enabled && limit.is_some_and(|limit| returned_len <= limit)
 }
 
 fn is_doris_family_config(config: &ConnectionConfig) -> bool {
@@ -4059,6 +4436,14 @@ fn oracle_ident(value: &str) -> String {
 
 fn mysql_ident(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
+}
+
+fn mysql_qualified_name(database: &str, name: &str) -> String {
+    if database.trim().is_empty() {
+        mysql_ident(name)
+    } else {
+        format!("{}.{}", mysql_ident(database), mysql_ident(name))
+    }
 }
 
 fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
@@ -4220,11 +4605,12 @@ pub fn sqlite_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> Stri
     )
 }
 
-pub fn mysql_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> String {
+pub fn mysql_object_source_sql(database: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
+    let qualified_name = mysql_qualified_name(database, name);
     match kind {
-        db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {}", mysql_ident(name)),
-        db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {}", mysql_ident(name)),
-        db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {}", mysql_ident(name)),
+        db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {qualified_name}"),
+        db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {qualified_name}"),
+        db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {qualified_name}"),
         db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
@@ -4254,11 +4640,12 @@ fn first_string_cell(result: db::QueryResult) -> Result<String, String> {
 
 async fn mysql_object_source(
     pool: &db::mysql::MySqlPool,
+    database: &str,
     name: &str,
     kind: &db::ObjectSourceKind,
 ) -> Result<String, String> {
     use mysql_async::prelude::*;
-    let sql = mysql_object_source_sql(name, kind);
+    let sql = mysql_object_source_sql(database, name, kind);
     let mut conn = db::mysql::get_conn_with_timeout(pool, db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
@@ -4354,7 +4741,10 @@ async fn get_object_source_once(
             }
         } else {
             match connections.get(&pool_key).ok_or("Pool not found")? {
-                PoolKind::Mysql(pool, _) => mysql_object_source(pool, name, &object_type).await?,
+                PoolKind::Mysql(pool, _) => {
+                    mysql_object_source(pool, mysql_table_metadata_catalog(database, schema), name, &object_type)
+                        .await?
+                }
                 PoolKind::Postgres(pool) if db_config.as_ref().is_some_and(is_questdb_config) => {
                     // only view
                     db::questdb::questdb_object_source(pool, name).await?
@@ -4385,6 +4775,7 @@ async fn get_object_source_once(
         object_type,
         schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
         source,
+        editable: None,
     })
 }
 
@@ -4545,6 +4936,140 @@ fn append_oracle_comments_to_ddl(
         }
     }
     result
+}
+
+async fn db2_agent_table_ddl(
+    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    database: &str,
+    schema: &str,
+    table: &str,
+    timeout_duration: Option<Duration>,
+) -> Result<String, String> {
+    let mut client = client.lock().await;
+    let ddl = client.get_table_ddl::<String>(database, schema, table, timeout_duration).await?;
+    match append_db2_comments_to_ddl(&mut client, database, schema, table, &ddl, timeout_duration).await {
+        Ok(ddl) => Ok(ddl),
+        Err(error) => {
+            log::debug!(
+                "[schema][db2:get_table_ddl:comments-fallback-failed] schema={} table={} error={}",
+                schema,
+                table,
+                error
+            );
+            Ok(ddl)
+        }
+    }
+}
+
+async fn append_db2_comments_to_ddl(
+    client: &mut db::agent_driver::AgentDriverClient,
+    database: &str,
+    schema: &str,
+    table: &str,
+    ddl: &str,
+    timeout_duration: Option<Duration>,
+) -> Result<String, String> {
+    let table_comment = db2_table_comment(client, database, schema, table, timeout_duration).await;
+    let column_comments = db2_column_comments(client, database, schema, table, timeout_duration).await;
+    let mut columns =
+        client.get_columns::<Vec<db::ColumnInfo>>(database, schema, table, timeout_duration).await.unwrap_or_default();
+    if !column_comments.is_empty() {
+        for column in &mut columns {
+            if column.comment.as_deref().map_or(true, |c| c.trim().is_empty() || c.trim().eq_ignore_ascii_case("null"))
+            {
+                if let Some(remark) = column_comments.get(&column.name.to_uppercase()) {
+                    column.comment = Some(remark.clone());
+                }
+            }
+        }
+    }
+    Ok(append_oracle_comments_to_ddl(ddl, schema, table, table_comment.as_deref(), &columns))
+}
+
+async fn db2_table_comment(
+    client: &mut db::agent_driver::AgentDriverClient,
+    database: &str,
+    schema: &str,
+    table: &str,
+    timeout_duration: Option<Duration>,
+) -> Option<String> {
+    // 优先使用原始值查询，支持 quoted/mixed-case 对象；如果查不到再 fallback 到大写
+    for (schema_name, table_name) in
+        [(schema.trim(), table.trim()), (&schema.trim().to_uppercase(), &table.trim().to_uppercase())]
+    {
+        let schema_filter = if schema_name.is_empty() { "CURRENT SCHEMA".to_string() } else { sql_string(schema_name) };
+        let sql = format!(
+            "SELECT REMARKS FROM SYSCAT.TABLES WHERE TABSCHEMA = {} AND TABNAME = {} AND REMARKS IS NOT NULL",
+            schema_filter,
+            sql_string(table_name),
+        );
+        if let Ok(result) = client
+            .execute_query_with_timeout::<db::QueryResult>(
+                agent_execute_query_params(
+                    &sql,
+                    if database.is_empty() { None } else { Some(database) },
+                    if schema.is_empty() { None } else { Some(schema) },
+                    QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                ),
+                timeout_duration,
+            )
+            .await
+        {
+            if let Some(comment) =
+                result.rows.first().and_then(|row| row.first()).and_then(|v| v.as_str()).map(|s| s.to_string())
+            {
+                return Some(comment);
+            }
+        }
+    }
+    None
+}
+
+async fn db2_column_comments(
+    client: &mut db::agent_driver::AgentDriverClient,
+    database: &str,
+    schema: &str,
+    table: &str,
+    timeout_duration: Option<Duration>,
+) -> HashMap<String, String> {
+    // 优先使用原始值查询，支持 quoted/mixed-case 对象；如果查不到再 fallback 到大写
+    let mut comments = HashMap::new();
+    for (schema_name, table_name) in
+        [(schema.trim(), table.trim()), (&schema.trim().to_uppercase(), &table.trim().to_uppercase())]
+    {
+        let schema_filter = if schema_name.is_empty() { "CURRENT SCHEMA".to_string() } else { sql_string(schema_name) };
+        let sql = format!(
+            "SELECT COLNAME, REMARKS FROM SYSCAT.COLUMNS WHERE TABSCHEMA = {} AND TABNAME = {} AND REMARKS IS NOT NULL",
+            schema_filter,
+            sql_string(table_name),
+        );
+        let result = match client
+            .execute_query_with_timeout::<db::QueryResult>(
+                agent_execute_query_params(
+                    &sql,
+                    if database.is_empty() { None } else { Some(database) },
+                    if schema.is_empty() { None } else { Some(schema) },
+                    QueryExecutionOptions { ..Default::default() },
+                ),
+                timeout_duration,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+        for row in &result.rows {
+            let col_name = row.first().and_then(|v| v.as_str()).unwrap_or("").trim();
+            let remark = row.get(1).and_then(|v| v.as_str()).unwrap_or("").trim();
+            if !col_name.is_empty() && !remark.is_empty() {
+                comments.entry(col_name.to_uppercase()).or_insert_with(|| remark.to_string());
+            }
+        }
+        if !comments.is_empty() {
+            break;
+        }
+    }
+    comments
 }
 
 async fn postgres_object_source(
@@ -4894,11 +5419,28 @@ mod ddl_tests {
             "SELECT pg_get_tabledef('\"tenant''s schema\".\"active users\"')"
         );
     }
+
+    #[test]
+    fn mysql_display_ddl_gets_statement_terminator() {
+        let ddl = "CREATE TABLE `users` (\n  `id` int NOT NULL\n) ENGINE=InnoDB";
+
+        assert_eq!(
+            ensure_display_ddl_terminated(ddl.to_string()),
+            "CREATE TABLE `users` (\n  `id` int NOT NULL\n) ENGINE=InnoDB;"
+        );
+    }
+
+    #[test]
+    fn mysql_display_ddl_does_not_duplicate_existing_terminator() {
+        let ddl = "CREATE TABLE `users` (`id` int);\n";
+
+        assert_eq!(ensure_display_ddl_terminated(ddl.to_string()), ddl);
+    }
 }
 
-pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, table: &str) -> Result<String, String> {
+pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, database: &str, table: &str) -> Result<String, String> {
     use mysql_async::prelude::*;
-    let sql = format!("SHOW CREATE TABLE `{}`", table.replace('`', "``"));
+    let sql = format!("SHOW CREATE TABLE {}", mysql_qualified_name(database, table));
     // Use the health-checked getter so a stale pooled connection (server closed
     // it after an idle timeout, NAT/firewall dropped the TCP state, etc.) is
     // detected and replaced before issuing the query. Without this, the first
@@ -4908,14 +5450,27 @@ pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, table: &str) -> Result<Strin
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     let row = rows.first().ok_or("DDL not found")?;
-    row.get_opt::<String, usize>(1)
+    let ddl = row
+        .get_opt::<String, usize>(1)
         .and_then(|result| result.ok())
         .or_else(|| {
             row.get_opt::<Vec<u8>, usize>(1)
                 .and_then(|result| result.ok())
                 .map(|b| String::from_utf8_lossy(&b).to_string())
         })
-        .ok_or_else(|| "Failed to read DDL".to_string())
+        .ok_or_else(|| "Failed to read DDL".to_string())?;
+    Ok(ensure_display_ddl_terminated(ddl))
+}
+
+fn ensure_display_ddl_terminated(sql: String) -> String {
+    let trimmed = sql.trim_end();
+    // SHOW CREATE TABLE returns a table definition, not a runnable script; DBX
+    // displays/copies it as SQL, so include the default statement terminator.
+    if trimmed.ends_with(';') {
+        sql
+    } else {
+        format!("{trimmed};")
+    }
 }
 
 pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, table: &str) -> Result<String, String> {

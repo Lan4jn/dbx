@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { restoreOpenTabsState, serializeOpenTabs } from "../../apps/desktop/src/lib/openTabsPersistence.ts";
+import { restoreOpenTabsState, serializeOpenTabs } from "../../apps/desktop/src/lib/app/openTabsPersistence.ts";
 import type { QueryTab } from "../../apps/desktop/src/types/database.ts";
 
 function queryTab(overrides: Partial<QueryTab> = {}): QueryTab {
@@ -354,6 +354,24 @@ test("restores MQ tabs with selected tenant context", () => {
   const restored = restoreOpenTabsState(raw, "tab-1");
 
   assert.equal(restored.tabs[0]?.mqTenant, "public");
+});
+
+test("restores GridFS manager tabs with their mode intact", () => {
+  const raw = JSON.stringify([
+    queryTab({
+      id: "gridfs",
+      title: "GridFS",
+      mode: "mongo-gridfs" as QueryTab["mode"],
+      sql: "",
+      database: "amazon",
+    }),
+  ]);
+
+  const restored = restoreOpenTabsState(raw, "gridfs");
+
+  assert.equal(restored.tabs[0]?.mode, "mongo-gridfs");
+  assert.equal(restored.tabs[0]?.title, "GridFS");
+  assert.equal(restored.activeTabId, "gridfs");
 });
 
 test("query-only restore keeps legacy query tabs without a mode", () => {

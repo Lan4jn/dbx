@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, onBeforeUnmount, nextTick, type Component } from "vue";
 import { ChevronRight } from "@lucide/vue";
+import { shortcutDisplayKeys } from "@/lib/editor/shortcutDisplay";
 
 export interface ContextMenuItem {
   label: string;
@@ -9,6 +10,7 @@ export interface ContextMenuItem {
   separator?: boolean;
   icon?: Component;
   iconClass?: string;
+  // Raw shortcut syntax such as `Mod+C` or `Shift+Alt+U`; display formatting stays in this component.
   shortcut?: string;
   variant?: "default" | "destructive";
   visible?: boolean;
@@ -21,6 +23,10 @@ const props = defineProps<{
 
 defineEmits<{
   close: [];
+}>();
+
+defineSlots<{
+  default(props: { onContextMenu: (event: MouseEvent) => void }): any;
 }>();
 
 // ---- module-level singleton state ----
@@ -52,9 +58,11 @@ const subRef = ref<HTMLElement>();
 const subX = ref(0);
 const subY = ref(0);
 let subCloseTimer: ReturnType<typeof setTimeout> | null = null;
+let subAnchorRect: { left: number; right: number; top: number; bottom: number } | null = null;
 
 function close() {
   activeSubIndex.value = null;
+  subAnchorRect = null;
   show.value = false;
 }
 
@@ -147,6 +155,7 @@ function onItemMouseEnter(index: number, event: MouseEvent) {
   }
   const trigger = event.currentTarget as HTMLElement;
   const rect = trigger.getBoundingClientRect();
+  subAnchorRect = { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
   subX.value = rect.right + 4;
   subY.value = rect.top;
   activeSubIndex.value = index;
@@ -194,11 +203,25 @@ function adjustSubPosition() {
   const rect = subRef.value.getBoundingClientRect();
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  if (rect.right > vw) {
-    subX.value = Math.max(0, vw - rect.width - 8);
+  const margin = 8;
+  const gap = 4;
+  if (subAnchorRect) {
+    const rightX = subAnchorRect.right + gap;
+    const leftX = subAnchorRect.left - rect.width - gap;
+    if (rightX + rect.width <= vw - margin) {
+      subX.value = rightX;
+    } else if (leftX >= margin) {
+      subX.value = leftX;
+    } else {
+      subX.value = Math.max(margin, Math.min(rightX, vw - rect.width - margin));
+    }
+  } else if (rect.right > vw - margin) {
+    subX.value = Math.max(margin, vw - rect.width - margin);
   }
-  if (rect.bottom > vh) {
-    subY.value = Math.max(0, vh - rect.height - 8);
+  if (rect.bottom > vh - margin) {
+    subY.value = Math.max(margin, vh - rect.height - margin);
+  } else if (rect.top < margin) {
+    subY.value = margin;
   }
   // When the submenu flips left due to right-edge overflow, it may land
   // under the mouse cursor. Since the mouse didn't move, mouseenter won't
@@ -218,20 +241,8 @@ function itemButtonClass(variant?: "default" | "destructive") {
   ];
 }
 
-function shortcutKeyLabel(part: string): string {
-  if (part === "Cmd") return "⌘";
-  if (part === "Meta") return "⌘";
-  if (part === "Alt") return "⌥";
-  if (part === "Shift") return "⇧";
-  if (part === "Delete") return "Del";
-  if (part === "Backspace") return "⌫";
-  if (part === "Enter") return "↵";
-  if (part === "Escape") return "Esc";
-  return part;
-}
-
 function shortcutKeys(shortcut?: string): string[] {
-  return shortcut?.split("+").filter(Boolean).map(shortcutKeyLabel) || [];
+  return shortcutDisplayKeys(shortcut);
 }
 
 onBeforeUnmount(() => {
@@ -244,10 +255,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <slot :on-context-menu="onContextMenu" />
+  <slot :onContextMenu="onContextMenu" />
   <!-- Main menu -->
   <Teleport to="body">
-    <div v-if="show" ref="menuRef" :style="{ position: 'fixed', left: x + 'px', top: y + 'px', zIndex: 9999 }" class="bg-popover text-popover-foreground min-w-40 rounded-[6px] p-1 overflow-x-hidden overflow-y-auto ring-1 ring-foreground/10 shadow-lg">
+    <div v-if="show" ref="menuRef" :style="{ position: 'fixed', left: x + 'px', top: y + 'px', zIndex: 9999 }" class="bg-popover text-popover-foreground min-w-40 w-max max-w-[calc(100vw-16px)] rounded-[6px] p-1 overflow-y-auto ring-1 ring-foreground/10 shadow-lg">
       <template v-for="(item, index) in items" :key="index">
         <template v-if="item.visible !== false">
           <div v-if="item.separator" class="-mx-1 my-1 flex items-center px-1">
@@ -257,7 +268,7 @@ onBeforeUnmount(() => {
             <span class="flex size-4 shrink-0 items-center justify-center">
               <component :is="item.icon" v-if="item.icon" :class="['size-4', item.iconClass]" />
             </span>
-            <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
+            <span class="flex-1 whitespace-nowrap">{{ item.label }}</span>
             <span v-if="item.shortcut" class="ml-8 inline-flex shrink-0 items-center gap-1 text-muted-foreground">
               <kbd v-for="key in shortcutKeys(item.shortcut)" :key="key" class="min-w-4 rounded border border-border/70 bg-muted/60 px-1 py-0.5 text-center font-mono text-[10px] leading-none text-muted-foreground shadow-xs">{{ key }}</kbd>
             </span>
@@ -272,8 +283,8 @@ onBeforeUnmount(() => {
     <div
       v-if="show && activeSubIndex !== null && items[activeSubIndex]?.children?.length"
       ref="subRef"
-      :style="{ position: 'fixed', left: subX + 'px', top: subY + 'px', zIndex: 10000 }"
-      class="bg-popover text-popover-foreground min-w-40 rounded-[6px] p-1 overflow-x-hidden overflow-y-auto ring-1 ring-foreground/10 shadow-lg"
+      :style="{ position: 'fixed', left: subX + 'px', top: subY + 'px', zIndex: 10000, maxHeight: 'min(420px, calc(100vh - 16px))' }"
+      class="bg-popover text-popover-foreground min-w-56 w-max max-w-[calc(100vw-16px)] rounded-[6px] p-1 overflow-y-auto ring-1 ring-foreground/10 shadow-lg"
       @mouseenter="onSubMouseEnter"
       @mouseleave="onSubMouseLeave"
     >
@@ -286,7 +297,7 @@ onBeforeUnmount(() => {
             <span class="flex size-4 shrink-0 items-center justify-center">
               <component :is="child.icon" v-if="child.icon" :class="['size-4', child.iconClass]" />
             </span>
-            <span class="min-w-0 flex-1 truncate">{{ child.label }}</span>
+            <span class="flex-1 whitespace-nowrap">{{ child.label }}</span>
             <span v-if="child.shortcut" class="ml-8 inline-flex shrink-0 items-center gap-1 text-muted-foreground">
               <kbd v-for="key in shortcutKeys(child.shortcut)" :key="key" class="min-w-4 rounded border border-border/70 bg-muted/60 px-1 py-0.5 text-center font-mono text-[10px] leading-none text-muted-foreground shadow-xs">{{ key }}</kbd>
             </span>

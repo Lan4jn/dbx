@@ -8,6 +8,7 @@ pub enum TablePaginationStrategy {
     SqlServerTop,
     IrisTop,
     InformixFirst,
+    FirebirdRows,
     Rownum,
     QuestDbLimit,
     Unbounded,
@@ -51,6 +52,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Trino
             | DatabaseType::PrestoSql
             | DatabaseType::Hive
+            | DatabaseType::Spark
             | DatabaseType::Db2
             | DatabaseType::Tdengine
             | DatabaseType::Xugu
@@ -61,6 +63,12 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
 
 pub fn uses_fetch_first(database_type: DatabaseType) -> bool {
     matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Db2)
+}
+
+/// Oracle 系方言不支持 `INSERT ... VALUES (...), (...)` 多行语法，
+/// 复制为 INSERT 与导出 INSERT 都需按行生成单条语句。
+pub fn uses_single_row_insert_statements(database_type: DatabaseType) -> bool {
+    matches!(database_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
 }
 
 pub fn pagination_strategy(database_type: Option<DatabaseType>, context: PaginationContext) -> TablePaginationStrategy {
@@ -84,6 +92,7 @@ pub fn pagination_strategy(database_type: Option<DatabaseType>, context: Paginat
         Some(DatabaseType::SqlServer) => TablePaginationStrategy::SqlServerTop,
         Some(DatabaseType::Iris) => TablePaginationStrategy::IrisTop,
         Some(DatabaseType::Informix) => TablePaginationStrategy::InformixFirst,
+        Some(DatabaseType::Firebird) => TablePaginationStrategy::FirebirdRows,
         Some(DatabaseType::OceanbaseOracle) => TablePaginationStrategy::Rownum,
         Some(DatabaseType::Questdb) => TablePaginationStrategy::QuestDbLimit,
         _ => TablePaginationStrategy::LimitOffset,
@@ -101,4 +110,14 @@ pub(super) fn is_simple_informix_identifier(name: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+}
+
+pub fn firebird_rows_clause(limit: usize, offset: usize) -> String {
+    if offset > 0 {
+        let start = offset + 1;
+        let end = offset + limit;
+        format!("ROWS {start} TO {end}")
+    } else {
+        format!("ROWS {limit}")
+    }
 }

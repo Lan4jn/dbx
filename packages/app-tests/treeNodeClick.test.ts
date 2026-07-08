@@ -1,6 +1,6 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { copyNameForTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "../../apps/desktop/src/lib/treeNodeClick.ts";
+import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "../../apps/desktop/src/lib/sidebar/treeNodeClick.ts";
 
 test("table and view rows open data without toggling structure groups", () => {
   assert.equal(treeNodeRowAction("table", true), "open-data");
@@ -40,13 +40,22 @@ test("leaf data browser nodes keep their open behavior through toggle handler", 
   assert.equal(treeNodeRowAction("redis-db", false), "toggle");
   assert.equal(treeNodeRowAction("etcd-root", false), "toggle");
   assert.equal(treeNodeRowAction("zookeeper-root", false), "toggle");
+  assert.equal(treeNodeRowAction("mongo-gridfs" as never, false), "toggle");
   assert.equal(treeNodeRowAction("mongo-collection", false), "toggle");
+  assert.equal(treeNodeRowAction("mongo-bucket", false), "toggle");
 });
 
-test("repeated clicks continue to toggle expandable rows", () => {
+test("document browser helper covers Mongo collections and GridFS buckets", () => {
+  assert.equal(isDocumentBrowserTreeNode("mongo-collection"), true);
+  assert.equal(isDocumentBrowserTreeNode("mongo-bucket"), true);
+  assert.equal(isDocumentBrowserTreeNode("redis-db"), false);
+});
+
+test("double-click follow-up clicks do not run row actions", () => {
   assert.equal(shouldRunTreeNodeRowAction("toggle", 1), true);
-  assert.equal(shouldRunTreeNodeRowAction("toggle", 2), true);
-  assert.equal(shouldRunTreeNodeRowAction("toggle", 3), true);
+  assert.equal(shouldRunTreeNodeRowAction("toggle", 2), false);
+  assert.equal(shouldRunTreeNodeRowAction("toggle", 3), false);
+  assert.equal(shouldRunTreeNodeRowAction("open-data", 1), true);
   assert.equal(shouldRunTreeNodeRowAction("open-data", 2), false);
   assert.equal(shouldRunTreeNodeRowAction("none", 1), false);
 });
