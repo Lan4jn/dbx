@@ -71,8 +71,9 @@ fn classify_statement(stmt: &Statement) -> SqlRisk {
         | Statement::ShowSchemas { .. }
         | Statement::ShowCreate { .. }
         | Statement::ShowVariables { .. }
-        | Statement::ShowStatus { .. }
-        | Statement::ShowProcessList { .. } => SqlRisk::ReadOnly,
+        | Statement::ShowStatus { .. } => SqlRisk::ReadOnly,
+        #[cfg(not(feature = "legacy-sqlparser-060"))]
+        Statement::ShowProcessList { .. } => SqlRisk::ReadOnly,
 
         // Write operations
         Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge { .. } => {

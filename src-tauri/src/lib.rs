@@ -4,6 +4,7 @@ mod db;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
 mod models;
+mod webview2_runtime;
 mod window_state_guard;
 
 use commands::connection::AppState;
@@ -55,8 +56,8 @@ impl CloseBehaviorState {
     }
 }
 #[cfg(target_os = "macos")]
-const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
-const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
+const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/tray-macos-template.png");
+const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/icon-black.png");
 
 pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
     log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
@@ -78,9 +79,14 @@ fn should_confirm_app_exit_request(exit_code: Option<i32>, confirmed_exit: bool)
     exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
 }
 
+pub(crate) fn use_native_window_decorations_for_platform(target_os: &str) -> bool {
+    cfg!(feature = "legacy-native-window-decorations") && target_os == "windows"
+}
+
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
     match target_os {
-        "windows" | "linux" => Some(false),
+        "windows" => Some(use_native_window_decorations_for_platform(target_os)),
+        "linux" => Some(false),
         _ => None,
     }
 }
@@ -424,6 +430,7 @@ mod tests {
         linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
         linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
         should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        use_native_window_decorations_for_platform,
     };
     use std::ffi::OsStr;
 
@@ -464,9 +471,22 @@ mod tests {
 
     #[test]
     fn overrides_native_window_decorations_for_desktop_platforms() {
-        assert_eq!(native_window_decorations_override("windows"), Some(false));
+        assert_eq!(
+            native_window_decorations_override("windows"),
+            Some(cfg!(feature = "legacy-native-window-decorations"))
+        );
         assert_eq!(native_window_decorations_override("linux"), Some(false));
         assert_eq!(native_window_decorations_override("macos"), None);
+    }
+
+    #[test]
+    fn native_window_decorations_are_feature_gated_for_legacy_windows() {
+        assert_eq!(
+            use_native_window_decorations_for_platform("windows"),
+            cfg!(feature = "legacy-native-window-decorations")
+        );
+        assert!(!use_native_window_decorations_for_platform("linux"));
+        assert!(!use_native_window_decorations_for_platform("macos"));
     }
 
     #[test]
@@ -574,6 +594,13 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if webview2_runtime::handle_webview2_uninstall_arg() {
+        return;
+    }
+    webview2_runtime::configure_bundled_webview2_fallback();
+    #[cfg(feature = "legacy-ring-crypto")]
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+    #[cfg(not(feature = "legacy-ring-crypto"))]
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
     #[cfg(target_os = "linux")]
     apply_linux_webkit_rendering_workarounds();
@@ -718,6 +745,7 @@ pub fn run() {
             commands::ai::delete_ai_conversation,
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
+            commands::app_settings::use_native_window_decorations,
             commands::app_settings::complete_app_close,
             commands::app_settings::request_app_close_from_window_controls,
             commands::app_settings::load_data_dir_config,

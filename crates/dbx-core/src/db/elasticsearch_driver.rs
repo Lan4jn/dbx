@@ -1311,7 +1311,7 @@ enum SqlScanState {
 }
 
 fn is_at_identifier_boundary(output: &str) -> bool {
-    output.chars().next_back().is_none_or(|ch| !is_sql_identifier_part(ch))
+    output.chars().next_back().map_or(true, |ch| !is_sql_identifier_part(ch))
 }
 
 fn is_sql_identifier_part(ch: char) -> bool {
@@ -1332,8 +1332,8 @@ fn relation_name_needs_quotes(relation: &str) -> bool {
 
 fn is_keyword_at(query: &str, index: usize, keyword: &str) -> bool {
     query.get(index..index + keyword.len()).is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-        && query[..index].chars().next_back().is_none_or(|ch| !is_keyword_boundary_char(ch))
-        && query[index + keyword.len()..].chars().next().is_none_or(|ch| !is_keyword_boundary_char(ch))
+        && query[..index].chars().next_back().map_or(true, |ch| !is_keyword_boundary_char(ch))
+        && query[index + keyword.len()..].chars().next().map_or(true, |ch| !is_keyword_boundary_char(ch))
 }
 
 fn is_keyword_boundary_char(ch: char) -> bool {

@@ -6,14 +6,15 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 
 // ---------------------------------------------------------------------------
 // Stream cancel registry
 // ---------------------------------------------------------------------------
 
-static AI_STREAMS: LazyLock<RwLock<HashMap<String, Arc<Notify>>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static AI_STREAMS: once_cell::sync::Lazy<RwLock<HashMap<String, Arc<Notify>>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
 pub async fn register_stream(session_id: &str) -> Arc<Notify> {
     let notify = Arc::new(Notify::new());

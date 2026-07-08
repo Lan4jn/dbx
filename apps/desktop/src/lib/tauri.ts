@@ -76,6 +76,10 @@ export interface AgentDriverUpdateIssue {
   error: string;
 }
 
+export function useNativeWindowDecorations(): Promise<boolean> {
+  return invoke("use_native_window_decorations");
+}
+
 export interface UpgradeAllAgentDriversResult {
   upgraded: number;
   failed: AgentDriverUpdateIssue[];

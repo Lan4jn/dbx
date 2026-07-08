@@ -26,7 +26,7 @@ pub fn duckdb_query_tables_in_database_with_attached(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), schema), |row| {
+        .query_map(duckdb::params![database.as_str(), schema], |row| {
             Ok(db::TableInfo {
                 name: row.get::<_, String>(0)?,
                 table_type: row.get::<_, String>(1)?,
@@ -159,7 +159,7 @@ pub fn duckdb_query_columns_in_database_with_attached(
         )
         .map_err(|e| e.to_string())?;
     let pk_rows = pk_stmt
-        .query_map((database.as_str(), schema, table), |row| row.get::<_, String>(0))
+        .query_map(duckdb::params![database.as_str(), schema, table], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
     let primary_keys: std::collections::HashSet<String> = pk_rows.filter_map(|r| r.ok()).collect();
 
@@ -172,7 +172,7 @@ pub fn duckdb_query_columns_in_database_with_attached(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), schema, table), |row| {
+        .query_map(duckdb::params![database.as_str(), schema, table], |row| {
             let name = row.get::<_, String>(0)?;
             Ok(db::ColumnInfo {
                 is_primary_key: primary_keys.contains(&name),

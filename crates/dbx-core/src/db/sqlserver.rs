@@ -780,7 +780,7 @@ pub async fn list_linked_server_tables(
     let rows = linked_server_table_rows(client, server, catalog, Some(schema), None).await?;
     Ok(rows
         .into_iter()
-        .filter(|row| filter.as_ref().is_none_or(|value| row.name.to_lowercase().contains(value)))
+        .filter(|row| filter.as_ref().map_or(true, |value| row.name.to_lowercase().contains(value)))
         .skip(offset)
         .take(limit)
         .map(|row| TableInfo {

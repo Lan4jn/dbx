@@ -64,7 +64,7 @@ pub fn duckdb_query_tables_in_database_with_attached(
         "SELECT table_name, table_type FROM information_schema.tables WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name"
     ).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), schema), |row| {
+        .query_map(duckdb::params![database.as_str(), schema], |row| {
             Ok(db::TableInfo {
                 name: row.get::<_, String>(0)?,
                 table_type: row.get::<_, String>(1)?,
@@ -210,7 +210,7 @@ pub fn duckdb_query_columns_in_database_with_attached(
         )
         .map_err(|e| e.to_string())?;
     let pk_rows = pk_stmt
-        .query_map((database.as_str(), schema, table), |row| row.get::<_, String>(0))
+        .query_map(duckdb::params![database.as_str(), schema, table], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
     let primary_keys: std::collections::HashSet<String> = pk_rows.filter_map(|r| r.ok()).collect();
 
@@ -223,7 +223,7 @@ pub fn duckdb_query_columns_in_database_with_attached(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), schema, table), |row| {
+        .query_map(duckdb::params![database.as_str(), schema, table], |row| {
             let name = row.get::<_, String>(0)?;
             Ok(db::ColumnInfo {
                 is_primary_key: primary_keys.contains(&name),
@@ -304,7 +304,7 @@ fn duckdb_completion_schemas(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), pattern.as_str(), limit as i64), |row| {
+        .query_map(duckdb::params![database.as_str(), pattern.as_str(), limit as i64], |row| {
             let schema = row.get::<_, String>(0)?;
             Ok(db::CompletionAssistantCandidate {
                 name: schema.clone(),
@@ -350,23 +350,26 @@ fn duckdb_completion_tables(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), schema, include_tables, include_views, pattern.as_str(), limit as i64), |row| {
-            let table_type = row.get::<_, String>(1)?;
-            Ok(db::CompletionAssistantCandidate {
-                name: row.get(0)?,
-                kind: if table_type.eq_ignore_ascii_case("VIEW") {
-                    db::CompletionAssistantCandidateKind::View
-                } else {
-                    db::CompletionAssistantCandidateKind::Table
-                },
-                database: Some(request.database.clone()),
-                schema: Some(schema.to_string()),
-                parent_schema: None,
-                parent_name: None,
-                comment: None,
-                data_type: None,
-            })
-        })
+        .query_map(
+            duckdb::params![database.as_str(), schema, include_tables, include_views, pattern.as_str(), limit as i64],
+            |row| {
+                let table_type = row.get::<_, String>(1)?;
+                Ok(db::CompletionAssistantCandidate {
+                    name: row.get(0)?,
+                    kind: if table_type.eq_ignore_ascii_case("VIEW") {
+                        db::CompletionAssistantCandidateKind::View
+                    } else {
+                        db::CompletionAssistantCandidateKind::Table
+                    },
+                    database: Some(request.database.clone()),
+                    schema: Some(schema.to_string()),
+                    parent_schema: None,
+                    parent_name: None,
+                    comment: None,
+                    data_type: None,
+                })
+            },
+        )
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
@@ -400,7 +403,7 @@ fn duckdb_completion_columns(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map((database.as_str(), schema, table, pattern.as_str(), limit as i64), |row| {
+        .query_map(duckdb::params![database.as_str(), schema, table, pattern.as_str(), limit as i64], |row| {
             Ok(db::CompletionAssistantCandidate {
                 name: row.get(0)?,
                 kind: db::CompletionAssistantCandidateKind::Column,
@@ -3617,7 +3620,7 @@ fn merge_optional_string(target: &mut Option<String>, candidate: Option<String>)
         }
         return;
     }
-    if target.as_ref().is_none_or(|value| value.trim().is_empty()) {
+    if target.as_ref().map_or(true, |value| value.trim().is_empty()) {
         *target = Some(candidate);
     }
 }

@@ -6,7 +6,9 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use russh::client::{self, Config, Handle};
-use russh::keys::agent::{client::AgentClient, AgentIdentity};
+use russh::keys::agent::client::AgentClient;
+#[cfg(not(feature = "legacy-russh-054"))]
+use russh::keys::agent::AgentIdentity;
 use russh::keys::{decode_secret_key, key::PrivateKeyWithHashAlg, PrivateKey};
 use russh::{kex, ChannelMsg, Preferred};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -165,6 +167,9 @@ async fn try_authenticate_with_agent(
 
     #[cfg(windows)]
     let mut agent = {
+        #[cfg(feature = "legacy-russh-054")]
+        let stream = pageant::PageantStream::new();
+        #[cfg(not(feature = "legacy-russh-054"))]
         let stream = pageant::PageantStream::new()
             .await
             .map_err(|e| format!("No SSH password or key provided, and ssh-agent (Pageant) is unavailable: {e}"))?;
@@ -185,21 +190,39 @@ async fn try_authenticate_with_agent(
 
     let auth_result = tokio::time::timeout(*connect_timeout, async {
         for identity in identities {
-            let result = match &identity {
-                AgentIdentity::PublicKey { key, .. } => {
-                    session.authenticate_publickey_with(ssh_user, key.clone(), hash_alg, &mut agent).await
-                }
-                AgentIdentity::Certificate { certificate, .. } => {
-                    session.authenticate_certificate_with(ssh_user, certificate.clone(), hash_alg, &mut agent).await
-                }
-            };
+            #[cfg(feature = "legacy-russh-054")]
+            {
+                let comment = identity.comment().to_string();
+                let result = session.authenticate_publickey_with(ssh_user, identity, hash_alg, &mut agent).await;
 
-            match result {
-                Ok(auth_res) if auth_res.success() => return Ok(()),
-                Ok(_) => continue,
-                Err(e) => {
-                    log::debug!("SSH agent identity ({}) auth failed: {e}", identity.comment());
-                    continue;
+                match result {
+                    Ok(auth_res) if auth_res.success() => return Ok(()),
+                    Ok(_) => continue,
+                    Err(e) => {
+                        log::debug!("SSH agent identity ({comment}) auth failed: {e}");
+                        continue;
+                    }
+                }
+            }
+
+            #[cfg(not(feature = "legacy-russh-054"))]
+            {
+                let result = match &identity {
+                    AgentIdentity::PublicKey { key, .. } => {
+                        session.authenticate_publickey_with(ssh_user, key.clone(), hash_alg, &mut agent).await
+                    }
+                    AgentIdentity::Certificate { certificate, .. } => {
+                        session.authenticate_certificate_with(ssh_user, certificate.clone(), hash_alg, &mut agent).await
+                    }
+                };
+
+                match result {
+                    Ok(auth_res) if auth_res.success() => return Ok(()),
+                    Ok(_) => continue,
+                    Err(e) => {
+                        log::debug!("SSH agent identity ({}) auth failed: {e}", identity.comment());
+                        continue;
+                    }
                 }
             }
         }

@@ -799,7 +799,7 @@ async fn stream_query_rows_text_on_client(
 pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, String> {
     let url_with_keepalive = inject_postgres_keepalive_params(url);
     let postgres_url = postgres_connection_url(&url_with_keepalive)?;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    install_default_rustls_provider();
 
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
     let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
@@ -843,6 +843,24 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
         Ok(pool)
     })
     .await
+}
+
+fn install_default_rustls_provider() {
+    #[cfg(feature = "legacy-ring-crypto")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    #[cfg(not(feature = "legacy-ring-crypto"))]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+fn default_rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    #[cfg(feature = "legacy-ring-crypto")]
+    {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+    #[cfg(not(feature = "legacy-ring-crypto"))]
+    {
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1019,7 +1037,7 @@ fn postgres_tls_config(
     verifies_hostname: bool,
 ) -> Result<rustls::ClientConfig, String> {
     if pg_config.get_ssl_mode() != SslMode::Disable && accepts_invalid_certs {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = default_rustls_provider();
         let builder = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoPostgresCertVerification { provider }));
@@ -1030,7 +1048,7 @@ fn postgres_tls_config(
     let builder = if verifies_hostname {
         rustls::ClientConfig::builder().with_root_certificates(root_store)
     } else {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = default_rustls_provider();
         rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(
             PostgresCaOnlyCertVerification { provider, roots: Arc::new(root_store) },
         ))

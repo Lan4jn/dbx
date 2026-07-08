@@ -63,7 +63,7 @@ fn quote_table_ref(database: &str, table: &str) -> String {
 fn row_get<T, I>(row: &mysql_async::Row, index: I) -> Option<T>
 where
     T: mysql_async::prelude::FromValue,
-    I: mysql_async::prelude::ColumnIndex,
+    I: mysql_common::prelude::ColumnIndex,
 {
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }
@@ -562,7 +562,14 @@ fn mysql_ssl_opts(
 
     let mut ssl_opts = base_ssl_opts.unwrap_or_default();
     if let Some(ca_cert_path) = ca_cert_path.filter(|_| mysql_url_requires_ssl(url) || has_client_identity) {
-        ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(ca_cert_path).into()]);
+        #[cfg(feature = "legacy-mysql-032")]
+        {
+            ssl_opts = ssl_opts.with_root_cert_path(Some(PathBuf::from(ca_cert_path)));
+        }
+        #[cfg(not(feature = "legacy-mysql-032"))]
+        {
+            ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(ca_cert_path).into()]);
+        }
         if !mysql_url_verifies_identity(url) {
             ssl_opts = ssl_opts.with_danger_skip_domain_validation(true);
         }
@@ -570,10 +577,20 @@ fn mysql_ssl_opts(
 
     match (files.sslcert.as_deref(), files.sslkey.as_deref()) {
         (Some(cert_path), Some(key_path)) => {
-            ssl_opts = ssl_opts.with_client_identity(Some(mysql_async::ClientIdentity::new(
-                PathBuf::from(cert_path).into(),
-                PathBuf::from(key_path).into(),
-            )));
+            #[cfg(feature = "legacy-mysql-032")]
+            {
+                ssl_opts = ssl_opts.with_client_identity(Some(mysql_async::ClientIdentity::new(
+                    PathBuf::from(cert_path),
+                    PathBuf::from(key_path),
+                )));
+            }
+            #[cfg(not(feature = "legacy-mysql-032"))]
+            {
+                ssl_opts = ssl_opts.with_client_identity(Some(mysql_async::ClientIdentity::new(
+                    PathBuf::from(cert_path).into(),
+                    PathBuf::from(key_path).into(),
+                )));
+            }
         }
         (Some(_), None) => return Err("MySQL ssl-cert requires ssl-key".to_string()),
         (None, Some(_)) => return Err("MySQL ssl-key requires ssl-cert".to_string()),

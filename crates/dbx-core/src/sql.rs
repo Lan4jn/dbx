@@ -1392,13 +1392,13 @@ impl Default for SqlScanner {
 fn keyword_at(sql: &str, idx: usize, keyword: &str) -> bool {
     let end = idx + keyword.len();
     sql.get(idx..end).is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-        && sql[..idx].chars().next_back().is_none_or(|ch| !is_sql_ident_char(ch))
-        && sql.get(end..).and_then(|tail| tail.chars().next()).is_none_or(|ch| !is_sql_ident_char(ch))
+        && sql[..idx].chars().next_back().map_or(true, |ch| !is_sql_ident_char(ch))
+        && sql.get(end..).and_then(|tail| tail.chars().next()).map_or(true, |ch| !is_sql_ident_char(ch))
 }
 
 fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
     sql.get(..keyword.len()).is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-        && sql.get(keyword.len()..).and_then(|tail| tail.chars().next()).is_none_or(|ch| !is_sql_ident_char(ch))
+        && sql.get(keyword.len()..).and_then(|tail| tail.chars().next()).map_or(true, |ch| !is_sql_ident_char(ch))
 }
 
 fn is_sql_ident_char(ch: char) -> bool {

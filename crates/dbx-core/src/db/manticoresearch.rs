@@ -12,7 +12,7 @@ fn quote_identifier(value: &str) -> String {
 fn row_get<T, I>(row: &mysql_async::Row, index: I) -> Option<T>
 where
     T: mysql_async::prelude::FromValue,
-    I: mysql_async::prelude::ColumnIndex,
+    I: mysql_common::prelude::ColumnIndex,
 {
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }

@@ -6,6 +6,10 @@ describe("window controls", () => {
     expect(shouldShowWindowControls(false, true)).toBe(true);
   });
 
+  it("hides custom controls when native window decorations are enabled", () => {
+    expect(shouldShowWindowControls(false, true, true)).toBe(false);
+  });
+
   it("keeps macOS on native traffic lights", () => {
     expect(shouldShowWindowControls(true, true)).toBe(false);
   });

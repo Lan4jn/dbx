@@ -232,7 +232,7 @@ pub fn prestosql_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str,
     let mut jdbc_config = config.clone();
     jdbc_config.connection_string =
         Some(trino_like_jdbc_connection_string(config, host, port, config.effective_database().unwrap_or("")));
-    if jdbc_config.jdbc_driver_class.as_deref().is_none_or(|value| value.trim().is_empty()) {
+    if jdbc_config.jdbc_driver_class.as_deref().map_or(true, |value| value.trim().is_empty()) {
         jdbc_config.jdbc_driver_class = Some(PRESTOSQL_JDBC_DRIVER_CLASS.to_string());
     }
     jdbc_config

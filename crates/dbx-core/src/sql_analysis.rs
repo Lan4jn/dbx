@@ -1,7 +1,5 @@
-use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
-
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
     ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
@@ -15,11 +13,11 @@ use sqlparser::tokenizer::Span;
 
 use crate::sql::{starts_with_duckdb_result_sql_keyword, starts_with_executable_sql_keyword};
 
-static CLICKHOUSE_STRICTNESS_FIRST_JOIN_RE: LazyLock<Regex> = LazyLock::new(|| {
+static CLICKHOUSE_STRICTNESS_FIRST_JOIN_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(r"(?i)\b(ANY|ALL|SEMI|ANTI|ASOF)\s+(LEFT|RIGHT|FULL|INNER|CROSS)(\s+OUTER)?\s+JOIN\b")
         .expect("valid ClickHouse join strictness regex")
 });
-static POSTGRES_DEFAULT_PRIVILEGES_RE: LazyLock<Regex> = LazyLock::new(|| {
+static POSTGRES_DEFAULT_PRIVILEGES_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(r"(?i)^\s*ALTER\s+DEFAULT\s+PRIVILEGES\b").expect("valid PostgreSQL default privileges regex")
 });
 
@@ -224,9 +222,9 @@ impl Analyzer {
 
         for item in &select.projection {
             match item {
-                SelectItem::UnnamedExpr(expr)
-                | SelectItem::ExprWithAlias { expr, .. }
-                | SelectItem::ExprWithAliases { expr, .. } => self.visit_expr(expr),
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => self.visit_expr(expr),
+                #[cfg(not(feature = "legacy-sqlparser-060"))]
+                SelectItem::ExprWithAliases { expr, .. } => self.visit_expr(expr),
                 _ => {}
             }
         }

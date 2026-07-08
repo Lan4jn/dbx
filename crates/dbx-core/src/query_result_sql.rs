@@ -671,7 +671,9 @@ fn sql_server_row_number_pagination_safe(statement: &str) -> bool {
     select.projection.iter().all(|item| match item {
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
         SelectItem::UnnamedExpr(expr) => sql_server_derived_projection_has_name(expr),
-        SelectItem::ExprWithAlias { .. } | SelectItem::ExprWithAliases { .. } => true,
+        SelectItem::ExprWithAlias { .. } => true,
+        #[cfg(not(feature = "legacy-sqlparser-060"))]
+        SelectItem::ExprWithAliases { .. } => true,
     })
 }
 

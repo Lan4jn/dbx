@@ -131,8 +131,8 @@ fn replace_old_jre_dir(am: &AgentManager, path: &Path) -> Result<Option<PathBuf>
 const REGISTRY_PATH: &str = "https://github.com/t8y2/dbx/releases/download/agents-latest/agent-registry.json";
 const REGISTRY_R2_PATH: &str = "agents/agent-registry.json";
 
-static REGISTRY_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time::Instant, AgentRegistry)>>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+static REGISTRY_CACHE: once_cell::sync::Lazy<tokio::sync::Mutex<Option<(std::time::Instant, AgentRegistry)>>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AgentProgressEvent {

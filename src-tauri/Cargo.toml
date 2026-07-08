@@ -16,6 +16,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 default = ["duckdb-bundled", "mq-admin"]
 duckdb-bundled = ["duckdb", "dbx-core/duckdb-bundled"]
 mq-admin = ["dbx-core/mq-admin"]
+custom-protocol = ["tauri/custom-protocol"]
+legacy-ring-crypto = []
+legacy-native-window-decorations = []
 
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }

@@ -8,8 +8,8 @@ use tauri::{AppHandle, Manager, State, Window};
 
 use super::connection::AppState;
 use crate::{
-    apply_debug_log_level, apply_desktop_settings, hide_main_window_for_close, request_app_close, CloseBehaviorState,
-    DataDirState,
+    apply_debug_log_level, apply_desktop_settings, hide_main_window_for_close, request_app_close,
+    use_native_window_decorations_for_platform, CloseBehaviorState, DataDirState,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -33,6 +33,11 @@ pub struct DataDirConfig {
     pub source: String,
     pub restart_required: bool,
     pub env_locked: bool,
+}
+
+#[tauri::command]
+pub fn use_native_window_decorations() -> bool {
+    use_native_window_decorations_for_platform(std::env::consts::OS)
 }
 
 #[tauri::command]

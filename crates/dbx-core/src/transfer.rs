@@ -14,8 +14,8 @@ use crate::sql::split_sql_statements;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::sql_dialect::{qualified_transfer_table, quote_transfer_identifier};
 
-static CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+static CANCELLED: once_cell::sync::Lazy<RwLock<HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashSet::new()));
 
 const MAX_TRANSFER_WRITE_SQL_BYTES: usize = 512 * 1024;
 const MAX_SQLSERVER_INSERT_ROWS: usize = 1000;

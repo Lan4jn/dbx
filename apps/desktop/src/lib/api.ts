@@ -48,6 +48,8 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 // Re-export all functions via lazy forwarding
 // ---------------------------------------------------------------------------
 
+export const useNativeWindowDecorations = forward("useNativeWindowDecorations");
+
 // Connection
 export const testConnection = forward("testConnection");
 export const connectDb = forward("connectDb");

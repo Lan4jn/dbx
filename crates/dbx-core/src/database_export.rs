@@ -12,8 +12,8 @@ use crate::transfer::{
     wrap_dameng_identity_insert_sql_for_table,
 };
 
-static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+static EXPORT_CANCELLED: once_cell::sync::Lazy<RwLock<HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashSet::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -514,8 +514,8 @@ fn normalize_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>) ->
         return ddl.to_string();
     }
 
-    static LEGACY_MYSQL_ROW_FORMAT_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bROW_FORMAT\s*=\s*(COMPACT|REDUNDANT)\b").unwrap());
+    static LEGACY_MYSQL_ROW_FORMAT_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?i)\bROW_FORMAT\s*=\s*(COMPACT|REDUNDANT)\b").unwrap());
 
     LEGACY_MYSQL_ROW_FORMAT_RE.replace_all(ddl, "ROW_FORMAT=DYNAMIC").into_owned()
 }

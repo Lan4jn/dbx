@@ -89,7 +89,7 @@ fn tdengine_tbname_value(save_columns: &[Option<String>], row: &[Value]) -> Opti
 
 fn tdengine_can_insert_column(column: &str, table_name: &str, tbname: Option<&str>, tag_columns: &[String]) -> bool {
     let normalized = column.to_ascii_lowercase();
-    let target_is_child_table = tbname.is_none_or(|tbname| tbname == table_name);
+    let target_is_child_table = tbname.map_or(true, |tbname| tbname == table_name);
     if !target_is_child_table {
         return true;
     }

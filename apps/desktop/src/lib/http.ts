@@ -31,6 +31,10 @@ import type {
   SavedSqlLibrary,
 } from "@/types/database";
 import type { CollectionInfo } from "@/types/database";
+
+export async function useNativeWindowDecorations(): Promise<boolean> {
+  return false;
+}
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
