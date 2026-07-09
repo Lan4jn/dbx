@@ -58,6 +58,7 @@ import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
 import { databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
+import { parseAutoRefreshIntervalSeconds } from "@/lib/common/autoRefreshInterval";
 import { isTableDataEditable } from "@/lib/table/tableEditing";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
@@ -300,9 +301,11 @@ const canExportResultArchive = computed(() => props.activeTab.mode === "query" &
 const resultAutoSave = computed(() => props.activeTab.resultAutoSave === true);
 const QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS = [5, 10, 30, 60, 300];
 const queryResultAutoRefreshIntervalSeconds = ref(10);
+const queryResultAutoRefreshCustomIntervalInput = ref("10");
 const queryResultAutoRefreshEnabled = ref(false);
 let queryResultAutoRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const queryResultAutoRefreshLabel = computed(() => (queryResultAutoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: queryResultAutoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
+const queryResultAutoRefreshUsesCustomInterval = computed(() => !QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS.includes(queryResultAutoRefreshIntervalSeconds.value));
 watch(
   () => visibleResultItems.value.map((item) => item.index).join(","),
   () => {
@@ -641,7 +644,25 @@ function restartQueryResultAutoRefreshTimer() {
 
 function setQueryResultAutoRefreshInterval(seconds: number) {
   queryResultAutoRefreshIntervalSeconds.value = seconds;
+  queryResultAutoRefreshCustomIntervalInput.value = String(seconds);
   if (queryResultAutoRefreshEnabled.value) restartQueryResultAutoRefreshTimer();
+}
+
+function applyCustomQueryResultAutoRefreshInterval() {
+  if (queryResultAutoRefreshCustomIntervalInput.value.trim() === "") return;
+  const seconds = parseAutoRefreshIntervalSeconds(queryResultAutoRefreshCustomIntervalInput.value);
+  if (seconds == null) {
+    toast(t("tabs.invalidAutoRefreshInterval"), 4000);
+    return;
+  }
+  setQueryResultAutoRefreshInterval(seconds);
+}
+
+function onCustomQueryResultAutoRefreshInputKeydown(event: KeyboardEvent) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  applyCustomQueryResultAutoRefreshInterval();
+  (event.currentTarget as HTMLInputElement | null)?.blur();
 }
 
 function toggleQueryResultAutoRefresh() {
@@ -1023,6 +1044,24 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         <span v-else class="h-3.5 w-3.5" />
                         {{ t("tabs.autoRefreshEvery", { seconds }) }}
                       </DropdownMenuItem>
+                      <div class="relative flex cursor-default select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent">
+                        <Check v-if="queryResultAutoRefreshUsesCustomInterval" class="h-3.5 w-3.5 shrink-0" />
+                        <span v-else class="h-3.5 w-3.5 shrink-0" />
+                        <span class="shrink-0">{{ t("tabs.customAutoRefreshInterval") }}</span>
+                        <input
+                          v-model="queryResultAutoRefreshCustomIntervalInput"
+                          type="text"
+                          inputmode="numeric"
+                          pattern="[0-9]*"
+                          class="h-6 w-12 rounded border border-input bg-background px-1.5 text-right text-xs tabular-nums outline-none focus:border-ring focus:ring-1 focus:ring-ring"
+                          :aria-label="t('tabs.customAutoRefreshPrompt')"
+                          @pointerdown.stop
+                          @click.stop
+                          @keydown.stop="onCustomQueryResultAutoRefreshInputKeydown"
+                          @blur="applyCustomQueryResultAutoRefreshInterval"
+                        />
+                        <span class="shrink-0 text-xs text-muted-foreground">{{ t("tabs.autoRefreshSecondsUnit") }}</span>
+                      </div>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>

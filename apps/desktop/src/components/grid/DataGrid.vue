@@ -85,6 +85,7 @@ import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
 import type { QueryResult, ColumnInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo, TableInfoTab } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
+import { parseAutoRefreshIntervalSeconds } from "@/lib/common/autoRefreshInterval";
 import { dataGridCellDisplayText, dataGridCellEditorText } from "@/lib/dataGrid/dataGridCellCoercion";
 import { createColumnDrafts } from "@/lib/table/tableStructureEditorState";
 import type { BuildSingleColumnAlterSqlOptions } from "@/lib/table/tableStructureEditorSql";
@@ -249,9 +250,11 @@ const emit = defineEmits<{
 }>();
 
 const autoRefreshIntervalSeconds = ref(10);
+const autoRefreshCustomIntervalInput = ref("10");
 const autoRefreshEnabled = ref(false);
 let autoRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const autoRefreshLabel = computed(() => (autoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: autoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
+const autoRefreshUsesCustomInterval = computed(() => !AUTO_REFRESH_INTERVAL_OPTIONS.includes(autoRefreshIntervalSeconds.value));
 
 console.info("[DBX][DataGrid:setup]", {
   traceId: dataGridTraceId,
@@ -4080,7 +4083,25 @@ function restartAutoRefreshTimer() {
 
 function setAutoRefreshInterval(seconds: number) {
   autoRefreshIntervalSeconds.value = seconds;
+  autoRefreshCustomIntervalInput.value = String(seconds);
   if (autoRefreshEnabled.value) restartAutoRefreshTimer();
+}
+
+function applyCustomAutoRefreshInterval() {
+  if (autoRefreshCustomIntervalInput.value.trim() === "") return;
+  const seconds = parseAutoRefreshIntervalSeconds(autoRefreshCustomIntervalInput.value);
+  if (seconds == null) {
+    toast(t("tabs.invalidAutoRefreshInterval"), 4000);
+    return;
+  }
+  setAutoRefreshInterval(seconds);
+}
+
+function onCustomAutoRefreshInputKeydown(event: KeyboardEvent) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  applyCustomAutoRefreshInterval();
+  (event.currentTarget as HTMLInputElement | null)?.blur();
 }
 
 function toggleAutoRefresh() {
@@ -8843,6 +8864,24 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   <span v-else class="h-3.5 w-3.5" />
                   {{ t("tabs.autoRefreshEvery", { seconds }) }}
                 </DropdownMenuItem>
+                <div class="relative flex cursor-default select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent">
+                  <Check v-if="autoRefreshUsesCustomInterval" class="h-3.5 w-3.5 shrink-0" />
+                  <span v-else class="h-3.5 w-3.5 shrink-0" />
+                  <span class="shrink-0">{{ t("tabs.customAutoRefreshInterval") }}</span>
+                  <input
+                    v-model="autoRefreshCustomIntervalInput"
+                    type="text"
+                    inputmode="numeric"
+                    pattern="[0-9]*"
+                    class="h-6 w-12 rounded border border-input bg-background px-1.5 text-right text-xs tabular-nums outline-none focus:border-ring focus:ring-1 focus:ring-ring"
+                    :aria-label="t('tabs.customAutoRefreshPrompt')"
+                    @pointerdown.stop
+                    @click.stop
+                    @keydown.stop="onCustomAutoRefreshInputKeydown"
+                    @blur="applyCustomAutoRefreshInterval"
+                  />
+                  <span class="shrink-0 text-xs text-muted-foreground">{{ t("tabs.autoRefreshSecondsUnit") }}</span>
+                </div>
               </DropdownMenuContent>
             </DropdownMenu>
             <Tooltip v-if="props.result.columns.length">

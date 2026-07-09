@@ -68,3 +68,5 @@ src-tauri/target*/
 src-tauri-legacy/target*/
 third-party/webview2-fixed-runtime/
 _dev
+src-tauri/target-win-x64/
+src-tauri-legacy/target-win7-x64/
