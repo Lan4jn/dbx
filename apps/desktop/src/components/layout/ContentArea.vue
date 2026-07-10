@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, defineAsyncComponent, watch, nextTick, onMounted, onUnmounted } from "vue";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
+import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { Check, Columns3, EyeOff, Loader2, Search, Bot, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Timer, Wrench, Toolbox, ListChecks, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus } from "@lucide/vue";
+import { Check, Columns3, EyeOff, Loader2, Search, GitBranch, BarChart3, TableProperties, ChevronDown, ChevronUp, Inbox, RefreshCcw, Timer, Wrench, Toolbox, ListChecks, Database, Download, Upload, X, Pin, Rows3, SquareDashed, Minus, Plus } from "@lucide/vue";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { Button } from "@/components/ui/button";
@@ -14,15 +15,17 @@ import LightTooltip from "@/components/ui/LightTooltip.vue";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
 import ColumnInfoPanel from "@/components/editor/ColumnInfoPanel.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
+import QueryErrorActions from "@/components/common/QueryErrorActions.vue";
 import type { ColumnInfo } from "@/components/editor/ColumnInfoPanel.vue";
 let dataGridComponentPromise: Promise<typeof import("@/components/grid/DataGrid.vue")> | undefined;
 function loadDataGridComponent() {
   if (!dataGridComponentPromise) {
     dataGridComponentPromise = (async () => {
-      const startedAt = performance.now();
-      console.info("[DBX][DataGrid:load:start]");
+      const shouldLogTiming = isDebugLoggingEnabled();
+      const startedAt = shouldLogTiming ? performance.now() : 0;
+      if (shouldLogTiming) appendDebugLog("info", "[DBX][DataGrid:load:start]");
       const component = await import("@/components/grid/DataGrid.vue");
-      console.info("[DBX][DataGrid:load:done]", { elapsed: `${Math.round(performance.now() - startedAt)}ms` });
+      if (shouldLogTiming) appendDebugLog("info", "[DBX][DataGrid:load:done]", { elapsed: `${Math.round(performance.now() - startedAt)}ms` });
       return component;
     })();
   }
@@ -47,6 +50,7 @@ const NacosAdminConsole = defineAsyncComponent(() => import("@/components/nacos/
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
+const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/DamengJobAdmin.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 import { useQueryStore } from "@/stores/queryStore";
@@ -54,7 +58,6 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridSearchMode } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
-import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
 import { databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, resultSqlForGrid, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
@@ -71,7 +74,7 @@ import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import { useTabScroll } from "@/composables/useTabScroll";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
-import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta } from "@/types/database";
+import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta, ObjectBrowserViewport } from "@/types/database";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 
 type DataGridHandle = {
@@ -81,7 +84,7 @@ type DataGridHandle = {
   visibleColumnCount: number;
   displayableColumnCount: number;
   hiddenColumnCount: number;
-  filteredColumnVisibilityOptions: (search: string) => Array<{ index: number; column: string }>;
+  filteredColumnVisibilityOptions: (search: string) => Array<{ index: number; column: string; comment?: string }>;
   isColumnVisible: (columnIndex: number) => boolean;
   toggleColumnVisibility: (columnIndex: number) => void;
   showAllColumns: () => void;
@@ -121,6 +124,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:activeOutputView": [value: "result" | "summary" | "explain" | "chart"];
   fixWithAi: [errorMessage: string];
+  sendSelectionToAi: [sql: string];
   execute: [sqlOverride?: SqlExecutionOverride];
   saveSql: [];
   cancel: [];
@@ -141,6 +145,7 @@ const emit = defineEmits<{
   editTableStructure: [tableName: string];
   openObjectTable: [target: { tableName: string; schema?: string; tableType?: string }];
   objectSchemaChange: [schema: string | undefined];
+  objectBrowserViewportChange: [tabId: string, viewport: ObjectBrowserViewport];
   structureEditorSaved: [commentChanged: boolean];
   structureEditorClose: [];
   openSettings: [initialTab?: string, initialSection?: string];
@@ -480,8 +485,9 @@ watch(
   () => props.activeTab.result,
   (result) => {
     if (!result) return;
+    if (!isDebugLoggingEnabled()) return;
     const startedAt = performance.now();
-    console.info("[DBX][ContentArea:result:observed]", {
+    appendDebugLog("info", "[DBX][ContentArea:result:observed]", {
       tabId: props.activeTab.id,
       rowCount: result.rows.length,
       columnCount: result.columns.length,
@@ -489,13 +495,13 @@ watch(
       isExecuting: props.activeTab.isExecuting,
     });
     nextTick(() => {
-      console.info("[DBX][ContentArea:result:nextTick]", {
+      appendDebugLog("info", "[DBX][ContentArea:result:nextTick]", {
         tabId: props.activeTab.id,
         elapsed: `${Math.round(performance.now() - startedAt)}ms`,
         isExecuting: props.activeTab.isExecuting,
       });
       requestAnimationFrame(() => {
-        console.info("[DBX][ContentArea:result:first-frame]", {
+        appendDebugLog("info", "[DBX][ContentArea:result:first-frame]", {
           tabId: props.activeTab.id,
           elapsed: `${Math.round(performance.now() - startedAt)}ms`,
           isExecuting: props.activeTab.isExecuting,
@@ -793,6 +799,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
               :initial-selection="activeTab.editorSelection"
               @update:model-value="emit('editorUpdate', activeTab.id, $event)"
               @selection-change="emit('editorSelectionChange', $event)"
+              @send-selection-to-ai="emit('sendSelectionToAi', $event)"
               @cursor-change="emit('editorCursorChange', $event)"
               @viewport-change="emit('editorViewportChange', activeTab.id, $event)"
               @selection-state-change="emit('editorSelectionStateChange', activeTab.id, $event)"
@@ -1147,6 +1154,9 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 :editable="!!activeTab.queryAnalysis || !!mongoQueryResultSaveHandler"
                 :source-columns="activeTab.querySourceColumns"
                 :custom-save-handler="mongoQueryResultSaveHandler"
+                :query-editability-reason="activeTab.queryEditabilityReason"
+                :allow-insert-rows="activeTab.queryAnalysis?.allowInsertDelete !== false"
+                :allow-delete-rows="activeTab.queryAnalysis?.allowInsertDelete !== false"
                 context="results"
                 :database-type="activeEffectiveDatabaseType"
                 :connection-id="activeTab.connectionId"
@@ -1170,14 +1180,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                 @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
               >
                 <template v-if="activeTab.result?.columns.includes('Error')" #error-actions="{ errorMessage }">
-                  <Button v-if="activeTab.connectionId && isQueryTimeoutErrorMessage(String(errorMessage))" variant="outline" size="sm" class="h-7 gap-1.5 px-2.5 text-xs" @click="emit('openConnectionSettings', activeTab.connectionId, 'advanced')">
-                    <Wrench class="h-3.5 w-3.5" />
-                    {{ t("editor.changeQueryTimeout") }}
-                  </Button>
-                  <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2.5 text-xs" @click="emit('fixWithAi', String(errorMessage))">
-                    <Bot class="h-3.5 w-3.5" />
-                    {{ t("ai.fixWithAi") }}
-                  </Button>
+                  <QueryErrorActions :error-message="String(errorMessage)" :connection-id="activeTab.connectionId" @change-query-timeout="activeTab.connectionId && emit('openConnectionSettings', activeTab.connectionId, 'advanced')" @fix-with-ai="(message) => emit('fixWithAi', message)" />
                 </template>
               </DataGrid>
               <QueryLoadingState
@@ -1236,7 +1239,10 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                   <span class="flex h-4 w-4 items-center justify-center rounded border" :class="dataGridRef?.isColumnVisible(option.index) ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-transparent'">
                     <Check class="h-3 w-3 stroke-[3]" />
                   </span>
-                  <span class="truncate font-mono text-xs" :title="option.column">{{ option.column }}</span>
+                  <span class="min-w-0">
+                    <span class="block truncate font-mono text-xs" :title="option.column">{{ option.column }}</span>
+                    <span v-if="option.comment" class="block truncate text-[11px] leading-4 text-muted-foreground" :title="option.comment">{{ option.comment }}</span>
+                  </span>
                 </button>
                 <div v-if="columnVisibilityOptions.length === 0" class="px-2 py-6 text-center text-xs text-muted-foreground">
                   {{ t("grid.noSearchResults") }}
@@ -1451,7 +1457,11 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
           @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
           @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
           @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => emit('sort', column, columnIndex, direction, whereInput, mode)"
-        />
+        >
+          <template v-if="activeTab.result?.columns.includes('Error')" #error-actions="{ errorMessage }">
+            <QueryErrorActions :error-message="String(errorMessage)" :connection-id="activeTab.connectionId" @change-query-timeout="activeTab.connectionId && emit('openConnectionSettings', activeTab.connectionId, 'advanced')" @fix-with-ai="(message) => emit('fixWithAi', message)" />
+          </template>
+        </DataGrid>
         <QueryLoadingState v-else-if="activeTab.isExecuting" class="h-full" :label-key="queryExecutionLabelKey(activeTab)" :elapsed-seconds="queryRunningElapsedSeconds" show-cancel :cancel-disabled="!canCancelQueryExecution(activeTab)" :cancelling="activeTab.isCancelling" @cancel="emit('cancel')" />
         <div v-else class="h-full flex flex-col items-center justify-center gap-3 text-muted-foreground text-sm">
           <Inbox class="h-8 w-8 opacity-60" />
@@ -1544,8 +1554,10 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
           :connection="activeConnection"
           :database="activeTab.database"
           :schema="activeTab.objectBrowser?.schema"
+          :viewport="activeTab.objectBrowser?.viewport"
           @open-table="emit('openObjectTable', $event)"
           @schema-change="emit('objectSchemaChange', $event)"
+          @viewport-change="emit('objectBrowserViewportChange', activeTab.id, $event)"
         />
       </div>
     </template>
@@ -1571,6 +1583,10 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
 
     <template v-else-if="activeTab.mode === 'users' && activeConnection">
       <DatabaseUserAdmin :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'dameng-jobs' && activeConnection">
+      <DamengJobAdmin :key="activeTab.id" :connection="activeConnection" />
     </template>
   </div>
 </template>

@@ -11,6 +11,10 @@ export function shouldShowWindowControls(isMac: boolean, isDesktop = true, nativ
   return isDesktop && !isMac && !nativeDecorations;
 }
 
+export function shouldDrawDesktopWindowFrame(isMac: boolean, isDesktop = true): boolean {
+  return isDesktop && !isMac;
+}
+
 export function useWindowControls() {
   const isMaximized = ref(false);
   const isFullscreen = ref(false);

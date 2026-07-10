@@ -3,6 +3,7 @@ import type {
   DatabaseInfo,
   SchemaInfo,
   LinkedServerInfo,
+  CatalogInfo,
   TableInfo,
   ObjectInfo,
   CompletionAssistantRequest,
@@ -77,6 +78,7 @@ import type {
   SqlFileProgress,
   TransferRequest,
   TransferProgress,
+  TransferOwnershipPreview,
   TableImportPreviewRequest,
   TableImportPreview,
   TableImportRequest,
@@ -97,8 +99,10 @@ import type {
   ExplainSqlBuildResult,
   DroppedFilePreviewSqlOptions,
   MongoGridFsFileInfo,
+  AppSupportInfo,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
+import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
   DataGridColumnValueFilterConditionOptions,
@@ -339,8 +343,16 @@ export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
   return get("/api/agents/installed");
 }
 
+export async function isAgentInstalled(dbType: string): Promise<boolean> {
+  return get(`/api/agents/installed/${encodeURIComponent(dbType)}`);
+}
+
 export async function getDriverStoreUsage(): Promise<DriverStoreUsage> {
   return get("/api/agents/storage-usage");
+}
+
+export async function clearDriverDownloadCache(): Promise<void> {
+  await del("/api/agents/download-cache");
 }
 
 export async function getDriverRuntimeSummary(): Promise<DriverRuntimeSummary> {
@@ -488,6 +500,14 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
   return get(`/api/schema/databases?${qs({ connection_id: connectionId })}`);
 }
 
+export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
+  return get(`/api/schema/doris/catalogs?${qs({ connection_id: connectionId })}`);
+}
+
+export async function listDorisCatalogDatabases(connectionId: string, catalog: string): Promise<DatabaseInfo[]> {
+  return get(`/api/schema/doris/catalog-databases?${qs({ connection_id: connectionId, catalog })}`);
+}
+
 export async function listSqlServerLinkedServers(connectionId: string): Promise<LinkedServerInfo[]> {
   return get(`/api/schema/sqlserver/linked-servers?${qs({ connection_id: connectionId })}`);
 }
@@ -525,15 +545,15 @@ export async function listSchemaInfos(connectionId: string, database: string): P
   return schemas.map((name) => ({ name, comment: null }));
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[]): Promise<TableInfo[]> {
-  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset, object_types: objectTypes?.join(",") })}`);
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[], catalog?: string): Promise<TableInfo[]> {
+  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset, object_types: objectTypes?.join(","), catalog })}`);
 }
 
-export async function getTableComment(_connectionId: string, _database: string, _schema: string, _table: string): Promise<string | null> {
+export async function getTableComment(_connectionId: string, _database: string, _schema: string, _table: string, _catalog?: string): Promise<string | null> {
   throw new Error("Table comment lookup is not available in the web backend");
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number): Promise<ObjectInfo[]> {
+export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
   return get(
     `/api/schema/objects?${qs({
       connection_id: connectionId,
@@ -543,6 +563,7 @@ export async function listObjects(connectionId: string, database: string, schema
       filter,
       limit,
       offset,
+      catalog,
     })}`,
   );
 }
@@ -563,28 +584,28 @@ export async function getObjectSource(connectionId: string, database: string, sc
   return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType })}`);
 }
 
-export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
-  return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table })}`);
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ColumnInfo[]> {
+  return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
   return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }
 
-export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
-  return get(`/api/schema/indexes?${qs({ connection_id: connectionId, database, schema, table })}`);
+export async function listIndexes(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<IndexInfo[]> {
+  return get(`/api/schema/indexes?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
-export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string): Promise<ForeignKeyInfo[]> {
-  return get(`/api/schema/foreign-keys?${qs({ connection_id: connectionId, database, schema, table })}`);
+export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ForeignKeyInfo[]> {
+  return get(`/api/schema/foreign-keys?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
-export async function listTriggers(connectionId: string, database: string, schema: string, table: string): Promise<TriggerInfo[]> {
-  return get(`/api/schema/triggers?${qs({ connection_id: connectionId, database, schema, table })}`);
+export async function listTriggers(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<TriggerInfo[]> {
+  return get(`/api/schema/triggers?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind): Promise<string> {
-  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType })}`);
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string): Promise<string> {
+  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog })}`);
 }
 
 export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): Promise<SchemaDiffPreparation> {
@@ -663,6 +684,7 @@ export async function executeMulti(
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
+    useTransaction?: boolean;
   },
 ): Promise<QueryResult[]> {
   return post("/api/query/execute-multi", { connectionId, database, sql, schema, executionId, ...options });
@@ -1317,7 +1339,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     es.onmessage = (e) => {
       const progress: TransferProgress = JSON.parse(e.data);
       onProgress(progress);
-      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
+      if (isTerminalTransferProgress(progress)) {
         es.close();
         resolve();
       }
@@ -1331,6 +1353,10 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
 
 export async function cancelTransfer(transferId: string): Promise<void> {
   return post("/api/transfer/cancel", { transferId });
+}
+
+export async function previewTransferOwnership(request: TransferRequest): Promise<TransferOwnershipPreview> {
+  return post("/api/transfer/ownership-preview", { request });
 }
 
 export interface SortTablesByFkOptions {
@@ -2098,6 +2124,17 @@ export async function downloadAndInstallUpdate(_source: UpdateDownloadSource, _l
 export async function getAppVersion(): Promise<string> {
   const res: { version: string } = await get("/api/version");
   return res.version;
+}
+
+export async function getAppSupportInfo(): Promise<AppSupportInfo> {
+  const appVersion = await getAppVersion();
+  return {
+    appVersion,
+    runtime: "web",
+    osName: navigator.platform || "web",
+    osVersion: null,
+    arch: "",
+  };
 }
 
 // ---------------------------------------------------------------------------

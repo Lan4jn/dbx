@@ -50,6 +50,7 @@ import {
   Clipboard,
   Check,
   UsersRound,
+  CalendarClock,
   Lock,
   HardDriveDownload,
   FilePlus,
@@ -336,6 +337,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: TableProperties, colorClass: "text-primary" };
     case "user-admin":
       return { icon: UsersRound, colorClass: "text-primary" };
+    case "dameng-job-admin":
+      return { icon: CalendarClock, colorClass: "text-primary" };
     case "index":
       return { icon: Key, colorClass: "text-amber-400" };
     case "fkey":
@@ -410,7 +413,7 @@ function isGroupLabel(node: TreeNode): boolean {
 function displayLabel(node: TreeNode): string {
   if (node.type === "load-more") return t(node.label);
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
-  if (node.type === "user-admin") return t(node.label);
+  if (node.type === "user-admin" || node.type === "dameng-job-admin") return t(node.label);
   if (node.type === "linked-server-root") return t(node.label);
   if (node.label === "tree.defaultDatabase") return t(node.label);
   return isGroupLabel(node) ? t(node.label) : node.label;
@@ -616,6 +619,9 @@ async function toggle() {
     } else if (node.type === "user-admin" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       queryStore.openUserAdmin(node.connectionId);
+    } else if (node.type === "dameng-job-admin" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
+      queryStore.openDamengJobAdmin(node.connectionId);
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await connectionStore.loadMongoCollections(node.connectionId, node.database);
     } else if (node.type === "vector-database" && node.connectionId && node.database) {
@@ -644,15 +650,21 @@ async function toggle() {
         })
         .catch(() => {});
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
-      const config = connectionStore.getConfig(node.connectionId);
-      const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-      if (config?.db_type === "sqlserver") {
-        await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database);
-      } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
-        await connectionStore.loadSchemas(node.connectionId, node.database);
+      if (node.catalog && node.catalog !== "internal") {
+        await connectionStore.loadDorisCatalogTables(node);
       } else {
-        await connectionStore.loadTables(node.connectionId, node.database);
+        const config = connectionStore.getConfig(node.connectionId);
+        const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+        if (config?.db_type === "sqlserver") {
+          await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database);
+        } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
+          await connectionStore.loadSchemas(node.connectionId, node.database);
+        } else {
+          await connectionStore.loadTables(node.connectionId, node.database);
+        }
       }
+    } else if (node.type === "doris-catalog" && node.connectionId) {
+      await connectionStore.loadDorisCatalogDatabases(node);
     } else if (node.type === "schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await connectionStore.loadTables(node.connectionId, node.database, node.schema);
     } else if (node.type === "linked-server-root" && node.connectionId) {
@@ -664,15 +676,15 @@ async function toggle() {
     } else if (node.type === "linked-server-schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await connectionStore.loadTables(node.connectionId, node.database, node.schema);
     } else if ((node.type === "table" || node.type === "view" || node.type === "materialized_view") && node.connectionId && hasTreeNodeDatabaseContext(node)) {
-      await connectionStore.loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
+      await connectionStore.loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id, node.catalog);
     } else if (node.type === "group-columns" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadColumns(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadColumns(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-indexes" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-fkeys" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await connectionStore.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await connectionStore.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (databaseObjectGroup) {
       await connectionStore.loadObjectGroupChildren(node);
     }
@@ -761,6 +773,11 @@ function selectedTreeNodesInVisibleOrder(): TreeNode[] {
 }
 
 function selectSingleTreeNode(node: TreeNode) {
+  // Re-clicking the selected row should not replace the selection array and
+  // force visible tree rows to recompute.
+  if (!connectionStore.connectionMultiSelectActive && connectionStore.selectedTreeNodeId === node.id && connectionStore.treeSelectionAnchorId === node.id && connectionStore.selectedTreeNodeIds.length === 1 && connectionStore.selectedTreeNodeIds[0] === node.id) {
+    return;
+  }
   connectionStore.connectionMultiSelectActive = false;
   connectionStore.selectedTreeNodeId = node.id;
   connectionStore.selectedTreeNodeIds = [node.id];
@@ -1125,6 +1142,18 @@ async function openUserAdmin() {
   }
 }
 
+async function openDamengJobAdmin() {
+  const node = props.node;
+  if (!node.connectionId) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    connectionStore.activeConnectionId = node.connectionId;
+    queryStore.openDamengJobAdmin(node.connectionId);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
 async function openData() {
   const node = props.node;
   if (!(node.type === "table" || node.type === "view" || node.type === "materialized_view") || !hasNodeDatabaseContext(node)) return;
@@ -1158,7 +1187,8 @@ async function openData() {
   const querySchema = config ? connectionObjectTreeQuerySchema(config, node.database, tableSchema) : (tableSchema ?? "");
   const effectiveDbType = effectiveDatabaseTypeForConnection(config);
   const metadataDatabaseType = effectiveDbType || config?.db_type || "";
-  const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
+  const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) =>
+    tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.tableMeta?.catalog || "") === (node.catalog || "") && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
   const existingSameTableTab = queryStore.tabs.find(isSameDataTableTab);
   const resetReusedDataTabState = (tab: (typeof queryStore.tabs)[number]) => {
     tab.title = node.label;
@@ -1232,15 +1262,20 @@ async function openData() {
         tableType,
         databaseType: metadataDatabaseType,
         driverProfile: config.driver_profile || config.db_type,
+        catalog: node.catalog,
       })
     : undefined;
-  const tabCachedTableMeta = existingTableMeta?.tableName === node.label && existingTableMeta.schema === tableSchema && existingTableMeta.tableType === tableType && existingTableMeta.columns.length > 0 && existingTableMetaAgeMs < DATA_TAB_METADATA_TTL_MS ? existingTableMeta : undefined;
+  const tabCachedTableMeta =
+    existingTableMeta?.tableName === node.label && (existingTableMeta.catalog || "") === (node.catalog || "") && existingTableMeta.schema === tableSchema && existingTableMeta.tableType === tableType && existingTableMeta.columns.length > 0 && existingTableMetaAgeMs < DATA_TAB_METADATA_TTL_MS
+      ? existingTableMeta
+      : undefined;
   const cachedTableMeta = sharedCachedTableMeta ? tableMetadataToDataTabMeta(sharedCachedTableMeta.metadata, tableSchema) : tabCachedTableMeta;
   const cachedTableMetaAgeMs = sharedCachedTableMeta?.ageMs ?? existingTableMetaAgeMs;
   const cachedTableMetaSource = sharedCachedTableMeta ? "shared" : tabCachedTableMeta ? "tab" : undefined;
   queryStore.setTableMeta(
     tabId,
     cachedTableMeta ?? {
+      catalog: node.catalog,
       schema: tableSchema,
       tableName: node.label,
       tableType,
@@ -1288,6 +1323,7 @@ async function openData() {
           tableType,
           databaseType: metadataDatabaseType,
           driverProfile: config.driver_profile || config.db_type,
+          catalog: node.catalog,
           traceLogger: (event) => console.debug("[DBX][openData:metadata:trace]", { sourceTraceId: traceId, ...event }),
         });
         if (!isCurrentDataTab()) {
@@ -1344,6 +1380,7 @@ async function openData() {
       schema: tableSchema,
       tableName: node.label,
       tableType,
+      catalog: node.catalog,
       columns: columns.map((column) => column.name),
       primaryKeys,
       limit,
@@ -2419,6 +2456,11 @@ const isDuckDbConnection = computed(() => {
   return props.node.type === "connection" && connectionNamespaceCreationTarget(config) === "attach";
 });
 
+const isConnectionSchemaCreation = computed(() => {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  return props.node.type === "connection" && connectionNamespaceCreationTarget(config) === "schema";
+});
+
 const canSetCreateDatabaseCharset = computed(() => {
   const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
   return connectionNamespaceCreationTarget(config) === "database" && supportsCreateDatabaseCharset(config?.db_type, config?.driver_profile);
@@ -2831,6 +2873,20 @@ function openCreateDatabaseDialog() {
   }
 }
 
+function openConnectionNamespaceCreation() {
+  if (isConnectionSchemaCreation.value) {
+    openCreateSchemaDialog();
+    return;
+  }
+  void openCreateDatabase();
+}
+
+function connectionNamespaceCreationLabel() {
+  if (isDuckDbConnection.value) return t("contextMenu.createDuckDbFile");
+  if (isConnectionSchemaCreation.value) return t("contextMenu.createSchema");
+  return t("contextMenu.createDatabase");
+}
+
 function updateCreateDatabaseCharset(value: string) {
   const previousCharset = createDatabaseCharset.value;
   createDatabaseCharset.value = value;
@@ -2857,7 +2913,11 @@ async function loadCreateDatabaseCharsetMetadata(target: "create" | "edit" = "cr
     createDatabaseCollationsByCharset.value = metadata.collationsByCharset;
     const selectedCharset = target === "create" ? createDatabaseCharset.value : editDatabaseCharset.value;
     if (!createDatabaseCharsetOptions.value.includes(selectedCharset) && createDatabaseCharsetOptions.value.length) {
-      target === "create" ? updateCreateDatabaseCharset(createDatabaseCharsetOptions.value[0]) : updateEditDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+      if (target === "create") {
+        updateCreateDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+      } else {
+        updateEditDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+      }
     } else {
       if (target === "create") {
         createDatabaseCollation.value = nextCreateDatabaseCollation(createDatabaseCharset.value, createDatabaseCharset.value, createDatabaseCollation.value, createDatabaseCollationsByCharset.value);
@@ -2966,6 +3026,7 @@ async function createDuckDbAttachedDatabaseFile() {
         attached_databases: [...(config.attached_databases ?? []), { name, path }],
       });
     }
+    await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
     connectionStore.selectedTreeNodeId = `${node.connectionId}:${name}`;
     toast(t("contextMenu.createDuckDbFileSuccess", { name }), 3000);
@@ -2985,6 +3046,7 @@ async function confirmCreateDatabase() {
     if (config?.db_type === "mongodb") {
       await api.mongoCreateDatabase(node.connectionId, name);
       toast(t("contextMenu.createDatabaseSuccess", { name }), 3000);
+      await connectionStore.ensureVisibleDatabase(node.connectionId, name);
       await connectionStore.loadMongoDatabases(node.connectionId);
       return;
     }
@@ -2998,6 +3060,7 @@ async function confirmCreateDatabase() {
     });
     await api.executeQuery(node.connectionId, "", sql);
     toast(t("contextMenu.createDatabaseSuccess", { name }), 3000);
+    await connectionStore.ensureVisibleDatabase(node.connectionId, name);
     await connectionStore.loadDatabases(node.connectionId, { force: true });
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -3149,21 +3212,25 @@ function openCreateSchemaDialog() {
 async function confirmCreateSchema() {
   const node = props.node;
   const name = createSchemaName.value.trim();
-  if (!name || !node.connectionId || !node.database) return;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  const isConnectionLevelSchemaCreation = node.type === "connection" && connectionNamespaceCreationTarget(config) === "schema";
+  const targetDatabase = isConnectionLevelSchemaCreation ? "" : node.database;
+  if (!name || !node.connectionId || (!targetDatabase && !isConnectionLevelSchemaCreation)) return;
   showCreateSchemaDialog.value = false;
   try {
     await connectionStore.ensureConnected(node.connectionId);
     const sql = await buildCreateSchemaSql({
-      databaseType: currentDatabaseType(),
+      databaseType: effectiveDatabaseTypeForConnection(config),
       name,
     });
-    await api.executeQuery(node.connectionId, node.database, sql);
+    await api.executeQuery(node.connectionId, targetDatabase || "", sql);
     toast(t("contextMenu.createSchemaSuccess", { name }), 3000);
-    const config = connectionStore.getConfig(node.connectionId);
-    if (config?.db_type === "sqlserver") {
-      await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database, { force: true });
+    if (isConnectionLevelSchemaCreation) {
+      await connectionStore.loadDatabases(node.connectionId, { force: true });
+    } else if (config?.db_type === "sqlserver") {
+      await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, targetDatabase || "", { force: true });
     } else {
-      await connectionStore.loadSchemas(node.connectionId, node.database, { force: true });
+      await connectionStore.loadSchemas(node.connectionId, targetDatabase || "", { force: true });
     }
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -4472,6 +4539,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (supportsDatabaseUserAdmin(currentDatabaseType())) {
       items.push({ label: t("contextMenu.userAdmin"), action: openUserAdmin, icon: UsersRound });
     }
+    if (currentDatabaseType() === "dameng") {
+      items.push({ label: t("contextMenu.damengJobAdmin"), action: openDamengJobAdmin, icon: CalendarClock });
+    }
     if (canCopyFinalProxyPort.value) {
       items.push({ label: t("contextMenu.copyFinalProxyPort"), action: copyFinalProxyPort, icon: Network });
     }
@@ -4483,8 +4553,8 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (canCreateDatabase.value) {
       items.push({
-        label: isDuckDbConnection.value ? t("contextMenu.createDuckDbFile") : t("contextMenu.createDatabase"),
-        action: openCreateDatabase,
+        label: connectionNamespaceCreationLabel(),
+        action: openConnectionNamespaceCreation,
         icon: Plus,
       });
     }
@@ -4690,6 +4760,11 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   if (node.type === "user-admin") {
     items.push({ label: t("contextMenu.openUserAdmin"), action: openUserAdmin, icon: UsersRound });
+    return items;
+  }
+
+  if (node.type === "dameng-job-admin") {
+    items.push({ label: t("contextMenu.openDamengJobAdmin"), action: openDamengJobAdmin, icon: CalendarClock });
     return items;
   }
 
@@ -5064,9 +5139,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
     </div>
   </div>
 
-  <CustomContextMenu v-else :items="treeItemMenuItems()" v-slot="contextMenuSlot">
+  <CustomContextMenu v-else :items="treeItemMenuItems" v-slot="contextMenuSlot">
     <div @contextmenu="onTreeItemContextMenu($event, contextMenuSlot.onContextMenu)">
-      <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0">
+      <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
         <div
           ref="rowRef"
           class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer relative outline-none"

@@ -163,6 +163,7 @@ mod tests {
             driver_profile: Some("mongodb".to_string()),
             driver_label: Some("MongoDB".to_string()),
             url_params: Some("authSource=admin&authMechanism=SCRAM-SHA-1".to_string()),
+            agent_java_options: Vec::new(),
             host: "172.22.4.42".to_string(),
             port: 27017,
             username: "mongouser".to_string(),
@@ -596,7 +597,16 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 }
             }
             DatabaseType::Mysql if config.needs_bare_mysql() && config.bare_mysql_uses_tls() => {
-                match db::mysql::connect_with_ca_cert(&url, Some(&config.ca_cert_path), connect_timeout).await {
+                match db::mysql::connect_compatible_with_ca_cert_pool_limit_idle_and_setup(
+                    &url,
+                    Some(&config.ca_cert_path),
+                    connect_timeout,
+                    10,
+                    None,
+                    &[],
+                )
+                .await
+                {
                     Ok(pool) => {
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
@@ -624,7 +634,15 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             }
             DatabaseType::StarRocks => {
                 let connect = if config.bare_mysql_uses_tls() {
-                    db::mysql::connect_with_ca_cert(&url, Some(&config.ca_cert_path), connect_timeout).await
+                    db::mysql::connect_compatible_with_ca_cert_pool_limit_idle_and_setup(
+                        &url,
+                        Some(&config.ca_cert_path),
+                        connect_timeout,
+                        10,
+                        None,
+                        &[],
+                    )
+                    .await
                 } else {
                     db::mysql::connect_bare(&url, connect_timeout).await
                 };
@@ -729,17 +747,9 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
-            DatabaseType::SqlServer => db::sqlserver::connect(
-                &host,
-                port,
-                &config.username,
-                &config.password,
-                config.database.as_deref(),
-                config.url_params.as_deref(),
-                connect_timeout,
-            )
-            .await
-            .map(|_| "Connection successful".to_string()),
+            DatabaseType::SqlServer => {
+                state.test_sqlserver_connection_with_legacy_fallback(&config, &host, port, connect_timeout).await
+            }
             DatabaseType::Elasticsearch => {
                 let mut client = db::elasticsearch_driver::EsClient::from_config(
                     &url,
@@ -1029,17 +1039,7 @@ pub async fn connect_db(
             PoolKind::ClickHouse(client)
         }
         DatabaseType::SqlServer => {
-            let client = db::sqlserver::connect(
-                &host,
-                port,
-                &db_config.username,
-                &db_config.password,
-                db_config.database.as_deref(),
-                db_config.url_params.as_deref(),
-                connect_timeout,
-            )
-            .await?;
-            PoolKind::SqlServer(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+            state.connect_sqlserver_pool_with_legacy_fallback(&db_config, &host, port, connect_timeout).await?
         }
         DatabaseType::Elasticsearch => {
             let mut client = db::elasticsearch_driver::EsClient::from_config(

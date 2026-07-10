@@ -5,6 +5,7 @@ import type {
   DatabaseInfo,
   SchemaInfo,
   LinkedServerInfo,
+  CatalogInfo,
   TableInfo,
   ObjectInfo,
   CompletionAssistantRequest,
@@ -37,6 +38,7 @@ import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
+import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
   DataGridColumnValueFilterConditionOptions,
@@ -211,6 +213,14 @@ export interface WebDavPasswordStatus {
 export interface WebDavSyncSecretsStatus {
   enabled: boolean;
   hasSavedPassphrase: boolean;
+}
+
+export interface AppSupportInfo {
+  appVersion: string;
+  runtime: "desktop" | "web";
+  osName: string;
+  osVersion?: string | null;
+  arch: string;
 }
 
 export interface QueryPagination {
@@ -619,6 +629,14 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
   return invoke("list_databases", { connectionId });
 }
 
+export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
+  return invoke("list_doris_catalogs", { connectionId });
+}
+
+export async function listDorisCatalogDatabases(connectionId: string, catalog: string): Promise<DatabaseInfo[]> {
+  return invoke("list_doris_catalog_databases", { connectionId, catalog });
+}
+
 export async function listSqlServerLinkedServers(connectionId: string): Promise<LinkedServerInfo[]> {
   return invoke("list_sqlserver_linked_servers", { connectionId });
 }
@@ -647,16 +665,16 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
   return invoke("delete_schema_cache_prefix", { prefix });
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[]): Promise<TableInfo[]> {
-  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes });
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[], catalog?: string): Promise<TableInfo[]> {
+  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes, catalog });
 }
 
-export async function getTableComment(connectionId: string, database: string, schema: string, table: string): Promise<string | null> {
-  return invoke("get_table_comment", { connectionId, database, schema, table });
+export async function getTableComment(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<string | null> {
+  return invoke("get_table_comment", { connectionId, database, schema, table, catalog });
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number): Promise<ObjectInfo[]> {
-  return invoke("list_objects", { connectionId, database, schema, objectTypes, filter, limit, offset });
+export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
+  return invoke("list_objects", { connectionId, database, schema, objectTypes, filter, limit, offset, catalog });
 }
 
 export async function listObjectStatistics(connectionId: string, database: string, schema: string): Promise<ObjectStatistics[]> {
@@ -683,8 +701,8 @@ export async function listSchemaInfos(connectionId: string, database: string): P
   return invoke("list_schema_infos", { connectionId, database });
 }
 
-export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
-  return invoke("get_columns", { connectionId, database, schema, table });
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ColumnInfo[]> {
+  return invoke("get_columns", { connectionId, database, schema, table, catalog });
 }
 
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
@@ -990,20 +1008,20 @@ export async function buildDataCompareSyncPlan(options: DataCompareSyncPlanOptio
   return invoke("build_data_compare_sync_plan", { options });
 }
 
-export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
-  return invoke("list_indexes", { connectionId, database, schema, table });
+export async function listIndexes(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<IndexInfo[]> {
+  return invoke("list_indexes", { connectionId, database, schema, table, catalog });
 }
 
-export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string): Promise<ForeignKeyInfo[]> {
-  return invoke("list_foreign_keys", { connectionId, database, schema, table });
+export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ForeignKeyInfo[]> {
+  return invoke("list_foreign_keys", { connectionId, database, schema, table, catalog });
 }
 
-export async function listTriggers(connectionId: string, database: string, schema: string, table: string): Promise<TriggerInfo[]> {
-  return invoke("list_triggers", { connectionId, database, schema, table });
+export async function listTriggers(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<TriggerInfo[]> {
+  return invoke("list_triggers", { connectionId, database, schema, table, catalog });
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind): Promise<string> {
-  return invoke("get_table_ddl", { connectionId, database, schema, table, objectType });
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string): Promise<string> {
+  return invoke("get_table_ddl", { connectionId, database, schema, table, objectType, catalog });
 }
 
 export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): Promise<SchemaDiffPreparation> {
@@ -1130,8 +1148,16 @@ export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
   return invoke("list_installed_agents");
 }
 
+export async function isAgentInstalled(dbType: string): Promise<boolean> {
+  return invoke("is_agent_installed", { dbType });
+}
+
 export async function getDriverStoreUsage(): Promise<DriverStoreUsage> {
   return invoke("get_driver_store_usage");
+}
+
+export async function clearDriverDownloadCache(): Promise<void> {
+  return invoke("clear_driver_download_cache");
 }
 
 export async function getDriverRuntimeSummary(): Promise<DriverRuntimeSummary> {
@@ -1314,6 +1340,10 @@ export async function getAppVersion(): Promise<string> {
   return getVersion();
 }
 
+export async function getAppSupportInfo(): Promise<AppSupportInfo> {
+  return invoke<AppSupportInfo>("get_app_support_info");
+}
+
 // --- Redis ---
 export interface RedisKeyInfo {
   key_display: string;
@@ -1391,7 +1421,7 @@ export interface RedisScanResult {
   total_keys: number;
 }
 
-export type RedisCommandSafety = "allowed" | "confirm" | "blocked";
+export type RedisCommandSafety = "allowed" | "write" | "confirm" | "blocked";
 
 export interface RedisCommandResult {
   command: string;
@@ -1911,6 +1941,7 @@ export async function listenSqlFileProgress(handler: (progress: SqlFileProgress)
 // --- Data Transfer ---
 export type TransferMode = "append" | "overwrite" | "upsert";
 export type TransferTableNameCase = "preserve" | "lower" | "upper";
+export type TransferOwnershipPolicy = "preserve" | "skip" | "reassignMissing";
 
 export interface TransferRequest {
   transferId: string;
@@ -1924,7 +1955,13 @@ export interface TransferRequest {
   createTable: boolean;
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
+  ownershipPolicy?: TransferOwnershipPolicy;
   batchSize: number;
+}
+
+export interface TransferOwnershipPreview {
+  missingOwners: string[];
+  targetOwner: string;
 }
 
 export interface TransferProgress {
@@ -1936,6 +1973,7 @@ export interface TransferProgress {
   totalRows: number | null;
   status: "running" | "tableDone" | "done" | "error" | "cancelled";
   error: string | null;
+  terminal: boolean;
 }
 
 export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void): Promise<void> {
@@ -1946,7 +1984,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
           if (event.payload.transferId !== request.transferId) return;
           onProgress(event.payload);
-          if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
+          if (isTerminalTransferProgress(event.payload)) {
             unlisten?.();
             resolve();
           }
@@ -1963,6 +2001,10 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
 
 export async function cancelTransfer(transferId: string): Promise<void> {
   return invoke("cancel_transfer", { transferId });
+}
+
+export async function previewTransferOwnership(request: TransferRequest): Promise<TransferOwnershipPreview> {
+  return invoke("preview_transfer_ownership", { request });
 }
 
 export interface SortTablesByFkOptions {

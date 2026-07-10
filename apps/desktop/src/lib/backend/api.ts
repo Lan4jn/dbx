@@ -77,7 +77,9 @@ export const installJdbcPluginLocal = forward("installJdbcPluginLocal");
 export const uninstallJdbcPlugin = forward("uninstallJdbcPlugin");
 export const listInstalledAgentsLocal = forward("listInstalledAgentsLocal");
 export const listInstalledAgents = forward("listInstalledAgents");
+export const isAgentInstalled = forward("isAgentInstalled");
 export const getDriverStoreUsage = forward("getDriverStoreUsage");
+export const clearDriverDownloadCache = forward("clearDriverDownloadCache");
 export const getDriverRuntimeSummary = forward("getDriverRuntimeSummary");
 export const stopDriverRuntime = forward("stopDriverRuntime");
 export const restartDriverRuntime = forward("restartDriverRuntime");
@@ -108,6 +110,8 @@ export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
 
 // Schema
 export const listDatabases = forward("listDatabases");
+export const listDorisCatalogs = forward("listDorisCatalogs");
+export const listDorisCatalogDatabases = forward("listDorisCatalogDatabases");
 export const listSqlServerLinkedServers = forward("listSqlServerLinkedServers");
 export const listSqlServerLinkedServerCatalogs = forward("listSqlServerLinkedServerCatalogs");
 export const listSqlServerLinkedServerSchemas = forward("listSqlServerLinkedServerSchemas");
@@ -282,6 +286,7 @@ export const nacosRawRequest = forward("nacosRawRequest");
 // Data Transfer
 export const startTransfer = forward("startTransfer");
 export const cancelTransfer = forward("cancelTransfer");
+export const previewTransferOwnership = forward("previewTransferOwnership");
 export const sortTablesByFkDependency = forward("sortTablesByFkDependency");
 
 // Table File Import
@@ -441,6 +446,7 @@ export const checkForUpdates = forward("checkForUpdates");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadAndInstallUpdate = forward("downloadAndInstallUpdate");
 export const getAppVersion = forward("getAppVersion");
+export const getAppSupportInfo = forward("getAppSupportInfo");
 
 // Layout
 export const saveSidebarLayout = forward("saveSidebarLayout");
@@ -451,6 +457,7 @@ export const loadSidebarLayout = forward("loadSidebarLayout");
 // ---------------------------------------------------------------------------
 
 export type {
+  AppSupportInfo,
   AiMessage,
   AiCompletionRequest,
   AiTaskContract,
@@ -516,6 +523,8 @@ export type {
   TransferProgress,
   TransferMode,
   TransferTableNameCase,
+  TransferOwnershipPolicy,
+  TransferOwnershipPreview,
   TableImportMode,
   TableImportStatus,
   TableImportSourceFormat,

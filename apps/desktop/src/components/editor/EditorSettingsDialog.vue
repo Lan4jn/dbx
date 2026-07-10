@@ -58,6 +58,7 @@ import {
   forgetWebdavSyncSecretsPassphrase,
   forgetWebdavSavedPassword,
   clearDataDirConfig,
+  getAppSupportInfo,
   listSystemFonts,
   loadDataDirConfig,
   saveWebdavSyncSecretsPreference,
@@ -68,6 +69,7 @@ import {
   webdavSyncSecretsStatus,
   webdavSyncTest,
   webdavSyncUpload,
+  type AppSupportInfo,
   type AiModelInfo,
   type McpServerStatus,
   type WebDavConfig,
@@ -93,6 +95,7 @@ import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import SqlFormatterSettingsPanel from "./SqlFormatterSettingsPanel.vue";
 import { APP_THEME_PALETTES, type AppThemeAppearance, type AppThemeMode, type AppThemePalette } from "@/lib/app/appTheme";
+import { editorSettingsDraftChanged, editorSettingsDraftFromSettings, editorSettingsPatchFromDraft, type EditorSettingsDraft } from "@/lib/settings/editorSettingsDraft";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
@@ -100,6 +103,7 @@ import { LOCALE_OPTIONS } from "@/lib/app/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdav/webdavAutoUploadConfig";
 import { apiUrl } from "@/lib/common/webPath";
 import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -248,6 +252,7 @@ const editShowCurrentStatementFrame = ref(settingsStore.editorSettings.showCurre
 const editAutoAliasTables = ref(settingsStore.editorSettings.autoAliasTables);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
 const editVimModeEnabled = ref(settingsStore.editorSettings.vimModeEnabled);
+const editAutoCloseBrackets = ref(settingsStore.editorSettings.autoCloseBrackets);
 const editSqlSemanticDiagnosticsMode = ref<SqlSemanticDiagnosticsMode>(settingsStore.editorSettings.sqlSemanticDiagnosticsMode);
 const editSqlSemanticDiagnosticsEnabled = ref(settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
 const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
@@ -335,6 +340,60 @@ function editableSnippet(snippet: SqlSnippet): SqlSnippet {
 }
 
 const editSnippets = ref<SqlSnippet[]>(settingsStore.editorSettings.snippets.map(editableSnippet));
+
+function currentEditorSettingsDraft(): EditorSettingsDraft {
+  return {
+    fontFamily: editFontFamily.value,
+    fontSize: editFontSize.value,
+    uiFontFamily: editUiFontFamily.value,
+    uiScale: editUiScale.value,
+    theme: editTheme.value,
+    customThemes: editCustomThemes.value,
+    activeCustomThemeId: editActiveCustomThemeId.value,
+    executeMode: editExecuteMode.value,
+    showExecutionTargetPicker: editShowExecutionTargetPicker.value,
+    showStatementRunButtons: editShowStatementRunButtons.value,
+    showCurrentStatementFrame: editShowCurrentStatementFrame.value,
+    autoAliasTables: editAutoAliasTables.value,
+    wordWrap: editWordWrap.value,
+    vimModeEnabled: editVimModeEnabled.value,
+    autoCloseBrackets: editAutoCloseBrackets.value,
+    sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode.value,
+    confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
+    confirmUnsavedSqlClose: editConfirmUnsavedSqlClose.value,
+    appLayout: editAppLayout.value,
+    showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
+    showColumnTypesInHeader: editShowColumnTypesInHeader.value,
+    compactColumnHeaderActions: editCompactColumnHeaderActions.value,
+    dataGridQuickEntry: editDataGridQuickEntry.value,
+    infiniteScroll: editInfiniteScroll.value,
+    infiniteScrollMaxRows: editInfiniteScrollMaxRows.value,
+    tableColumnTemplateFields: normalizedEditTableColumnTemplateFields.value,
+    shortcuts: editShortcuts.value,
+    sqlFormatter: normalizeSqlFormatterSettings(editSqlFormatter.value),
+    sidebarActivation: editSidebarActivation.value,
+    sidebarObjectDisplay: editSidebarObjectDisplay.value,
+    sidebarTableSearchEnabled: editSidebarTableSearchEnabled.value,
+    autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode.value,
+    openTabsRestoreMode: editOpenTabsRestoreMode.value,
+    disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
+    reuseDataTab: editReuseDataTab.value,
+    updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
+    sidebarHideTableComments: editSidebarHideTableComments.value,
+    sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
+    sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value),
+    exportBatchSize: editExportBatchSize.value,
+    exportRowLimitEnabled: editExportRowLimitEnabled.value,
+    exportRowLimit: editExportRowLimit.value,
+    queryExportKeysetOptimizationEnabled: editQueryExportKeysetOptimizationEnabled.value,
+    updateDownloadSource: editUpdateDownloadSource.value,
+    toolbarItems: { ...editToolbarItems.value },
+    snippets: editSnippets.value,
+  };
+}
+
+const editEditorSettingsBase = ref<EditorSettingsDraft>(editorSettingsDraftFromSettings(settingsStore.editorSettings));
+const hasEditorDraftChanges = computed(() => editorSettingsDraftChanged(currentEditorSettingsDraft(), editEditorSettingsBase.value));
 
 const snippetDialogOpen = ref(false);
 const snippetEditingId = ref<string | null>(null);
@@ -552,67 +611,83 @@ async function loadSystemFontOptions() {
   }
 }
 
+function syncEditorSettingsDraftFromStore() {
+  editFontFamily.value = settingsStore.editorSettings.fontFamily;
+  editFontSize.value = settingsStore.editorSettings.fontSize;
+  editUiFontFamily.value = settingsStore.editorSettings.uiFontFamily;
+  editUiScale.value = settingsStore.editorSettings.uiScale;
+  editTheme.value = settingsStore.editorSettings.theme;
+  editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
+  editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
+  editExecuteMode.value = settingsStore.editorSettings.executeMode;
+  editShowExecutionTargetPicker.value = settingsStore.editorSettings.showExecutionTargetPicker;
+  editShowStatementRunButtons.value = settingsStore.editorSettings.showStatementRunButtons;
+  editShowCurrentStatementFrame.value = settingsStore.editorSettings.showCurrentStatementFrame;
+  editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
+  editWordWrap.value = settingsStore.editorSettings.wordWrap;
+  editVimModeEnabled.value = settingsStore.editorSettings.vimModeEnabled;
+  editAutoCloseBrackets.value = settingsStore.editorSettings.autoCloseBrackets;
+  editSqlSemanticDiagnosticsMode.value = settingsStore.editorSettings.sqlSemanticDiagnosticsMode;
+  editSqlSemanticDiagnosticsEnabled.value = settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled;
+  editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
+  editConfirmUnsavedSqlClose.value = settingsStore.editorSettings.confirmUnsavedSqlClose;
+  editAppLayout.value = settingsStore.editorSettings.appLayout;
+  editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
+  editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
+  editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
+  editDataGridQuickEntry.value = settingsStore.editorSettings.dataGridQuickEntry;
+  editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
+  editInfiniteScrollMaxRows.value = settingsStore.editorSettings.infiniteScrollMaxRows;
+  editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields);
+  editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
+  editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
+  sqlFormatterConfigValid.value = true;
+  editSidebarActivation.value = settingsStore.editorSettings.sidebarActivation;
+  editSidebarObjectDisplay.value = settingsStore.editorSettings.sidebarObjectDisplay;
+  editSidebarTableSearchEnabled.value = settingsStore.editorSettings.sidebarTableSearchEnabled;
+  editAutoSelectActiveSidebarNode.value = settingsStore.editorSettings.autoSelectActiveSidebarNode;
+  editOpenTabsRestoreMode.value = settingsStore.editorSettings.openTabsRestoreMode;
+  editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
+  editReuseDataTab.value = settingsStore.editorSettings.reuseDataTab;
+  editUpdateNotificationsEnabled.value = settingsStore.editorSettings.updateNotificationsEnabled;
+  editSidebarHiddenTablePrefixes.value = settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n");
+  editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
+  editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
+  editExportBatchSize.value = settingsStore.editorSettings.exportBatchSize;
+  editExportRowLimitEnabled.value = settingsStore.editorSettings.exportRowLimitEnabled;
+  editExportRowLimit.value = settingsStore.editorSettings.exportRowLimit;
+  editQueryExportKeysetOptimizationEnabled.value = settingsStore.editorSettings.queryExportKeysetOptimizationEnabled;
+  editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
+  editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
+  editSnippets.value = settingsStore.editorSettings.snippets.map(editableSnippet);
+  editEditorSettingsBase.value = editorSettingsDraftFromSettings(settingsStore.editorSettings);
+}
+
 // Sync from store when dialog opens
 watch(
   () => settingsVisible.value,
   (open) => {
     if (open) {
-      editFontFamily.value = settingsStore.editorSettings.fontFamily;
-      editFontSize.value = settingsStore.editorSettings.fontSize;
-      editUiFontFamily.value = settingsStore.editorSettings.uiFontFamily;
-      editUiScale.value = settingsStore.editorSettings.uiScale;
-      editTheme.value = settingsStore.editorSettings.theme;
-      editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
-      editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
-      editExecuteMode.value = settingsStore.editorSettings.executeMode;
-      editShowExecutionTargetPicker.value = settingsStore.editorSettings.showExecutionTargetPicker;
-      editShowStatementRunButtons.value = settingsStore.editorSettings.showStatementRunButtons;
-      editShowCurrentStatementFrame.value = settingsStore.editorSettings.showCurrentStatementFrame;
-      editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
-      editWordWrap.value = settingsStore.editorSettings.wordWrap;
-      editVimModeEnabled.value = settingsStore.editorSettings.vimModeEnabled;
-      editSqlSemanticDiagnosticsMode.value = settingsStore.editorSettings.sqlSemanticDiagnosticsMode;
-      editSqlSemanticDiagnosticsEnabled.value = settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled;
-      editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
-      editConfirmUnsavedSqlClose.value = settingsStore.editorSettings.confirmUnsavedSqlClose;
-      editAppLayout.value = settingsStore.editorSettings.appLayout;
+      syncEditorSettingsDraftFromStore();
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
       editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
       editDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
-      editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
-      editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
-      editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
-      editDataGridQuickEntry.value = settingsStore.editorSettings.dataGridQuickEntry;
-      editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
-      editInfiniteScrollMaxRows.value = settingsStore.editorSettings.infiniteScrollMaxRows;
-      editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields);
-      editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
-      editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
-      sqlFormatterConfigValid.value = true;
-      editSidebarActivation.value = settingsStore.editorSettings.sidebarActivation;
-      editSidebarObjectDisplay.value = settingsStore.editorSettings.sidebarObjectDisplay;
-      editSidebarTableSearchEnabled.value = settingsStore.editorSettings.sidebarTableSearchEnabled;
-      editAutoSelectActiveSidebarNode.value = settingsStore.editorSettings.autoSelectActiveSidebarNode;
-      editOpenTabsRestoreMode.value = settingsStore.editorSettings.openTabsRestoreMode;
-      editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
-      editReuseDataTab.value = settingsStore.editorSettings.reuseDataTab;
-      editUpdateNotificationsEnabled.value = settingsStore.editorSettings.updateNotificationsEnabled;
-      editSidebarHiddenTablePrefixes.value = settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n");
-      editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
-      editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
-      editExportBatchSize.value = settingsStore.editorSettings.exportBatchSize;
-      editExportRowLimitEnabled.value = settingsStore.editorSettings.exportRowLimitEnabled;
-      editExportRowLimit.value = settingsStore.editorSettings.exportRowLimit;
-      editQueryExportKeysetOptimizationEnabled.value = settingsStore.editorSettings.queryExportKeysetOptimizationEnabled;
-      editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
-      editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
-      editSnippets.value = settingsStore.editorSettings.snippets.map(editableSnippet);
     }
   },
   { immediate: true },
+);
+
+watch(
+  () => settingsStore.editorSettings,
+  () => {
+    if (settingsVisible.value && !hasEditorDraftChanges.value) {
+      syncEditorSettingsDraftFromStore();
+    }
+  },
+  { deep: true },
 );
 
 const shortcutConflicts = computed(() =>
@@ -654,7 +729,7 @@ const filteredShortcutDefinitions = computed(() => {
   });
 });
 const hasShortcutConflicts = computed(() => shortcutConflicts.value.length > 0);
-const shortcutsChanged = computed(() => JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts));
+const shortcutsChanged = computed(() => JSON.stringify(editShortcuts.value) !== JSON.stringify(editEditorSettingsBase.value.shortcuts));
 const duckDbWorkerSettingsRequireRestart = computed(() => editDuckDbWorkerProcessIsolation.value !== startupDuckDbWorkerProcessIsolation.value || normalizeDuckDbWorkerMaxProcesses(editDuckDbWorkerMaxProcesses.value) !== startupDuckDbWorkerMaxProcesses.value);
 const hasBlockingShortcutConflicts = computed(() => shortcutsChanged.value && hasShortcutConflicts.value);
 const hasBlockingFormatterConfig = computed(() => activeSettingsTab.value === "formatter" && !sqlFormatterConfigValid.value);
@@ -662,113 +737,26 @@ const hasApplyBlocker = computed(() => hasBlockingShortcutConflicts.value || has
 
 function hasChanges(): boolean {
   return (
-    editFontFamily.value !== settingsStore.editorSettings.fontFamily ||
-    editFontSize.value !== settingsStore.editorSettings.fontSize ||
-    editUiFontFamily.value !== settingsStore.editorSettings.uiFontFamily ||
-    editUiScale.value !== settingsStore.editorSettings.uiScale ||
-    editTheme.value !== settingsStore.editorSettings.theme ||
-    JSON.stringify(editCustomThemes.value) !== JSON.stringify(settingsStore.editorSettings.customThemes) ||
-    editActiveCustomThemeId.value !== settingsStore.editorSettings.activeCustomThemeId ||
-    editExecuteMode.value !== settingsStore.editorSettings.executeMode ||
-    editShowExecutionTargetPicker.value !== settingsStore.editorSettings.showExecutionTargetPicker ||
-    editShowStatementRunButtons.value !== settingsStore.editorSettings.showStatementRunButtons ||
-    editShowCurrentStatementFrame.value !== settingsStore.editorSettings.showCurrentStatementFrame ||
-    editAutoAliasTables.value !== settingsStore.editorSettings.autoAliasTables ||
-    editWordWrap.value !== settingsStore.editorSettings.wordWrap ||
-    editVimModeEnabled.value !== settingsStore.editorSettings.vimModeEnabled ||
-    editSqlSemanticDiagnosticsMode.value !== settingsStore.editorSettings.sqlSemanticDiagnosticsMode ||
-    editSqlSemanticDiagnosticsEnabled.value !== settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled ||
-    editConfirmDangerousSqlExecution.value !== settingsStore.editorSettings.confirmDangerousSqlExecution ||
-    editConfirmUnsavedSqlClose.value !== settingsStore.editorSettings.confirmUnsavedSqlClose ||
-    editAppLayout.value !== settingsStore.editorSettings.appLayout ||
+    hasEditorDraftChanges.value ||
     editShowTrayIcon.value !== settingsStore.desktopSettings.show_tray_icon ||
     editQuitOnClose.value !== settingsStore.desktopSettings.quit_on_close ||
     editIconTheme.value !== settingsStore.desktopSettings.icon_theme ||
     editDebugLoggingEnabled.value !== settingsStore.desktopSettings.debug_logging_enabled ||
     editDuckDbWorkerProcessIsolation.value !== settingsStore.desktopSettings.duckdb_worker_process_isolation ||
     normalizeDuckDbWorkerMaxProcesses(editDuckDbWorkerMaxProcesses.value) !== settingsStore.desktopSettings.duckdb_worker_max_processes ||
-    editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE) ||
-    editShowColumnCommentsInHeader.value !== settingsStore.editorSettings.showColumnCommentsInHeader ||
-    editShowColumnTypesInHeader.value !== settingsStore.editorSettings.showColumnTypesInHeader ||
-    editCompactColumnHeaderActions.value !== settingsStore.editorSettings.compactColumnHeaderActions ||
-    editDataGridQuickEntry.value !== settingsStore.editorSettings.dataGridQuickEntry ||
-    editInfiniteScroll.value !== settingsStore.editorSettings.infiniteScroll ||
-    editInfiniteScrollMaxRows.value !== settingsStore.editorSettings.infiniteScrollMaxRows ||
-    JSON.stringify(normalizedEditTableColumnTemplateFields.value) !== JSON.stringify(settingsStore.editorSettings.tableColumnTemplateFields) ||
-    JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts) ||
-    JSON.stringify(editSqlFormatter.value) !== JSON.stringify(normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter)) ||
-    editSidebarActivation.value !== settingsStore.editorSettings.sidebarActivation ||
-    editSidebarObjectDisplay.value !== settingsStore.editorSettings.sidebarObjectDisplay ||
-    editSidebarTableSearchEnabled.value !== settingsStore.editorSettings.sidebarTableSearchEnabled ||
-    editAutoSelectActiveSidebarNode.value !== settingsStore.editorSettings.autoSelectActiveSidebarNode ||
-    editOpenTabsRestoreMode.value !== settingsStore.editorSettings.openTabsRestoreMode ||
-    editDisconnectTabHandlingMode.value !== settingsStore.editorSettings.disconnectTabHandlingMode ||
-    editReuseDataTab.value !== settingsStore.editorSettings.reuseDataTab ||
-    editUpdateNotificationsEnabled.value !== settingsStore.editorSettings.updateNotificationsEnabled ||
-    editSidebarHideTableComments.value !== settingsStore.editorSettings.sidebarHideTableComments ||
-    editSidebarAllowHorizontalScroll.value !== settingsStore.editorSettings.sidebarAllowHorizontalScroll ||
-    editExportBatchSize.value !== settingsStore.editorSettings.exportBatchSize ||
-    editExportRowLimitEnabled.value !== settingsStore.editorSettings.exportRowLimitEnabled ||
-    editExportRowLimit.value !== settingsStore.editorSettings.exportRowLimit ||
-    editQueryExportKeysetOptimizationEnabled.value !== settingsStore.editorSettings.queryExportKeysetOptimizationEnabled ||
-    editUpdateDownloadSource.value !== settingsStore.editorSettings.updateDownloadSource ||
-    JSON.stringify(editToolbarItems.value) !== JSON.stringify(settingsStore.editorSettings.toolbarItems) ||
-    JSON.stringify(normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value)) !== JSON.stringify(settingsStore.editorSettings.sidebarHiddenTablePrefixes) ||
-    JSON.stringify(editSnippets.value) !== JSON.stringify(settingsStore.editorSettings.snippets)
+    editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE)
   );
 }
 
 async function persistSettings() {
   if (hasApplyBlocker.value) return;
-  const sidebarObjectDisplayChanged = editSidebarObjectDisplay.value !== settingsStore.editorSettings.sidebarObjectDisplay;
+  const editorSettingsPatch = editorSettingsPatchFromDraft(currentEditorSettingsDraft(), editEditorSettingsBase.value);
+  const sidebarObjectDisplayChanged = editorSettingsPatch.sidebarObjectDisplay !== undefined && editorSettingsPatch.sidebarObjectDisplay !== settingsStore.editorSettings.sidebarObjectDisplay;
   const sidebarTablePageSizeChanged = editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
-  settingsStore.updateEditorSettings({
-    fontFamily: editFontFamily.value,
-    fontSize: editFontSize.value,
-    uiFontFamily: editUiFontFamily.value,
-    uiScale: editUiScale.value,
-    theme: editTheme.value,
-    customThemes: editCustomThemes.value,
-    activeCustomThemeId: editActiveCustomThemeId.value,
-    executeMode: editExecuteMode.value,
-    showExecutionTargetPicker: editShowExecutionTargetPicker.value,
-    showStatementRunButtons: editShowStatementRunButtons.value,
-    showCurrentStatementFrame: editShowCurrentStatementFrame.value,
-    autoAliasTables: editAutoAliasTables.value,
-    wordWrap: editWordWrap.value,
-    vimModeEnabled: editVimModeEnabled.value,
-    sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode.value,
-    confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
-    confirmUnsavedSqlClose: editConfirmUnsavedSqlClose.value,
-    appLayout: editAppLayout.value,
-    showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
-    showColumnTypesInHeader: editShowColumnTypesInHeader.value,
-    compactColumnHeaderActions: editCompactColumnHeaderActions.value,
-    dataGridQuickEntry: editDataGridQuickEntry.value,
-    infiniteScroll: editInfiniteScroll.value,
-    infiniteScrollMaxRows: editInfiniteScrollMaxRows.value,
-    tableColumnTemplateFields: normalizedEditTableColumnTemplateFields.value,
-    shortcuts: editShortcuts.value,
-    sqlFormatter: normalizeSqlFormatterSettings(editSqlFormatter.value),
-    sidebarActivation: editSidebarActivation.value,
-    sidebarObjectDisplay: editSidebarObjectDisplay.value,
-    sidebarTableSearchEnabled: editSidebarTableSearchEnabled.value,
-    autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode.value,
-    openTabsRestoreMode: editOpenTabsRestoreMode.value,
-    disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
-    reuseDataTab: editReuseDataTab.value,
-    updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
-    sidebarHideTableComments: editSidebarHideTableComments.value,
-    sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
-    sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value),
-    exportBatchSize: editExportBatchSize.value,
-    exportRowLimitEnabled: editExportRowLimitEnabled.value,
-    exportRowLimit: editExportRowLimit.value,
-    queryExportKeysetOptimizationEnabled: editQueryExportKeysetOptimizationEnabled.value,
-    updateDownloadSource: editUpdateDownloadSource.value,
-    toolbarItems: { ...editToolbarItems.value },
-    snippets: editSnippets.value,
-  });
+  if (Object.keys(editorSettingsPatch).length > 0) {
+    settingsStore.updateEditorSettings(editorSettingsPatch);
+    editEditorSettingsBase.value = editorSettingsDraftFromSettings(settingsStore.editorSettings);
+  }
   await settingsStore.updateDesktopSettings({
     show_tray_icon: editShowTrayIcon.value,
     quit_on_close: editQuitOnClose.value,
@@ -821,6 +809,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
     editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
     editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
+    editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
     editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
     editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
     editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
@@ -892,6 +881,7 @@ function resetAllDefaults() {
   editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
   editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
+  editAutoCloseBrackets.value = DEFAULT_EDITOR_SETTINGS.autoCloseBrackets;
   editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
   editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
   editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
@@ -1198,13 +1188,26 @@ function setSidebarActivation(value: "single" | "double") {
 
 const activeSettingsTab = ref("appearance");
 const isWeb = !isTauriRuntime();
-const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
 const dataDirConfig = ref<DataDirConfig | null>(null);
 const dataDirLoading = ref(false);
 const dataDirError = ref("");
 const dataDirSaved = ref(false);
 const displayedDataDir = computed(() => dataDirConfig.value?.configuredDataDir || dataDirConfig.value?.currentDataDir || "");
 const dataDirControlsDisabled = computed(() => dataDirLoading.value || dataDirConfig.value?.envLocked === true);
+const appSupportInfo = ref<AppSupportInfo | null>(null);
+const appSupportInfoLoading = ref(false);
+const appSupportInfoError = ref("");
+const appSupportInfoCopied = ref(false);
+const appSupportInfoLabels = computed<AppSupportInfoLabels>(() => ({
+  appVersion: t("settings.supportInfoAppVersion"),
+  runtime: t("settings.supportInfoRuntime"),
+  runtimeDesktop: t("settings.supportInfoRuntimeDesktop"),
+  runtimeWeb: t("settings.supportInfoRuntimeWeb"),
+  operatingSystem: t("settings.supportInfoOperatingSystem"),
+  architecture: t("settings.supportInfoArchitecture"),
+  unknown: t("settings.supportInfoUnknown"),
+}));
+const appSupportInfoRows = computed(() => (appSupportInfo.value ? buildAppSupportInfoRows(appSupportInfo.value, appSupportInfoLabels.value) : []));
 type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "appearance", label: t("settings.appearanceTab") },
@@ -1294,6 +1297,44 @@ async function copyDebugLogs() {
   window.setTimeout(() => {
     debugLogCopied.value = false;
   }, 1500);
+}
+
+function fallbackAppSupportInfo(): AppSupportInfo {
+  return {
+    appVersion: props.appVersion || "",
+    runtime: isWeb ? "web" : "desktop",
+    osName: "",
+    osVersion: null,
+    arch: "",
+  };
+}
+
+async function refreshAppSupportInfo() {
+  if (appSupportInfoLoading.value) return;
+  appSupportInfoLoading.value = true;
+  appSupportInfoError.value = "";
+  try {
+    appSupportInfo.value = await getAppSupportInfo();
+  } catch (e: any) {
+    appSupportInfo.value = appSupportInfo.value || fallbackAppSupportInfo();
+    appSupportInfoError.value = e?.message || String(e);
+  } finally {
+    appSupportInfoLoading.value = false;
+  }
+}
+
+async function copyAppSupportInfo() {
+  if (!appSupportInfo.value) await refreshAppSupportInfo();
+  if (!appSupportInfo.value) return;
+  try {
+    await copyToClipboard(formatAppSupportInfoForClipboard(appSupportInfo.value, appSupportInfoLabels.value));
+    appSupportInfoCopied.value = true;
+    window.setTimeout(() => {
+      appSupportInfoCopied.value = false;
+    }, 1500);
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 function clearDebugLogs() {
@@ -1633,6 +1674,7 @@ watch(
       syncAiEditState();
       if (!isWeb && activeSettingsTab.value === "mcp") void refreshMcpStatus();
       if (!isWeb && activeSettingsTab.value === "ai" && aiIsCodexCli.value) void ensureCodexMcpStatus();
+      if (activeSettingsTab.value === "about") void refreshAppSupportInfo();
       await scrollToInitialSettingsSection();
     }
   },
@@ -1669,6 +1711,7 @@ watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
 watch(activeSettingsTab, (tab) => {
   if (tab === "mcp" && !mcpStatus.value && !mcpStatusLoading.value) void refreshMcpStatus();
   if (tab === "ai" && aiIsCodexCli.value) void ensureCodexMcpStatus();
+  if (tab === "about" && !appSupportInfo.value) void refreshAppSupportInfo();
   if (tab === "appearance") {
     checkLayoutDescTruncation();
     checkIconThemeDescTruncation();
@@ -2592,6 +2635,14 @@ onUnmounted(cleanupPreviewEditor);
                     <p class="text-xs text-muted-foreground">{{ t("settings.vimModeDescription") }}</p>
                   </div>
                   <Switch id="editor-vim-mode" v-model="editVimModeEnabled" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-auto-close-brackets">{{ t("settings.autoCloseBrackets") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.autoCloseBracketsDescription") }}</p>
+                  </div>
+                  <Switch id="editor-auto-close-brackets" v-model="editAutoCloseBrackets" class="mt-0.5" />
                 </div>
 
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
@@ -4227,16 +4278,27 @@ onUnmounted(cleanupPreviewEditor);
             </section>
 
             <section v-else-if="activeSettingsTab === 'about'" class="flex flex-col gap-5 py-2">
-              <div class="rounded-lg border bg-muted/20 p-4">
-                <div class="flex items-start justify-between gap-4">
+              <div class="rounded-lg border p-4">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div class="min-w-0 space-y-1">
-                    <div class="text-lg font-semibold">DBX</div>
-                    <p class="text-sm text-muted-foreground">{{ t("settings.aboutDescription") }}</p>
+                    <Label>{{ t("settings.supportInfoTitle") }}</Label>
+                    <p class="text-sm text-muted-foreground">{{ t("settings.supportInfoDescription") }}</p>
                   </div>
-                  <div v-if="displayedAppVersion" class="rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground">
-                    {{ displayedAppVersion }}
+                  <Button type="button" variant="outline" size="sm" class="shrink-0" :disabled="appSupportInfoLoading && !appSupportInfo" @click="copyAppSupportInfo">
+                    <Loader2 v-if="appSupportInfoLoading && !appSupportInfo" class="mr-1 h-3.5 w-3.5 animate-spin" />
+                    <CheckCircle2 v-else-if="appSupportInfoCopied" class="mr-1 h-3.5 w-3.5" />
+                    <Copy v-else class="mr-1 h-3.5 w-3.5" />
+                    {{ appSupportInfoCopied ? t("settings.supportInfoCopied") : t("settings.supportInfoCopy") }}
+                  </Button>
+                </div>
+                <div v-if="appSupportInfoRows.length" class="mt-4 grid gap-3 sm:grid-cols-2">
+                  <div v-for="row in appSupportInfoRows" :key="row.key" class="min-w-0 rounded-md bg-muted/30 px-3 py-2">
+                    <div class="text-xs font-medium text-muted-foreground">{{ row.label }}</div>
+                    <div class="mt-1 min-w-0 select-text break-words font-mono text-xs text-foreground">{{ row.value }}</div>
                   </div>
                 </div>
+                <p v-else class="mt-4 text-sm text-muted-foreground">{{ t("settings.supportInfoLoading") }}</p>
+                <p v-if="appSupportInfoError" class="mt-3 text-xs text-destructive">{{ t("settings.supportInfoLoadFailed", { message: appSupportInfoError }) }}</p>
               </div>
 
               <div class="rounded-lg border p-4">

@@ -299,6 +299,14 @@ export interface LinkedServerInfo {
   data_source?: string | null;
 }
 
+/** A catalog exposed by a multi-catalog engine (Doris / StarRocks). */
+export interface CatalogInfo {
+  name: string;
+  catalog_type: string;
+  is_current: boolean;
+  comment?: string | null;
+}
+
 export interface TableInfo {
   name: string;
   table_type: string;
@@ -349,6 +357,7 @@ export interface ColumnInfo {
   numeric_precision?: number | null;
   numeric_scale?: number | null;
   character_maximum_length?: number | null;
+  enum_values?: string[] | null;
 }
 
 export interface IndexInfo {
@@ -512,6 +521,7 @@ export type TreeNodeType =
   | "connection"
   | "connection-group"
   | "database"
+  | "doris-catalog"
   | "linked-server-root"
   | "linked-server"
   | "linked-server-catalog"
@@ -541,6 +551,7 @@ export type TreeNodeType =
   | "extension"
   | "object-browser"
   | "user-admin"
+  | "dameng-job-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
@@ -587,6 +598,8 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  catalog?: string;
+  catalogType?: string;
   linkedServer?: string;
   linkedCatalog?: string;
   linkedSchema?: string;
@@ -631,7 +644,20 @@ export interface TableStructureEditorDraft {
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
+  scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   initialized: boolean;
+}
+
+export interface TableStructureEditorViewport {
+  scrollTop: number;
+  scrollLeft: number;
+}
+
+export type ObjectBrowserViewMode = "list" | "grid";
+
+export interface ObjectBrowserViewport {
+  scrollTop: number;
+  viewMode: ObjectBrowserViewMode;
 }
 
 export interface QueryTab {
@@ -689,7 +715,7 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users";
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs";
   mqTenant?: string;
   mqInitialTab?: "topics";
   nacosNamespace?: string;
@@ -702,6 +728,7 @@ export interface QueryTab {
   objectBrowser?: {
     schema?: string;
     objectType?: "tables";
+    viewport?: ObjectBrowserViewport;
   };
   objectSource?: {
     schema?: string;
@@ -712,21 +739,40 @@ export interface QueryTab {
     schema?: string;
     tableName: string;
     tableType?: string;
+    catalog?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
   tableInfoTab?: TableInfoTab;
   queryAnalysis?: {
+    catalog?: string;
+    catalogQuoted?: boolean;
     schema?: string;
     schemaQuoted?: boolean;
     tableName: string;
     tableNameQuoted?: boolean;
     tableAlias?: string;
     selectStar: boolean;
+    editableSourceKey?: string;
+    multiSource?: boolean;
+    allowInsertDelete?: boolean;
+    sources?: {
+      key: string;
+      catalog?: string;
+      catalogQuoted?: boolean;
+      schema?: string;
+      schemaQuoted?: boolean;
+      tableName: string;
+      tableNameQuoted?: boolean;
+      alias?: string;
+    }[];
     columns: {
       sourceName?: string;
       sourceNameQuoted?: boolean;
+      sourceQualifier?: string;
+      sourceKey?: string;
+      star?: boolean;
       resultName: string;
       expression: string;
     }[];

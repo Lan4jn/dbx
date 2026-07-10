@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -78,7 +79,7 @@ func TestMissingTableReadSessionMethodsReturnEmptyOrFalse(t *testing.T) {
 	if err := json.Unmarshal(data, &page); err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Columns) != 0 || len(page.Rows) != 0 || page.HasMore || page.SessionID != nil {
+	if len(page.Columns) != 0 || len(page.ColumnTypes) != 0 || len(page.Rows) != 0 || page.HasMore || page.SessionID != nil {
 		t.Fatalf("missing table read session should return empty page, got %+v", page)
 	}
 
@@ -100,8 +101,11 @@ func TestEmptyResultSlicesMarshalAsArrays(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	if strings.Contains(text, `"columns":null`) || strings.Contains(text, `"rows":null`) {
+	if strings.Contains(text, `"columns":null`) || strings.Contains(text, `"column_types":null`) || strings.Contains(text, `"rows":null`) {
 		t.Fatalf("query result should marshal nil slices as arrays: %s", text)
+	}
+	if !strings.Contains(text, `"column_types":[]`) {
+		t.Fatalf("query result should marshal empty column types array: %s", text)
 	}
 
 	data, err = json.Marshal(indexInfo{})
@@ -122,6 +126,32 @@ func TestGetTableDDLResultMarshalsAsString(t *testing.T) {
 	var ddl string
 	if err := json.Unmarshal(data, &ddl); err != nil {
 		t.Fatalf("get_table_ddl result must deserialize as a string: %v", err)
+	}
+}
+
+func TestNormalizeValueFormatsOracleBinaryColumnsAsHex(t *testing.T) {
+	tests := map[string]string{
+		"RAW":            "0x000f10ff",
+		"raw":            "0x000f10ff",
+		"LongRaw":        "0x000f10ff",
+		"LONG RAW":       "0x000f10ff",
+		"LongVarRaw":     "0x000f10ff",
+		"OCIBlobLocator": "0x000f10ff",
+	}
+
+	for columnType, want := range tests {
+		if got := normalizeValue([]byte{0x00, 0x0f, 0x10, 0xff}, columnType); got != want {
+			t.Fatalf("normalizeValue RAW bytes for %q = %#v, want %q", columnType, got, want)
+		}
+	}
+}
+
+func TestNormalizeValueKeepsNonBinaryBytesAsText(t *testing.T) {
+	if got := normalizeValue([]byte("hello"), "VARCHAR2"); got != "hello" {
+		t.Fatalf("normalizeValue text bytes = %#v, want %q", got, "hello")
+	}
+	if got := normalizeValue([]byte("legacy"), ""); got != "legacy" {
+		t.Fatalf("normalizeValue bytes without metadata = %#v, want %q", got, "legacy")
 	}
 }
 
@@ -266,6 +296,66 @@ func TestBuildDSNUsesConnectionStringWhenProvided(t *testing.T) {
 
 	if dsn != "oracle://scott:tiger@db.example.com:1521/ORCLPDB1" {
 		t.Fatalf("unexpected dsn: %s", dsn)
+	}
+}
+
+func TestBuildDSNEncodesColonInCredentials(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:     "db.example.com",
+		Port:     1521,
+		Database: "XE",
+		Username: "9008888:reader",
+		Password: "dbx:pass",
+	})
+
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password, _ := parsed.User.Password()
+	if parsed.User.Username() != `"9008888:reader"` || password != "dbx:pass" {
+		t.Fatalf("credentials should survive URL parsing, dsn=%s username=%q password=%q", dsn, parsed.User.Username(), password)
+	}
+	if !strings.HasPrefix(parsed.User.String(), "%229008888%3Areader%22:") {
+		t.Fatalf("Oracle auth username should be quoted and escaped for non-regular identifiers, dsn=%s", dsn)
+	}
+}
+
+func TestBuildDSNEncodesColonInCredentialsFromJDBCServiceURL(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Username:         "9008888:reader",
+		Password:         "dbx:pass",
+		ConnectionString: "jdbc:oracle:thin:@//db.example.com:1521/XE",
+	})
+
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password, _ := parsed.User.Password()
+	if parsed.User.Username() != `"9008888:reader"` || password != "dbx:pass" {
+		t.Fatalf("credentials should survive JDBC URL conversion, dsn=%s username=%q password=%q", dsn, parsed.User.Username(), password)
+	}
+	if parsed.Host != "db.example.com:1521" || strings.TrimPrefix(parsed.Path, "/") != "XE" {
+		t.Fatalf("JDBC host/service should survive conversion, dsn=%s", dsn)
+	}
+}
+
+func TestOracleAuthUsernameQuotesOnlyNonRegularIdentifiers(t *testing.T) {
+	tests := map[string]string{
+		"scott":          "scott",
+		"test":           "test",
+		"SCOTT_1":        "SCOTT_1",
+		"9008888:reader": `"9008888:reader"`,
+		"abc:def":        `"abc:def"`,
+		`"abc:def"`:      `"abc:def"`,
+		`abc"def`:        `"abc""def"`,
+	}
+
+	for input, want := range tests {
+		if got := oracleAuthUsername(input); got != want {
+			t.Fatalf("oracleAuthUsername(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 
@@ -474,6 +564,41 @@ func TestListTablesQueryAppliesMetadataConstraints(t *testing.T) {
 	}
 }
 
+func TestListSessionUserTablesQueryUsesUserDictionary(t *testing.T) {
+	query := oracleListSessionUserTablesQuery(metadataListConstraints{
+		Filter:      "u_r",
+		Limit:       501,
+		Offset:      10,
+		ObjectTypes: []string{"view", "TABLE", "TABLE"},
+	})
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "USER_TABLES") || !strings.Contains(sqlText, "USER_OBJECTS") {
+		t.Fatalf("session-user table listing should use USER_* dictionaries, got: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "ALL_TABLES") || strings.Contains(sqlText, "ALL_OBJECTS") {
+		t.Fatalf("session-user table listing should avoid ALL_* dictionaries, got: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "OWNER =") {
+		t.Fatalf("session-user table listing should not add owner predicates, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE :1 ESCAPE '\\'") {
+		t.Fatalf("table listing should push filter predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "TABLE_TYPE IN (:2,:3)") {
+		t.Fatalf("table listing should push table type predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "ROWNUM <= :4") || !strings.Contains(sqlText, "DBX_RN > :5") {
+		t.Fatalf("table listing should use rownum pagination, got: %s", query.SQL)
+	}
+	if len(query.Args) != 5 {
+		t.Fatalf("unexpected args: %#v", query.Args)
+	}
+	if query.Args[0] != "%U%\\_%R%" || query.Args[1] != "TABLE" || query.Args[2] != "VIEW" || query.Args[3] != 511 || query.Args[4] != 10 {
+		t.Fatalf("constraints args were not normalized: %#v", query.Args)
+	}
+}
+
 func TestListObjectsSQLUsesSplitDictionaryQuery(t *testing.T) {
 	sqlText := strings.ToUpper(oracleListObjectsSQL)
 
@@ -512,6 +637,40 @@ func TestListObjectsQueryAppliesMetadataConstraints(t *testing.T) {
 		t.Fatalf("unexpected args: %#v", query.Args)
 	}
 	if query.Args[2] != "%P%K%G%\\%%" || query.Args[3] != "FUNCTION" || query.Args[4] != "PACKAGE" || query.Args[5] != 25 || query.Args[6] != 0 {
+		t.Fatalf("object constraints args were not normalized: %#v", query.Args)
+	}
+}
+
+func TestListSessionUserObjectsQueryUsesUserDictionary(t *testing.T) {
+	query := oracleListSessionUserObjectsQuery(metadataListConstraints{
+		Filter:      "pkg%",
+		Limit:       25,
+		ObjectTypes: []string{"FUNCTION", "package"},
+	})
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "USER_TABLES") || !strings.Contains(sqlText, "USER_OBJECTS") {
+		t.Fatalf("session-user object listing should use USER_* dictionaries, got: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "ALL_TABLES") || strings.Contains(sqlText, "ALL_OBJECTS") {
+		t.Fatalf("session-user object listing should avoid ALL_* dictionaries, got: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "OWNER =") {
+		t.Fatalf("session-user object listing should not add owner predicates, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE :1 ESCAPE '\\'") {
+		t.Fatalf("object listing should push filter predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "OBJECT_TYPE IN (:2,:3)") {
+		t.Fatalf("object listing should push object type predicate, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "ROWNUM <= :4") || !strings.Contains(sqlText, "DBX_RN > :5") {
+		t.Fatalf("object listing should use rownum pagination, got: %s", query.SQL)
+	}
+	if len(query.Args) != 5 {
+		t.Fatalf("unexpected args: %#v", query.Args)
+	}
+	if query.Args[0] != "%P%K%G%\\%%" || query.Args[1] != "FUNCTION" || query.Args[2] != "PACKAGE" || query.Args[3] != 25 || query.Args[4] != 0 {
 		t.Fatalf("object constraints args were not normalized: %#v", query.Args)
 	}
 }
