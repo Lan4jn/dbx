@@ -3155,6 +3155,7 @@ export default withEnglishFallback({
     mcpInstallSuccess: "インストール成功",
     mcpInstallFailed: "インストール失敗",
     mcpConfig: "MCP設定",
+    mcpConfigOptionsHint: "これらのオプションは下の生成設定だけを更新します。AIクライアントにコピーした後、MCPセッションを再起動してください。",
     mcpCodexConfig: "Codex設定",
     mcpCodexConfigPath: "Codexは ~/.codex/config.toml またはプロジェクトレベルの .codex/config.toml を使用できます。",
     mcpCursorConfigPath: "Cursorはプロジェクトの .cursor/mcp.json またはグローバル ~/.cursor/mcp.json を使用できます。",

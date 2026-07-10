@@ -3272,6 +3272,7 @@ export default {
     mcpInstallSuccess: "Installation successful",
     mcpInstallFailed: "Installation failed",
     mcpConfig: "MCP config",
+    mcpConfigOptionsHint: "These options only update the generated config below. Copy it into your AI client and restart the MCP session to apply it.",
     mcpCodexConfig: "Codex config",
     mcpCodexConfigPath: "Codex can use ~/.codex/config.toml or a project-level .codex/config.toml.",
     mcpCursorConfigPath: "Cursor can use .cursor/mcp.json in the project or ~/.cursor/mcp.json globally.",

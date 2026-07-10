@@ -3171,6 +3171,7 @@ export default withEnglishFallback({
     mcpInstallSuccess: "Installazione completata",
     mcpInstallFailed: "Installazione fallita",
     mcpConfig: "Configurazione MCP",
+    mcpConfigOptionsHint: "Queste opzioni aggiornano solo la configurazione generata. Copiala nel client AI e riavvia la sessione MCP per applicarla.",
     mcpCodexConfig: "Configurazione Codex",
     mcpCodexConfigPath: "Codex può utilizzare ~/.codex/config.toml o un .codex/config.toml a livello di progetto.",
     mcpCursorConfigPath: "Cursor può usare .cursor/mcp.json nel progetto o ~/.cursor/mcp.json globalmente.",

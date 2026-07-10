@@ -3274,6 +3274,7 @@ export default withEnglishFallback({
     mcpInstallSuccess: "安装成功",
     mcpInstallFailed: "安装失败",
     mcpConfig: "MCP 配置",
+    mcpConfigOptionsHint: "以下选项只会更新下方生成的配置文本。复制到 AI 客户端配置后，请重启对应 MCP 会话使其生效。",
     mcpCodexConfig: "Codex 配置",
     mcpCodexConfigPath: "Codex 可放在 ~/.codex/config.toml 或项目级 .codex/config.toml。",
     mcpCursorConfigPath: "Cursor 可放在项目级 .cursor/mcp.json 或全局 ~/.cursor/mcp.json。",
