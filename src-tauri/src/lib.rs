@@ -59,10 +59,10 @@ impl CloseBehaviorState {
     }
 }
 #[cfg(target_os = "macos")]
-const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
+const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/tray-macos-template.png");
 #[cfg(target_os = "macos")]
-const ABOUT_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.png");
-const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
+const ABOUT_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/icon.png");
+const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/icon-black.png");
 
 pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
     log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
