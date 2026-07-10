@@ -301,7 +301,8 @@ const canExportResultArchive = computed(() => props.activeTab.mode === "query" &
 const resultAutoSave = computed(() => props.activeTab.resultAutoSave === true);
 const QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS = [5, 10, 30, 60, 300];
 const queryResultAutoRefreshIntervalSeconds = ref(10);
-const queryResultAutoRefreshCustomIntervalInput = ref("10");
+const queryResultAutoRefreshCustomIntervalInput = ref("15");
+const queryResultAutoRefreshCustomIntervalInputRef = ref<HTMLInputElement | null>(null);
 const queryResultAutoRefreshEnabled = ref(false);
 let queryResultAutoRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const queryResultAutoRefreshLabel = computed(() => (queryResultAutoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: queryResultAutoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
@@ -642,10 +643,16 @@ function restartQueryResultAutoRefreshTimer() {
   queryResultAutoRefreshTimer = setInterval(runQueryResultAutoRefreshTick, queryResultAutoRefreshIntervalSeconds.value * 1000);
 }
 
-function setQueryResultAutoRefreshInterval(seconds: number) {
+function setQueryResultAutoRefreshInterval(seconds: number, options: { syncCustomInput?: boolean } = {}) {
   queryResultAutoRefreshIntervalSeconds.value = seconds;
-  queryResultAutoRefreshCustomIntervalInput.value = String(seconds);
+  if (options.syncCustomInput !== false) {
+    queryResultAutoRefreshCustomIntervalInput.value = String(seconds);
+  }
   if (queryResultAutoRefreshEnabled.value) restartQueryResultAutoRefreshTimer();
+}
+
+function setQueryResultAutoRefreshPresetInterval(seconds: number) {
+  setQueryResultAutoRefreshInterval(seconds, { syncCustomInput: false });
 }
 
 function applyCustomQueryResultAutoRefreshInterval() {
@@ -656,6 +663,16 @@ function applyCustomQueryResultAutoRefreshInterval() {
     return;
   }
   setQueryResultAutoRefreshInterval(seconds);
+}
+
+function focusCustomQueryResultAutoRefreshIntervalInput() {
+  queryResultAutoRefreshCustomIntervalInputRef.value?.focus({ preventScroll: true });
+  queryResultAutoRefreshCustomIntervalInputRef.value?.select();
+}
+
+function activateCustomQueryResultAutoRefreshIntervalInput() {
+  applyCustomQueryResultAutoRefreshInterval();
+  focusCustomQueryResultAutoRefreshIntervalInput();
 }
 
 function onCustomQueryResultAutoRefreshInputKeydown(event: KeyboardEvent) {
@@ -1039,16 +1056,17 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
                         <span v-else class="h-3.5 w-3.5" />
                         {{ queryResultAutoRefreshEnabled ? t("tabs.stopAutoRefresh") : t("tabs.startAutoRefresh") }}
                       </DropdownMenuItem>
-                      <DropdownMenuItem v-for="seconds in QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setQueryResultAutoRefreshInterval(seconds)">
+                      <DropdownMenuItem v-for="seconds in QUERY_RESULT_AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setQueryResultAutoRefreshPresetInterval(seconds)">
                         <Check v-if="queryResultAutoRefreshIntervalSeconds === seconds" class="h-3.5 w-3.5" />
                         <span v-else class="h-3.5 w-3.5" />
                         {{ t("tabs.autoRefreshEvery", { seconds }) }}
                       </DropdownMenuItem>
-                      <div class="relative flex cursor-default select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent">
+                      <div class="relative flex cursor-text select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent hover:bg-accent" @pointerdown.stop @click.stop.prevent="activateCustomQueryResultAutoRefreshIntervalInput">
                         <Check v-if="queryResultAutoRefreshUsesCustomInterval" class="h-3.5 w-3.5 shrink-0" />
                         <span v-else class="h-3.5 w-3.5 shrink-0" />
                         <span class="shrink-0">{{ t("tabs.customAutoRefreshInterval") }}</span>
                         <input
+                          ref="queryResultAutoRefreshCustomIntervalInputRef"
                           v-model="queryResultAutoRefreshCustomIntervalInput"
                           type="text"
                           inputmode="numeric"

@@ -250,7 +250,8 @@ const emit = defineEmits<{
 }>();
 
 const autoRefreshIntervalSeconds = ref(10);
-const autoRefreshCustomIntervalInput = ref("10");
+const autoRefreshCustomIntervalInput = ref("15");
+const autoRefreshCustomIntervalInputRef = ref<HTMLInputElement | null>(null);
 const autoRefreshEnabled = ref(false);
 let autoRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const autoRefreshLabel = computed(() => (autoRefreshEnabled.value ? t("tabs.autoRefreshEvery", { seconds: autoRefreshIntervalSeconds.value }) : t("tabs.autoRefresh")));
@@ -4081,10 +4082,16 @@ function restartAutoRefreshTimer() {
   autoRefreshTimer = setInterval(runAutoRefreshTick, autoRefreshIntervalSeconds.value * 1000);
 }
 
-function setAutoRefreshInterval(seconds: number) {
+function setAutoRefreshInterval(seconds: number, options: { syncCustomInput?: boolean } = {}) {
   autoRefreshIntervalSeconds.value = seconds;
-  autoRefreshCustomIntervalInput.value = String(seconds);
+  if (options.syncCustomInput !== false) {
+    autoRefreshCustomIntervalInput.value = String(seconds);
+  }
   if (autoRefreshEnabled.value) restartAutoRefreshTimer();
+}
+
+function setAutoRefreshPresetInterval(seconds: number) {
+  setAutoRefreshInterval(seconds, { syncCustomInput: false });
 }
 
 function applyCustomAutoRefreshInterval() {
@@ -4095,6 +4102,16 @@ function applyCustomAutoRefreshInterval() {
     return;
   }
   setAutoRefreshInterval(seconds);
+}
+
+function focusCustomAutoRefreshIntervalInput() {
+  autoRefreshCustomIntervalInputRef.value?.focus({ preventScroll: true });
+  autoRefreshCustomIntervalInputRef.value?.select();
+}
+
+function activateCustomAutoRefreshIntervalInput() {
+  applyCustomAutoRefreshInterval();
+  focusCustomAutoRefreshIntervalInput();
 }
 
 function onCustomAutoRefreshInputKeydown(event: KeyboardEvent) {
@@ -8859,16 +8876,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   <span v-else class="h-3.5 w-3.5" />
                   {{ autoRefreshEnabled ? t("tabs.stopAutoRefresh") : t("tabs.startAutoRefresh") }}
                 </DropdownMenuItem>
-                <DropdownMenuItem v-for="seconds in AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setAutoRefreshInterval(seconds)">
+                <DropdownMenuItem v-for="seconds in AUTO_REFRESH_INTERVAL_OPTIONS" :key="seconds" class="gap-2" @select="setAutoRefreshPresetInterval(seconds)">
                   <Check v-if="autoRefreshIntervalSeconds === seconds" class="h-3.5 w-3.5" />
                   <span v-else class="h-3.5 w-3.5" />
                   {{ t("tabs.autoRefreshEvery", { seconds }) }}
                 </DropdownMenuItem>
-                <div class="relative flex cursor-default select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent">
+                <div class="relative flex cursor-text select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent hover:bg-accent" @pointerdown.stop @click.stop.prevent="activateCustomAutoRefreshIntervalInput">
                   <Check v-if="autoRefreshUsesCustomInterval" class="h-3.5 w-3.5 shrink-0" />
                   <span v-else class="h-3.5 w-3.5 shrink-0" />
                   <span class="shrink-0">{{ t("tabs.customAutoRefreshInterval") }}</span>
                   <input
+                    ref="autoRefreshCustomIntervalInputRef"
                     v-model="autoRefreshCustomIntervalInput"
                     type="text"
                     inputmode="numeric"
