@@ -8,10 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
-const OFFICIAL_UPDATE_ENDPOINTS: [&str; 2] = [
-    "https://dl.dbxio.com/releases/latest/latest.json",
-    "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-];
+const OFFICIAL_UPDATE_ENDPOINTS: [&str; 1] = ["https://server.sjserver.fun:880/dbx/latest.json"];
 const CNB_RELEASE_DOWNLOAD_PREFIX: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/download/";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/t8y2/dbx/releases/download/";
 const ATOMGIT_RELEASE_DOWNLOAD_PREFIX: &str = "https://atomgit.com/t8y2/dbx/releases/download/";

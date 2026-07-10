@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-const LATEST_JSON_PATH: &str = "https://github.com/t8y2/dbx/releases/latest/download/latest.json";
-const LATEST_JSON_R2_PATH: &str = "releases/latest/latest.json";
+const LATEST_JSON_PATH: &str = "https://server.sjserver.fun:880/dbx/latest.json";
 const LATEST_EN_NOTES_R2_PATH: &str = "changelog/latest-en.json";
 const GITHUB_RELEASE_API_PREFIX: &str = "https://api.github.com/repos/t8y2/dbx/releases/tags/v";
 const RELEASE_URL_PREFIX: &str = "https://github.com/t8y2/dbx/releases/tag/v";
@@ -49,8 +48,12 @@ pub struct UpdateInfo {
 pub async fn fetch_latest_release(locale: &str) -> Result<TauriRelease, String> {
     let client = build_update_http_client()?;
 
-    let resp = crate::race_download(&client, LATEST_JSON_PATH, LATEST_JSON_R2_PATH, "dbx-update-checker")
+    let resp = client
+        .get(LATEST_JSON_PATH)
+        .header(reqwest::header::USER_AGENT, "dbx-update-checker")
+        .send()
         .await
+        .and_then(|response| response.error_for_status())
         .map_err(|e| format!("Failed to check updates: {e}"))?;
 
     let mut release = resp.json::<TauriRelease>().await.map_err(|e| format!("Failed to parse update response: {e}"))?;
