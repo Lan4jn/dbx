@@ -212,6 +212,7 @@ import { columnHeaderCanvasPointerDisabled, columnHeaderClickShouldBeSuppressed,
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
 import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/common/clipboard";
+import { claimDataGridPaste } from "@/lib/dataGrid/dataGridClipboard";
 import ExportProgressDialog from "@/components/export/ExportProgressDialog.vue";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
@@ -6918,8 +6919,6 @@ function clipboardShortcut(event: KeyboardEvent, key: string): boolean {
   return isPlainClipboardShortcut(event, key);
 }
 
-let lastPasteEventAt = 0;
-
 async function pasteClipboardIntoSelection() {
   if (!props.editable) return;
   const text = await readTextFromClipboard();
@@ -6952,13 +6951,11 @@ function pasteTextIntoSelection(text: string): boolean {
 }
 
 function onGridPaste(event: ClipboardEvent) {
-  if (!props.editable || (!selectedRange.value && !hasColumnSelection.value)) return;
-  const target = event.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return;
+  const intent = claimDataGridPaste(event, props.editable, !!selectedRange.value || hasColumnSelection.value);
+  if (intent === "native") return;
+  if (intent === "block") return;
   const text = event.clipboardData?.getData("text/plain");
   if (text === undefined) return;
-  event.preventDefault();
-  lastPasteEventAt = Date.now();
   pasteTextIntoSelection(text);
 }
 
@@ -7420,12 +7417,11 @@ async function onGridKeydown(event: KeyboardEvent) {
     return;
   }
   if (clipboardShortcut(event, "v")) {
-    if (!props.editable || (!selectedRange.value && !hasColumnSelection.value)) return;
-    const keydownAt = Date.now();
-    window.setTimeout(() => {
-      if (lastPasteEventAt >= keydownAt) return;
-      pasteClipboardIntoSelection().catch((e) => toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000));
-    }, 50);
+    const intent = claimDataGridPaste(event, props.editable, !!selectedRange.value || hasColumnSelection.value);
+    if (intent === "native") return;
+    // A focused grid owns the shortcut even when read-only; otherwise the webview may paste into the previously focused SQL editor.
+    if (intent === "block") return;
+    pasteClipboardIntoSelection().catch((e) => toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000));
     return;
   }
 }
