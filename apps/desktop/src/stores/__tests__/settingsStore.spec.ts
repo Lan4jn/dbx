@@ -18,6 +18,14 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ showCurrentStatementFrame: false }).showCurrentStatementFrame).toBe(false);
   });
 
+  it("shows INSERT value column hints by default", () => {
+    expect(normalizeEditorSettings({}).showInsertValueHints).toBe(true);
+  });
+
+  it("preserves disabled INSERT value column hints", () => {
+    expect(normalizeEditorSettings({ showInsertValueHints: false }).showInsertValueHints).toBe(false);
+  });
+
   it("keeps SQL semantic diagnostics in auto mode and disabled by default", () => {
     const settings = normalizeEditorSettings({});
     expect(settings.sqlSemanticDiagnosticsMode).toBe("auto");
@@ -71,6 +79,11 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ dataGridSearchMode: "invalid" as any }).dataGridSearchMode).toBe("filter");
   });
 
+  it("shows cell detail metadata by default and preserves collapsed state", () => {
+    expect(normalizeEditorSettings({}).cellDetailMetadataCollapsed).toBe(false);
+    expect(normalizeEditorSettings({ cellDetailMetadataCollapsed: true }).cellDetailMetadataCollapsed).toBe(true);
+  });
+
   it("normalizes toolbar item settings from older saved settings", () => {
     const settings = normalizeEditorSettings({
       toolbarItems: {
@@ -97,5 +110,20 @@ describe("normalizeDesktopSettings", () => {
     expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 0 }).duckdb_worker_max_processes).toBe(1);
     expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 32 }).duckdb_worker_max_processes).toBe(16);
     expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 3.6 }).duckdb_worker_max_processes).toBe(4);
+  });
+});
+
+describe("normalizeEditorSettings - continueOnErrorOnBatch", () => {
+  it("defaults continueOnErrorOnBatch to false", () => {
+    expect(normalizeEditorSettings({}).continueOnErrorOnBatch).toBe(false);
+  });
+
+  it("preserves enabled continueOnErrorOnBatch", () => {
+    expect(normalizeEditorSettings({ continueOnErrorOnBatch: true }).continueOnErrorOnBatch).toBe(true);
+  });
+
+  it("treats non-boolean values as false", () => {
+    expect(normalizeEditorSettings({ continueOnErrorOnBatch: "yes" } as any).continueOnErrorOnBatch).toBe(false);
+    expect(normalizeEditorSettings({ continueOnErrorOnBatch: 1 } as any).continueOnErrorOnBatch).toBe(false);
   });
 });

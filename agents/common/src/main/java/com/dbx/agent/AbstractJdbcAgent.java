@@ -21,6 +21,16 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     }
 
     @Override
+    public String getIdentifierQuote() {
+        try {
+            String quote = requireConnected().getMetaData().getIdentifierQuoteString();
+            return quote == null || quote.trim().isEmpty() ? "" : quote.trim();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    @Override
     public final void connect(ConnectParams params) {
         uncheckedVoid(() -> {
             loadDriver(params);
@@ -104,8 +114,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
-        return JdbcExecutor.INSTANCE.execute(
-            requireConnected(),
+        Connection conn = requireConnected();
+        uncheckedVoid(() -> beforeQueryExecution(conn, options.getTimeoutSecs()));
+        return JdbcExecutor.current().execute(
+            conn,
             sql,
             schema,
             this::setSchemaSQL,
@@ -118,8 +130,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.executePage(
-            requireConnected(),
+        Connection conn = requireConnected();
+        uncheckedVoid(() -> beforeQueryExecution(conn, options.getTimeoutSecs()));
+        return JdbcExecutor.current().executePage(
+            conn,
             sql,
             schema,
             this::setSchemaSQL,
@@ -130,18 +144,20 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryPageResult fetchQueryPage(String sessionId, int pageSize) {
-        return JdbcExecutor.INSTANCE.fetchPage(sessionId, pageSize);
+        return JdbcExecutor.current().fetchPage(sessionId, pageSize);
     }
 
     @Override
     public boolean closeQuerySession(String sessionId) {
-        return JdbcExecutor.INSTANCE.closeQuerySession(sessionId);
+        return JdbcExecutor.current().closeQuerySession(sessionId);
     }
 
     @Override
     public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.startTableRead(
-            requireConnected(),
+        Connection conn = requireConnected();
+        uncheckedVoid(() -> beforeQueryExecution(conn, options.getTimeoutSecs()));
+        return JdbcExecutor.current().startTableRead(
+            conn,
             sql,
             schema,
             this::setSchemaSQL,
@@ -152,12 +168,12 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
-        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+        return JdbcExecutor.current().fetchTableReadPage(sessionId, pageSize);
     }
 
     @Override
     public boolean closeTableReadSession(String sessionId) {
-        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
+        return JdbcExecutor.current().closeTableReadSession(sessionId);
     }
 
     @Override
@@ -184,6 +200,9 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     }
 
     protected void afterConnect(ConnectParams params, Connection connection) throws Exception {
+    }
+
+    protected void beforeQueryExecution(Connection connection, int timeoutSecs) throws Exception {
     }
 
     protected String getConfiguredDatabase() {

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -45,6 +48,87 @@ func TestHandshakeResponse(t *testing.T) {
 	if !contains(result.Capabilities, "query") || !contains(result.Capabilities, "metadata") {
 		t.Fatalf("expected query and metadata capabilities, got %v", result.Capabilities)
 	}
+}
+
+func TestRuntimeHandshakeAdvertisesMultiSessionProtocol(t *testing.T) {
+	runtime := newRuntimeServer()
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":7,"method":"handshake","params":{"appVersion":"dev"}}`)
+	if shutdown || resp.Error != nil {
+		t.Fatalf("unexpected handshake response: shutdown=%v error=%v", shutdown, resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		ProtocolVersion      int      `json:"protocolVersion"`
+		AgentProtocolVersion int      `json:"agentProtocolVersion"`
+		Capabilities         []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ProtocolVersion != 2 || result.AgentProtocolVersion != 2 {
+		t.Fatalf("unexpected protocol versions: %+v", result)
+	}
+	if !contains(result.Capabilities, "multi_session") {
+		t.Fatalf("expected multi_session capability, got %v", result.Capabilities)
+	}
+}
+
+func TestRuntimeMissingAgentSessionDoesNotUseQueryCursorSessionID(t *testing.T) {
+	runtime := newRuntimeServer()
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":8,"method":"fetch_query_page","params":{"sessionId":"cursor-1","pageSize":10}}`)
+	if shutdown {
+		t.Fatal("fetch_query_page should not shut down the runtime")
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, legacyAgentSessionID) {
+		t.Fatalf("expected missing legacy agent session error, got %#v", resp.Error)
+	}
+}
+
+func TestRuntimeCloseOneSessionKeepsOtherSessionRegistered(t *testing.T) {
+	runtime := newRuntimeServer()
+	runtime.sessions["a"] = &agentSession{server: newServer()}
+	runtime.sessions["b"] = &agentSession{server: newServer()}
+
+	if err := runtime.closeSession("a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.session("a"); err == nil {
+		t.Fatal("closed session should be removed")
+	}
+	if _, err := runtime.session("b"); err != nil {
+		t.Fatalf("other session should remain registered: %v", err)
+	}
+}
+
+func TestRuntimeCancelSessionOnlyCancelsTargetSession(t *testing.T) {
+	runtime := newRuntimeServer()
+	serverA := newServer()
+	serverB := newServer()
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	serverA.activeCancel = cancelA
+	serverB.activeCancel = cancelB
+	runtime.sessions["a"] = &agentSession{server: serverA}
+	runtime.sessions["b"] = &agentSession{server: serverB}
+
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":9,"method":"cancel_session","params":{"agentSessionId":"a"}}`)
+	if shutdown || resp.Error != nil {
+		t.Fatalf("unexpected cancel response: shutdown=%v error=%v", shutdown, resp.Error)
+	}
+	select {
+	case <-ctxA.Done():
+	default:
+		t.Fatal("target session was not canceled")
+	}
+	select {
+	case <-ctxB.Done():
+		t.Fatal("canceling session a should not cancel session b")
+	default:
+	}
+	cancelB()
 }
 
 func TestCloseMissingQuerySessionReturnsFalse(t *testing.T) {
@@ -247,6 +331,67 @@ func TestTrimStatementSQLRemovesRegularStatementSemicolon(t *testing.T) {
 	}
 }
 
+func TestOracleExplainPlanBindParamsIncludesNamedParameters(t *testing.T) {
+	sqlText := `
+SELECT *
+FROM orders
+WHERE id = :id
+  AND status = :status
+  AND parent_id = :id`
+
+	want := []oracleBindParam{
+		{Name: "id"},
+		{Name: "status"},
+	}
+	if got := oracleExplainPlanBindParams(sqlText); !reflect.DeepEqual(got, want) {
+		t.Fatalf("oracleExplainPlanBindParams() = %#v, want %#v", got, want)
+	}
+}
+
+func TestOracleExplainPlanBindParamsSkipsQuotedTextAndComments(t *testing.T) {
+	sqlText := `
+SELECT ':literal' AS literal_value,
+       q'[not :q_param]' AS q_literal,
+       "COL:NAME" AS quoted_identifier
+FROM orders
+WHERE id = :id
+  -- ignored :comment_param
+  AND note <> 'escaped '' :text_param'
+  /* ignored :block_param */`
+
+	want := []oracleBindParam{{Name: "id"}}
+	if got := oracleExplainPlanBindParams(sqlText); !reflect.DeepEqual(got, want) {
+		t.Fatalf("oracleExplainPlanBindParams() = %#v, want %#v", got, want)
+	}
+}
+
+func TestOracleExplainPlanBindParamsIncludesPositionalParameters(t *testing.T) {
+	sqlText := "SELECT * FROM orders WHERE id = :1 AND status = :status"
+
+	want := []oracleBindParam{
+		{Name: "1", Positional: true},
+		{Name: "status"},
+	}
+	if got := oracleExplainPlanBindParams(sqlText); !reflect.DeepEqual(got, want) {
+		t.Fatalf("oracleExplainPlanBindParams() = %#v, want %#v", got, want)
+	}
+}
+
+func TestOracleExplainPlanBindArgsUsesNamedArguments(t *testing.T) {
+	args := oracleExplainPlanBindArgs("SELECT * FROM orders WHERE id = :id")
+
+	if len(args) != 1 {
+		t.Fatalf("expected one bind argument, got %#v", args)
+	}
+	named, ok := args[0].(sql.NamedArg)
+	if !ok {
+		t.Fatalf("expected sql.NamedArg, got %#v", args[0])
+	}
+	if named.Name != "id" || named.Value != nil {
+		t.Fatalf("unexpected named bind argument: %#v", named)
+	}
+}
+
 func protocolContract(t *testing.T) struct {
 	ProtocolVersion int      `json:"protocolVersion"`
 	AllCapabilities []string `json:"allCapabilities"`
@@ -299,7 +444,7 @@ func TestBuildDSNUsesConnectionStringWhenProvided(t *testing.T) {
 	}
 }
 
-func TestBuildDSNEncodesColonInCredentials(t *testing.T) {
+func TestBuildDSNPreservesBastionUsernameAndEncodesCredentials(t *testing.T) {
 	dsn := buildDSN(connectParams{
 		Host:     "db.example.com",
 		Port:     1521,
@@ -313,11 +458,11 @@ func TestBuildDSNEncodesColonInCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	password, _ := parsed.User.Password()
-	if parsed.User.Username() != `"9008888:reader"` || password != "dbx:pass" {
+	if parsed.User.Username() != "9008888:reader" || password != "dbx:pass" {
 		t.Fatalf("credentials should survive URL parsing, dsn=%s username=%q password=%q", dsn, parsed.User.Username(), password)
 	}
-	if !strings.HasPrefix(parsed.User.String(), "%229008888%3Areader%22:") {
-		t.Fatalf("Oracle auth username should be quoted and escaped for non-regular identifiers, dsn=%s", dsn)
+	if !strings.HasPrefix(parsed.User.String(), "9008888%3Areader:") {
+		t.Fatalf("bastion username should be escaped without being quoted, dsn=%s", dsn)
 	}
 }
 
@@ -333,7 +478,7 @@ func TestBuildDSNEncodesColonInCredentialsFromJDBCServiceURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	password, _ := parsed.User.Password()
-	if parsed.User.Username() != `"9008888:reader"` || password != "dbx:pass" {
+	if parsed.User.Username() != "9008888:reader" || password != "dbx:pass" {
 		t.Fatalf("credentials should survive JDBC URL conversion, dsn=%s username=%q password=%q", dsn, parsed.User.Username(), password)
 	}
 	if parsed.Host != "db.example.com:1521" || strings.TrimPrefix(parsed.Path, "/") != "XE" {
@@ -341,21 +486,21 @@ func TestBuildDSNEncodesColonInCredentialsFromJDBCServiceURL(t *testing.T) {
 	}
 }
 
-func TestOracleAuthUsernameQuotesOnlyNonRegularIdentifiers(t *testing.T) {
-	tests := map[string]string{
-		"scott":          "scott",
-		"test":           "test",
-		"SCOTT_1":        "SCOTT_1",
-		"9008888:reader": `"9008888:reader"`,
-		"abc:def":        `"abc:def"`,
-		`"abc:def"`:      `"abc:def"`,
-		`abc"def`:        `"abc""def"`,
-	}
+func TestBuildDSNPreservesExplicitlyQuotedUsername(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:     "db.example.com",
+		Port:     1521,
+		Database: "XE",
+		Username: `"abc:def"`,
+		Password: "dbx:pass",
+	})
 
-	for input, want := range tests {
-		if got := oracleAuthUsername(input); got != want {
-			t.Fatalf("oracleAuthUsername(%q) = %q, want %q", input, got, want)
-		}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.User.Username() != `"abc:def"` {
+		t.Fatalf("explicitly quoted username should remain unchanged, dsn=%s username=%q", dsn, parsed.User.Username())
 	}
 }
 
@@ -680,6 +825,102 @@ func TestOracleFuzzyLikePatternEscapesSpecialCharacters(t *testing.T) {
 	want := `%a%\_%\%%\\%b%`
 	if got != want {
 		t.Fatalf("oracleFuzzyLikePattern() = %q, want %q", got, want)
+	}
+}
+
+func TestOracleCompletionTablesQuerySearchesAcrossSchemasWithPriority(t *testing.T) {
+	query := oracleCompletionTablesQuery(completionAssistantRequest{
+		Database:     "ORCL",
+		Schema:       "APP",
+		ObjectKinds:  []string{"table", "view"},
+		Mask:         "dept_d",
+		GlobalSearch: true,
+		MatchMode:    "prefix",
+	}, "APP", 201)
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "ALL_OBJECTS") || !strings.Contains(sqlText, "ALL_SYNONYMS") {
+		t.Fatalf("global completion should include objects and synonyms: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "S.TABLE_OWNER AS TARGET_OWNER") || !strings.Contains(sqlText, "S.TABLE_NAME AS TARGET_NAME") || !strings.Contains(sqlText, "S.DB_LINK IS NULL") {
+		t.Fatalf("table completion should return local synonym targets for bounded validation: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "JOIN ALL_OBJECTS TARGET") {
+		t.Fatalf("Oracle 11g completion must not join full dictionary views before applying the result limit: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, TARGET_OWNER, TARGET_NAME\nFROM (\nSELECT O.OWNER") {
+		t.Fatalf("Oracle 11g requires the union to be wrapped before expression-based ordering: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "WHERE UPPER(OBJECT_NAME) LIKE UPPER(:1) ESCAPE '\\' AND OWNER =") {
+		t.Fatalf("global completion must not restrict results to one owner: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "WHEN OWNER = :3 THEN 0") || !strings.Contains(sqlText, "WHERE ROWNUM <= :5") {
+		t.Fatalf("completion should prioritize the current schema and use Oracle 11g rownum limiting: %s", query.SQL)
+	}
+	if len(query.Args) != 5 || query.Args[0] != `dept\_d%` || query.Args[1] != `dept\_d%` || query.Args[2] != "APP" || query.Args[3] != "dept_d" || query.Args[4] != 201 {
+		t.Fatalf("unexpected completion args: %#v", query.Args)
+	}
+}
+
+func TestOracleCompletionSynonymTargetsQueryIsBoundedToCandidates(t *testing.T) {
+	query := oracleCompletionSynonymTargetsQuery([]oracleCompletionSynonymTarget{{Owner: "DBX_TEST", Name: "DEPT_DICT"}, {Owner: "HR", Name: "EMP_VIEW"}}, []string{"'TABLE'", "'VIEW'"})
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "O.OBJECT_TYPE IN ('TABLE','VIEW')") || !strings.Contains(sqlText, "(O.OWNER = :1 AND O.OBJECT_NAME = :2)") || !strings.Contains(sqlText, "(O.OWNER = :3 AND O.OBJECT_NAME = :4)") {
+		t.Fatalf("synonym target validation should query only returned targets: %s", query.SQL)
+	}
+	wantArgs := []any{"DBX_TEST", "DEPT_DICT", "HR", "EMP_VIEW"}
+	if !reflect.DeepEqual(query.Args, wantArgs) {
+		t.Fatalf("unexpected synonym target args: %#v", query.Args)
+	}
+}
+
+func TestOracleCompletionTablesQueryScopesExplicitSchema(t *testing.T) {
+	query := oracleCompletionTablesQuery(completionAssistantRequest{
+		Schema:       "APP",
+		ParentSchema: "HR",
+		ObjectKinds:  []string{"table"},
+		Mask:         "EMP",
+	}, "APP", 50)
+
+	if !strings.Contains(strings.ToUpper(query.SQL), "AND O.OWNER = :2") || !strings.Contains(strings.ToUpper(query.SQL), "AND S.OWNER = :4") {
+		t.Fatalf("explicit schema completion should restrict owner: %s", query.SQL)
+	}
+	if len(query.Args) != 7 || query.Args[1] != "HR" || query.Args[3] != "HR" || query.Args[4] != "APP" {
+		t.Fatalf("unexpected scoped completion args: %#v", query.Args)
+	}
+}
+
+func TestOracleCompletionRoutinesQueryUsesPublicPackageMetadata(t *testing.T) {
+	query := oracleCompletionRoutinesQuery(completionAssistantRequest{
+		Schema:       "HR",
+		ParentSchema: "HR",
+		ParentName:   "PAYROLL",
+		ObjectKinds:  []string{"routine"},
+		Mask:         "CALC",
+	}, "HR", 200)
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "ALL_PROCEDURES") || !strings.Contains(sqlText, "ALL_ARGUMENTS") {
+		t.Fatalf("package completion should use callable procedure metadata: %s", query.SQL)
+	}
+	if strings.Contains(sqlText, "ALL_SOURCE") || strings.Contains(sqlText, "PACKAGE BODY") {
+		t.Fatalf("package completion must not expose private package body source: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "P.OBJECT_NAME = :1") || !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE UPPER(:2)") || !strings.Contains(sqlText, "AND OWNER = :3") {
+		t.Fatalf("package completion should scope package and owner: %s", query.SQL)
+	}
+	if len(query.Args) != 6 || query.Args[0] != "PAYROLL" || query.Args[1] != "CALC%" || query.Args[2] != "HR" {
+		t.Fatalf("unexpected package completion args: %#v", query.Args)
+	}
+}
+
+func TestOracleCompletionLikePatternSupportsPrefixAndContains(t *testing.T) {
+	if got := oracleCompletionLikePattern(`A_%`, "prefix"); got != `A\_\%%` {
+		t.Fatalf("prefix pattern = %q", got)
+	}
+	if got := oracleCompletionLikePattern("DEPT", "contains"); got != "%DEPT%" {
+		t.Fatalf("contains pattern = %q", got)
 	}
 }
 

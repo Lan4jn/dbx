@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use tokio::sync::RwLock;
 
+use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
 use crate::object_source_sql::build_export_object_source_sql;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
@@ -15,6 +16,10 @@ use crate::transfer::{
 
 static EXPORT_CANCELLED: once_cell::sync::Lazy<RwLock<HashSet<String>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashSet::new()));
+
+pub fn database_export_client_session_id(export_id: &str) -> String {
+    task_client_session_id("database-export", export_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -633,11 +638,12 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
         .columns
         .iter()
         .enumerate()
-        .filter(|(index, _)| {
-            !is_postgres_tsvector_export_column(
-                options.database_type,
-                options.column_types.get(*index).and_then(|value| value.as_deref()),
-            )
+        .filter(|(index, column)| {
+            !is_internal_export_column(options.database_type, column)
+                && !is_postgres_tsvector_export_column(
+                    options.database_type,
+                    options.column_types.get(*index).and_then(|value| value.as_deref()),
+                )
         })
         .collect::<Vec<_>>();
     if insert_columns.is_empty() {
@@ -688,6 +694,13 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     }
 
     Ok(statements)
+}
+
+pub(crate) fn is_internal_export_column(database_type: Option<DatabaseType>, column: &str) -> bool {
+    // Oracle-compatible ROWID is injected only to identify editable rows. It
+    // is not a physical table column and must never propagate into exports.
+    crate::sql_dialect::uses_oracle_row_id(database_type)
+        && column.eq_ignore_ascii_case(crate::sql_dialect::DBX_ROWID_COLUMN)
 }
 
 fn is_postgres_tsvector_export_column(database_type: Option<DatabaseType>, column_type: Option<&str>) -> bool {
@@ -979,7 +992,10 @@ pub async fn export_database_sql_core(
         .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
 
     // 2. Get pool
-    let pool_key = state.get_or_create_pool(&request.connection_id, Some(&request.database)).await?;
+    let client_session_id = database_export_client_session_id(&request.export_id);
+    let pool_key = state
+        .get_or_create_pool_for_session(&request.connection_id, Some(&request.database), Some(&client_session_id))
+        .await?;
 
     // 3. List tables
     let all_tables = crate::schema::list_tables_core(
@@ -1213,7 +1229,7 @@ pub async fn export_database_sql_core(
             if !col_names.is_empty() {
                 // Get row count
                 let count_query = crate::transfer::count_sql(table_name, &request.schema, &db_type);
-                let total_rows = match crate::transfer::execute_on_pool(state, &pool_key, &count_query).await {
+                let total_rows = match crate::transfer::execute_read_on_pool(state, &pool_key, &count_query).await {
                     Ok(result) => result.rows.first().and_then(|r| r.first()).and_then(|v| match v {
                         serde_json::Value::Number(n) => n.as_u64(),
                         serde_json::Value::String(s) => s.parse::<u64>().ok(),
@@ -1251,7 +1267,7 @@ pub async fn export_database_sql_core(
                         batch_size,
                     );
 
-                    let result = match crate::transfer::execute_on_pool(state, &pool_key, &sql).await {
+                    let result = match crate::transfer::execute_read_on_pool(state, &pool_key, &sql).await {
                         Ok(r) => r,
                         Err(e) => {
                             writeln!(file, "-- ERROR exporting data for table {table_name}: {e}")
@@ -1351,6 +1367,7 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 view_name,
                 crate::db::ObjectSourceKind::View,
+                None,
             )
             .await
             {
@@ -1394,6 +1411,7 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 proc_name,
                 crate::db::ObjectSourceKind::Procedure,
+                None,
             )
             .await
             {
@@ -1440,6 +1458,7 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 func_name,
                 crate::db::ObjectSourceKind::Function,
+                None,
             )
             .await
             {
@@ -1720,6 +1739,60 @@ mod tests {
                 "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (2, 'Linus');",
             ]
         );
+    }
+
+    #[test]
+    fn oracle_export_omits_synthetic_rowid_from_insert_columns() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("APP".to_string()),
+            table_name: Some("USERS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["__DBX_ROWID".to_string(), "ID".to_string(), "NAME".to_string()],
+            column_types: vec![Some("VARCHAR2".to_string()), Some("NUMBER".to_string()), Some("VARCHAR2".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("AAAPr9AAEAAAAGfAAA"), json!(1), json!("Ada")]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');"]);
+    }
+
+    #[test]
+    fn oceanbase_oracle_export_omits_synthetic_rowid_from_insert_columns() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::OceanbaseOracle),
+            schema: Some("APP".to_string()),
+            table_name: Some("USERS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["__DBX_ROWID".to_string(), "ID".to_string(), "NAME".to_string()],
+            column_types: vec![Some("VARCHAR2".to_string()), Some("NUMBER".to_string()), Some("VARCHAR2".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("*AAABk1AAEAAAAAgAAA"), json!(1), json!("Ada")]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');"]);
+    }
+
+    #[test]
+    fn non_oracle_export_preserves_dbx_rowid_named_column() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: Some("users".to_string()),
+            qualified_table_name: None,
+            columns: vec!["__DBX_ROWID".to_string(), "name".to_string()],
+            column_types: Vec::new(),
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(7), json!("Ada")]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO `users` (`__DBX_ROWID`, `name`) VALUES (7, 'Ada');"]);
     }
 
     #[test]

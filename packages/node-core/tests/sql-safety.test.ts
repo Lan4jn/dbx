@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { evaluateSqlSafety, sqlSafetyFromEnv } from "../src/sql-safety.js";
+import { evaluateSqlSafety, splitSqlStatements, sqlSafetyFromEnv } from "../src/sql-safety.js";
 
 test("allows read-only SQL by default", () => {
   const decision = evaluateSqlSafety("select * from users limit 5");
+
+  assert.equal(decision.allowed, true);
+});
+
+test("allows read-only EXPLAIN without ANALYZE", () => {
+  const decision = evaluateSqlSafety("EXPLAIN SELECT * FROM users");
 
   assert.equal(decision.allowed, true);
 });
@@ -28,6 +34,27 @@ test("blocks update without where when writes are enabled", () => {
   assert.match(decision.reason ?? "", /WHERE/i);
 });
 
+test("blocks writes that do not start with a write keyword in read-only mode", () => {
+  for (const sql of [
+    "EXPLAIN ANALYZE DELETE FROM users WHERE id = 1",
+    "/*! DELETE FROM users WHERE id = 1 */",
+    "COPY users FROM '/tmp/users.csv'",
+    "SELECT * INTO backup_users FROM users",
+    "SELECT * FROM users INTO OUTFILE '/tmp/users.csv'",
+  ]) {
+    const decision = evaluateSqlSafety(sql);
+    assert.equal(decision.allowed, false, sql);
+    assert.match(decision.reason ?? "", /read-only|blocked/i);
+  }
+});
+
+test("blocks unrecognized SQL unless dangerous SQL is explicitly enabled", () => {
+  const decision = evaluateSqlSafety("MAINTAIN UNKNOWN THING", { allowWrites: true });
+
+  assert.equal(decision.allowed, false);
+  assert.match(decision.reason ?? "", /unrecognized/i);
+});
+
 test("blocks multiple SQL statements unless explicitly allowed", () => {
   const decision = evaluateSqlSafety("select 1; select 2");
 
@@ -50,6 +77,24 @@ test("checks every statement in a multi-statement SQL string", () => {
   assert.equal(decision.allowed, false);
   assert.match(decision.reason ?? "", /Statement 2/i);
   assert.match(decision.reason ?? "", /WHERE/i);
+});
+
+test("splits statements without altering SQL literals or comments", () => {
+  const sql = "SELECT 'a;b' AS value, ''abc'' AS quoted; -- keep comment\nSELECT $$c;d$$ AS dollar;";
+
+  assert.deepEqual(splitSqlStatements(sql), [
+    "SELECT 'a;b' AS value, ''abc'' AS quoted",
+    "-- keep comment\nSELECT $$c;d$$ AS dollar",
+  ]);
+});
+
+test("keeps tagged dollar quotes and quoted identifiers intact", () => {
+  const sql = 'SELECT $body$begin; end$body$ AS body, "semi;colon" AS "quoted;column"; SELECT 2;';
+
+  assert.deepEqual(splitSqlStatements(sql), [
+    'SELECT $body$begin; end$body$ AS body, "semi;colon" AS "quoted;column"',
+    "SELECT 2",
+  ]);
 });
 
 test("sqlSafetyFromEnv allows writes by default but keeps dangerous SQL blocked", () => {

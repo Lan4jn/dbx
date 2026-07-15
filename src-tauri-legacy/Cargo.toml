@@ -2,7 +2,7 @@
 
 [package]
 name = "dbx"
-version = "0.5.52"
+version = "0.5.57"
 description = "Open-source database management tool"
 authors = ["skyler"]
 license = "Apache-2.0"

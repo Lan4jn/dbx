@@ -46,6 +46,7 @@ import {
 import { createRunStatementButtonDom, loadEditorTheme, editorFontTheme } from "@/lib/editor/editorThemes";
 import { formatAiModelOption } from "@/lib/ai/aiModelPresentation";
 import ThemeCustomizerDialog from "./ThemeCustomizerDialog.vue";
+import TunnelProfileManager from "@/components/connection/TunnelProfileManager.vue";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useTheme } from "@/composables/useTheme";
 import { copyToClipboard } from "@/lib/common/clipboard";
@@ -55,6 +56,7 @@ import {
   aiTestConnection,
   checkMcpServerStatus,
   installMcpServer,
+  forgetSnippetSavedToken,
   forgetWebdavSyncSecretsPassphrase,
   forgetWebdavSavedPassword,
   clearDataDirConfig,
@@ -64,6 +66,11 @@ import {
   saveWebdavSyncSecretsPreference,
   saveWebdavSavedPassword,
   setDataDirConfig,
+  saveSnippetSavedToken,
+  snippetSyncDownload,
+  snippetSyncTest,
+  snippetSyncUpload,
+  snippetTokenStatus,
   webdavPasswordStatus,
   webdavSyncDownload,
   webdavSyncSecretsStatus,
@@ -72,6 +79,8 @@ import {
   type AppSupportInfo,
   type AiModelInfo,
   type McpServerStatus,
+  type SnippetProvider,
+  type SnippetSyncConfig,
   type WebDavConfig,
 } from "@/lib/backend/api";
 import type { DataDirConfig } from "@/lib/backend/api";
@@ -79,13 +88,14 @@ import { eventToShortcut } from "@/lib/editor/keyboardShortcuts";
 import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/editor/shortcutRegistry";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
-import { currentStatementFrameRangeTo, visualSqlColumns } from "@/lib/sql/currentStatementFrame";
+import { currentStatementFrameRangeTo, visualSqlColumnsWithInlineHints } from "@/lib/sql/currentStatementFrame";
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { currentExecutableStatementRange, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import { executableStatementRangeCacheForDoc, executableStatementRangeStartingAt, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/table/tableColumnTemplates";
+import { DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES, normalizeSqlVariableSyntaxOverrides, SQL_VARIABLE_SYNTAX_DATABASE_TYPES, SQL_VARIABLE_SYNTAX_KEYS, SQL_VARIABLE_SYNTAX_TOKENS, type SqlVariableSyntaxOverrides, type SqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 import { buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, type McpEnvEntry, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
-import { isWindows } from "@/lib/backend/platform";
+import { isMacOS } from "@/lib/backend/platform";
 import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/table/tableStructureEditorState";
 import { useToast } from "@/composables/useToast";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
@@ -93,11 +103,13 @@ import { uuid } from "@/lib/common/utils";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
+import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
 import SqlFormatterSettingsPanel from "./SqlFormatterSettingsPanel.vue";
 import { APP_THEME_PALETTES, type AppThemeAppearance, type AppThemeMode, type AppThemePalette } from "@/lib/app/appTheme";
 import { editorSettingsDraftChanged, editorSettingsDraftFromSettings, editorSettingsPatchFromDraft, type EditorSettingsDraft } from "@/lib/settings/editorSettingsDraft";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/app/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdav/webdavAutoUploadConfig";
@@ -110,6 +122,7 @@ const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
+const tunnelProfileStore = useTunnelProfileStore();
 const { isDark, themeMode, themePalette, setThemeMode, setThemePalette } = useTheme();
 
 const appThemePaletteOptions = computed(
@@ -249,6 +262,7 @@ const editExecuteMode = ref(settingsStore.editorSettings.executeMode);
 const editShowExecutionTargetPicker = ref(settingsStore.editorSettings.showExecutionTargetPicker);
 const editShowStatementRunButtons = ref(settingsStore.editorSettings.showStatementRunButtons);
 const editShowCurrentStatementFrame = ref(settingsStore.editorSettings.showCurrentStatementFrame);
+const editShowInsertValueHints = ref(settingsStore.editorSettings.showInsertValueHints);
 const editAutoAliasTables = ref(settingsStore.editorSettings.autoAliasTables);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
 const editVimModeEnabled = ref(settingsStore.editorSettings.vimModeEnabled);
@@ -256,6 +270,7 @@ const editAutoCloseBrackets = ref(settingsStore.editorSettings.autoCloseBrackets
 const editSqlSemanticDiagnosticsMode = ref<SqlSemanticDiagnosticsMode>(settingsStore.editorSettings.sqlSemanticDiagnosticsMode);
 const editSqlSemanticDiagnosticsEnabled = ref(settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
 const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
+const editContinueOnErrorOnBatch = ref(settingsStore.editorSettings.continueOnErrorOnBatch);
 const editConfirmUnsavedSqlClose = ref(settingsStore.editorSettings.confirmUnsavedSqlClose);
 const editAppLayout = ref(settingsStore.editorSettings.appLayout);
 const editShowTrayIcon = ref(settingsStore.desktopSettings.show_tray_icon);
@@ -278,8 +293,36 @@ const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactC
 const editDataGridQuickEntry = ref(settingsStore.editorSettings.dataGridQuickEntry);
 const editInfiniteScroll = ref(settingsStore.editorSettings.infiniteScroll);
 const editInfiniteScrollMaxRows = ref(settingsStore.editorSettings.infiniteScrollMaxRows);
+const editAutoCalculateTotalRows = ref(settingsStore.editorSettings.autoCalculateTotalRows);
 const editTableColumnTemplateRows = ref<TableColumnTemplateGridRow[]>(tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields));
 const editTableColumnTemplateDatabaseType = ref<DatabaseType>(TABLE_COLUMN_TEMPLATE_DATABASE_TYPES[0] ?? "mysql");
+const editSqlVariableSyntaxOverrides = ref<SqlVariableSyntaxOverrides>(normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides));
+const editSqlVariableSyntaxDatabaseType = ref<DatabaseType>(SQL_VARIABLE_SYNTAX_DATABASE_TYPES[0] ?? "mysql");
+
+function sqlVariableSyntaxToggle(key: keyof SqlVariableSyntaxToggles): boolean {
+  return editSqlVariableSyntaxOverrides.value[editSqlVariableSyntaxDatabaseType.value]?.[key] ?? true;
+}
+
+function setSqlVariableSyntaxToggle(key: keyof SqlVariableSyntaxToggles, value: boolean) {
+  const dbType = editSqlVariableSyntaxDatabaseType.value;
+  const merged: SqlVariableSyntaxToggles = {
+    ...DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES,
+    ...editSqlVariableSyntaxOverrides.value[dbType],
+    [key]: value,
+  };
+  const next: SqlVariableSyntaxOverrides = { ...editSqlVariableSyntaxOverrides.value };
+  // Keep storage sparse: an all-enabled type has no entry; otherwise persist only the disabled syntaxes.
+  if (SQL_VARIABLE_SYNTAX_KEYS.every((toggleKey) => merged[toggleKey])) {
+    delete next[dbType];
+  } else {
+    const partial: Partial<SqlVariableSyntaxToggles> = {};
+    for (const toggleKey of SQL_VARIABLE_SYNTAX_KEYS) {
+      if (!merged[toggleKey]) partial[toggleKey] = false;
+    }
+    next[dbType] = partial;
+  }
+  editSqlVariableSyntaxOverrides.value = next;
+}
 const tableColumnTemplateSectionRef = ref<HTMLElement | null>(null);
 const draggedTableColumnTemplateRowId = ref<string | null>(null);
 let tableColumnTemplatePointerDragCleanup: (() => void) | null = null;
@@ -295,6 +338,7 @@ const editAutoSelectActiveSidebarNode = ref(settingsStore.editorSettings.autoSel
 const editOpenTabsRestoreMode = ref<OpenTabsRestoreMode>(settingsStore.editorSettings.openTabsRestoreMode);
 const editDisconnectTabHandlingMode = ref<DisconnectTabHandlingMode>(settingsStore.editorSettings.disconnectTabHandlingMode);
 const editReuseDataTab = ref(settingsStore.editorSettings.reuseDataTab);
+const editPrefillNewQueryWithSelect = ref(settingsStore.editorSettings.prefillNewQueryWithSelect);
 const editUpdateNotificationsEnabled = ref(settingsStore.editorSettings.updateNotificationsEnabled);
 const editSidebarHiddenTablePrefixes = ref(settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n"));
 const editSidebarHideTableComments = ref(settingsStore.editorSettings.sidebarHideTableComments);
@@ -354,12 +398,14 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     showExecutionTargetPicker: editShowExecutionTargetPicker.value,
     showStatementRunButtons: editShowStatementRunButtons.value,
     showCurrentStatementFrame: editShowCurrentStatementFrame.value,
+    showInsertValueHints: editShowInsertValueHints.value,
     autoAliasTables: editAutoAliasTables.value,
     wordWrap: editWordWrap.value,
     vimModeEnabled: editVimModeEnabled.value,
     autoCloseBrackets: editAutoCloseBrackets.value,
     sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode.value,
     confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
+    continueOnErrorOnBatch: editContinueOnErrorOnBatch.value,
     confirmUnsavedSqlClose: editConfirmUnsavedSqlClose.value,
     appLayout: editAppLayout.value,
     showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
@@ -368,6 +414,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     dataGridQuickEntry: editDataGridQuickEntry.value,
     infiniteScroll: editInfiniteScroll.value,
     infiniteScrollMaxRows: editInfiniteScrollMaxRows.value,
+    autoCalculateTotalRows: editAutoCalculateTotalRows.value,
     tableColumnTemplateFields: normalizedEditTableColumnTemplateFields.value,
     shortcuts: editShortcuts.value,
     sqlFormatter: normalizeSqlFormatterSettings(editSqlFormatter.value),
@@ -378,6 +425,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     openTabsRestoreMode: editOpenTabsRestoreMode.value,
     disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
     reuseDataTab: editReuseDataTab.value,
+    prefillNewQueryWithSelect: editPrefillNewQueryWithSelect.value,
     updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
     sidebarHideTableComments: editSidebarHideTableComments.value,
     sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
@@ -389,6 +437,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     updateDownloadSource: editUpdateDownloadSource.value,
     toolbarItems: { ...editToolbarItems.value },
     snippets: editSnippets.value,
+    sqlVariableSyntaxOverrides: editSqlVariableSyntaxOverrides.value,
   };
 }
 
@@ -404,6 +453,7 @@ const iconThemeDescRef = {
   default: ref<HTMLElement | null>(null),
   black: ref<HTMLElement | null>(null),
 };
+const iconThemeBlackDescriptionText = computed(() => (isMacOS() ? t("settings.iconThemeBlackDescriptionMac") : t("settings.iconThemeBlackDescription")));
 const layoutDescTruncated = { separated: ref<boolean>(false), classic: ref<boolean>(false) };
 const layoutDescRefs = {
   separated: ref<HTMLElement | null>(null),
@@ -422,7 +472,7 @@ function observeElementTruncation(el: Ref<HTMLElement | null>, truncated: Ref<bo
   if (!el.value) return;
 
   const observer = new ResizeObserver(() => {
-    truncated.value = el.value!.scrollWidth > el.value!.clientWidth;
+    truncated.value = checkElementTruncation(el.value);
   });
 
   observer.observe(el.value);
@@ -623,6 +673,7 @@ function syncEditorSettingsDraftFromStore() {
   editShowExecutionTargetPicker.value = settingsStore.editorSettings.showExecutionTargetPicker;
   editShowStatementRunButtons.value = settingsStore.editorSettings.showStatementRunButtons;
   editShowCurrentStatementFrame.value = settingsStore.editorSettings.showCurrentStatementFrame;
+  editShowInsertValueHints.value = settingsStore.editorSettings.showInsertValueHints;
   editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
   editWordWrap.value = settingsStore.editorSettings.wordWrap;
   editVimModeEnabled.value = settingsStore.editorSettings.vimModeEnabled;
@@ -630,6 +681,7 @@ function syncEditorSettingsDraftFromStore() {
   editSqlSemanticDiagnosticsMode.value = settingsStore.editorSettings.sqlSemanticDiagnosticsMode;
   editSqlSemanticDiagnosticsEnabled.value = settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled;
   editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
+  editContinueOnErrorOnBatch.value = settingsStore.editorSettings.continueOnErrorOnBatch;
   editConfirmUnsavedSqlClose.value = settingsStore.editorSettings.confirmUnsavedSqlClose;
   editAppLayout.value = settingsStore.editorSettings.appLayout;
   editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
@@ -638,6 +690,7 @@ function syncEditorSettingsDraftFromStore() {
   editDataGridQuickEntry.value = settingsStore.editorSettings.dataGridQuickEntry;
   editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
   editInfiniteScrollMaxRows.value = settingsStore.editorSettings.infiniteScrollMaxRows;
+  editAutoCalculateTotalRows.value = settingsStore.editorSettings.autoCalculateTotalRows;
   editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields);
   editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
@@ -649,6 +702,7 @@ function syncEditorSettingsDraftFromStore() {
   editOpenTabsRestoreMode.value = settingsStore.editorSettings.openTabsRestoreMode;
   editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
   editReuseDataTab.value = settingsStore.editorSettings.reuseDataTab;
+  editPrefillNewQueryWithSelect.value = settingsStore.editorSettings.prefillNewQueryWithSelect;
   editUpdateNotificationsEnabled.value = settingsStore.editorSettings.updateNotificationsEnabled;
   editSidebarHiddenTablePrefixes.value = settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n");
   editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
@@ -660,6 +714,7 @@ function syncEditorSettingsDraftFromStore() {
   editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
   editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
   editSnippets.value = settingsStore.editorSettings.snippets.map(editableSnippet);
+  editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides);
   editEditorSettingsBase.value = editorSettingsDraftFromSettings(settingsStore.editorSettings);
 }
 
@@ -806,6 +861,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
     editShowStatementRunButtons.value = DEFAULT_EDITOR_SETTINGS.showStatementRunButtons;
     editShowCurrentStatementFrame.value = DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame;
+    editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
     editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
     editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
     editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
@@ -813,7 +869,9 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editSqlSemanticDiagnosticsMode.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
     editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
     editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
+    editContinueOnErrorOnBatch.value = DEFAULT_EDITOR_SETTINGS.continueOnErrorOnBatch;
     editConfirmUnsavedSqlClose.value = DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose;
+    editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(DEFAULT_EDITOR_SETTINGS.sqlVariableSyntaxOverrides);
   } else if (tab === "formatter") {
     editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
     sqlFormatterConfigValid.value = true;
@@ -838,6 +896,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
     editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
     editReuseDataTab.value = DEFAULT_EDITOR_SETTINGS.reuseDataTab;
+    editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
     editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
     editSidebarHideTableComments.value = DEFAULT_EDITOR_SETTINGS.sidebarHideTableComments;
     editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
@@ -850,6 +909,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
     editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
+    editAutoCalculateTotalRows.value = DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows;
     editDuckDbWorkerProcessIsolation.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation;
     editDuckDbWorkerMaxProcesses.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_max_processes;
     editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
@@ -878,6 +938,7 @@ function resetAllDefaults() {
   editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
   editShowStatementRunButtons.value = DEFAULT_EDITOR_SETTINGS.showStatementRunButtons;
   editShowCurrentStatementFrame.value = DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame;
+  editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
   editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
   editVimModeEnabled.value = DEFAULT_EDITOR_SETTINGS.vimModeEnabled;
@@ -886,6 +947,7 @@ function resetAllDefaults() {
   editSqlSemanticDiagnosticsEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsEnabled;
   editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
   editConfirmUnsavedSqlClose.value = DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose;
+  editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(DEFAULT_EDITOR_SETTINGS.sqlVariableSyntaxOverrides);
   editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
   editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
   editQuitOnClose.value = DEFAULT_DESKTOP_SETTINGS.quit_on_close;
@@ -901,6 +963,7 @@ function resetAllDefaults() {
   editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
   editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
   editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
+  editAutoCalculateTotalRows.value = DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows;
   editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
   editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
@@ -912,6 +975,7 @@ function resetAllDefaults() {
   editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
   editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
   editReuseDataTab.value = DEFAULT_EDITOR_SETTINGS.reuseDataTab;
+  editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
   editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
   editSidebarHideTableComments.value = DEFAULT_EDITOR_SETTINGS.sidebarHideTableComments;
   editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
@@ -1208,13 +1272,14 @@ const appSupportInfoLabels = computed<AppSupportInfoLabels>(() => ({
   unknown: t("settings.supportInfoUnknown"),
 }));
 const appSupportInfoRows = computed(() => (appSupportInfo.value ? buildAppSupportInfoRows(appSupportInfo.value, appSupportInfoLabels.value) : []));
-type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
+type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "tunnels" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "appearance", label: t("settings.appearanceTab") },
   { value: "editor", label: t("settings.editorTab") },
   { value: "formatter", label: t("settings.sqlFormatterTab") },
   { value: "navigation", label: t("settings.navigationTab") },
   { value: "data", label: t("settings.dataTab") },
+  { value: "tunnels", label: t("settings.tunnelsTab") },
   { value: "shortcuts", label: t("settings.shortcutsTab") },
   { value: "snippets", label: t("settings.snippetsTab") },
   ...(isWeb ? [] : [{ value: "sync" as const, label: t("settings.syncTab") }]),
@@ -1230,7 +1295,10 @@ function hasSettingsApplyFooter(value: SettingsCategory): boolean {
 }
 
 function settingsCategoryButton(value: SettingsCategory): string {
-  return ["w-auto shrink-0 whitespace-nowrap rounded-md px-3 py-2 text-left text-sm transition-colors lg:w-full", value === activeSettingsTab.value ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground"].join(" ");
+  return [
+    "settings-category-button w-auto shrink-0 whitespace-nowrap rounded-md px-3 py-2 text-left text-sm transition-colors lg:w-full",
+    value === activeSettingsTab.value ? "settings-category-button--active bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+  ].join(" ");
 }
 
 function openExternalUrl(url: string) {
@@ -1361,8 +1429,10 @@ const mcpStatusLoading = ref(false);
 const mcpStatusError = ref("");
 const mcpCopied = ref<"" | McpCopyKind>("");
 const mcpConfigTab = ref<McpConfigTab>("claude");
-const mcpReadonlyMode = ref(false);
-const mcpAllowDangerous = ref(false);
+const MCP_READONLY_STORAGE_KEY = "dbx-mcp-config-readonly";
+const MCP_ALLOW_DANGEROUS_STORAGE_KEY = "dbx-mcp-config-allow-dangerous";
+const mcpReadonlyMode = ref(localStorage.getItem(MCP_READONLY_STORAGE_KEY) === "true");
+const mcpAllowDangerous = ref(localStorage.getItem(MCP_ALLOW_DANGEROUS_STORAGE_KEY) === "true");
 const mcpInstalling = ref(false);
 const mcpInstallMessage = ref("");
 const mcpInstallError = ref(false);
@@ -1379,9 +1449,9 @@ const mcpEnvEntries = computed<McpEnvEntry[]>(() => {
 });
 
 const mcpLaunchConfig = computed<McpLaunchConfig | undefined>(() => {
-  if (!isWindows() || !mcpStatus.value?.script_path) return undefined;
+  if (!mcpStatus.value?.node_path || !mcpStatus.value.script_path) return undefined;
   return {
-    command: mcpStatus.value.node_path || "node",
+    command: mcpStatus.value.node_path,
     args: [mcpStatus.value.script_path],
   };
 });
@@ -1415,7 +1485,12 @@ const mcpCommand = computed(() => {
 });
 
 watch(mcpReadonlyMode, (value) => {
+  localStorage.setItem(MCP_READONLY_STORAGE_KEY, String(value));
   if (value) mcpAllowDangerous.value = false;
+});
+
+watch(mcpAllowDangerous, (value) => {
+  localStorage.setItem(MCP_ALLOW_DANGEROUS_STORAGE_KEY, String(value));
 });
 
 async function refreshMcpStatus() {
@@ -1483,8 +1558,107 @@ const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-web
 const webdavBusy = ref<"" | "test" | "upload" | "download">("");
 const webdavMessage = ref("");
 const webdavError = ref(false);
+const syncMethodTab = ref<"webdav" | "snippet">("webdav");
+
+const snippetProvider = ref<SnippetProvider>((localStorage.getItem("dbx-snippet-provider") as SnippetProvider) || "github");
+const snippetId = ref(localStorage.getItem(`dbx-snippet-id-${snippetProvider.value}`) || "");
+const snippetToken = ref("");
+const snippetRememberToken = ref(localStorage.getItem(`dbx-snippet-remember-token-${snippetProvider.value}`) === "true");
+const snippetHasSavedToken = ref(false);
+const snippetBusy = ref<"" | "test" | "upload" | "download">("");
+const snippetMessage = ref("");
+const snippetError = ref(false);
 
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim() || webdavHasSavedSecretsPassphrase.value));
+const snippetReady = computed(() => !snippetBusy.value && (!!snippetToken.value.trim() || snippetHasSavedToken.value));
+
+function currentSnippetConfig(): SnippetSyncConfig {
+  return {
+    provider: snippetProvider.value,
+    token: snippetToken.value.trim() || undefined,
+    snippetId: snippetId.value.trim() || undefined,
+  };
+}
+
+function currentSnippetAccountConfig(): SnippetSyncConfig {
+  return { ...currentSnippetConfig(), token: undefined };
+}
+
+async function refreshSnippetTokenStatus() {
+  try {
+    const status = await snippetTokenStatus(currentSnippetAccountConfig());
+    snippetHasSavedToken.value = status.hasSavedToken;
+    if (status.hasSavedToken) snippetRememberToken.value = true;
+  } catch {
+    snippetHasSavedToken.value = false;
+  }
+}
+
+async function applySnippetTokenPreference() {
+  const token = snippetToken.value.trim();
+  if (snippetRememberToken.value && token) {
+    await saveSnippetSavedToken(currentSnippetAccountConfig(), token);
+    snippetHasSavedToken.value = true;
+    return;
+  }
+  if (!snippetRememberToken.value && snippetHasSavedToken.value) {
+    await forgetSnippetSavedToken(currentSnippetAccountConfig());
+    snippetHasSavedToken.value = false;
+  }
+}
+
+async function runSnippetAction(kind: "test" | "upload" | "download", action: () => Promise<string>) {
+  snippetBusy.value = kind;
+  snippetMessage.value = "";
+  snippetError.value = false;
+  try {
+    localStorage.setItem("dbx-snippet-provider", snippetProvider.value);
+    localStorage.setItem(`dbx-snippet-id-${snippetProvider.value}`, snippetId.value.trim());
+    localStorage.setItem(`dbx-snippet-remember-token-${snippetProvider.value}`, String(snippetRememberToken.value));
+    await applySnippetTokenPreference();
+    await applyWebDavSyncSecretsPreference();
+    snippetMessage.value = await action();
+  } catch (e: any) {
+    snippetMessage.value = e?.message || String(e);
+    snippetError.value = true;
+  } finally {
+    snippetBusy.value = "";
+  }
+}
+
+async function testSnippetSync() {
+  await runSnippetAction("test", async () => {
+    await snippetSyncTest(currentSnippetConfig());
+    return t("settings.syncSnippetTestSuccess");
+  });
+}
+
+async function uploadSnippetSnapshot() {
+  await runSnippetAction("upload", async () => {
+    const summary = await snippetSyncUpload(currentSnippetConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
+    snippetId.value = summary.snippetId;
+    localStorage.setItem(`dbx-snippet-id-${snippetProvider.value}`, summary.snippetId);
+    return t("settings.syncSnippetUploadSuccess", { bytes: summary.bytes, id: summary.snippetId });
+  });
+}
+
+async function downloadSnippetSnapshot() {
+  if (!snippetId.value.trim() || !window.confirm(t("settings.syncDownloadConfirm"))) return;
+  await runSnippetAction("download", async () => {
+    const result = await snippetSyncDownload(currentSnippetConfig(), webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
+    if (result.editorSettings && typeof result.editorSettings === "object") settingsStore.updateEditorSettings(result.editorSettings as any);
+    await settingsStore.updateDesktopSettings(result.desktopSettings);
+    await connectionStore.initFromDisk();
+    await savedSqlStore.initFromStorage();
+    // Snapshot downloads replace backend-managed tunnel profiles, so refresh
+    // the already-loaded Pinia store instead of leaving the UI stale.
+    await tunnelProfileStore.refresh();
+    let message = t("settings.syncSnippetDownloadSuccess", { bytes: result.summary.bytes, id: result.summary.snippetId });
+    if (result.applySummary.encryptedSecretsPresent && !result.applySummary.secretsApplied) message += ` ${t("settings.syncSecretsSkipped")}`;
+    if (result.applySummary.secretsApplied) message += ` ${t("settings.syncSecretsApplied")}`;
+    return message;
+  });
+}
 
 function currentWebDavConfig(): WebDavConfig {
   return {
@@ -1615,6 +1789,8 @@ async function downloadWebDavSnapshot() {
     await settingsStore.updateDesktopSettings(result.desktopSettings);
     await connectionStore.initFromDisk();
     await savedSqlStore.initFromStorage();
+    // Keep the shared tunnel profile UI consistent with the downloaded snapshot.
+    await tunnelProfileStore.refresh();
     const message = t("settings.syncDownloadSuccess", {
       bytes: result.summary.bytes,
       path: result.summary.remotePath,
@@ -1668,9 +1844,11 @@ watch(
       }
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
       webdavPassword.value = "";
+      snippetToken.value = "";
       webdavSecretsPassphrase.value = "";
       await refreshWebDavPasswordStatus();
       await refreshWebDavSyncSecretsStatus();
+      await refreshSnippetTokenStatus();
       syncAiEditState();
       if (!isWeb && activeSettingsTab.value === "mcp") void refreshMcpStatus();
       if (!isWeb && activeSettingsTab.value === "ai" && aiIsCodexCli.value) void ensureCodexMcpStatus();
@@ -1706,6 +1884,13 @@ watch(webdavRememberPassword, (val) => {
 watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
   webdavAutoUploadIntervalMinutes.value = normalizedWebDavAutoUploadInterval(webdavAutoUploadIntervalMinutes.value);
   rememberWebDavFields();
+});
+watch(snippetProvider, (provider) => {
+  localStorage.setItem("dbx-snippet-provider", provider);
+  snippetId.value = localStorage.getItem(`dbx-snippet-id-${provider}`) || "";
+  snippetRememberToken.value = localStorage.getItem(`dbx-snippet-remember-token-${provider}`) === "true";
+  snippetToken.value = "";
+  void refreshSnippetTokenStatus();
 });
 
 watch(activeSettingsTab, (tab) => {
@@ -2296,7 +2481,7 @@ function buildPreviewCurrentStatementFrameExtension(viewModule: Pick<typeof impo
         for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
           const line = view.state.doc.line(lineNumber);
           const lineRangeTo = Math.min(line.to, frameTo);
-          maxWidth = Math.max(maxWidth, visualSqlColumns(view.state.doc.sliceString(line.from, lineRangeTo)));
+          maxWidth = Math.max(maxWidth, visualSqlColumnsWithInlineHints(view.state.doc.sliceString(line.from, lineRangeTo), line.from, lineRangeTo));
         }
 
         const deco: any[] = [];
@@ -2496,8 +2681,8 @@ onUnmounted(cleanupPreviewEditor);
         </component>
       </DialogHeader>
 
-      <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden lg:flex-row">
-        <nav class="settingsCategoryNav flex min-h-0 shrink-0 gap-1 overflow-x-auto border-b pb-3 lg:w-40 lg:flex-col lg:overflow-x-hidden lg:overflow-y-auto lg:border-b-0 lg:border-r lg:pb-0 lg:pr-3">
+      <div class="settings-layout flex min-h-0 flex-1 flex-col gap-3 overflow-hidden lg:flex-row">
+        <nav class="settingsCategoryNav settings-category-nav flex min-h-0 shrink-0 gap-1 overflow-x-auto border-b pb-3 lg:w-40 lg:flex-col lg:overflow-x-hidden lg:overflow-y-auto lg:border-b-0 lg:border-r lg:pb-0 lg:pr-3">
           <button v-for="category in settingsCategoryNav" :key="category.value" type="button" :class="settingsCategoryButton(category.value)" @click="activeSettingsTab = category.value">
             {{ category.label }}
           </button>
@@ -2623,6 +2808,14 @@ onUnmounted(cleanupPreviewEditor);
 
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="editor-show-insert-value-hints">{{ t("settings.showInsertValueHints") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.showInsertValueHintsDescription") }}</p>
+                  </div>
+                  <Switch id="editor-show-insert-value-hints" v-model="editShowInsertValueHints" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="editor-word-wrap">{{ t("settings.wordWrap") }}</Label>
                     <p class="text-xs text-muted-foreground">{{ t("settings.wordWrapDescription") }}</p>
                   </div>
@@ -2677,12 +2870,63 @@ onUnmounted(cleanupPreviewEditor);
 
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="editor-continue-on-error">{{ t("settings.continueOnErrorOnBatch") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.continueOnErrorOnBatchDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="editor-continue-on-error" v-model="editContinueOnErrorOnBatch" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="editor-confirm-unsaved-sql-close">{{ t("settings.confirmUnsavedSqlClose") }}</Label>
                     <p class="text-xs text-muted-foreground">
                       {{ t("settings.confirmUnsavedSqlCloseDescription") }}
                     </p>
                   </div>
                   <Switch id="editor-confirm-unsaved-sql-close" v-model="editConfirmUnsavedSqlClose" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-prefill-new-query">{{ t("settings.prefillNewQueryWithSelect") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.prefillNewQueryWithSelectDescription") }}</p>
+                  </div>
+                  <Switch id="editor-prefill-new-query" v-model="editPrefillNewQueryWithSelect" class="mt-0.5" />
+                </div>
+              </div>
+
+              <Separator />
+
+              <div class="space-y-3">
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                  <div class="space-y-1">
+                    <div class="text-sm font-medium text-muted-foreground">{{ t("settings.sqlVariableSyntax") }}</div>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.sqlVariableSyntaxDescription") }}</p>
+                  </div>
+                  <Select v-model="editSqlVariableSyntaxDatabaseType">
+                    <SelectTrigger class="h-8 w-44 px-2 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent class="max-h-72">
+                      <SelectItem v-for="dbType in SQL_VARIABLE_SYNTAX_DATABASE_TYPES" :key="dbType" :value="dbType">
+                        {{ dbType }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div class="grid gap-3 md:grid-cols-2">
+                  <div v-for="key in SQL_VARIABLE_SYNTAX_KEYS" :key="key" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                    <div class="min-w-0 space-y-1">
+                      <Label :for="`sql-var-syntax-${key}`" class="flex items-center gap-1.5">
+                        <span class="font-mono text-xs text-primary">{{ SQL_VARIABLE_SYNTAX_TOKENS[key] }}</span>
+                        <span>{{ t(`settings.sqlVariableSyntax_${key}`) }}</span>
+                      </Label>
+                      <p class="text-xs text-muted-foreground">{{ t(`settings.sqlVariableSyntax_${key}Description`) }}</p>
+                    </div>
+                    <Switch :id="`sql-var-syntax-${key}`" :model-value="sqlVariableSyntaxToggle(key)" class="mt-0.5 shrink-0" @update:model-value="(value) => setSqlVariableSyntaxToggle(key, value as boolean)" />
+                  </div>
                 </div>
               </div>
 
@@ -2768,7 +3012,7 @@ onUnmounted(cleanupPreviewEditor);
               <SqlFormatterSettingsPanel v-model="editSqlFormatter" @validity-change="(value: boolean) => (sqlFormatterConfigValid = value)" />
             </section>
 
-            <section v-else-if="activeSettingsTab === 'appearance'" class="flex flex-col gap-5 py-2">
+            <section v-else-if="activeSettingsTab === 'appearance'" class="settings-appearance-section flex flex-col gap-5 py-2">
               <div v-if="!isWeb" class="space-y-2">
                 <div class="flex items-center justify-between gap-3">
                   <Label>{{ t("settings.dataDirTitle") }}</Label>
@@ -2803,8 +3047,8 @@ onUnmounted(cleanupPreviewEditor);
 
               <Separator v-if="!isWeb" />
 
-              <div class="grid gap-x-1.5 gap-y-4 sm:grid-cols-[minmax(0,127fr)_minmax(0,127fr)_minmax(0,191fr)_minmax(0,130fr)]">
-                <div class="space-y-2 min-w-0">
+              <div class="settings-appearance-top-grid">
+                <div class="settings-appearance-field min-w-0">
                   <div class="flex h-9 items-end">
                     <Label class="whitespace-normal leading-tight">{{ t("settings.languageTitle") }}</Label>
                   </div>
@@ -2832,7 +3076,7 @@ onUnmounted(cleanupPreviewEditor);
                   </Select>
                 </div>
 
-                <div class="space-y-2 min-w-0">
+                <div class="settings-appearance-field min-w-0">
                   <div class="flex h-9 items-end">
                     <Label class="whitespace-normal leading-tight">{{ t("settings.colorTheme") }}</Label>
                   </div>
@@ -2856,7 +3100,7 @@ onUnmounted(cleanupPreviewEditor);
                   </Select>
                 </div>
 
-                <div class="space-y-2 min-w-0">
+                <div class="settings-appearance-field min-w-0">
                   <div class="flex h-9 items-end gap-1">
                     <Label class="min-w-0 whitespace-normal leading-tight">{{ t("settings.uiFontFamily") }}</Label>
                     <HelpTooltip :label="t('settings.uiFontFamily')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -2895,7 +3139,7 @@ onUnmounted(cleanupPreviewEditor);
                   </SearchableSelect>
                 </div>
 
-                <div class="space-y-2 min-w-0">
+                <div class="settings-appearance-field min-w-0">
                   <div class="flex h-9 items-end gap-1">
                     <Label class="min-w-0 whitespace-normal leading-tight">{{ t("settings.uiScale") }}</Label>
                     <HelpTooltip :label="t('settings.uiScale')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -2921,17 +3165,17 @@ onUnmounted(cleanupPreviewEditor);
                 </div>
               </div>
 
-              <div class="space-y-2">
+              <div class="settings-appearance-group">
                 <Label>{{ t("settings.theme") }}</Label>
-                <div class="flex flex-wrap gap-2">
+                <div class="settings-appearance-button-row flex flex-wrap gap-2">
                   <Button
                     v-for="option in appThemeModeOptions"
                     :key="option.value"
                     type="button"
                     variant="outline"
                     size="sm"
-                    class="h-8 gap-1.5 rounded-[6px] px-3"
-                    :class="themeMode === option.value ? 'border-primary/40 bg-primary/10 text-primary ring-1 ring-primary/30' : 'text-foreground'"
+                    class="settings-choice-button h-8 gap-1.5 rounded-[6px] px-3"
+                    :class="themeMode === option.value ? 'settings-choice-button--selected border-primary/40 bg-primary/10 text-primary ring-1 ring-primary/30' : 'text-foreground'"
                     @click="setThemeMode(option.value)"
                   >
                     <component :is="option.icon" class="h-3.5 w-3.5" />
@@ -2942,10 +3186,10 @@ onUnmounted(cleanupPreviewEditor);
 
               <Separator />
 
-              <div class="space-y-2">
+              <div class="settings-appearance-group">
                 <Label>{{ t("settings.appLayout") }}</Label>
-                <div class="grid grid-cols-2 gap-2">
-                  <Button type="button" variant="outline" class="h-auto justify-start border p-3" :class="editAppLayout === 'separated' ? 'border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setAppLayout('separated')">
+                <div class="settings-appearance-choice-grid">
+                  <Button type="button" variant="outline" class="settings-choice-card h-auto justify-start border p-3" :class="editAppLayout === 'separated' ? 'settings-choice-card--selected border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setAppLayout('separated')">
                     <TooltipProvider>
                       <Tooltip>
                         <TooltipTrigger as-child>
@@ -2960,7 +3204,7 @@ onUnmounted(cleanupPreviewEditor);
                       </Tooltip>
                     </TooltipProvider>
                   </Button>
-                  <Button type="button" variant="outline" class="h-auto justify-start border p-3" :class="editAppLayout === 'classic' ? 'border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setAppLayout('classic')">
+                  <Button type="button" variant="outline" class="settings-choice-card h-auto justify-start border p-3" :class="editAppLayout === 'classic' ? 'settings-choice-card--selected border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setAppLayout('classic')">
                     <TooltipProvider>
                       <Tooltip>
                         <TooltipTrigger as-child>
@@ -2979,12 +3223,12 @@ onUnmounted(cleanupPreviewEditor);
               </div>
 
               <!-- <div v-if="!isWeb" class="space-y-2"> -->
-              <div class="space-y-2">
+              <div class="settings-appearance-group">
                 <Label>{{ t("settings.iconTheme") }}</Label>
-                <div class="grid grid-cols-2 gap-2">
-                  <Button type="button" variant="outline" class="h-auto justify-start border p-3" :class="editIconTheme === 'default' ? 'border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setIconTheme('default')">
+                <div class="settings-appearance-choice-grid">
+                  <Button type="button" variant="outline" class="settings-choice-card h-auto justify-start border p-3" :class="editIconTheme === 'default' ? 'settings-choice-card--selected border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setIconTheme('default')">
                     <div class="flex items-center gap-3 text-left w-full min-w-0">
-                      <img src="/logo.png" alt="DBX" class="h-8 w-8 rounded-md" />
+                      <img src="/icon-preview-default.png" alt="DBX" class="h-12 w-12 shrink-0" />
                       <TooltipProvider>
                         <Tooltip>
                           <TooltipTrigger as-child>
@@ -3000,19 +3244,19 @@ onUnmounted(cleanupPreviewEditor);
                       </TooltipProvider>
                     </div>
                   </Button>
-                  <Button type="button" variant="outline" class="h-auto justify-start border p-3" :class="editIconTheme === 'black' ? 'border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setIconTheme('black')">
+                  <Button type="button" variant="outline" class="settings-choice-card h-auto justify-start border p-3" :class="editIconTheme === 'black' ? 'settings-choice-card--selected border-blue-300 ring-2 ring-blue-300/50' : ''" @click="setIconTheme('black')">
                     <div class="flex items-center gap-3 text-left w-full min-w-0">
-                      <img src="/logo-black.png" alt="DBX" class="h-8 w-8 dark:invert shrink-0" />
+                      <img src="/icon-preview-black.png" alt="DBX" class="h-12 w-12 shrink-0" />
                       <TooltipProvider>
                         <Tooltip>
                           <TooltipTrigger as-child>
                             <div class="w-full min-w-0 text-left">
                               <div class="text-sm font-medium">{{ t("settings.iconThemeBlack") }}</div>
-                              <div :ref="(el) => setIconThemeDescRef('black', el)" class="text-xs text-muted-foreground truncate">{{ t("settings.iconThemeBlackDescription") }}</div>
+                              <div :ref="(el) => setIconThemeDescRef('black', el)" class="text-xs text-muted-foreground truncate">{{ iconThemeBlackDescriptionText }}</div>
                             </div>
                           </TooltipTrigger>
                           <TooltipContent v-if="iconThemeDescTruncated.black.value" class="max-w-[320px] text-xs leading-relaxed">
-                            {{ t("settings.iconThemeBlackDescription") }}
+                            {{ iconThemeBlackDescriptionText }}
                           </TooltipContent>
                         </Tooltip>
                       </TooltipProvider>
@@ -3072,7 +3316,7 @@ onUnmounted(cleanupPreviewEditor);
 
               <Separator />
 
-              <div class="space-y-3">
+              <div class="settings-appearance-group settings-option-stack">
                 <Label>{{ t("settings.dataGridDisplay") }}</Label>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
@@ -3147,6 +3391,17 @@ onUnmounted(cleanupPreviewEditor);
                     :max="50000"
                     class="h-7 w-24 px-2 text-xs tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                   />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="auto-calculate-total-rows">
+                      {{ t("settings.autoCalculateTotalRows") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.autoCalculateTotalRowsDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="auto-calculate-total-rows" v-model="editAutoCalculateTotalRows" />
                 </div>
               </div>
 
@@ -3706,91 +3961,199 @@ onUnmounted(cleanupPreviewEditor);
               </div>
             </section>
 
-            <section v-else-if="activeSettingsTab === 'sync'" class="flex flex-col gap-5 py-2">
-              <div class="space-y-1">
-                <div class="flex items-center gap-2 text-sm font-medium">
-                  <Cloud class="h-4 w-4 text-muted-foreground" />
-                  {{ t("settings.syncWebDavTitle") }}
-                </div>
-                <p class="text-xs text-muted-foreground">{{ t("settings.syncWebDavDescription") }}</p>
-              </div>
+            <section v-else-if="activeSettingsTab === 'sync'" class="py-2">
+              <Tabs v-model="syncMethodTab" class="w-full">
+                <TabsList class="grid w-full grid-cols-2">
+                  <TabsTrigger value="webdav">WebDAV</TabsTrigger>
+                  <TabsTrigger value="snippet">GitHub / Gitee</TabsTrigger>
+                </TabsList>
 
-              <div class="grid gap-4 md:grid-cols-2">
-                <div class="space-y-2 md:col-span-2">
-                  <Label for="webdav-endpoint">{{ t("settings.syncEndpoint") }}</Label>
-                  <Input id="webdav-endpoint" v-model="webdavEndpoint" autocomplete="off" placeholder="https://example.com/remote.php/dav/files/user/" />
-                </div>
-                <div class="space-y-2">
-                  <Label for="webdav-username">{{ t("settings.syncUsername") }}</Label>
-                  <Input id="webdav-username" v-model="webdavUsername" autocomplete="username" />
-                </div>
-                <div class="space-y-2">
-                  <Label for="webdav-password">{{ t("settings.syncPassword") }}</Label>
-                  <div class="relative">
-                    <PasswordInput id="webdav-password" v-model="webdavPassword" :placeholder="webdavHasSavedPassword ? '••••••••' : t('settings.syncPasswordPlaceholder')" :disabled="webdavHasSavedPassword" :show-toggle="!webdavHasSavedPassword" autocomplete="current-password" />
-                    <button
-                      v-if="webdavHasSavedPassword"
-                      type="button"
-                      class="absolute right-1 top-1/2 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-3 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
-                      :title="t('settings.syncClearSavedPassword')"
-                      @click="
-                        webdavRememberPassword = false;
-                        forgetWebdavSavedPassword(currentWebDavAccountConfig());
-                        webdavHasSavedPassword = false;
-                        webdavPassword = '';
-                      "
-                    >
-                      <X class="size-3.5" />
-                    </button>
+                <TabsContent value="webdav" class="mt-5 space-y-5">
+                  <div class="space-y-1">
+                    <div class="flex items-center gap-2 text-sm font-medium">
+                      <Cloud class="h-4 w-4 text-muted-foreground" />
+                      {{ t("settings.syncWebDavTitle") }}
+                    </div>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.syncWebDavDescription") }}</p>
                   </div>
-                  <div class="flex items-center gap-2 text-xs text-muted-foreground">
-                    <label class="flex items-center gap-2">
-                      <input v-model="webdavRememberPassword" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
-                      <span>
-                        {{ t("settings.syncRememberWebDavPassword") }}
-                        <span v-if="webdavHasSavedPassword">{{ t("settings.syncSavedPassword") }}</span>
-                      </span>
-                    </label>
-                    <HelpTooltip :label="t('settings.syncRememberWebDavPassword')">
-                      {{ t("settings.syncRememberWebDavPasswordDescription") }}
-                    </HelpTooltip>
-                  </div>
-                </div>
-                <div class="space-y-2 md:col-span-2">
-                  <Label for="webdav-remote-path">{{ t("settings.syncRemotePath") }}</Label>
-                  <Input id="webdav-remote-path" v-model="webdavRemotePath" autocomplete="off" />
-                  <p class="text-xs text-muted-foreground">{{ t("settings.syncRemotePathDescription") }}</p>
-                </div>
-                <div class="space-y-2 md:col-span-2 rounded-md border bg-muted/20 px-3 py-3">
-                  <label class="flex items-center gap-2 text-xs">
-                    <input v-model="webdavAutoUploadEnabled" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
-                    <span class="font-medium">{{ t("settings.syncAutoUpload") }}</span>
-                  </label>
-                  <div class="flex items-center gap-2">
-                    <Label for="webdav-auto-upload-interval" class="text-xs text-muted-foreground">{{ t("settings.syncAutoUploadInterval") }}</Label>
-                    <Input id="webdav-auto-upload-interval" v-model.number="webdavAutoUploadIntervalMinutes" type="number" min="1" max="1440" step="1" class="h-7 w-24 text-xs" :disabled="!webdavAutoUploadEnabled" />
-                    <span class="text-xs text-muted-foreground">{{ t("settings.syncAutoUploadMinutes") }}</span>
-                  </div>
-                  <p class="text-xs text-muted-foreground">{{ t("settings.syncAutoUploadDescription") }}</p>
-                </div>
-              </div>
 
-              <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                {{ t("settings.syncSecretNotice") }}
-              </div>
+                  <div class="grid gap-4 md:grid-cols-2">
+                    <div class="space-y-2 md:col-span-2">
+                      <Label for="webdav-endpoint">{{ t("settings.syncEndpoint") }}</Label>
+                      <Input id="webdav-endpoint" v-model="webdavEndpoint" autocomplete="off" placeholder="https://example.com/remote.php/dav/files/user/" />
+                    </div>
+                    <div class="space-y-2">
+                      <Label for="webdav-username">{{ t("settings.syncUsername") }}</Label>
+                      <Input id="webdav-username" v-model="webdavUsername" autocomplete="username" />
+                    </div>
+                    <div class="space-y-2">
+                      <Label for="webdav-password">{{ t("settings.syncPassword") }}</Label>
+                      <div class="relative">
+                        <PasswordInput id="webdav-password" v-model="webdavPassword" :placeholder="webdavHasSavedPassword ? '••••••••' : t('settings.syncPasswordPlaceholder')" :disabled="webdavHasSavedPassword" :show-toggle="!webdavHasSavedPassword" autocomplete="current-password" />
+                        <button
+                          v-if="webdavHasSavedPassword"
+                          type="button"
+                          class="absolute right-1 top-1/2 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-3 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                          :title="t('settings.syncClearSavedPassword')"
+                          @click="
+                            webdavRememberPassword = false;
+                            forgetWebdavSavedPassword(currentWebDavAccountConfig());
+                            webdavHasSavedPassword = false;
+                            webdavPassword = '';
+                          "
+                        >
+                          <X class="size-3.5" />
+                        </button>
+                      </div>
+                      <div class="flex items-center gap-2 text-xs text-muted-foreground">
+                        <label class="flex items-center gap-2">
+                          <input v-model="webdavRememberPassword" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                          <span>
+                            {{ t("settings.syncRememberWebDavPassword") }}
+                            <span v-if="webdavHasSavedPassword">{{ t("settings.syncSavedPassword") }}</span>
+                          </span>
+                        </label>
+                        <HelpTooltip :label="t('settings.syncRememberWebDavPassword')">
+                          {{ t("settings.syncRememberWebDavPasswordDescription") }}
+                        </HelpTooltip>
+                      </div>
+                    </div>
+                    <div class="space-y-2 md:col-span-2">
+                      <Label for="webdav-remote-path">{{ t("settings.syncRemotePath") }}</Label>
+                      <Input id="webdav-remote-path" v-model="webdavRemotePath" autocomplete="off" />
+                      <p class="text-xs text-muted-foreground">{{ t("settings.syncRemotePathDescription") }}</p>
+                    </div>
+                    <div class="space-y-2 md:col-span-2 rounded-md border bg-muted/20 px-3 py-3">
+                      <label class="flex items-center gap-2 text-xs">
+                        <input v-model="webdavAutoUploadEnabled" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                        <span class="font-medium">{{ t("settings.syncAutoUpload") }}</span>
+                      </label>
+                      <div class="flex items-center gap-2">
+                        <Label for="webdav-auto-upload-interval" class="text-xs text-muted-foreground">{{ t("settings.syncAutoUploadInterval") }}</Label>
+                        <Input id="webdav-auto-upload-interval" v-model.number="webdavAutoUploadIntervalMinutes" type="number" min="1" max="1440" step="1" class="h-7 w-24 text-xs" :disabled="!webdavAutoUploadEnabled" />
+                        <span class="text-xs text-muted-foreground">{{ t("settings.syncAutoUploadMinutes") }}</span>
+                      </div>
+                      <p class="text-xs text-muted-foreground">{{ t("settings.syncAutoUploadDescription") }}</p>
+                    </div>
+                  </div>
 
-              <div class="space-y-3 rounded-md border bg-muted/20 px-3 py-3">
+                  <div v-if="webdavMessage" class="text-xs" :class="webdavError ? 'text-destructive' : 'text-green-600 dark:text-green-400'">
+                    {{ webdavMessage }}
+                  </div>
+                  <div class="flex flex-wrap justify-end gap-2">
+                    <Button variant="outline" size="sm" :disabled="!webdavReady" @click="testWebDav">
+                      <Loader2 v-if="webdavBusy === 'test'" class="mr-1 h-3 w-3 animate-spin" />
+                      {{ t("settings.syncTest") }}
+                    </Button>
+                    <Button variant="outline" size="sm" :disabled="!webdavReady" @click="downloadWebDavSnapshot">
+                      <Loader2 v-if="webdavBusy === 'download'" class="mr-1 h-3 w-3 animate-spin" />
+                      <Download v-else class="mr-1 h-3 w-3" />
+                      {{ t("settings.syncDownload") }}
+                    </Button>
+                    <Button size="sm" :disabled="!webdavReady" @click="uploadWebDavSnapshot">
+                      <Loader2 v-if="webdavBusy === 'upload'" class="mr-1 h-3 w-3 animate-spin" />
+                      <Upload v-else class="mr-1 h-3 w-3" />
+                      {{ t("settings.syncUpload") }}
+                    </Button>
+                  </div>
+                </TabsContent>
+
+                <TabsContent value="snippet" class="mt-5 space-y-5">
+                  <div class="space-y-1">
+                    <div class="flex items-center justify-between gap-3">
+                      <div class="flex items-center gap-2 text-sm font-medium">
+                        <Cloud class="h-4 w-4 text-muted-foreground" />
+                        {{ t("settings.syncSnippetTitle") }}
+                      </div>
+                      <Button type="button" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openExternalUrl(`https://dbxio.com/${currentLocale() === 'zh-CN' ? 'cn' : 'en'}/docs/cloud-sync`)">
+                        <ExternalLink class="mr-1 h-3 w-3" />
+                        {{ t("settings.syncSnippetGuide") }}
+                      </Button>
+                    </div>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.syncSnippetDescription") }}</p>
+                  </div>
+
+                  <div class="grid gap-4 rounded-md border p-4 md:grid-cols-2">
+                    <div class="space-y-2">
+                      <Label>{{ t("settings.syncSnippetProvider") }}</Label>
+                      <Select v-model="snippetProvider">
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="github">GitHub Gist</SelectItem>
+                          <SelectItem value="gitee">Gitee 代码片段</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div class="space-y-2">
+                      <Label for="snippet-sync-id">{{ t("settings.syncSnippetId") }}</Label>
+                      <Input id="snippet-sync-id" v-model="snippetId" autocomplete="off" :placeholder="t('settings.syncSnippetIdPlaceholder')" />
+                    </div>
+                    <div class="space-y-2 md:col-span-2">
+                      <Label for="snippet-sync-token">{{ t("settings.syncSnippetToken") }}</Label>
+                      <div class="relative">
+                        <PasswordInput id="snippet-sync-token" v-model="snippetToken" :placeholder="snippetHasSavedToken ? '••••••••' : ''" :disabled="snippetHasSavedToken" :show-toggle="!snippetHasSavedToken" autocomplete="off" />
+                        <button
+                          v-if="snippetHasSavedToken"
+                          type="button"
+                          class="absolute right-1 top-1/2 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+                          :title="t('settings.syncClearSavedPassword')"
+                          @click="
+                            snippetRememberToken = false;
+                            forgetSnippetSavedToken(currentSnippetAccountConfig());
+                            snippetHasSavedToken = false;
+                            snippetToken = '';
+                          "
+                        >
+                          <X class="size-3.5" />
+                        </button>
+                      </div>
+                      <label class="flex items-center gap-2 text-xs text-muted-foreground">
+                        <input v-model="snippetRememberToken" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                        <span>{{ t("settings.syncSnippetRememberToken") }}</span>
+                      </label>
+                      <p class="text-xs text-muted-foreground">{{ t("settings.syncSnippetTokenDescription") }}</p>
+                    </div>
+                    <div class="flex flex-wrap items-center justify-between gap-3 md:col-span-2">
+                      <div v-if="snippetMessage" class="min-w-0 flex-1 text-xs" :class="snippetError ? 'text-destructive' : 'text-green-600 dark:text-green-400'">
+                        {{ snippetMessage }}
+                      </div>
+                      <div v-else class="flex-1" />
+                      <div class="flex shrink-0 flex-wrap justify-end gap-2">
+                        <Button variant="outline" size="sm" :disabled="!snippetReady" @click="testSnippetSync">
+                          <Loader2 v-if="snippetBusy === 'test'" class="mr-1 h-3 w-3 animate-spin" />
+                          {{ t("settings.syncTest") }}
+                        </Button>
+                        <Button variant="outline" size="sm" :disabled="!snippetReady || !snippetId.trim()" @click="downloadSnippetSnapshot">
+                          <Loader2 v-if="snippetBusy === 'download'" class="mr-1 h-3 w-3 animate-spin" />
+                          <Download v-else class="mr-1 h-3 w-3" />
+                          {{ t("settings.syncDownload") }}
+                        </Button>
+                        <Button size="sm" :disabled="!snippetReady" @click="uploadSnippetSnapshot">
+                          <Loader2 v-if="snippetBusy === 'upload'" class="mr-1 h-3 w-3 animate-spin" />
+                          <Upload v-else class="mr-1 h-3 w-3" />
+                          {{ t("settings.syncUpload") }}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                </TabsContent>
+              </Tabs>
+
+              <div class="mt-5 space-y-3 rounded-md border bg-muted/20 px-3 py-3">
                 <div class="flex items-center justify-between gap-4">
                   <div class="space-y-1">
-                    <Label for="webdav-sync-secrets">{{ t("settings.syncSecrets") }}</Label>
-                    <p class="text-xs text-muted-foreground">{{ t("settings.syncSecretsDescription") }}</p>
+                    <Label for="sync-secrets">{{ t("settings.syncSecrets") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.syncSecretsSharedDescription") }}</p>
                   </div>
-                  <Switch id="webdav-sync-secrets" v-model="webdavSyncSecrets" />
+                  <Switch id="sync-secrets" v-model="webdavSyncSecrets" />
+                </div>
+                <div class="rounded-md border bg-background/60 px-3 py-2 text-xs text-muted-foreground">
+                  {{ t("settings.syncSecretNotice") }}
                 </div>
                 <div v-if="webdavSyncSecrets" class="space-y-2">
-                  <Label for="webdav-secrets-passphrase">{{ t("settings.syncSecretsPassphrase") }}</Label>
+                  <Label for="sync-secrets-passphrase">{{ t("settings.syncSecretsPassphrase") }}</Label>
                   <div class="flex items-center gap-2">
-                    <PasswordInput id="webdav-secrets-passphrase" v-model="webdavSecretsPassphrase" class="min-w-0 flex-1" :placeholder="webdavHasSavedSecretsPassphrase ? '••••••••' : ''" :show-toggle="!webdavHasSavedSecretsPassphrase || !!webdavSecretsPassphrase" autocomplete="new-password" />
+                    <PasswordInput id="sync-secrets-passphrase" v-model="webdavSecretsPassphrase" class="min-w-0 flex-1" :placeholder="webdavHasSavedSecretsPassphrase ? '••••••••' : ''" :show-toggle="!webdavHasSavedSecretsPassphrase || !!webdavSecretsPassphrase" autocomplete="new-password" />
                     <Button
                       v-if="webdavHasSavedSecretsPassphrase"
                       type="button"
@@ -4120,6 +4483,7 @@ onUnmounted(cleanupPreviewEditor);
               </div>
 
               <div class="space-y-2">
+                <p class="text-xs text-muted-foreground">{{ t("settings.mcpConfigOptionsHint") }}</p>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="mcp-readonly-mode">{{ t("settings.mcpReadonlyMode") }}</Label>
@@ -4277,6 +4641,10 @@ onUnmounted(cleanupPreviewEditor);
               </div>
             </section>
 
+            <section v-else-if="activeSettingsTab === 'tunnels'" class="flex flex-col gap-5 py-2">
+              <TunnelProfileManager />
+            </section>
+
             <section v-else-if="activeSettingsTab === 'about'" class="flex flex-col gap-5 py-2">
               <div class="rounded-lg border p-4">
                 <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -4300,6 +4668,8 @@ onUnmounted(cleanupPreviewEditor);
                 <p v-else class="mt-4 text-sm text-muted-foreground">{{ t("settings.supportInfoLoading") }}</p>
                 <p v-if="appSupportInfoError" class="mt-3 text-xs text-destructive">{{ t("settings.supportInfoLoadFailed", { message: appSupportInfoError }) }}</p>
               </div>
+
+              <ChangelogPanel />
 
               <div class="rounded-lg border p-4">
                 <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -4440,24 +4810,6 @@ onUnmounted(cleanupPreviewEditor);
             <Button variant="outline" @click="closeSettings">
               {{ t("common.close") }}
             </Button>
-            <p v-if="webdavMessage" class="text-xs self-center truncate max-w-[280px]" :class="webdavError ? 'text-destructive' : 'text-green-500'">
-              {{ webdavMessage }}
-            </p>
-            <div class="flex-1" />
-            <Button variant="outline" :disabled="!webdavReady" @click="testWebDav">
-              <Loader2 v-if="webdavBusy === 'test'" class="mr-1 h-3 w-3 animate-spin" />
-              {{ t("settings.syncTest") }}
-            </Button>
-            <Button variant="outline" :disabled="!webdavReady" @click="downloadWebDavSnapshot">
-              <Loader2 v-if="webdavBusy === 'download'" class="mr-1 h-3 w-3 animate-spin" />
-              <Download v-else class="mr-1 h-3 w-3" />
-              {{ t("settings.syncDownload") }}
-            </Button>
-            <Button :disabled="!webdavReady" @click="uploadWebDavSnapshot">
-              <Loader2 v-if="webdavBusy === 'upload'" class="mr-1 h-3 w-3 animate-spin" />
-              <Upload v-else class="mr-1 h-3 w-3" />
-              {{ t("settings.syncUpload") }}
-            </Button>
           </DialogFooter>
 
           <DialogFooter v-else-if="activeSettingsTab === 'mcp' && !isWeb" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
@@ -4544,3 +4896,120 @@ onUnmounted(cleanupPreviewEditor);
     </Dialog>
   </component>
 </template>
+
+<style>
+@media (min-width: 1024px) {
+  .settings-layout {
+    flex-direction: row !important;
+  }
+
+  .settings-category-nav {
+    width: 10rem !important;
+    flex-direction: column !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    border-bottom-width: 0 !important;
+    border-right: 1px solid var(--border) !important;
+    padding-bottom: 0 !important;
+    padding-right: 0.75rem !important;
+  }
+
+  .settings-category-button {
+    width: 100% !important;
+    text-align: left !important;
+  }
+}
+
+.settings-category-button--active {
+  background-color: rgb(23, 23, 23) !important;
+  color: rgb(255, 255, 255) !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.settings-choice-button {
+  color: rgb(23, 23, 23);
+}
+
+.settings-choice-button--selected {
+  border-color: rgb(96, 165, 250) !important;
+  background-color: rgba(59, 130, 246, 0.1) !important;
+  color: rgb(29, 78, 216) !important;
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.45) !important;
+}
+
+.settings-choice-button--selected svg {
+  color: currentColor !important;
+}
+
+.settings-choice-card--selected {
+  border-color: rgb(96, 165, 250) !important;
+  background-color: rgba(59, 130, 246, 0.04) !important;
+  color: rgb(23, 23, 23) !important;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.45) !important;
+}
+
+.settings-appearance-section > * + * {
+  margin-top: 1.25rem;
+}
+
+.settings-appearance-top-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  column-gap: 0.75rem;
+  row-gap: 1rem;
+}
+
+.settings-appearance-field > * + * {
+  margin-top: 0.5rem;
+}
+
+.settings-appearance-group > * + * {
+  margin-top: 0.625rem;
+}
+
+.settings-appearance-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.settings-appearance-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.625rem;
+}
+
+.settings-option-stack > * + * {
+  margin-top: 0.625rem;
+}
+
+@media (max-width: 760px) {
+  .settings-appearance-top-grid,
+  .settings-appearance-choice-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dark .settings-category-button--active {
+  background-color: rgb(245, 245, 245) !important;
+  color: rgb(23, 23, 23) !important;
+}
+
+.dark .settings-choice-button {
+  color: rgb(245, 245, 245);
+}
+
+.dark .settings-choice-button--selected {
+  border-color: rgb(147, 197, 253) !important;
+  background-color: rgba(96, 165, 250, 0.18) !important;
+  color: rgb(191, 219, 254) !important;
+  box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.5) !important;
+}
+
+.dark .settings-choice-card--selected {
+  border-color: rgb(147, 197, 253) !important;
+  background-color: rgba(96, 165, 250, 0.12) !important;
+  color: rgb(245, 245, 245) !important;
+  box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.45) !important;
+}
+</style>

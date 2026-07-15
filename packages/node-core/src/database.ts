@@ -34,6 +34,8 @@ export interface ColumnInfo {
   numeric_scale?: number | null;
   character_maximum_length?: number | null;
   enum_values?: string[] | null;
+  character_set?: string | null;
+  collation?: string | null;
 }
 
 export interface QueryResult {
@@ -564,11 +566,13 @@ interface BridgeColumnInfo {
   numeric_scale?: number | null;
   character_maximum_length?: number | null;
   enum_values?: string[] | null;
+  character_set?: string | null;
+  collation?: string | null;
 }
 
 const POSTGRES_DESCRIBE_TABLE_SQL = `SELECT c.column_name AS name, CASE WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name ELSE c.data_type END AS data_type, c.is_nullable = 'YES' AS is_nullable, c.column_default, CASE WHEN tc.constraint_type = 'PRIMARY KEY' THEN true ELSE false END AS is_primary_key, col_description(cls.oid, c.ordinal_position) AS comment, CASE WHEN enum_t.oid IS NULL THEN NULL ELSE COALESCE((SELECT array_to_json(array_agg(e.enumlabel ORDER BY e.enumsortorder)) FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]'::json) END AS enum_values FROM information_schema.columns c LEFT JOIN information_schema.key_column_usage kcu ON kcu.table_schema = c.table_schema AND kcu.table_name = c.table_name AND kcu.column_name = c.column_name LEFT JOIN information_schema.table_constraints tc ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema AND tc.constraint_type = 'PRIMARY KEY' LEFT JOIN pg_class cls ON cls.relname = c.table_name AND cls.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = c.table_schema) LEFT JOIN pg_namespace type_ns ON type_ns.nspname = c.udt_schema LEFT JOIN pg_type t ON t.typnamespace = type_ns.oid AND t.typname = c.udt_name LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position`;
 const POSTGRES_DESCRIBE_TABLE_COMPAT_SQL = `SELECT c.column_name AS name, CASE WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name ELSE c.data_type END AS data_type, c.is_nullable = 'YES' AS is_nullable, c.column_default, CASE WHEN tc.constraint_type = 'PRIMARY KEY' THEN true ELSE false END AS is_primary_key, col_description(cls.oid, c.ordinal_position) AS comment, NULL AS enum_values FROM information_schema.columns c LEFT JOIN information_schema.key_column_usage kcu ON kcu.table_schema = c.table_schema AND kcu.table_name = c.table_name AND kcu.column_name = c.column_name LEFT JOIN information_schema.table_constraints tc ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema AND tc.constraint_type = 'PRIMARY KEY' LEFT JOIN pg_class cls ON cls.relname = c.table_name AND cls.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = c.table_schema) WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position`;
-const MYSQL_DESCRIBE_TABLE_SQL = `SELECT c.COLUMN_NAME AS name, c.DATA_TYPE AS data_type, c.COLUMN_TYPE AS column_type, c.IS_NULLABLE = 'YES' AS is_nullable, c.COLUMN_DEFAULT AS column_default, c.COLUMN_KEY = 'PRI' AS is_primary_key, c.COLUMN_COMMENT AS comment FROM information_schema.COLUMNS c WHERE c.TABLE_SCHEMA = DATABASE() AND c.TABLE_NAME = ? ORDER BY c.ORDINAL_POSITION`;
+const MYSQL_DESCRIBE_TABLE_SQL = `SELECT c.COLUMN_NAME AS name, c.DATA_TYPE AS data_type, c.COLUMN_TYPE AS column_type, c.IS_NULLABLE = 'YES' AS is_nullable, c.COLUMN_DEFAULT AS column_default, c.COLUMN_KEY = 'PRI' AS is_primary_key, c.COLUMN_COMMENT AS comment, c.CHARACTER_SET_NAME AS character_set, c.COLLATION_NAME AS collation FROM information_schema.COLUMNS c WHERE c.TABLE_SCHEMA = DATABASE() AND c.TABLE_NAME = ? ORDER BY c.ORDINAL_POSITION`;
 
 function normalizeEnumValues(value: unknown): string[] | null {
   if (value == null) return null;
@@ -649,6 +653,8 @@ function mapDescribeTableColumn(
     numeric_precision?: number | null;
     numeric_scale?: number | null;
     character_maximum_length?: number | null;
+    character_set?: string | null;
+    collation?: string | null;
   },
   enumValues: string[] | null,
 ): ColumnInfo {
@@ -664,6 +670,8 @@ function mapDescribeTableColumn(
   if ("numeric_precision" in row) column.numeric_precision = row.numeric_precision;
   if ("numeric_scale" in row) column.numeric_scale = row.numeric_scale;
   if ("character_maximum_length" in row) column.character_maximum_length = row.character_maximum_length;
+  if ("character_set" in row) column.character_set = row.character_set ?? null;
+  if ("collation" in row) column.collation = row.collation ?? null;
   return column;
 }
 
@@ -856,6 +864,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   if (hasActiveSshLayer(config)) {
     const result = await withTimeout(
       bridgeDataRequest<BridgeQueryResult>("/data/execute-query", {
+        connection_id: config.id,
         connection_name: config.name,
         database: config.database || "",
         sql,
@@ -872,8 +881,8 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
     }
     const count = parseMongoCountDocumentsCommand(sql);
     if (count) {
-      const result = await withTimeout(mongoFindDocuments(config, count.collection, 0, 1, count.filter), resolveTimeoutMs(options));
-      return { columns: ["count"], rows: [{ count: result.total }], row_count: 1 };
+      const total = await withTimeout(mongoCountDocuments(config, count.collection, count.filter, count.mode), resolveTimeoutMs(options));
+      return { columns: ["count"], rows: [{ count: total }], row_count: 1 };
     }
     const find = parseMongoFindCommand(sql);
     if (find) {
@@ -927,6 +936,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
   }
   const result = await withTimeout(
     bridgeDataRequest<BridgeQueryResult>("/data/execute-query", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       sql,
@@ -945,6 +955,7 @@ export async function executeRedisCommand(config: ConnectionConfig, db: number, 
   }
   return withTimeout(
     bridgeDataRequest<RedisCommandResult>("/data/redis/execute-command", {
+      connection_id: config.id,
       connection_name: config.name,
       db,
       command,
@@ -1029,6 +1040,7 @@ function redisTextToJson(value: string): unknown {
 export async function listTables(config: ConnectionConfig, schema?: string): Promise<TableInfo[]> {
   if (config.db_type === "mongodb") {
     const collections = await bridgeDataRequest<CollectionListEntry[]>("/data/mongo/list-collections", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
@@ -1041,6 +1053,7 @@ export async function listTables(config: ConnectionConfig, schema?: string): Pro
   }
   if (hasActiveSshLayer(config) || !isDirectQueryType(config.db_type)) {
     const tables = await bridgeDataRequest<BridgeTableInfo[]>("/data/list-tables", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
@@ -1074,6 +1087,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
   }
   if (hasActiveSshLayer(config) || !isDirectQueryType(config.db_type)) {
     const columns = await bridgeDataRequest<BridgeColumnInfo[]>("/data/describe-table", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
@@ -1099,6 +1113,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
 
 async function mongoFindDocuments(config: ConnectionConfig, collection: string, skip: number, limit: number, filter: string, projection?: string, sort?: string): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/find-documents", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection,
@@ -1110,8 +1125,20 @@ async function mongoFindDocuments(config: ConnectionConfig, collection: string, 
   });
 }
 
+async function mongoCountDocuments(config: ConnectionConfig, collection: string, filter: string, mode: MongoCountDocumentsCommand["mode"]): Promise<number> {
+  return bridgeDataRequest<number>("/data/mongo/count-documents", {
+    connection_id: config.id,
+    connection_name: config.name,
+    database: config.database || "",
+    collection,
+    filter,
+    mode,
+  });
+}
+
 async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
   return bridgeDataRequest<string>("/data/mongo/server-version", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
   });
@@ -1119,6 +1146,7 @@ async function mongoServerVersion(config: ConnectionConfig): Promise<string> {
 
 async function mongoCollectionStats(config: ConnectionConfig, collection: string, scale?: number): Promise<Record<string, unknown>> {
   return bridgeDataRequest<Record<string, unknown>>("/data/mongo/collection-stats", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection,
@@ -1129,6 +1157,7 @@ async function mongoCollectionStats(config: ConnectionConfig, collection: string
 async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCommand): Promise<{ affectedRows: number; indexName?: string; droppedNames?: string[] }> {
   if (command.kind === "insert") {
     const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/insert-documents", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1138,17 +1167,20 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "update") {
     const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/update-documents", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
       filter_json: command.filter,
       update_json: command.update,
       many: command.many,
+      options_json: command.options,
     });
     return { affectedRows: result.affected_rows };
   }
   if (command.kind === "createIndex") {
     const result = await bridgeDataRequest<{ name: string }>("/data/mongo/create-index", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1159,6 +1191,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "dropIndex" || command.kind === "dropIndexes") {
     const result = await bridgeDataRequest<{ dropped_names: string[]; affected_rows: number }>("/data/mongo/drop-indexes", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1169,6 +1202,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
   }
   if (command.kind === "dropCollection") {
     await bridgeDataRequest<{ ok: boolean }>("/data/mongo/drop-collection", {
+      connection_id: config.id,
       connection_name: config.name,
       database: config.database || "",
       collection: command.collection,
@@ -1176,6 +1210,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
     return { affectedRows: 1 };
   }
   const result = await bridgeDataRequest<{ affected_rows: number }>("/data/mongo/delete-documents", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection: command.collection,
@@ -1187,6 +1222,7 @@ async function executeMongoWrite(config: ConnectionConfig, command: MongoWriteCo
 
 async function mongoAggregateDocuments(config: ConnectionConfig, collection: string, pipelineJson: string, maxRows: number): Promise<MongoDocumentResult> {
   return bridgeDataRequest<MongoDocumentResult>("/data/mongo/aggregate-documents", {
+    connection_id: config.id,
     connection_name: config.name,
     database: config.database || "",
     collection,
@@ -1271,6 +1307,7 @@ interface MongoFindCommand {
 interface MongoCountDocumentsCommand {
   collection: string;
   filter: string;
+  mode: "accurate" | "legacy";
 }
 
 interface MongoAggregateCommand {
@@ -1292,7 +1329,7 @@ interface MongoCollectionStatsCommand {
 
 export type MongoWriteCommand =
   | { kind: "insert"; collection: string; docsJson: string }
-  | { kind: "update"; collection: string; filter: string; update: string; many: boolean }
+  | { kind: "update"; collection: string; filter: string; update: string; options?: string; many: boolean }
   | { kind: "delete"; collection: string; filter: string; many: boolean }
   | { kind: "createIndex"; collection: string; keys: string; options?: string }
   | { kind: "dropIndex"; collection: string; index: string }
@@ -1339,8 +1376,6 @@ export function parseMongoVersionCommand(input: string): boolean {
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  // Accept deprecated Mongo shell count helpers for old server workflows, but
-  // keep DBX's internal execution mapped to the countDocuments result shape.
   return parseCollectionCountCommand(source, "countDocuments") ?? parseCollectionCountCommand(source, "count") ?? parseFindCountCommand(source);
 }
 
@@ -1353,7 +1388,7 @@ function parseCollectionCountCommand(source: string, method: "countDocuments" | 
   const args = splitTopLevel(source.slice(openIndex + 1, closeIndex));
   if (args.length > 1 && args.slice(1).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(args[0] || "{}");
-  return filter ? { collection: target.collection, filter } : null;
+  return filter ? { collection: target.collection, filter, mode: method === "countDocuments" ? "accurate" : "legacy" } : null;
 }
 
 function parseFindCountCommand(source: string): MongoCountDocumentsCommand | null {
@@ -1367,7 +1402,7 @@ function parseFindCountCommand(source: string): MongoCountDocumentsCommand | nul
   const findArgs = splitTopLevel(source.slice(findOpenIndex + 1, findCloseIndex));
   if (findArgs.length > 2 && findArgs.slice(2).some((arg) => arg.trim())) return null;
   const filter = normalizeJsonArgument(findArgs[0] || "{}");
-  return filter ? { collection: target.collection, filter } : null;
+  return filter ? { collection: target.collection, filter, mode: "legacy" } : null;
 }
 
 export function parseMongoAggregateCommand(input: string): MongoAggregateCommand | null {
@@ -1441,11 +1476,13 @@ export function parseMongoWriteCommand(input: string): MongoWriteCommand | null 
     const target = parseCollectionMethodTarget(source, method);
     if (!target) continue;
     const args = parseMethodArgs(source, target.methodCallIndex);
-    if (!args || args.length !== 2) return null;
+    if (!args || args.length < 2 || args.length > 3) return null;
     const filter = normalizeJsonArgument(args[0]);
     const update = normalizeJsonArgument(args[1]);
     if (!filter || !update) return null;
-    return { kind: "update", collection: target.collection, filter, update, many: method === "updateMany" };
+    const options = args[2]?.trim() ? normalizeJsonArgument(args[2]) : undefined;
+    if (args[2]?.trim() && !options) return null;
+    return { kind: "update", collection: target.collection, filter, update, ...(options ? { options } : {}), many: method === "updateMany" };
   }
 
   for (const method of ["deleteOne", "deleteMany"] as const) {

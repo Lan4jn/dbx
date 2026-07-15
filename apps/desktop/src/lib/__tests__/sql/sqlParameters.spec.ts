@@ -177,6 +177,93 @@ describe("extractSqlParameters", () => {
     expect(extractSqlParameters(sql)).toEqual(["actual_value"]);
   });
 
+  it("ignores Doris STRUCT field type separators", () => {
+    const sql = `
+      create table \`events\` (
+        \`field0\` int not null comment 'field 0',
+        \`field_list\` array<struct<field1:smallint, field2:int, field3:decimal(16,5), field4:varchar(255)>> comment 'field list'
+      )
+      engine = olap
+      properties ("replication_num" = "1");
+    `;
+
+    expect(extractSqlParameters(sql, { databaseType: "doris" })).toEqual([]);
+    // SelectDB connections use the MySQL db type with a SelectDB driver profile.
+    expect(extractSqlParameters(sql, { databaseType: "mysql" })).toEqual([]);
+    expect(substituteSqlParameters(sql, {}, { databaseType: "doris" })).toBe(sql);
+  });
+
+  it("keeps named parameters that are not STRUCT field type separators", () => {
+    const sql = `
+      create table \`events\` (
+        \`field_list\` array<struct<
+          field1:smallint,
+          nested:struct<\`field2\` /* field type */ :decimal(:precision, :scale)>
+        >>
+      ) properties ("buckets" = :bucket_count);
+    `;
+
+    expect(extractSqlParameters(sql, { databaseType: "doris" })).toEqual(["precision", "scale", "bucket_count"]);
+    expect(
+      substituteSqlParameters(
+        sql,
+        {
+          precision: { kind: "number", value: "16" },
+          scale: { kind: "number", value: "5" },
+          bucket_count: { kind: "number", value: "8" },
+        },
+        { databaseType: "doris" },
+      ),
+    ).toBe(`
+      create table \`events\` (
+        \`field_list\` array<struct<
+          field1:smallint,
+          nested:struct<\`field2\` /* field type */ :decimal(16, 5)>
+        >>
+      ) properties ("buckets" = 8);
+    `);
+  });
+
+  it("does not let an unterminated complex type hide a later named parameter", () => {
+    const sql = "create table `broken` (value struct<field:int,\nselect :real;";
+
+    expect(extractSqlParameters(sql, { databaseType: "doris" })).toEqual(["real"]);
+    expect(substituteSqlParameters(sql, { real: { kind: "number", value: "7" } }, { databaseType: "doris" })).toBe("create table `broken` (value struct<field:int,\nselect 7;");
+  });
+
+  it("ignores Doris VARIANT field type separators", () => {
+    const sql = `
+      create table \`events\` (
+        value variant<
+          match_name 'path_1':decimal(:precision, :scale),
+          match_name_glob 'meta*':bigint,
+          properties('variant_max_subcolumns_count' = :property_value)
+        >
+      );
+    `;
+
+    expect(extractSqlParameters(sql, { databaseType: "doris" })).toEqual(["precision", "scale", "property_value"]);
+    expect(
+      substituteSqlParameters(
+        sql,
+        {
+          precision: { kind: "number", value: "16" },
+          scale: { kind: "number", value: "5" },
+          property_value: { kind: "string", value: "2048" },
+        },
+        { databaseType: "doris" },
+      ),
+    ).toBe(`
+      create table \`events\` (
+        value variant<
+          match_name 'path_1':decimal(16, 5),
+          match_name_glob 'meta*':bigint,
+          properties('variant_max_subcolumns_count' = '2048')
+        >
+      );
+    `);
+  });
+
   it("ignores HANA SQLScript variable references", () => {
     const sql = "DO BEGIN Dummy1 = SELECT 1 FROM DUMMY; SELECT * FROM :Dummy1; END";
     expect(extractSqlParameters(sql, { databaseType: "saphana" })).toEqual([]);
@@ -273,6 +360,45 @@ DEALLOCATE PREPARE stmt;`;
   it("keeps HANA SQLScript variable references while replacing template parameters", () => {
     const sql = "DO BEGIN Dummy1 = SELECT * FROM ORDERS WHERE TENANT_ID = ${tenant_id}; SELECT * FROM :Dummy1; END";
     expect(substituteSqlParameters(sql, { tenant_id: { kind: "number", value: "42" } }, { databaseType: "saphana" })).toBe("DO BEGIN Dummy1 = SELECT * FROM ORDERS WHERE TENANT_ID = 42; SELECT * FROM :Dummy1; END");
+  });
+});
+
+describe("enabledSyntaxes option", () => {
+  const mixedSql = "select ? as a, :named as b, ${shell_name} as c, #{mybatis_name} as d, @sql_server_name as e";
+
+  it("extracts every syntax when the option is omitted (backward compatible)", () => {
+    expect(extractSqlParameters(mixedSql)).toEqual(["?1", "named", "shell_name", "mybatis_name", "sql_server_name"]);
+  });
+
+  it("only extracts the enabled syntaxes", () => {
+    expect(extractSqlParameters(mixedSql, { enabledSyntaxes: ["named"] })).toEqual(["named"]);
+    expect(extractSqlParameters(mixedSql, { enabledSyntaxes: ["shell", "mybatis"] })).toEqual(["shell_name", "mybatis_name"]);
+  });
+
+  it("extracts nothing when no syntax is enabled", () => {
+    expect(extractSqlParameters(mixedSql, { enabledSyntaxes: [] })).toEqual([]);
+  });
+
+  it("leaves disabled-syntax tokens untouched when substituting", () => {
+    // Only :named is enabled, so every other token survives verbatim.
+    expect(substituteSqlParameters(mixedSql, { named: { kind: "number", value: "2" } }, { enabledSyntaxes: ["named"] })).toBe("select ? as a, 2 as b, ${shell_name} as c, #{mybatis_name} as d, @sql_server_name as e");
+  });
+
+  it("does not consume the positional counter for disabled positional placeholders", () => {
+    expect(substituteSqlParameters("select ?, ?", {}, { enabledSyntaxes: ["named"] })).toBe("select ?, ?");
+  });
+
+  it("keeps #{name} out of hash-comment handling when mybatis is disabled", () => {
+    expect(extractSqlParameters("select #{mybatis_name} from t", { enabledSyntaxes: ["shell"] })).toEqual([]);
+    expect(substituteSqlParameters("select #{mybatis_name} from t", {}, { enabledSyntaxes: ["shell"] })).toBe("select #{mybatis_name} from t");
+  });
+
+  it("intersects the enabled set with the saphana named-parameter rule", () => {
+    const sql = "select :named as a, ${shell_name} as b";
+    // saphana already disables :name; enabling named cannot re-enable it.
+    expect(extractSqlParameters(sql, { databaseType: "saphana", enabledSyntaxes: ["named", "shell"] })).toEqual(["shell_name"]);
+    // A non-saphana database with named disabled also drops :name.
+    expect(extractSqlParameters(sql, { enabledSyntaxes: ["shell"] })).toEqual(["shell_name"]);
   });
 });
 

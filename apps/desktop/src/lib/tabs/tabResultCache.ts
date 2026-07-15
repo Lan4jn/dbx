@@ -16,6 +16,13 @@ export interface TabResultSnapshot {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  /**
+   * Source ordering retained while a local grid sort is active. It must travel
+   * with the snapshot so clearing the sort after a cache/archive restore can
+   * still return to the original result order.
+   */
+  resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultRuns?: QueryTab["resultRuns"];
   activeResultRunId?: string;
   queryAnalysis?: QueryTab["queryAnalysis"];
@@ -33,15 +40,19 @@ export interface TabResultSnapshot {
 
 interface ColumnarQueryResult {
   columns: string[];
+  execution_error?: true;
   column_types?: string[];
   columnValues: CellValue[][];
   rowCount: number;
+  mongo_documents?: unknown[];
   affected_rows: number;
   execution_time_ms: number;
   truncated?: boolean;
   has_more?: boolean;
   sourceLabel?: string;
   sourceStatement?: string;
+  sourceFrom?: number;
+  sourceTo?: number;
 }
 
 type QueryResultRunSnapshot = NonNullable<QueryTab["resultRuns"]>[number];
@@ -126,8 +137,10 @@ function stripSessionIds(result: QueryResult | undefined): QueryResult | undefin
   if (!result) return undefined;
   return {
     columns: [...result.columns],
+    execution_error: result.execution_error,
     column_types: result.column_types ? [...result.column_types] : undefined,
     rows: result.rows.map((row) => [...row]),
+    mongo_documents: result.mongo_documents ? clonePlain(result.mongo_documents) : undefined,
     affected_rows: result.affected_rows,
     execution_time_ms: result.execution_time_ms,
     truncated: result.truncated,
@@ -135,6 +148,8 @@ function stripSessionIds(result: QueryResult | undefined): QueryResult | undefin
     has_more: result.has_more,
     sourceLabel: result.sourceLabel,
     sourceStatement: result.sourceStatement,
+    sourceFrom: result.sourceFrom,
+    sourceTo: result.sourceTo,
   };
 }
 
@@ -147,6 +162,8 @@ function stripResultRunSessionIds(resultRuns: QueryTab["resultRuns"]): QueryTab[
     ...run,
     result: stripSessionIds(run.result),
     results: stripResultSessionIds(run.results),
+    resultLocalSortOriginalRows: run.resultLocalSortOriginalRows?.map((row) => [...row]),
+    resultLocalSortOriginalMongoDocuments: run.resultLocalSortOriginalMongoDocuments ? clonePlain(run.resultLocalSortOriginalMongoDocuments) : undefined,
     resultSessionId: undefined,
   }));
 }
@@ -156,15 +173,19 @@ function toColumnarResult(result: QueryResult | undefined): ColumnarQueryResult 
   const columnValues = result.columns.map((_, colIndex) => result.rows.map((row) => row[colIndex] ?? null));
   return removeUndefinedFields({
     columns: [...result.columns],
+    execution_error: result.execution_error,
     column_types: result.column_types ? [...result.column_types] : undefined,
     columnValues,
     rowCount: result.rows.length,
+    mongo_documents: result.mongo_documents ? clonePlain(result.mongo_documents) : undefined,
     affected_rows: result.affected_rows,
     execution_time_ms: result.execution_time_ms,
     truncated: result.truncated,
     has_more: result.has_more,
     sourceLabel: result.sourceLabel,
     sourceStatement: result.sourceStatement,
+    sourceFrom: result.sourceFrom,
+    sourceTo: result.sourceTo,
   });
 }
 
@@ -173,8 +194,10 @@ function fromColumnarResult(result: ColumnarQueryResult | undefined): QueryResul
   const rows = Array.from({ length: result.rowCount }, (_, rowIndex) => result.columnValues.map((values) => values[rowIndex] ?? null));
   return {
     columns: [...result.columns],
+    execution_error: result.execution_error,
     column_types: result.column_types ? [...result.column_types] : undefined,
     rows,
+    mongo_documents: result.mongo_documents ? clonePlain(result.mongo_documents) : undefined,
     affected_rows: result.affected_rows,
     execution_time_ms: result.execution_time_ms,
     truncated: result.truncated,
@@ -182,6 +205,8 @@ function fromColumnarResult(result: ColumnarQueryResult | undefined): QueryResul
     has_more: result.has_more,
     sourceLabel: result.sourceLabel,
     sourceStatement: result.sourceStatement,
+    sourceFrom: result.sourceFrom,
+    sourceTo: result.sourceTo,
   };
 }
 
@@ -364,6 +389,8 @@ export function buildTabResultSnapshot(tab: QueryTab): TabResultSnapshot | undef
     result: stripSessionIds(tab.result),
     results: stripResultSessionIds(tab.results),
     activeResultIndex: tab.activeResultIndex,
+    resultLocalSortOriginalRows: tab.resultLocalSortOriginalRows?.map((row) => [...row]),
+    resultLocalSortOriginalMongoDocuments: tab.resultLocalSortOriginalMongoDocuments ? clonePlain(tab.resultLocalSortOriginalMongoDocuments) : undefined,
     resultRuns: stripResultRunSessionIds(tab.resultRuns),
     activeResultRunId: tab.activeResultRunId,
     queryAnalysis: tab.queryAnalysis ? clonePlain(tab.queryAnalysis) : undefined,

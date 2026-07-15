@@ -7,14 +7,16 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::MysqlMode;
-use crate::connection::{AppState, PoolKind};
-use crate::csv_export::{escape_csv, format_csv, value_to_csv_text};
+use crate::connection::{task_client_session_id, AppState, PoolKind};
+use crate::csv_export::{escape_csv, format_csv, format_tsv, format_tsv_rows, value_to_csv_text};
 pub use crate::database_export::ExportStatus;
-use crate::database_export::{build_export_insert_statements, is_export_cancelled, BuildExportInsertStatementsOptions};
+use crate::database_export::{
+    build_export_insert_statements, is_export_cancelled, is_internal_export_column, BuildExportInsertStatementsOptions,
+};
 use crate::db::agent_driver::AgentTableReadStartParams;
 use crate::models::connection::DatabaseType;
 use crate::transfer::{
-    count_sql_with_where, execute_on_pool, execute_on_pool_with_max_rows, keyset_pagination_sql,
+    count_sql_with_where, execute_read_on_pool, execute_read_on_pool_with_max_rows, keyset_pagination_sql,
     pagination_sql_with_filter_order, qualified_table, quote_identifier,
 };
 use crate::types::QueryResult;
@@ -22,6 +24,10 @@ use crate::xlsx_export::{finish_streaming_xlsx_workbook, start_streaming_xlsx_wo
 
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 const SQL_INSERT_BATCH_SIZE: usize = 100;
+
+pub fn table_export_client_session_id(export_id: &str) -> String {
+    task_client_session_id("table-export", export_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,7 +38,7 @@ pub struct TableExportRequest {
     pub schema: Option<String>,
     pub table_name: String,
     pub file_path: String,
-    /// "csv", "xlsx", "json", "markdown", or "sql"
+    /// "csv", "xlsx", "json", "markdown", "sql", or "txt"
     pub format: String,
     #[serde(default)]
     pub columns: Option<Vec<String>>,
@@ -71,6 +77,47 @@ fn format_csv_rows(rows: &[Vec<Value>]) -> String {
         .map(|row| row.iter().map(|cell| escape_csv(&value_to_csv_text(cell))).collect::<Vec<_>>().join(","))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn export_column_types(request: &TableExportRequest) -> Vec<String> {
+    request
+        .column_types
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|column_type| column_type.clone().unwrap_or_default())
+        .collect()
+}
+
+fn resolve_requested_export_columns(
+    database_type: DatabaseType,
+    columns: &[String],
+    column_types: Option<&[Option<String>]>,
+    primary_keys: Option<&[String]>,
+) -> (Vec<String>, Vec<Option<String>>, Vec<String>) {
+    let mut resolved_columns = Vec::with_capacity(columns.len());
+    let mut resolved_column_types = column_types.map(|_| Vec::with_capacity(columns.len())).unwrap_or_default();
+
+    // Filter names and their index-aligned type metadata together so the
+    // fetched rows and later SQL literal formatting keep the same positions.
+    for (index, column) in columns.iter().enumerate() {
+        if is_internal_export_column(Some(database_type), column) {
+            continue;
+        }
+        resolved_columns.push(column.clone());
+        if let Some(column_types) = column_types {
+            resolved_column_types.push(column_types.get(index).cloned().unwrap_or(None));
+        }
+    }
+
+    let resolved_primary_keys = primary_keys
+        .unwrap_or_default()
+        .iter()
+        .filter(|column| !is_internal_export_column(Some(database_type), column))
+        .cloned()
+        .collect();
+
+    (resolved_columns, resolved_column_types, resolved_primary_keys)
 }
 
 fn write_json_row_object<W: Write>(writer: &mut W, columns: &[String], row: &[Value]) -> Result<(), String> {
@@ -343,7 +390,7 @@ async fn fetch_paginated_table_export_batch(
         offset,
         active_batch_size,
     );
-    execute_on_pool_with_max_rows(state, pool_key, &sql, Some(active_batch_size)).await
+    execute_read_on_pool_with_max_rows(state, pool_key, &sql, Some(active_batch_size)).await
 }
 
 async fn close_table_read_session_if_open(
@@ -491,11 +538,55 @@ async fn try_export_native_table_stream(
             }
             result
         }
+        "txt" => {
+            let mut file = BufWriter::new(
+                std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
+            );
+            let header = format_tsv(col_names, &[]);
+            let header = header.strip_suffix('\n').unwrap_or(&header);
+            file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write TXT: {e}"))?;
+
+            let result = stream_native_table_rows(
+                state,
+                pool_key,
+                db_type,
+                &sql,
+                row_limit,
+                &cancelled,
+                cancel_token.clone(),
+                |row| {
+                    let row_tsv = format_tsv_rows(&[row.to_vec()]);
+                    write!(file, "\n{row_tsv}").map_err(|e| format!("Failed to write TXT rows: {e}"))?;
+                    rows_exported += 1;
+                    if rows_exported % progress_interval == 0 {
+                        on_progress(TableExportProgress {
+                            export_id: request.export_id.clone(),
+                            table_name: request.table_name.clone(),
+                            rows_exported,
+                            total_rows,
+                            status: ExportStatus::Running,
+                            error_message: None,
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            if result.is_ok() {
+                file.flush().map_err(|e| format!("Failed to flush export file: {e}"))?;
+            }
+            result
+        }
         "xlsx" => {
+            let column_types = export_column_types(request);
             let xlsx_file =
                 std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
-            let mut writer =
-                start_streaming_xlsx_workbook(BufWriter::new(xlsx_file), Some(&request.table_name), col_names)?;
+            let mut writer = start_streaming_xlsx_workbook(
+                BufWriter::new(xlsx_file),
+                Some(&request.table_name),
+                col_names,
+                &column_types,
+            )?;
             let result = stream_native_table_rows(
                 state,
                 pool_key,
@@ -758,15 +849,22 @@ pub async fn export_table_data_core(
         .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
 
     // 2. Get pool
-    let pool_key = state.get_or_create_pool(&request.connection_id, Some(&request.database)).await?;
+    let client_session_id = table_export_client_session_id(&request.export_id);
+    let pool_key = state
+        .get_or_create_pool_for_session(&request.connection_id, Some(&request.database), Some(&client_session_id))
+        .await?;
 
     // 3. Resolve columns. Data grid exports can provide columns/primary keys
     // directly, which avoids expensive metadata round-trips on JDBC drivers.
     let requested_columns = request.columns.as_ref().filter(|columns| !columns.is_empty());
     let (col_names, column_types, column_extras, primary_keys) = if let Some(requested_columns) = requested_columns {
-        let primary_keys = request.primary_keys.clone().unwrap_or_default();
-        let column_types = request.column_types.clone().unwrap_or_default();
-        (requested_columns.clone(), column_types, Vec::new(), primary_keys)
+        let (col_names, column_types, primary_keys) = resolve_requested_export_columns(
+            db_type,
+            requested_columns,
+            request.column_types.as_deref(),
+            request.primary_keys.as_deref(),
+        );
+        (col_names, column_types, Vec::new(), primary_keys)
     } else {
         let columns = crate::schema::get_columns_core(
             state,
@@ -815,7 +913,7 @@ pub async fn export_table_data_core(
             &db_type,
             request.where_input.as_deref(),
         );
-        match execute_on_pool(state, &pool_key, &count_query).await {
+        match execute_read_on_pool(state, &pool_key, &count_query).await {
             Ok(result) => result
                 .rows
                 .first()
@@ -957,14 +1055,98 @@ pub async fn export_table_data_core(
                 }
             }
         }
+        "txt" => {
+            let mut is_first_batch = true;
+            let header = format_tsv(&col_names, &[]);
+            let header = header.strip_suffix('\n').unwrap_or(&header);
+            file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write TXT: {e}"))?;
+
+            loop {
+                if is_export_cancelled(&request.export_id).await {
+                    on_progress(TableExportProgress {
+                        export_id: request.export_id.clone(),
+                        table_name: request.table_name.clone(),
+                        rows_exported,
+                        total_rows,
+                        status: ExportStatus::Cancelled,
+                        error_message: Some("Export cancelled".to_string()),
+                    });
+                    close_table_read_session_if_open(state, &pool_key, &mut table_read_session_id).await;
+                    return Ok(());
+                }
+
+                let Some(active_batch_size) = next_export_batch_size(row_limit, rows_exported, batch_size) else {
+                    break;
+                };
+                let result = fetch_table_export_batch(
+                    state,
+                    &pool_key,
+                    request,
+                    &db_type,
+                    &col_names,
+                    &primary_keys,
+                    use_keyset,
+                    &last_pk_values,
+                    offset,
+                    active_batch_size,
+                    &mut table_read_session_id,
+                    &mut table_read_attempted,
+                    &mut table_read_completed,
+                )
+                .await?;
+                let row_count = result.rows.len();
+                if row_count == 0 {
+                    break;
+                }
+
+                if is_first_batch {
+                    let rows_tsv = format_tsv_rows(&result.rows);
+                    write!(file, "\n{rows_tsv}").map_err(|e| format!("Failed to write TXT rows: {e}"))?;
+                    is_first_batch = false;
+                } else {
+                    let rows_tsv = format_tsv_rows(&result.rows);
+                    if !rows_tsv.is_empty() {
+                        write!(file, "\n{rows_tsv}").map_err(|e| format!("Failed to write TXT rows: {e}"))?;
+                    }
+                }
+
+                rows_exported += row_count as u64;
+
+                if use_keyset {
+                    if let Some(last_row) = result.rows.last() {
+                        last_pk_values = pk_indices.iter().map(|&i| last_row[i].clone()).collect();
+                    }
+                } else {
+                    offset += row_count as u64;
+                }
+
+                on_progress(TableExportProgress {
+                    export_id: request.export_id.clone(),
+                    table_name: request.table_name.clone(),
+                    rows_exported,
+                    total_rows,
+                    status: ExportStatus::Running,
+                    error_message: None,
+                });
+
+                if row_count < active_batch_size {
+                    break;
+                }
+            }
+        }
         "xlsx" => {
+            let column_types = export_column_types(request);
             // Create a dedicated file handle for the streaming XLSX writer
             // instead of cloning the outer BufWriter's handle.  This avoids
             // sharing a file descriptor between two independent buffers.
             let xlsx_file =
                 std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
-            let mut writer =
-                start_streaming_xlsx_workbook(BufWriter::new(xlsx_file), Some(&request.table_name), &col_names)?;
+            let mut writer = start_streaming_xlsx_workbook(
+                BufWriter::new(xlsx_file),
+                Some(&request.table_name),
+                &col_names,
+                &column_types,
+            )?;
 
             loop {
                 // Check cancellation between batches
@@ -1376,6 +1558,44 @@ mod tests {
         assert_eq!(out, "\"just\",\"one\"");
     }
 
+    // -----------------------------------------------------------------------
+    // format_tsv (Navicat-style TXT export)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn formats_tsv_with_header_and_tab_separated_values() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![vec![json!(1), json!("Alice")], vec![json!(2), json!("Bob")]];
+        assert_eq!(format_tsv(&columns, &rows), "id\tname\n1\tAlice\n2\tBob");
+    }
+
+    #[test]
+    fn formats_tsv_renders_null_as_empty() {
+        let columns = vec!["id".to_string(), "note".to_string()];
+        let rows = vec![vec![json!(1), Value::Null]];
+        assert_eq!(format_tsv(&columns, &rows), "id\tnote\n1\t");
+    }
+
+    #[test]
+    fn formats_tsv_quotes_fields_containing_tab_or_newline() {
+        let columns = vec!["a".to_string(), "b".to_string()];
+        let rows = vec![vec![json!("x\ty"), json!("line1\nline2")]];
+        assert_eq!(format_tsv(&columns, &rows), "a\tb\n\"x\ty\"\t\"line1\nline2\"");
+    }
+
+    #[test]
+    fn formats_tsv_escapes_embedded_quotes() {
+        let columns = vec!["name".to_string()];
+        let rows = vec![vec![json!(r#"Bob "Builder""#)]];
+        assert_eq!(format_tsv(&columns, &rows), "name\n\"Bob \"\"Builder\"\"\"");
+    }
+
+    #[test]
+    fn formats_tsv_rows_returns_empty_for_empty_rows() {
+        let rows: Vec<Vec<Value>> = vec![];
+        assert_eq!(format_tsv_rows(&rows), "");
+    }
+
     #[test]
     fn export_batch_size_respects_row_limit_remaining_rows() {
         assert_eq!(next_export_batch_size(None, 12_000, 10_000), Some(10_000));
@@ -1418,6 +1638,66 @@ mod tests {
         assert!(!sql.contains("OFFSET"));
         assert!(!sql.contains("FETCH NEXT"));
         assert!(!sql.contains("ROWNUM"));
+    }
+
+    #[test]
+    fn oracle_requested_export_columns_omit_synthetic_rowid_and_keep_metadata_aligned() {
+        let columns = vec!["__DBX_ROWID".to_string(), "ID".to_string(), "NAME".to_string()];
+        let column_types = vec![Some("VARCHAR2".to_string()), Some("NUMBER".to_string()), Some("VARCHAR2".to_string())];
+        let primary_keys = vec!["__DBX_ROWID".to_string()];
+
+        let (columns, column_types, primary_keys) =
+            resolve_requested_export_columns(DatabaseType::Oracle, &columns, Some(&column_types), Some(&primary_keys));
+
+        assert_eq!(columns, vec!["ID", "NAME"]);
+        assert_eq!(column_types, vec![Some("NUMBER".to_string()), Some("VARCHAR2".to_string())]);
+        assert!(primary_keys.is_empty());
+
+        let request = TableExportRequest {
+            export_id: "export-rowid".to_string(),
+            connection_id: "conn-1".to_string(),
+            database: "ORCL".to_string(),
+            schema: Some("APP".to_string()),
+            table_name: "USERS".to_string(),
+            file_path: "users.sql".to_string(),
+            format: "sql".to_string(),
+            columns: None,
+            column_types: None,
+            primary_keys: None,
+            where_input: None,
+            order_by: None,
+            skip_count: false,
+            batch_size: Some(100),
+            row_limit: None,
+        };
+        let sql = table_cursor_sql(&request, &DatabaseType::Oracle, &columns, &primary_keys);
+        assert_eq!(sql, "SELECT \"ID\", \"NAME\" FROM \"APP\".\"USERS\"");
+
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: request.schema,
+            table_name: Some(request.table_name),
+            qualified_table_name: None,
+            columns,
+            column_types,
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(1), json!("Ada")]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+        assert_eq!(statements, vec!["INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');"]);
+    }
+
+    #[test]
+    fn requested_export_columns_preserve_regular_oracle_and_non_oracle_columns() {
+        let oracle_columns = vec!["ROW_ID".to_string(), "NAME".to_string()];
+        let (resolved_oracle, _, _) =
+            resolve_requested_export_columns(DatabaseType::Oracle, &oracle_columns, None, None);
+        assert_eq!(resolved_oracle, oracle_columns);
+
+        let mysql_columns = vec!["__DBX_ROWID".to_string(), "name".to_string()];
+        let (resolved_mysql, _, _) = resolve_requested_export_columns(DatabaseType::Mysql, &mysql_columns, None, None);
+        assert_eq!(resolved_mysql, mysql_columns);
     }
 
     #[test]
@@ -1490,6 +1770,7 @@ mod tests {
         let data = XlsxWorksheetData {
             sheet_name: Some("employees".to_string()),
             columns: vec!["id".to_string(), "name".to_string(), "salary".to_string()],
+            column_types: vec![],
             rows: vec![
                 vec![json!(1), json!("Alice"), json!(75000.50)],
                 vec![json!(2), json!("Bob"), json!(82000)],

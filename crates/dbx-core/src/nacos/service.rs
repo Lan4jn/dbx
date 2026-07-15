@@ -183,6 +183,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
@@ -213,6 +214,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: true,
+            is_production: false,
+            production_databases: Vec::new(),
         };
         cfg.read_only = true;
         state.configs.write().await.insert(cfg.id.clone(), cfg);
@@ -248,6 +251,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
@@ -278,6 +282,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: true,
+            is_production: false,
+            production_databases: Vec::new(),
         };
         state.configs.write().await.insert(cfg.id.clone(), cfg);
         let err = nacos_rollback_config_core(

@@ -1,4 +1,5 @@
 import type { QueryResult } from "@/types/database";
+import { mongoDocumentIdForGrid } from "@/lib/mongo/mongoDocumentValues";
 
 export interface MongoFindCommand {
   collection: string;
@@ -9,9 +10,17 @@ export interface MongoFindCommand {
   sort?: string;
 }
 
+export interface MongoFindOneCommand {
+  collection: string;
+  filter: string;
+  projection?: string;
+  options?: string;
+}
+
 export interface MongoCountDocumentsCommand {
   collection: string;
   filter: string;
+  mode: "accurate" | "legacy";
 }
 
 export interface MongoAggregateCommand {
@@ -39,10 +48,11 @@ export interface MongoCollectionStatsCommand {
   scale?: number;
 }
 
-type MongoWriteKind = "insert" | "update" | "delete" | "createIndex" | "dropIndex" | "dropIndexes" | "dropCollection";
+type MongoWriteKind = "insert" | "update" | "delete" | "createIndex" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
 
 export type MongoCommand =
   | ({ kind: "find" } & MongoFindCommand)
+  | ({ kind: "findOne" } & MongoFindOneCommand)
   | MongoVersionCommand
   | ({ kind: "countDocuments" } & MongoCountDocumentsCommand)
   | ({ kind: "aggregate" } & MongoAggregateCommand)
@@ -50,12 +60,15 @@ export type MongoCommand =
   | ({ kind: "collectionStats" } & MongoCollectionStatsCommand)
   | ({ kind: "use" } & MongoUseCommand)
   | { kind: "insert"; collection: string; docsJson: string }
-  | { kind: "update"; collection: string; filter: string; update: string; many: boolean }
+  | { kind: "update"; collection: string; filter: string; update: string; options?: string; many: boolean }
   | { kind: "delete"; collection: string; filter: string; many: boolean }
   | { kind: "createIndex"; collection: string; keys: string; options?: string }
   | { kind: "dropIndex"; collection: string; index: string }
   | { kind: "dropIndexes"; collection: string; indexes?: string }
-  | { kind: "dropCollection"; collection: string };
+  | { kind: "dropCollection"; collection: string }
+  | { kind: "findOneAndUpdate"; collection: string; filter: string; update: string; options?: string }
+  | { kind: "findOneAndReplace"; collection: string; filter: string; replacement: string; options?: string }
+  | { kind: "findOneAndDelete"; collection: string; filter: string; options?: string };
 
 export type MongoWriteCommand = Extract<MongoCommand, { kind: MongoWriteKind }>;
 
@@ -122,6 +135,103 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   };
 }
 
+export function parseMongoFindOneCommand(input: string): MongoFindOneCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseCollectionMethodTarget(source, "findOne");
+  if (!target) return null;
+
+  const args = parseMethodArgs(source, target.methodCallIndex);
+  if (!args) return null;
+  if (args.length > 3 && args.slice(3).some((arg) => arg.trim())) return null;
+
+  const filter = normalizeJsonArgument(args[0] || "{}");
+  if (!filter) return null;
+
+  let projection: string | undefined;
+  if (args[1]?.trim()) {
+    const parsedProjection = normalizeJsonArgument(args[1]);
+    if (!parsedProjection) return null;
+    projection = parsedProjection;
+  }
+
+  const options = args[2]?.trim() ? normalizeJsonArgument(args[2]) : undefined;
+  if (args[2]?.trim() && !options) return null;
+
+  return {
+    collection: target.collection,
+    filter,
+    ...(projection ? { projection } : {}),
+    ...(options ? { options } : {}),
+  };
+}
+
+export interface MongoFindOneAndUpdateCommand {
+  collection: string;
+  filter: string;
+  update: string;
+  options?: string;
+}
+
+export interface MongoFindOneAndReplaceCommand {
+  collection: string;
+  filter: string;
+  replacement: string;
+  options?: string;
+}
+
+export interface MongoFindOneAndDeleteCommand {
+  collection: string;
+  filter: string;
+  options?: string;
+}
+
+export function parseMongoFindOneAndUpdateCommand(input: string): MongoFindOneAndUpdateCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseCollectionMethodTarget(source, "findOneAndUpdate");
+  if (!target) return null;
+
+  const args = parseMethodArgs(source, target.methodCallIndex);
+  if (!args || args.length < 2 || args.length > 3) return null;
+  const filter = normalizeJsonArgument(args[0] || "{}");
+  const update = normalizeJsonArgument(args[1]);
+  if (!filter || !update) return null;
+  const options = args[2]?.trim() ? normalizeJsonArgument(args[2]) : undefined;
+  if (args[2]?.trim() && !options) return null;
+
+  return { collection: target.collection, filter, update, ...(options ? { options } : {}) };
+}
+
+export function parseMongoFindOneAndReplaceCommand(input: string): MongoFindOneAndReplaceCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseCollectionMethodTarget(source, "findOneAndReplace");
+  if (!target) return null;
+
+  const args = parseMethodArgs(source, target.methodCallIndex);
+  if (!args || args.length < 2 || args.length > 3) return null;
+  const filter = normalizeJsonArgument(args[0] || "{}");
+  const replacement = normalizeJsonArgument(args[1]);
+  if (!filter || !replacement) return null;
+  const options = args[2]?.trim() ? normalizeJsonArgument(args[2]) : undefined;
+  if (args[2]?.trim() && !options) return null;
+
+  return { collection: target.collection, filter, replacement, ...(options ? { options } : {}) };
+}
+
+export function parseMongoFindOneAndDeleteCommand(input: string): MongoFindOneAndDeleteCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseCollectionMethodTarget(source, "findOneAndDelete");
+  if (!target) return null;
+
+  const args = parseMethodArgs(source, target.methodCallIndex);
+  if (!args || args.length < 1 || args.length > 2) return null;
+  const filter = normalizeJsonArgument(args[0] || "{}");
+  if (!filter) return null;
+  const options = args[1]?.trim() ? normalizeJsonArgument(args[1]) : undefined;
+  if (args[1]?.trim() && !options) return null;
+
+  return { collection: target.collection, filter, ...(options ? { options } : {}) };
+}
+
 export function applyMongoFindSort(input: string, column: string, direction: "asc" | "desc"): string | null {
   const source = input.trim().replace(/;$/, "").trim();
   const parsed = parseMongoFindCommand(source);
@@ -145,8 +255,6 @@ export function applyMongoFindSort(input: string, column: string, direction: "as
 
 export function parseMongoCountDocumentsCommand(input: string): MongoCountDocumentsCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
-  // Accept deprecated Mongo shell count helpers for old server workflows, but
-  // keep DBX's internal execution mapped to the countDocuments result shape.
   return parseCollectionCountCommand(source, "countDocuments") ?? parseCollectionCountCommand(source, "count") ?? parseFindCountCommand(source);
 }
 
@@ -166,6 +274,7 @@ function parseCollectionCountCommand(source: string, method: "countDocuments" | 
   return {
     collection: target.collection,
     filter,
+    mode: method === "countDocuments" ? "accurate" : "legacy",
   };
 }
 
@@ -188,6 +297,7 @@ function parseFindCountCommand(source: string): MongoCountDocumentsCommand | nul
   return {
     collection: target.collection,
     filter,
+    mode: "legacy",
   };
 }
 
@@ -293,11 +403,13 @@ export function parseMongoWriteCommand(input: string): MongoWriteCommand | null 
     const target = parseCollectionMethodTarget(source, method);
     if (!target) continue;
     const args = parseMethodArgs(source, target.methodCallIndex);
-    if (!args || args.length !== 2) return null;
+    if (!args || args.length < 2 || args.length > 3) return null;
     const filter = normalizeJsonArgument(args[0]);
     const update = normalizeJsonArgument(args[1]);
     if (!filter || !update) return null;
-    return { kind: "update", collection: target.collection, filter, update, many: method === "updateMany" };
+    const options = args[2]?.trim() ? normalizeJsonArgument(args[2]) : undefined;
+    if (args[2]?.trim() && !options) return null;
+    return { kind: "update", collection: target.collection, filter, update, ...(options ? { options } : {}), many: method === "updateMany" };
   }
 
   for (const method of ["deleteOne", "deleteMany"] as const) {
@@ -373,6 +485,22 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
       return find ? { kind: "find", ...find } : null;
     },
     (source) => {
+      const findOne = parseMongoFindOneCommand(source);
+      return findOne ? { kind: "findOne", ...findOne } : null;
+    },
+    (source) => {
+      const findOneAndUpdate = parseMongoFindOneAndUpdateCommand(source);
+      return findOneAndUpdate ? { kind: "findOneAndUpdate", ...findOneAndUpdate } : null;
+    },
+    (source) => {
+      const findOneAndReplace = parseMongoFindOneAndReplaceCommand(source);
+      return findOneAndReplace ? { kind: "findOneAndReplace", ...findOneAndReplace } : null;
+    },
+    (source) => {
+      const findOneAndDelete = parseMongoFindOneAndDeleteCommand(source);
+      return findOneAndDelete ? { kind: "findOneAndDelete", ...findOneAndDelete } : null;
+    },
+    (source) => {
       const aggregate = parseMongoAggregateCommand(source);
       return aggregate ? { kind: "aggregate", ...aggregate } : null;
     },
@@ -423,7 +551,7 @@ export function evaluateMongoWriteSafety(command: MongoWriteCommand, options: Mo
       reason: "MCP MongoDB execution is read-only by default. Set DBX_MCP_ALLOW_WRITES=1 to allow write commands.",
     };
   }
-  if (!options.allowDangerous && (command.kind === "update" || command.kind === "delete") && isEmptyJsonObject(command.filter)) {
+  if (!options.allowDangerous && (command.kind === "update" || command.kind === "delete" || command.kind === "findOneAndUpdate" || command.kind === "findOneAndReplace" || command.kind === "findOneAndDelete") && isEmptyJsonObject(command.filter)) {
     return {
       allowed: false,
       reason: "MongoDB update/delete commands must include a non-empty filter unless DBX_MCP_ALLOW_DANGEROUS_SQL=1 is set.",
@@ -498,6 +626,7 @@ export function mongoDocumentsToQueryResult(documents: unknown[], executionTimeM
   return {
     columns,
     rows,
+    mongo_documents: documents,
     affected_rows: total,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
     truncated: total > documents.length,
@@ -634,11 +763,12 @@ function normalizeJsonArgument(value: string): string | null {
   if (!trimmed) return "{}";
   // Rewrite mongo shell constructors that are not valid JSON into the extended
   // JSON the backend understands (mongo_driver::json_value_to_bson): ObjectId(x)
-  // -> {"$oid":x} and ISODate(x)/new Date(x) -> {"$date":x}. Without this a
+  // -> {"$oid":x}, NumberLong(x) -> {"$numberLong":x}, and
+  // ISODate(x)/new Date(x) -> {"$date":x}. Without this a
   // filter such as { createdAt: { $gte: ISODate("...") } } fails JSON.parse,
   // the command is left unrecognized and falls through to the SQL executor,
   // which rejects it with "Use MongoDB-specific commands".
-  const withExtendedJson = trimmed.replace(/ObjectId\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$oid":"$1"}').replace(/(?:ISODate|new\s+Date)\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$date":"$1"}');
+  const withExtendedJson = replaceMongoShellConstructors(trimmed);
   const preprocessed = quoteUnquotedObjectKeys(convertSingleQuotedStrings(withExtendedJson));
   try {
     JSON.parse(preprocessed);
@@ -646,6 +776,41 @@ function normalizeJsonArgument(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+function replaceMongoShellConstructors(source: string): string {
+  const constructor = /^(ObjectId|NumberLong|ISODate)\s*\(\s*["']([^"']+)["']\s*\)|^(ObjectId|NumberLong)\s*\(\s*(-?\d+)\s*\)|^(?:new\s+Date)\s*\(\s*["']([^"']+)["']\s*\)/;
+  let result = "";
+  let index = 0;
+  while (index < source.length) {
+    const quote = source[index];
+    if (quote === '"' || quote === "'") {
+      const start = index++;
+      while (index < source.length) {
+        if (source[index] === "\\") index += 2;
+        else if (source[index] === quote) {
+          index++;
+          break;
+        } else index++;
+      }
+      result += source.slice(start, index);
+      continue;
+    }
+    const match = source.slice(index).match(constructor);
+    if (!match) {
+      result += source[index++];
+      continue;
+    }
+    if (match[1]) {
+      result += match[1] === "ObjectId" ? `{"$oid":"${match[2]}"}` : match[1] === "NumberLong" ? `{"$numberLong":"${match[2]}"}` : `{"$date":"${match[2]}"}`;
+    } else if (match[3]) {
+      result += match[3] === "NumberLong" ? `{"$numberLong":"${match[4]}"}` : `{"$oid":"${match[4]}"}`;
+    } else {
+      result += `{"$date":"${match[5]}"}`;
+    }
+    index += match[0].length;
+  }
+  return result;
 }
 
 function parseMethodArgs(source: string, methodCallIndex: number): string[] | null {
@@ -1167,5 +1332,5 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function toCellValue(value: unknown): string | number | boolean | null {
   if (value === undefined || value === null) return null;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
-  return JSON.stringify(value);
+  return mongoDocumentIdForGrid(value);
 }

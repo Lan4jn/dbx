@@ -80,7 +80,7 @@ jobs:
             8
             21
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew shadowJar
+      - run: ./gradlew shadowJar --parallel
         working-directory: agents
       - run: python3 scripts/validate_agent_jars.py
         working-directory: agents
@@ -174,7 +174,7 @@ jobs:
         include:
           - jre-key: "21"
             java-version: "21"
-            modules: "java.base,java.sql,java.sql.rowset,java.naming,java.management,java.desktop,java.security.jgss,java.security.sasl,jdk.charsets,java.scripting"
+            modules: "java.base,java.sql,java.sql.rowset,java.naming,java.management,java.desktop,java.security.jgss,java.security.sasl,jdk.security.auth,jdk.security.jgss,jdk.charsets,jdk.unsupported,java.scripting,java.compiler"
     steps:
       - uses: actions/setup-java@v4
         with:
@@ -385,7 +385,7 @@ jobs:
           {
             "jres": {
               "21": {
-                "version": "21.0.12",
+                "version": "21.0.12+kerberos.1",
                 "platforms": {
           ${JRE21_PLATFORMS}
                 }
@@ -551,3 +551,88 @@ jobs:
             aws s3 cp "$f" "$R2_BUCKET/$key" --endpoint-url "$R2_ENDPOINT"
             echo "Uploaded $(basename $f)"
           done
+
+  sync-release-to-cnb:
+    name: Sync agents releases to CNB
+    needs: release
+    if: ${{ always() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ["${{ github.ref_name }}", "agents-latest"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download GitHub release assets
+        env:
+          TAG_NAME: ${{ matrix.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+          gh release view "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
+            > "$RUNNER_TEMP/github-release/release.json"
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" \
+            --clobber
+
+      - name: Sync release assets to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_UPLOAD_CONCURRENCY: "3"
+          OVERWRITE_EXISTING: ${{ matrix.tag == 'agents-latest' }}
+        run: |
+          set -euo pipefail
+          args=(
+            --github-release "$RUNNER_TEMP/github-release/release.json"
+            --assets-dir "$RUNNER_TEMP/release-assets"
+          )
+          # agents-latest is mutable, so its stable asset names must replace the previous release contents.
+          if [[ "$OVERWRITE_EXISTING" == "true" ]]; then
+            args+=(--overwrite-existing)
+          fi
+          node .github/scripts/sync-cnb-release.mjs "${args[@]}"
+
+  sync-release-to-atomgit:
+    name: Sync agents releases to AtomGit
+    needs: release
+    if: ${{ always() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ["${{ github.ref_name }}", "agents-latest"]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Sync release assets to AtomGit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ matrix.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+          ATOMGIT_REPOSITORY: t8y2/dbx
+        run: |
+          set -euo pipefail
+          git fetch origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}" --force
+          git remote add atomgit "https://t8y2:${ATOMGIT_TOKEN}@atomgit.com/t8y2/dbx.git"
+          git push atomgit "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}" --force
+          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+          gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
+            > "$RUNNER_TEMP/github-release/release.json"
+          gh release download "$TAG_NAME" --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" --clobber
+          node .github/scripts/sync-atomgit-release.mjs \
+            --github-release "$RUNNER_TEMP/github-release/release.json" \
+            --assets-dir "$RUNNER_TEMP/release-assets" \
+            ${{ matrix.tag == 'agents-latest' && '--replace-assets' || '' }}

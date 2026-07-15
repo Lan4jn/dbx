@@ -911,6 +911,7 @@ checksum = "b1a9acfeb1555aa8def91fe8ff208aadaea850c109968ec35ac965edbe7d210b"
 dependencies = [
  "atoi_simd",
  "byteorder",
+ "chrono",
  "codepage",
  "encoding_rs",
  "fast-float2",
@@ -1702,7 +1703,7 @@ dependencies = [
 
 [[package]]
 name = "dbx"
-version = "0.5.52"
+version = "0.5.57"
 dependencies = [
  "anyhow",
  "axum",
@@ -1715,10 +1716,12 @@ dependencies = [
  "duckdb",
  "font-kit",
  "futures",
+ "libloading 0.8.9",
  "log",
  "mongodb",
  "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
  "percent-encoding",
  "portpicker",
  "redis",
@@ -1775,6 +1778,7 @@ dependencies = [
  "pageant",
  "percent-encoding",
  "portpicker",
+ "quick-xml 0.37.5",
  "rayon",
  "redis",
  "regex",
@@ -1801,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-web"
-version = "0.5.52"
+version = "0.5.57"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",

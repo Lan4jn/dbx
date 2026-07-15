@@ -86,6 +86,7 @@ pub async fn ai_agent_stream(
     database: String,
     db_type: String,
     mode: Option<String>,
+    allow_write_sql: Option<bool>,
 ) -> Result<String, String> {
     let request = resolve_codex_cli_request(request);
     let cancelled = dbx_core::ai::register_stream(&session_id).await;
@@ -94,16 +95,27 @@ pub async fn ai_agent_stream(
         serde_json::from_str(&format!("\"{}\"", db_type)).map_err(|_| format!("Unknown database type: {db_type}"))?;
 
     let cli_mcp_server_command = if matches!(request.config.provider, AiProvider::CodexCli) {
-        super::mcp::resolve_mcp_server_command().map(|(program, args)| CliAgentCommandSpec { program, args })
+        super::mcp::resolve_mcp_server_command().await.map(|(program, args)| CliAgentCommandSpec { program, args })
     } else {
         None
     };
+    let production_database = state
+        .configs
+        .read()
+        .await
+        .get(&connection_id)
+        .is_some_and(|config| dbx_core::production_safety::is_production_database(config, &database));
     let agent_ctx = AgentLoopContext {
         state: state.inner().clone(),
         connection_id,
         database,
         db_type: parsed_db_type,
         cli_mcp_server_command,
+        // Explicit confirmation grants write access only to this agent run, never to production.
+        sql_permissions: dbx_core::agent_tools::AgentSqlPermissions {
+            allow_writes: !production_database && allow_write_sql.unwrap_or(false),
+            allow_dangerous: !production_database && allow_write_sql.unwrap_or(false),
+        },
     };
     let is_agent_mode = mode.as_deref() == Some("agent");
 

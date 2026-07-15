@@ -267,9 +267,9 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
             content-class="w-[var(--reka-popover-trigger-width)]"
           >
             <template #option-label="{ option, label }">
-              <div class="flex items-center gap-2">
-                <DatabaseIcon :db-type="sqlConnections.find((c) => c.id === option)?.driver_profile || sqlConnections.find((c) => c.id === option)?.db_type || 'mysql'" class="w-3.5 h-3.5" />
-                {{ label }}
+              <div class="flex min-w-0 items-center gap-2">
+                <DatabaseIcon :db-type="sqlConnections.find((c) => c.id === option)?.driver_profile || sqlConnections.find((c) => c.id === option)?.db_type || 'mysql'" class="h-3.5 w-3.5 shrink-0" />
+                <span class="min-w-0 flex-1 truncate">{{ label }}</span>
               </div>
             </template>
           </SearchableSelect>
@@ -351,9 +351,9 @@ async function fetchDbVersion(connectionId: string, database: string, schema: st
             content-class="w-[var(--reka-popover-trigger-width)]"
           >
             <template #option-label="{ option, label }">
-              <div class="flex items-center gap-2">
-                <DatabaseIcon :db-type="sqlConnections.find((c) => c.id === option)?.driver_profile || sqlConnections.find((c) => c.id === option)?.db_type || 'mysql'" class="w-3.5 h-3.5" />
-                {{ label }}
+              <div class="flex min-w-0 items-center gap-2">
+                <DatabaseIcon :db-type="sqlConnections.find((c) => c.id === option)?.driver_profile || sqlConnections.find((c) => c.id === option)?.db_type || 'mysql'" class="h-3.5 w-3.5 shrink-0" />
+                <span class="min-w-0 flex-1 truncate">{{ label }}</span>
               </div>
             </template>
           </SearchableSelect>

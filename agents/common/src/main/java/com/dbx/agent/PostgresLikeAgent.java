@@ -29,8 +29,13 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
     }
 
     @Override
+    public String getIdentifierQuote() {
+        return mysqlCompatMode ? "`" : super.getIdentifierQuote();
+    }
+
+    @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
-        return JdbcExecutor.INSTANCE.execute(
+        return JdbcExecutor.current().execute(
             requireConnected(),
             sql,
             schema,
@@ -44,7 +49,7 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
 
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.executePage(
+        return JdbcExecutor.current().executePage(
             requireConnected(),
             sql,
             schema,
@@ -56,7 +61,7 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
 
     @Override
     public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.startTableRead(
+        return JdbcExecutor.current().startTableRead(
             requireConnected(),
             sql,
             schema,
@@ -245,7 +250,81 @@ public abstract class PostgresLikeAgent extends AbstractJdbcAgent {
             foreignKeys = Collections.emptyList();
         }
 
-        return DdlBuilder.buildTableDdl(schema, table, getColumns(schema, table), indexes, foreignKeys, mysqlCompatMode, true);
+        List<CheckConstraintInfo> checkConstraints;
+        try {
+            checkConstraints = listCheckConstraints(schema, table);
+        } catch (RuntimeException e) {
+            // Some PostgreSQL-compatible databases expose incomplete catalog APIs.
+            // DDL generation should still succeed with columns, indexes, and foreign keys.
+            checkConstraints = Collections.emptyList();
+        }
+
+        String tableComment = null;
+        try {
+            tableComment = getTableComment(schema, table);
+        } catch (RuntimeException e) {
+            // Table comment is optional; DDL generation should still succeed without it.
+        }
+
+        return DdlBuilder.buildTableDdl(
+            schema,
+            table,
+            getColumns(schema, table),
+            indexes,
+            foreignKeys,
+            checkConstraints,
+            mysqlCompatMode,
+            true,
+            tableComment
+        );
+    }
+
+    @Override
+    public String getTableComment(String schema, String table) {
+        return unchecked(() -> {
+            try (java.sql.PreparedStatement stmt = requireConnection().prepareStatement(
+                "SELECT obj_description(c.oid) AS table_comment " +
+                "FROM pg_catalog.pg_class c " +
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace " +
+                "WHERE n.nspname = ? AND c.relname = ? AND c.relkind IN ('r','m','f','p') " +
+                "LIMIT 1"
+            )) {
+                stmt.setString(1, schema);
+                stmt.setString(2, table);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        String comment = rs.getString("table_comment");
+                        return (comment != null && !comment.trim().isEmpty()) ? comment : null;
+                    }
+                }
+            }
+            return null;
+        });
+    }
+
+    protected List<CheckConstraintInfo> listCheckConstraints(String schema, String table) {
+        return unchecked(() -> {
+            List<CheckConstraintInfo> result = new ArrayList<>();
+            String sql = "SELECT co.conname AS constraint_name, pg_catalog.pg_get_constraintdef(co.oid, true) AS constraint_definition " +
+                "FROM pg_catalog.pg_constraint co " +
+                "JOIN pg_catalog.pg_class c ON c.oid = co.conrelid " +
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace " +
+                "WHERE co.contype = 'c' AND n.nspname = ? AND c.relname = ? " +
+                "ORDER BY co.conname";
+            try (java.sql.PreparedStatement stmt = requireConnection().prepareStatement(sql)) {
+                stmt.setString(1, schema);
+                stmt.setString(2, table);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(new CheckConstraintInfo(
+                            rs.getString("constraint_name"),
+                            rs.getString("constraint_definition")
+                        ));
+                    }
+                }
+            }
+            return result;
+        });
     }
 
     @Override

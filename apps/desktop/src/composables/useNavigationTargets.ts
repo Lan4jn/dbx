@@ -12,6 +12,7 @@ import type { TableInfoTab } from "@/types/database";
 export type NavigationTarget = {
   connectionId: string;
   database: string;
+  catalog?: string;
   schema?: string;
   tableName: string;
   tableType?: string;
@@ -23,11 +24,11 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
   const settingsStore = useSettingsStore();
-  const pageLimit = tableOpenPageLimit(settingsStore.editorSettings.pageSize);
+  const pageLimit = tableOpenPageLimit();
 
   connectionStore.activeConnectionId = target.connectionId;
   const config = connectionStore.getConfig(target.connectionId);
-  const tabTitle = target.schema ? `${target.schema}.${target.tableName}` : target.tableName;
+  const tabTitle = target.catalog ? `${target.catalog}.${target.schema || target.database}.${target.tableName}` : target.schema ? `${target.schema}.${target.tableName}` : target.tableName;
   if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
     await connectionStore.ensureConnected(target.connectionId);
     const tabId = queryStore.createTab(target.connectionId, target.database || "default", tabTitle, "vector");
@@ -36,12 +37,12 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
   }
   const tabId = (() => {
     if (settingsStore.editorSettings.reuseDataTab) {
-      const existing = queryStore.tabs.find((tab) => tab.mode === "data" && tab.connectionId === target.connectionId && tab.database === target.database);
+      const existing = queryStore.tabs.find((tab) => tab.mode === "data" && tab.connectionId === target.connectionId && tab.database === target.database && (tab.tableMeta?.catalog || "") === (target.catalog || ""));
       if (existing) {
         existing.title = tabTitle;
         existing.schema = target.schema;
         existing.tableInfoTab = options.tableInfoTab;
-        queryStore.activeTabId = existing.id;
+        queryStore.switchTab(existing.id);
         return existing.id;
       }
     }
@@ -55,6 +56,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     await connectionStore.ensureConnected(target.connectionId);
     if (!config) throw new Error("Connection config not found");
     const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+    const identifierQuote = connectionStore.connectionIdentifierQuote?.(target.connectionId);
     const querySchema = metadataSchemaForConnection(config, target.database, target.schema);
     const targetTableType = target.tableType ?? "TABLE";
     if (config.db_type === "neo4j") {
@@ -62,7 +64,10 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       const primaryKeys = editableRowIdentifierColumns(effectiveDbType, columns, undefined, targetTableType);
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
+        identifierQuote,
         schema: target.schema,
+        catalog: target.catalog,
+        database: target.database,
         tableName: target.tableName,
         tableType: targetTableType,
         columns: columns.map((column) => column.name),
@@ -72,6 +77,8 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       });
       queryStore.updateSql(tabId, sql);
       queryStore.setTableMeta(tabId, {
+        catalog: target.catalog,
+        database: target.database,
         schema: target.schema,
         tableName: target.tableName,
         tableType: targetTableType,
@@ -83,7 +90,10 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     }
     const sql = await buildTableSelectSql({
       databaseType: effectiveDbType,
+      identifierQuote,
       schema: target.schema,
+      catalog: target.catalog,
+      database: target.database,
       tableName: target.tableName,
       tableType: targetTableType,
       whereInput: target.whereInput,
@@ -92,6 +102,8 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     queryStore.updateSql(tabId, sql);
     queryStore.setTableMeta(tabId, {
       schema: target.schema,
+      catalog: target.catalog,
+      database: target.database,
       tableName: target.tableName,
       tableType: targetTableType,
       columns: [],
@@ -108,7 +120,10 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     if (fellBackToLimitZero) {
       const emptySql = await buildTableSelectSql({
         databaseType: effectiveDbType,
+        identifierQuote,
         schema: target.schema,
+        catalog: target.catalog,
+        database: target.database,
         tableName: target.tableName,
         tableType: targetTableType,
         whereInput: target.whereInput,
@@ -118,12 +133,14 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       await queryStore.executeTabSql(tabId, emptySql, { pagination: { limit: pageLimit, offset: 0 } });
     }
     try {
-      const columns = await api.getColumns(target.connectionId, target.database, querySchema, target.tableName);
-      const indexes = await api.listIndexes(target.connectionId, target.database, querySchema, target.tableName).catch(() => []);
+      const columns = await api.getColumns(target.connectionId, target.database, querySchema, target.tableName, target.catalog);
+      const indexes = await api.listIndexes(target.connectionId, target.database, querySchema, target.tableName, target.catalog).catch(() => []);
       const primaryKeys = editableRowIdentifierColumns(effectiveDbType, columns, indexes, targetTableType);
       const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, targetTableType);
       queryStore.setTableMeta(tabId, {
         schema: target.schema,
+        catalog: target.catalog,
+        database: target.database,
         tableName: target.tableName,
         tableType: targetTableType,
         columns,
@@ -132,7 +149,10 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       if (!fellBackToLimitZero && (useRowId || config.db_type === "tdengine")) {
         const newSql = await buildTableSelectSql({
           databaseType: effectiveDbType,
+          identifierQuote,
           schema: target.schema,
+          catalog: target.catalog,
+          database: target.database,
           tableName: target.tableName,
           tableType: targetTableType,
           whereInput: target.whereInput,

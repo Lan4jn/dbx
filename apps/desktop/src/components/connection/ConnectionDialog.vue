@@ -13,11 +13,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import type { ConnectionConfig, DatabaseType, HttpTunnelConfig, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, HttpTunnelConfig, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig } from "@/types/nacos";
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
+import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
+import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -34,7 +36,7 @@ import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedV
 import { mongodbAuthFailureHint, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongo/mongoConnectionOptions";
 import { mysqlCleartextPasswordAuthEnabled, setMysqlCleartextPasswordAuthEnabled } from "@/lib/database/mysqlConnectionOptions";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/connection/agentDriverInstallHint";
+import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState, type DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
@@ -43,20 +45,23 @@ import { normalizeKafkaBootstrapServers } from "@/lib/connection/kafkaBootstrapS
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { isSqlServerLegacyCompatibilityMode, requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityMode, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
-import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pencil, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
+import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pencil, Pipette, Plus, RefreshCw, Search, ShieldAlert, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connection/connectionVisibleDatabases";
 import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
-import { isSchemaAware } from "@/lib/database/databaseFeatureSupport";
+import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
+import CloudflareD1ConnectionFields from "@/components/connection/CloudflareD1ConnectionFields.vue";
 import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/database/oceanbaseConnectionMode";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
+import { hasCloudflareD1Credentials, isCloudflareD1Connection, normalizeCloudflareD1Connection } from "@/lib/connection/cloudflareD1";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
 type DialogStep = "select" | "config";
 type DbPickerView = "icon" | "list";
 export type ConfigTab = "connection" | "advanced" | "tls" | "transport";
+type ProductionScope = "connection" | "databases";
 type MqTokenSigningMode = "none" | "hs256" | "rs256";
 type NacosAuthKind = NacosAuthConfig["kind"];
 type DremioConnectionMode = "arrow-flight-sql" | "legacy";
@@ -112,10 +117,12 @@ const emit = defineEmits<{
   connectStarted: [name: string];
   connectSucceeded: [name: string];
   connectFailed: [message: string];
-  openDriverStore: [];
+  openDriverStore: [focus?: DriverStoreFocus];
+  openTunnelProfileSettings: [];
 }>();
 
 const store = useConnectionStore();
+const tunnelProfileStore = useTunnelProfileStore();
 const isTesting = ref(false);
 const isSaving = ref(false);
 const testResult = ref<{ ok: boolean; message: string } | null>(null);
@@ -136,6 +143,13 @@ const visibleDatabaseSelection = ref<Set<string>>(new Set());
 const visibleDatabaseSearchText = ref("");
 const visibleDatabaseError = ref("");
 const visibleDatabaseShowSystem = ref(false);
+const showProductionDatabasesDialog = ref(false);
+const isLoadingProductionDatabases = ref(false);
+const productionDatabaseNames = ref<string[]>([]);
+const productionDatabaseSelection = ref<Set<string>>(new Set());
+const productionDatabaseSearchText = ref("");
+const productionDatabaseError = ref("");
+const productionProtectionEnabled = ref(false);
 const showVisibleSchemasDialog = ref(false);
 const isLoadingVisibleSchemas = ref(false);
 const visibleSchemaNames = ref<string[]>([]);
@@ -188,7 +202,10 @@ const defaultForm = (): ConnectionForm => ({
   gbase_server: "",
   informix_server: "",
   external_config: undefined,
+  init_script: undefined,
   read_only: false,
+  is_production: false,
+  production_databases: [],
   visible_databases: undefined,
 });
 
@@ -241,6 +258,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     use_ssh_agent: !!hop.use_ssh_agent,
     ssh_agent_sock_path: hop.ssh_agent_sock_path || "",
     auth_method: hop.auth_method || inferSshAuthMethod(hop),
+    profile_id: hop.profile_id || undefined,
   };
 }
 
@@ -278,6 +296,7 @@ function normalizeProxyTunnel(layer: Partial<ProxyTunnelConfig>): ProxyTunnelCon
     port: Number(layer.port) || 1080,
     username: layer.username || "",
     password: layer.password || "",
+    profile_id: layer.profile_id || undefined,
   };
 }
 
@@ -289,6 +308,7 @@ function normalizeHttpTunnel(layer: Partial<HttpTunnelConfig>): HttpTunnelConfig
     url: layer.url || "",
     token: layer.token || "",
     connect_timeout_secs: Number(layer.connect_timeout_secs) || 10,
+    profile_id: layer.profile_id || undefined,
   };
 }
 
@@ -350,6 +370,33 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
 }
 
 const form = ref(defaultForm());
+
+function externalConfigRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
+}
+
+function sqlServerPortExplicitFromConfig(config: Pick<ConnectionConfig, "db_type" | "external_config">): boolean {
+  if (config.db_type !== "sqlserver") return false;
+  const external = externalConfigRecord(config.external_config);
+  return external.portExplicit === true || external.port_explicit === true;
+}
+
+function setSqlServerPortExplicit(config: Pick<ConnectionConfig, "db_type"> & { external_config?: unknown }, explicit: boolean) {
+  if (config.db_type !== "sqlserver") return;
+  const next = externalConfigRecord(config.external_config);
+  delete next.port_explicit;
+  if (explicit) {
+    next.portExplicit = true;
+  } else {
+    delete next.portExplicit;
+  }
+  config.external_config = Object.keys(next).length > 0 ? next : undefined;
+}
+
+function markSqlServerPortExplicit() {
+  setSqlServerPortExplicit(form.value, true);
+}
+
 const keepaliveEnabled = computed({
   get: () => Number(form.value.keepalive_interval_secs) > 0,
   set: (enabled: boolean) => {
@@ -369,6 +416,7 @@ const mongoUseUrl = ref(false);
 const jdbcDriverPathsInput = ref("");
 const jdbcDrivers = ref<JdbcDriverInfo[]>([]);
 const jdbcMavenBundles = ref<JdbcMavenBundleInfo[]>([]);
+const jdbcLocalBundles = ref<JdbcLocalBundleInfo[]>([]);
 const sshConfigHosts = ref<SshConfigHostEntry[]>([]);
 const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
@@ -457,6 +505,11 @@ const customColorInput = ref("");
 const customColorOpen = ref(false);
 
 const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
+  const localBundles = jdbcLocalBundles.value.map((bundle) => ({
+    id: `local:${bundle.id}`,
+    label: bundle.name,
+    paths: bundle.artifacts.map((artifact) => artifact.path),
+  }));
   const bundles = jdbcMavenBundles.value.map((bundle) => ({
     id: `maven:${bundle.id}`,
     label: bundle.coordinate,
@@ -469,7 +522,7 @@ const jdbcDriverSelectItems = computed<JdbcDriverSelectItem[]>(() => {
       label: driver.name,
       paths: [driver.path],
     }));
-  return [...bundles, ...manual].sort((left, right) => left.label.localeCompare(right.label));
+  return [...localBundles, ...bundles, ...manual].sort((left, right) => left.label.localeCompare(right.label));
 });
 
 const jdbcDriverSelectItemById = computed(() => new Map(jdbcDriverSelectItems.value.map((item) => [item.id, item])));
@@ -524,6 +577,7 @@ const driverProfiles: Record<
   sqlite: { type: "sqlite", port: 0, user: "", label: "SQLite", icon: "sqlite" },
   rqlite: { type: "rqlite", port: 4001, user: "", label: "RQLite", icon: "rqlite" },
   turso: { type: "turso", port: 443, user: "", label: "Turso", icon: "turso" },
+  "cloudflare-d1": { type: "cloudflare-d1", port: 443, user: "", label: "Cloudflare D1", icon: "cloudflare-d1" },
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
   access: { type: "access", port: 0, user: "", label: "Microsoft Access", icon: "access" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
@@ -619,13 +673,14 @@ const driverProfiles: Record<
     label: "CockroachDB",
     icon: "cockroachdb",
   },
-  dm: { type: "dameng", port: 5236, user: "SYSDBA", label: "DM (Dameng)", icon: "dm" },
+  dm: { type: "dameng", port: 5236, user: "SYSDBA", label: "达梦 Dameng", icon: "dm" },
   h2: { type: "h2", port: 9092, user: "sa", label: "H2", icon: "h2" },
+  "h2-legacy": { type: "h2", port: 9092, user: "sa", label: "H2 2.1 Legacy", icon: "h2" },
   snowflake: { type: "snowflake", port: 443, user: "", label: "Snowflake", icon: "snowflake" },
   trino: { type: "trino", port: 8080, user: "", label: "Trino", icon: "trino" },
   prestosql: { type: "prestosql", port: 8080, user: "", label: "PrestoSQL", icon: "presto" },
   hive: { type: "hive", port: 10000, user: "", label: "Apache Hive", icon: "hive" },
-  spark: { type: "spark", port: 10015, user: "", label: "Apache Spark", icon: "spark-logo.png" },
+  spark: { type: "spark", port: 10015, user: "", label: "Apache Spark", icon: "spark" },
   db2: { type: "db2", port: 50000, user: "db2inst1", label: "IBM DB2", icon: "db2" },
   informix: { type: "informix", port: 9088, user: "informix", label: "Informix", icon: "informix" },
   dremio: { type: "jdbc", port: 31010, user: "", label: "Dremio", icon: "dremio" },
@@ -1103,7 +1158,6 @@ async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<b
   if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return true;
 
   const label = t("connection.sqlServerLegacyCompatibilityComponent");
-  testResult.value = { ok: true, message: t("connection.sqlServerLegacyCompatibilityComponentInstalling") };
   beginAgentDriverInstall(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, label);
   try {
     await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY);
@@ -1121,6 +1175,8 @@ async function onSqlServerLegacyCompatibilityModeChange(event: Event) {
   if (form.value.db_type !== "sqlserver") return;
   const input = event.target instanceof HTMLInputElement ? event.target : null;
   const enabled = input?.checked === true;
+  // The connection test may still be using the previous compatibility mode.
+  resetTestState();
   if (!enabled) {
     form.value.url_params = setSqlServerLegacyCompatibilityMode(form.value.url_params, false);
     return;
@@ -1130,7 +1186,7 @@ async function onSqlServerLegacyCompatibilityModeChange(event: Event) {
   try {
     await installSqlServerLegacyCompatibilityComponentIfNeeded();
     form.value.url_params = setSqlServerLegacyCompatibilityMode(form.value.url_params, true);
-    testResult.value = { ok: true, message: t("connection.sqlServerLegacyCompatibilityModeEnabled") };
+    testResult.value = null;
   } catch {
     form.value.url_params = setSqlServerLegacyCompatibilityMode(form.value.url_params, false);
     if (input) input.checked = false;
@@ -1291,9 +1347,13 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   form.value.db_type = profile.type;
   form.value.driver_profile = val;
   form.value.driver_label = isCustomCompatibleProfile() ? customDriverName.value.trim() || profile.label : profile.label;
+  if (profile.type !== "sqlserver") {
+    form.value.external_config = undefined;
+  }
 
   if (!preserveConnectionFields) {
     form.value.port = profile.port;
+    setSqlServerPortExplicit(form.value, false);
     form.value.username = profile.user;
     form.value.url_params = profile.urlParams || "";
     form.value.agent_java_options = [];
@@ -1423,9 +1483,14 @@ watch(
         etcd_endpoints: config.etcd_endpoints || "",
         informix_server: config.informix_server || "",
         external_config: config.external_config,
+        attached_databases: config.attached_databases || [],
+        init_script: config.init_script,
         read_only: config.read_only || false,
+        is_production: config.is_production || false,
+        production_databases: config.production_databases || [],
         visible_databases: config.visible_databases,
       };
+      productionProtectionEnabled.value = !!config.is_production || (config.production_databases?.length ?? 0) > 0;
       connectionUrlInput.value = config.db_type === "h2" && config.connection_string ? config.connection_string : "";
       appliedConnectionUrlInput.value = connectionUrlInput.value.trim();
       if (config.db_type === "mq") {
@@ -1465,6 +1530,7 @@ watch(
     } else {
       editingId.value = null;
       form.value = defaultForm();
+      productionProtectionEnabled.value = false;
       selectedTransportLayerId.value = null;
       selectedType.value = "mysql";
       customDriverName.value = "";
@@ -1514,6 +1580,32 @@ const selectedSshLayer = computed(() => (selectedTransportLayer.value?.type === 
 const selectedProxyLayer = computed(() => (selectedTransportLayer.value?.type === "proxy" ? selectedTransportLayer.value : null));
 const selectedHttpTunnelLayer = computed(() => (selectedTransportLayer.value?.type === "http_tunnel" ? selectedTransportLayer.value : null));
 
+const tunnelProfiles = computed(() => tunnelProfileStore.profiles);
+const selectedLayerProfileId = computed(() => selectedTransportLayer.value?.profile_id || "");
+const selectedLayerProfile = computed(() => tunnelProfileStore.profileById(selectedLayerProfileId.value));
+
+function tunnelProfileOptionLabel(profile: (typeof tunnelProfiles.value)[number]): string {
+  const summary = tunnelProfileSummary(profile);
+  if (!profile.name?.trim()) return summary || profile.id;
+  return summary ? `${profile.name} (${summary})` : profile.name;
+}
+
+function applyTunnelProfileSelection(value: unknown) {
+  const selected = selectedTransportLayer.value;
+  if (!selected) return;
+  if (!value || value === "custom") {
+    if (!selected.profile_id) return;
+    const detached = detachTunnelProfileLayer(selected, tunnelProfileStore.profileById(selected.profile_id));
+    form.value.transport_layers = transportLayers.value.map((layer) => (layer.id === selected.id ? detached : layer));
+  } else {
+    const profile = tunnelProfileStore.profileById(String(value));
+    if (!profile) return;
+    const stub = tunnelProfileReferenceLayer(profile, selected);
+    form.value.transport_layers = transportLayers.value.map((layer) => (layer.id === selected.id ? stub : layer));
+  }
+  resetTestState();
+}
+
 function transportLayerDefaultName(layer: TransportLayerConfig, index: number): string {
   if (layer.type === "proxy") return `Proxy ${index + 1}`;
   if (layer.type === "http_tunnel") return t("connection.httpTunnelDefaultName", { index: index + 1 });
@@ -1521,6 +1613,11 @@ function transportLayerDefaultName(layer: TransportLayerConfig, index: number): 
 }
 
 function transportLayerDisplayName(layer: TransportLayerConfig, index: number): string {
+  if (layer.profile_id) {
+    const profile = tunnelProfileStore.profileById(layer.profile_id);
+    if (profile) return profile.name?.trim() || tunnelProfileSummary(profile) || transportLayerDefaultName(layer, index);
+    return layer.name?.trim() || t("connection.tunnelProfileMissingName");
+  }
   const target = layer.type === "http_tunnel" ? layer.url?.trim() : layer.host?.trim();
   return layer.name?.trim() || target || transportLayerDefaultName(layer, index);
 }
@@ -1577,6 +1674,7 @@ const iconTypeMap: Record<string, string> = {
   sqlite: "sqlite",
   rqlite: "rqlite",
   turso: "turso",
+  "cloudflare-d1": "cloudflare-d1",
   access: "access",
   redis: "redis",
   mongodb: "mongodb",
@@ -1633,7 +1731,7 @@ const iconTypeMap: Record<string, string> = {
   trino: "trino",
   prestosql: "prestosql",
   hive: "hive",
-  spark: "spark-logo.png",
+  spark: "spark",
   db2: "db2",
   informix: "informix",
   dremio: "dremio",
@@ -1663,9 +1761,10 @@ const dbOptions: DbOption[] = [
   { value: "milvus", label: "Milvus" },
   { value: "weaviate", label: "Weaviate" },
   { value: "chromadb", label: "ChromaDB" },
-  { value: "dm", label: "DM (Dameng)" },
+  { value: "dm", label: "达梦 Dameng" },
   { value: "opengauss", label: "openGauss" },
   { value: "turso", label: "Turso" },
+  { value: "cloudflare-d1", label: "Cloudflare D1" },
   { value: "duckdb", label: "DuckDB" },
   { value: "rqlite", label: "RQLite" },
   { value: "access", label: "Microsoft Access" },
@@ -1721,7 +1820,6 @@ const dbOptions: DbOption[] = [
   { value: "nacos", label: "Nacos" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
-  { value: "jdbc", label: "JDBC" },
   { value: "manticoresearch", label: "Manticore Search" },
   { value: "custom_mysql", label: "Custom (MySQL)" },
   { value: "custom_postgres", label: "Custom (PostgreSQL)" },
@@ -1857,9 +1955,10 @@ const zookeeperConnectString = computed({
     form.value.connection_string = normalizeZooKeeperConnectString(value);
   },
 });
-const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isH2FileMode.value);
+const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isCloudflareD1Connection(form.value) && !isH2FileMode.value);
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
+const agentDriverFocus = computed<DriverStoreFocus>(() => ({ target: "driver", driver: agentDriverInstallKey(form.value.db_type, form.value.driver_profile) }));
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
 const visibleFilterUsesSchemas = computed(() => connectionUsesVisibleSchemaFilter(form.value));
 const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
@@ -1887,6 +1986,37 @@ const visibleDatabaseHasSystemDatabases = computed(() => {
   const connection = connectionConfigSnapshotForVisibleDatabases();
   return visibleDatabaseNames.value.some((database) => isSystemDatabaseName(connection.db_type, database));
 });
+const filteredProductionDatabaseNames = computed(() => {
+  const query = productionDatabaseSearchText.value.trim().toLowerCase();
+  if (!query) return productionDatabaseNames.value;
+  return productionDatabaseNames.value.filter((name) => name.toLowerCase().includes(query));
+});
+const productionDatabaseSelectedCount = computed(() => productionDatabaseSelection.value.size);
+const productionDatabaseCanSave = computed(() => productionDatabaseNames.value.length > 0 && productionDatabaseSelection.value.size > 0);
+const productionDatabaseSummary = computed(() => {
+  const selected = form.value.production_databases?.length || 0;
+  if (!selected) return t("production.noDatabasesSelected");
+  if (!productionDatabaseNames.value.length) return t("production.databasesConfiguredCount", { count: selected });
+  return t("production.databasesSelectedCount", { selected, total: productionDatabaseNames.value.length });
+});
+const productionScope = computed<ProductionScope>({
+  get: () => (isSingleDatabase(form.value.db_type) || form.value.is_production ? "connection" : "databases"),
+  set: (scope) => {
+    form.value.is_production = isSingleDatabase(form.value.db_type) || scope === "connection";
+  },
+});
+const canSelectProductionDatabases = computed(() => !isSingleDatabase(form.value.db_type));
+
+function setProductionProtectionEnabled(enabled: boolean) {
+  productionProtectionEnabled.value = enabled;
+  if (!enabled) {
+    form.value.is_production = false;
+    form.value.production_databases = [];
+  } else if (!form.value.is_production && !form.value.production_databases?.length) {
+    // Enabling protection starts with the broadest scope until the user chooses a narrower one.
+    form.value.is_production = true;
+  }
+}
 const canChooseVisibleSchemas = computed(() => isSchemaAware(form.value.db_type));
 const visibleSchemasDatabaseKey = computed(() => form.value.database || "");
 const hasVisibleSchemaFilter = computed(() => {
@@ -1951,6 +2081,7 @@ const hasRequiredConnectionTarget = computed(() => {
   }
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
+  if (isCloudflareD1Connection(form.value)) return hasCloudflareD1Credentials(form.value);
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
   return !!(form.value.host || (mongoUseUrl.value && form.value.connection_string) || (form.value.db_type === "jdbc" && form.value.connection_string) || connectionUrlInput.value.trim());
 });
@@ -2201,6 +2332,12 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       throw new Error(t("connection.kingbaseDatabaseRequired"));
     }
   }
+  if (isCloudflareD1Connection(config)) {
+    normalizeCloudflareD1Connection(config);
+    if (!hasCloudflareD1Credentials(config)) {
+      throw new Error(t("connection.d1FieldsRequired"));
+    }
+  }
   config.transport_layers = (config.transport_layers || []).map(normalizeTransportLayer);
   config.transport_layers = config.transport_layers.map((layer) => {
     if (layer.type !== "ssh") return layer;
@@ -2248,6 +2385,14 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   }
   if (!config.one_time) config.one_time = undefined;
   if (!config.read_only) config.read_only = undefined;
+  if (isSingleDatabase(config.db_type) && config.production_databases?.length) {
+    // Single-database drivers expose schemas or internal names, not independently selectable databases.
+    config.is_production = true;
+    config.production_databases = [];
+  }
+  if (!config.is_production) config.is_production = undefined;
+  config.production_databases = [...new Set((config.production_databases || []).map((database) => database.trim()).filter(Boolean))];
+  if (!config.production_databases.length) config.production_databases = undefined;
   if (config.db_type === "mq") {
     const mqConfig = buildMqAdminConfig();
     config.external_config = mqConfig;
@@ -2281,6 +2426,8 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       config.password = config.password.trim();
       config.database = config.database?.trim() || undefined;
     }
+  } else if (config.db_type === "sqlserver") {
+    config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else {
     config.external_config = undefined;
   }
@@ -2679,6 +2826,16 @@ function resetVisibleDatabaseDraftState() {
   visibleDatabaseShowSystem.value = false;
 }
 
+function resetProductionDatabaseDraftState() {
+  showProductionDatabasesDialog.value = false;
+  isLoadingProductionDatabases.value = false;
+  productionDatabaseNames.value = [];
+  productionDatabaseSelection.value = new Set();
+  productionDatabaseSearchText.value = "";
+  productionDatabaseError.value = "";
+  productionProtectionEnabled.value = false;
+}
+
 /** Silently load database names so the summary count shows a real total. */
 async function preloadVisibleDatabaseNames() {
   if (!ensureConnectionHostResolvedFromUrl()) return;
@@ -2747,6 +2904,88 @@ async function loadVisibleDatabaseNames(connectionId: string, config: Connection
     return api.mongoListDatabases(connectionId);
   }
   return (await api.listDatabases(connectionId)).map((database) => database.name);
+}
+
+function normalizeProductionDatabaseSelection(selectedNames: Iterable<string>, databaseNames: string[]): string[] {
+  const available = new Map(databaseNames.map((name) => [name.toLowerCase(), name]));
+  const selected = new Set<string>();
+  for (const name of selectedNames) {
+    const canonicalName = available.get(name.toLowerCase());
+    if (canonicalName) selected.add(canonicalName);
+  }
+  return [...selected];
+}
+
+function initialProductionDatabaseSelection(databaseNames: string[]): string[] {
+  const configured = form.value.production_databases || [];
+  // A new database-level safeguard starts broad; users can explicitly narrow it in the picker.
+  return configured.length ? normalizeProductionDatabaseSelection(configured, databaseNames) : databaseNames;
+}
+
+async function loadProductionDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
+  if (config.db_type === "redis") {
+    return (await api.redisListDatabases(connectionId)).map((database) => String(database.db));
+  }
+  if (config.db_type === "mongodb") {
+    return api.mongoListDatabases(connectionId);
+  }
+  return (await api.listDatabases(connectionId)).map((database) => database.name);
+}
+
+async function openProductionDatabasesPicker() {
+  if (!ensureConnectionHostResolvedFromUrl() || !productionProtectionEnabled.value || form.value.is_production || isLoadingProductionDatabases.value) return;
+  showProductionDatabasesDialog.value = true;
+  await reloadProductionDatabases();
+}
+
+async function reloadProductionDatabases() {
+  if (isLoadingProductionDatabases.value) return;
+
+  isLoadingProductionDatabases.value = true;
+  productionDatabaseError.value = "";
+  productionDatabaseSearchText.value = "";
+  const draftId = `__production_database_draft_${uuid()}`;
+  try {
+    const draftConfig = {
+      ...connectionConfigForSubmit(draftId),
+      id: draftId,
+      one_time: true,
+    };
+    await api.connectDb(draftConfig);
+    productionDatabaseNames.value = await loadProductionDatabaseNames(draftId, draftConfig);
+    productionDatabaseSelection.value = new Set(initialProductionDatabaseSelection(productionDatabaseNames.value));
+  } catch (e: any) {
+    productionDatabaseNames.value = [];
+    productionDatabaseSelection.value = new Set();
+    productionDatabaseError.value = mongodbAuthFailureHint(errorMessage(e));
+  } finally {
+    await api.disconnectDb(draftId).catch(() => undefined);
+    isLoadingProductionDatabases.value = false;
+  }
+}
+
+function toggleProductionDatabase(database: string) {
+  const next = new Set(productionDatabaseSelection.value);
+  if (next.has(database)) next.delete(database);
+  else next.add(database);
+  productionDatabaseSelection.value = next;
+}
+
+function selectAllProductionDatabases() {
+  productionDatabaseSelection.value = new Set(productionDatabaseNames.value);
+}
+
+function clearProductionDatabaseSelection() {
+  productionDatabaseSelection.value = new Set();
+}
+
+function saveProductionDatabaseSelection() {
+  if (!productionDatabaseCanSave.value) return;
+  // A database selection is always narrower than a connection-wide marker.
+  productionProtectionEnabled.value = true;
+  form.value.is_production = false;
+  form.value.production_databases = normalizeProductionDatabaseSelection(productionDatabaseSelection.value, productionDatabaseNames.value);
+  showProductionDatabasesDialog.value = false;
 }
 
 function toggleVisibleDatabase(database: string) {
@@ -2899,6 +3138,7 @@ function resetForm() {
   dbSearchQuery.value = "";
   configTab.value = "connection";
   resetVisibleDatabaseDraftState();
+  resetProductionDatabaseDraftState();
   resetVisibleSchemasState();
   resetTestState();
 }
@@ -2906,7 +3146,7 @@ function resetForm() {
 const submittedOneTimePrefillKey = ref<string | null>(null);
 
 function oneTimePrefillKey(draft: ConnectionDeepLinkDraft) {
-  return JSON.stringify([draft.name, draft.dbType, draft.driverProfile, draft.driverLabel, draft.host, draft.port, draft.username, draft.password, draft.database, draft.urlParams, draft.ssl, draft.connectionString, draft.oracleConnectionType, draft.useMongoUrl]);
+  return JSON.stringify([draft.name, draft.dbType, draft.driverProfile, draft.driverLabel, draft.host, draft.port, draft.portExplicit, draft.username, draft.password, draft.database, draft.urlParams, draft.ssl, draft.connectionString, draft.oracleConnectionType, draft.useMongoUrl]);
 }
 
 function submitOneTimePrefill(draft: ConnectionDeepLinkDraft) {
@@ -2918,7 +3158,7 @@ function submitOneTimePrefill(draft: ConnectionDeepLinkDraft) {
 }
 
 function applyConnectionDraftToConfig(config: Omit<ConnectionConfig, "id">, draft: ConnectionDeepLinkDraft): Omit<ConnectionConfig, "id"> {
-  return {
+  const next = {
     ...config,
     db_type: draft.dbType,
     driver_profile: draft.driverProfile,
@@ -2934,6 +3174,8 @@ function applyConnectionDraftToConfig(config: Omit<ConnectionConfig, "id">, draf
     oracle_connection_type: draft.oracleConnectionType ?? config.oracle_connection_type,
     one_time: draft.oneTime || undefined,
   };
+  setSqlServerPortExplicit(next, draft.portExplicit === true);
+  return next;
 }
 
 function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
@@ -3154,6 +3396,9 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
   const layers = config.transport_layers || [];
   layers.forEach((layer, index) => {
     if (layer.enabled === false) return;
+    // Profile-referencing layers are stubs: the shared profile supplies the
+    // whole configuration at connect time, so there is nothing to validate.
+    if (layer.profile_id) return;
     const label = layer.name?.trim() || transportLayerDefaultName(layer, index);
     if (layer.type === "http_tunnel") {
       if (index !== 0) throw new Error(t("connection.httpTunnelInvalidOrder", { hop: label }));
@@ -3369,6 +3614,24 @@ async function browseHiveKerberosFile(target: "krb5" | "jaas") {
   }
 }
 
+async function browseKafkaKerberosFile(target: "keytab" | "krb5") {
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title: target === "keytab" ? t("connection.kafkaKerberosKeytabBrowse") : t("connection.kafkaKerberosKrb5ConfBrowse"),
+      multiple: false,
+      filters: [{ name: "Kerberos", extensions: target === "keytab" ? ["keytab", "kt", "*"] : ["conf", "ini", "*"] }],
+    });
+    if (selected && typeof selected === "string") {
+      if (target === "keytab") {
+        mqKafkaKerberosKeytabPath.value = selected;
+      } else {
+        mqKafkaKrb5ConfPath.value = selected;
+      }
+    }
+  }
+}
+
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -3479,13 +3742,15 @@ async function browseJdbcDriverPaths() {
 async function loadJdbcDrivers() {
   if (!isDesktop) return;
   try {
-    const [drivers, bundles] = await Promise.all([api.listJdbcDrivers(), api.listJdbcMavenBundles()]);
+    const [drivers, bundles, localBundles] = await Promise.all([api.listJdbcDrivers(), api.listJdbcMavenBundles(), api.listJdbcLocalBundles()]);
     jdbcDrivers.value = drivers;
     jdbcMavenBundles.value = bundles;
+    jdbcLocalBundles.value = localBundles;
     applyPrestoSqlBuiltinDriverPathsIfAvailable();
   } catch {
     jdbcDrivers.value = [];
     jdbcMavenBundles.value = [];
+    jdbcLocalBundles.value = [];
   }
 }
 
@@ -3541,6 +3806,7 @@ function onJdbcDriverSelect(id: any) {
 }
 
 onMounted(async () => {
+  void tunnelProfileStore.init();
   unlistenAgentInstallProgress = await api.listenAgentInstallProgress(handleAgentInstallProgress);
 });
 
@@ -3567,7 +3833,7 @@ function openExternalUrl(url: string) {
 
       <template v-if="dialogStep === 'select'">
         <div class="space-y-4">
-          <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex items-center gap-2">
               <div class="flex shrink-0 rounded-lg border bg-muted/40 p-0.5">
                 <Button type="button" size="icon-sm" :variant="dbPickerView === 'icon' ? 'secondary' : 'ghost'" :title="t('connection.iconView')" :aria-label="t('connection.iconView')" @click="dbPickerView = 'icon'">
@@ -3582,6 +3848,10 @@ function openExternalUrl(url: string) {
                 <Input v-model="dbSearchQuery" class="h-9 pl-8" :placeholder="t('connection.searchDatabasePlaceholder')" />
               </div>
             </div>
+            <Button data-jdbc-connection-entry type="button" variant="outline" class="h-9 shrink-0 gap-2" @click="goToConnectionStep('jdbc')">
+              <DatabaseIcon db-type="jdbc" class="h-4 w-4" />
+              {{ t("connection.jdbcConnection") }}
+            </Button>
           </div>
 
           <div class="max-h-[58vh] space-y-5 overflow-y-auto pr-2">
@@ -3590,13 +3860,13 @@ function openExternalUrl(url: string) {
                 <h3 v-if="category.title" class="text-sm font-medium">{{ category.title }}</h3>
               </div>
 
-              <div v-if="dbPickerView === 'icon'" class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-5">
+              <div v-if="dbPickerView === 'icon'" class="connection-db-picker-grid grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-5">
                 <button
                   v-for="opt in category.options"
                   :key="opt.value"
                   type="button"
-                  class="group flex min-h-24 flex-col items-center justify-center gap-2 rounded-xl border bg-background/70 p-3 text-center transition hover:-translate-y-0.5 hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  :class="selectedType === opt.value ? 'border-primary bg-primary/10 shadow-sm ring-1 ring-primary/30' : 'border-border'"
+                  class="connection-db-picker-option group flex min-h-24 flex-col items-center justify-center gap-2 rounded-xl border bg-background/70 p-3 text-center transition hover:-translate-y-0.5 hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  :class="selectedType === opt.value ? 'connection-db-picker-option--selected shadow-sm' : 'border-border'"
                   :aria-pressed="selectedType === opt.value"
                   @click="onDbTypeChange(opt.value)"
                   @dblclick="goToConnectionStep(opt.value)"
@@ -3613,8 +3883,8 @@ function openExternalUrl(url: string) {
                   v-for="opt in category.options"
                   :key="opt.value"
                   type="button"
-                  class="flex items-center gap-3 rounded-lg border bg-background px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  :class="selectedType === opt.value ? 'border-primary bg-primary/10 ring-1 ring-primary/30' : 'border-border'"
+                  class="connection-db-picker-option flex items-center gap-3 rounded-lg border bg-background px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  :class="selectedType === opt.value ? 'connection-db-picker-option--selected' : 'border-border'"
                   :aria-pressed="selectedType === opt.value"
                   @click="onDbTypeChange(opt.value)"
                   @dblclick="goToConnectionStep(opt.value)"
@@ -3759,10 +4029,34 @@ function openExternalUrl(url: string) {
                   </div>
                 </div>
 
+                <div v-if="form.db_type === 'h2'" class="grid grid-cols-4 items-center gap-4">
+                  <Label :class="connectionLabelSmallClass">Driver</Label>
+                  <div class="col-span-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      :variant="form.driver_profile !== 'h2-legacy' ? 'default' : 'outline'"
+                      @click="
+                        form.driver_profile = 'h2';
+                        resetTestState();
+                      "
+                      >H2 2.3</Button
+                    >
+                    <Button
+                      size="sm"
+                      :variant="form.driver_profile === 'h2-legacy' ? 'default' : 'outline'"
+                      @click="
+                        form.driver_profile = 'h2-legacy';
+                        resetTestState();
+                      "
+                      >H2 2.1 Legacy</Button
+                    >
+                  </div>
+                </div>
+
                 <div v-if="h2DriverMissing" class="grid grid-cols-4 items-center gap-4">
                   <span />
                   <p class="col-span-3 text-xs text-muted-foreground">
-                    {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore')">{{ t("toolbar.driverManager") }}</a
+                    {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore', agentDriverFocus)">{{ t("toolbar.driverManager") }}</a
                     >{{ t("connection.driverInstallHintSuffix") }}
                   </p>
                 </div>
@@ -3842,7 +4136,7 @@ function openExternalUrl(url: string) {
                         {{ t("connection.jdbcPluginHint") }}
                       </p>
                       <div class="flex flex-wrap gap-2">
-                        <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore')">
+                        <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
                           <FolderOpen class="h-3.5 w-3.5" />
                           {{ t("toolbar.driverManager") }}
                         </Button>
@@ -3917,6 +4211,20 @@ function openExternalUrl(url: string) {
                       </div>
                       <p class="text-xs text-muted-foreground">
                         {{ t("connection.sqliteExtensionsHint") }}
+                      </p>
+                    </div>
+                  </div>
+                  <div v-if="form.db_type === 'duckdb'" class="grid grid-cols-4 items-start gap-4">
+                    <Label :class="connectionLabelTopClass">{{ t("connection.initScript") }}</Label>
+                    <div class="col-span-3 space-y-1">
+                      <textarea
+                        v-model="form.init_script"
+                        class="flex min-h-[76px] w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        :placeholder="t('connection.initScriptPlaceholder')"
+                        spellcheck="false"
+                      />
+                      <p class="text-xs text-muted-foreground">
+                        {{ t("connection.initScriptHint") }}
                       </p>
                     </div>
                   </div>
@@ -4019,7 +4327,17 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosKeytab") }}</Label>
-                      <Input v-model="mqKafkaKerberosKeytabPath" class="col-span-3" :placeholder="t('connection.kafkaKerberosKeytabPlaceholder')" />
+                      <div class="col-span-3 flex items-center gap-1">
+                        <Input v-model="mqKafkaKerberosKeytabPath" class="flex-1" :placeholder="t('connection.kafkaKerberosKeytabPlaceholder')" />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseKafkaKerberosFile('keytab')">
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.kafkaKerberosKeytabBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosServiceName") }}</Label>
@@ -4027,7 +4345,17 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.kafkaKerberosKrb5Conf") }}</Label>
-                      <Input v-model="mqKafkaKrb5ConfPath" class="col-span-3" :placeholder="t('connection.kafkaKerberosKrb5ConfPlaceholder')" />
+                      <div class="col-span-3 flex items-center gap-1">
+                        <Input v-model="mqKafkaKrb5ConfPath" class="flex-1" :placeholder="t('connection.kafkaKerberosKrb5ConfPlaceholder')" />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseKafkaKerberosFile('krb5')">
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.kafkaKerberosKrb5ConfBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </div>
                     <div class="grid grid-cols-4 items-start gap-4">
                       <div></div>
@@ -4510,12 +4838,16 @@ function openExternalUrl(url: string) {
                   </div>
                 </template>
 
+                <template v-else-if="form.db_type === 'cloudflare-d1'">
+                  <CloudflareD1ConnectionFields v-model:account-id="form.host" v-model:database-id="form.database" v-model:api-token="form.password" />
+                </template>
+
                 <!-- MySQL / PostgreSQL: host, port, user, password, database -->
                 <template v-else>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
-                    <Input v-model.number="form.port" type="number" class="col-span-1" />
+                    <Input v-model.number="form.port" type="number" class="col-span-1" @input="markSqlServerPortExplicit" />
                   </div>
 
                   <div v-if="form.driver_profile === 'gbase8s'" class="grid grid-cols-4 items-center gap-4">
@@ -4640,7 +4972,7 @@ function openExternalUrl(url: string) {
                   <div v-if="shouldShowAgentDriverInstallHint" class="grid grid-cols-4 items-center gap-4">
                     <span />
                     <p class="col-span-3 text-xs text-muted-foreground">
-                      {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore')">{{ t("toolbar.driverManager") }}</a
+                      {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore', agentDriverFocus)">{{ t("toolbar.driverManager") }}</a
                       >{{ t("connection.driverInstallHintSuffix") }}
                     </p>
                   </div>
@@ -4729,7 +5061,7 @@ function openExternalUrl(url: string) {
                           {{ t("connection.jdbcPluginHint") }}
                         </p>
                         <div class="flex flex-wrap gap-2">
-                          <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore')">
+                          <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
                             <FolderOpen class="h-3.5 w-3.5" />
                             {{ t("toolbar.driverManager") }}
                           </Button>
@@ -5038,6 +5370,39 @@ function openExternalUrl(url: string) {
                     <span class="text-xs text-muted-foreground">{{ t("connection.readOnlyHint") }}</span>
                   </label>
                 </div>
+                <div class="grid grid-cols-4 items-start gap-4 rounded-[6px] border border-red-500/25 bg-red-500/[0.035] px-3 py-2.5">
+                  <Label :class="[connectionLabelSmallClass, 'pt-0.5 text-red-700 dark:text-red-300']">
+                    <span class="inline-flex items-center justify-end gap-1"><ShieldAlert class="h-3.5 w-3.5" />PROD</span>
+                  </Label>
+                  <div class="col-span-3 grid gap-2">
+                    <div class="flex items-center justify-between gap-3">
+                      <Label class="text-sm font-medium">{{ t("production.enable") }}</Label>
+                      <Switch :model-value="productionProtectionEnabled" @update:model-value="setProductionProtectionEnabled" />
+                    </div>
+                    <p v-if="!productionProtectionEnabled" class="text-xs leading-5 text-muted-foreground">{{ t("production.disabledDescription") }}</p>
+                    <template v-else>
+                      <Label class="text-xs font-medium">{{ t("production.scope") }}</Label>
+                      <Tabs v-model="productionScope" class="w-full">
+                        <TabsList class="grid h-8 w-full grid-cols-2">
+                          <TabsTrigger value="connection" class="text-xs">{{ t("production.allDatabases") }}</TabsTrigger>
+                          <TabsTrigger value="databases" class="text-xs" :disabled="!canSelectProductionDatabases" :title="canSelectProductionDatabases ? undefined : t('production.singleDatabaseScopeHint')">{{ t("production.selectedDatabases") }}</TabsTrigger>
+                        </TabsList>
+                      </Tabs>
+                      <p class="text-xs leading-5 text-muted-foreground">{{ productionScope === "connection" ? t("production.connectionDescription") : t("production.databaseDescription") }}</p>
+                      <div v-if="productionScope === 'databases'" class="grid gap-1.5">
+                        <div class="flex items-center justify-between gap-3">
+                          <Label class="text-xs font-medium">{{ t("production.databases") }}</Label>
+                          <span class="text-xs text-muted-foreground">{{ productionDatabaseSummary }}</span>
+                        </div>
+                        <Button type="button" variant="outline" size="sm" class="justify-start" :disabled="isTesting || isSaving || isLoadingProductionDatabases || !hasRequiredConnectionTarget" @click="openProductionDatabasesPicker">
+                          <Loader2 v-if="isLoadingProductionDatabases" class="mr-1.5 h-4 w-4 animate-spin" />
+                          <ListFilter v-else class="mr-1.5 h-4 w-4" />
+                          {{ t("production.selectDatabases") }}
+                        </Button>
+                      </div>
+                    </template>
+                  </div>
+                </div>
                 <div v-show="form.db_type === 'sqlserver'" class="grid grid-cols-4 items-start gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.sqlServerLegacyCompatibilityMode") }}</Label>
                   <div class="col-span-3 flex flex-col gap-1">
@@ -5147,7 +5512,35 @@ function openExternalUrl(url: string) {
                     <Label :class="connectionLabelSmallClass">{{ t("connection.sshHopName") }}</Label>
                     <Input v-model="selectedTransportLayer.name" class="col-span-3" :placeholder="t('connection.sshHopNamePlaceholder')" />
                   </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="tunnelProfiles.length || selectedLayerProfileId" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelSmallClass">{{ t("connection.tunnelProfile") }}</Label>
+                    <div class="col-span-3 flex min-w-0 items-center gap-2">
+                      <Select :model-value="selectedLayerProfileId || 'custom'" @update:model-value="applyTunnelProfileSelection">
+                        <SelectTrigger class="h-9 min-w-0 flex-1">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="custom">{{ t("connection.tunnelProfileCustom") }}</SelectItem>
+                          <SelectItem v-for="profile in tunnelProfiles" :key="profile.id" :value="profile.id">{{ tunnelProfileOptionLabel(profile) }}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button type="button" variant="outline" size="sm" class="shrink-0" @click="emit('openTunnelProfileSettings')">
+                        {{ t("connection.tunnelProfileManage") }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div v-if="selectedLayerProfileId" class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <div class="col-span-3 grid min-w-0 gap-1 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                      <template v-if="selectedLayerProfile">
+                        <span class="truncate font-medium text-foreground">{{ selectedLayerProfile.name || tunnelProfileSummary(selectedLayerProfile) }}</span>
+                        <span v-if="selectedLayerProfile.name && tunnelProfileSummary(selectedLayerProfile)" class="truncate">{{ tunnelProfileSummary(selectedLayerProfile) }}</span>
+                        <span>{{ t("connection.tunnelProfileManaged") }}</span>
+                      </template>
+                      <span v-else class="text-red-500">{{ t("connection.tunnelProfileMissing") }}</span>
+                    </div>
+                  </div>
+                  <div v-if="!selectedLayerProfileId" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">Type</Label>
                     <Select :model-value="selectedTransportLayer.type" @update:model-value="(value: any) => changeSelectedTransportLayerType(value)">
                       <SelectTrigger class="col-span-3 h-9">
@@ -5160,7 +5553,7 @@ function openExternalUrl(url: string) {
                       </SelectContent>
                     </Select>
                   </div>
-                  <template v-if="selectedSshLayer">
+                  <template v-if="selectedSshLayer && !selectedLayerProfileId">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshHost") }}</Label>
                       <Input v-model="selectedSshLayer.host" class="col-span-2" list="ssh-config-host-aliases" :placeholder="t('connection.sshHostPlaceholder')" :disabled="selectedSshLayer.enabled === false" @change="applySshConfigHostAliasPrefill(selectedSshLayer!)" />
@@ -5238,7 +5631,7 @@ function openExternalUrl(url: string) {
                       <Input v-model.number="selectedSshLayer.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                   </template>
-                  <template v-else-if="selectedProxyLayer">
+                  <template v-else-if="selectedProxyLayer && !selectedLayerProfileId">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.proxyType") }}</Label>
                       <Select :model-value="selectedProxyLayer.proxy_type || 'socks5'" :disabled="selectedProxyLayer.enabled === false" @update:model-value="updateSelectedProxyType">
@@ -5265,7 +5658,7 @@ function openExternalUrl(url: string) {
                       <PasswordInput v-model="selectedProxyLayer.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
                     </div>
                   </template>
-                  <template v-else-if="selectedHttpTunnelLayer">
+                  <template v-else-if="selectedHttpTunnelLayer && !selectedLayerProfileId">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelUrl") }}</Label>
                       <Input v-model="selectedHttpTunnelLayer.url" class="col-span-3" placeholder="https://dbx.example.com/dbx_tunnel.php" :disabled="selectedHttpTunnelLayer.enabled === false" />
@@ -5459,6 +5852,74 @@ function openExternalUrl(url: string) {
     </DialogContent>
   </Dialog>
 
+  <Dialog v-model:open="showProductionDatabasesDialog">
+    <DialogContent class="sm:max-w-[460px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("production.databasePickerTitle") }}</DialogTitle>
+        <p class="text-sm text-muted-foreground">
+          {{ t("production.databasePickerDescription", { connection: form.name || selectedProfile().label }) }}
+        </p>
+      </DialogHeader>
+
+      <div class="flex items-center gap-2 rounded-md border bg-background px-2">
+        <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
+        <Input v-model="productionDatabaseSearchText" :placeholder="t('production.databaseSearchPlaceholder')" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingProductionDatabases || !!productionDatabaseError" />
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-muted-foreground">
+        <span>{{ t("production.databasesSelectedCount", { selected: productionDatabaseSelectedCount, total: productionDatabaseNames.length }) }}</span>
+        <div class="flex items-center gap-2">
+          <button class="hover:text-foreground disabled:opacity-50" :disabled="isLoadingProductionDatabases || !!productionDatabaseError" @click="selectAllProductionDatabases">
+            {{ t("visibleDatabases.selectAll") }}
+          </button>
+          <button class="hover:text-foreground disabled:opacity-50" :disabled="isLoadingProductionDatabases || !!productionDatabaseError" @click="clearProductionDatabaseSelection">
+            {{ t("visibleDatabases.clear") }}
+          </button>
+        </div>
+      </div>
+      <p v-if="!isLoadingProductionDatabases && !productionDatabaseError && !productionDatabaseCanSave" class="text-xs text-destructive">
+        {{ t("production.databaseSelectionRequired") }}
+      </p>
+
+      <div class="h-72 overflow-y-auto rounded-md border bg-background/50 p-1">
+        <div v-if="isLoadingProductionDatabases" class="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+          <Loader2 class="h-4 w-4 animate-spin" />
+          {{ t("common.loading") }}
+        </div>
+        <div v-else-if="productionDatabaseError" class="flex h-full flex-col items-start justify-center gap-3 p-3 text-sm text-destructive">
+          <p>{{ t("production.databaseLoadFailed", { message: productionDatabaseError }) }}</p>
+          <Button type="button" variant="outline" size="sm" @click="reloadProductionDatabases">
+            <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
+            {{ t("production.retry") }}
+          </Button>
+        </div>
+        <div v-else-if="!filteredProductionDatabaseNames.length" class="p-3 text-sm text-muted-foreground">
+          {{ productionDatabaseNames.length ? t("grid.noSearchResults") : t("production.noDatabasesAvailable") }}
+        </div>
+        <template v-else>
+          <button
+            v-for="database in filteredProductionDatabaseNames"
+            :key="database"
+            type="button"
+            class="flex h-8 w-full min-w-0 items-center gap-2 rounded-sm px-2 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+            @click="toggleProductionDatabase(database)"
+          >
+            <CheckSquare v-if="productionDatabaseSelection.has(database)" class="h-4 w-4 shrink-0 text-primary" />
+            <Square v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span class="truncate">{{ database }}</span>
+          </button>
+        </template>
+      </div>
+
+      <DialogFooter>
+        <Button variant="outline" @click="showProductionDatabasesDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="isLoadingProductionDatabases || !!productionDatabaseError || !productionDatabaseCanSave" @click="saveProductionDatabaseSelection">
+          {{ t("visibleDatabases.save") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
   <VisibleSchemasDialog
     v-model:open="showVisibleSchemasDialog"
     draft-mode
@@ -5475,6 +5936,44 @@ function openExternalUrl(url: string) {
 </template>
 
 <style>
+@media (min-width: 640px) {
+  .connection-db-picker-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+  }
+}
+
+@media (min-width: 1024px) {
+  .connection-db-picker-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+  }
+}
+
+.connection-db-picker-option {
+  color: var(--foreground);
+}
+
+.connection-db-picker-option--selected {
+  border-color: rgb(23, 23, 23);
+  background-color: rgba(23, 23, 23, 0.08);
+  box-shadow: 0 0 0 1px rgba(23, 23, 23, 0.24);
+  color: rgb(10, 10, 10);
+}
+
+.connection-db-picker-option--selected:hover {
+  background-color: rgba(23, 23, 23, 0.12);
+}
+
+.dark .connection-db-picker-option--selected {
+  border-color: rgb(208, 208, 214);
+  background-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22);
+  color: rgb(221, 221, 226);
+}
+
+.dark .connection-db-picker-option--selected:hover {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
 .connection-dialog-content[data-wide="true"] .grid.grid-cols-4 {
   grid-template-columns: minmax(5.5rem, 0.7fr) repeat(3, minmax(0, 1fr));
 }

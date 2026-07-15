@@ -17,10 +17,8 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use dbx_core::connection::AppState;
 use dbx_core::storage::Storage;
-use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
-
 use state::WebState;
+use tokio::sync::RwLock;
 
 fn web_body_limit_bytes() -> usize {
     const DEFAULT_MB: usize = 1024;
@@ -210,9 +208,6 @@ async fn main() {
         export_files: RwLock::new(HashMap::new()),
     });
 
-    // CORS
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
-
     // API routes
     let api = Router::new()
         // Auth
@@ -227,6 +222,7 @@ async fn main() {
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/identifier-quote", post(routes::connection::connection_identifier_quote))
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
@@ -237,8 +233,10 @@ async fn main() {
             "/jdbc/drivers/maven",
             get(routes::jdbc::list_jdbc_maven_bundles).post(routes::jdbc::install_jdbc_driver_from_maven),
         )
+        .route("/jdbc/drivers/local", get(routes::jdbc::list_jdbc_local_bundles))
         .route("/jdbc/drivers/prestosql", post(routes::jdbc::install_prestosql_jdbc_driver))
         .route("/jdbc/drivers/maven/{bundle_id}", delete(routes::jdbc::delete_jdbc_maven_bundle))
+        .route("/jdbc/drivers/local/{bundle_id}", delete(routes::jdbc::delete_jdbc_local_bundle))
         .route("/jdbc/drivers/{name}", delete(routes::jdbc::delete_jdbc_driver))
         .route("/jdbc/plugin/status", get(routes::jdbc::get_jdbc_plugin_status))
         .route("/jdbc/plugin/install", post(routes::jdbc::install_jdbc_plugin))
@@ -247,6 +245,10 @@ async fn main() {
         // System
         .route("/system/fonts", get(routes::jdbc::list_system_fonts))
         .route("/ssh/config-hosts", get(routes::ssh_config::list_ssh_config_hosts))
+        // Tunnel profiles
+        .route("/tunnel-profiles/list", get(routes::tunnel_profiles::load_tunnel_profiles))
+        .route("/tunnel-profiles/save", post(routes::tunnel_profiles::save_tunnel_profiles))
+        .route("/tunnel-profiles/test", post(routes::tunnel_profiles::test_tunnel_profile))
         // Agent drivers
         .route("/agents/installed-local", get(routes::agents::list_installed_agents_local))
         .route("/agents/installed", get(routes::agents::list_installed_agents))
@@ -352,6 +354,11 @@ async fn main() {
         )
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
+        .route(
+            "/query/preview-sqlite-table-structure-change",
+            post(routes::query::preview_sqlite_table_structure_change),
+        )
+        .route("/query/apply-sqlite-table-structure-change", post(routes::query::apply_sqlite_table_structure_change))
         .route("/query/build-create-table-sql", post(routes::query::build_create_table_sql))
         .route("/query/build-single-column-alter-sql", post(routes::query::build_single_column_alter_sql))
         .route("/query/analyze-editability", post(routes::query::analyze_editable_query_editability))
@@ -469,6 +476,8 @@ async fn main() {
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
+        .route("/mongo/find-one", post(routes::mongo::find_one))
+        .route("/mongo/count-documents", post(routes::mongo::count_documents))
         .route("/mongo/server-version", post(routes::mongo::server_version))
         .route("/mongo/collection-stats", post(routes::mongo::collection_stats))
         .route("/mongo/aggregate-documents", post(routes::mongo::aggregate_documents))
@@ -480,6 +489,9 @@ async fn main() {
         .route("/mongo/update-documents", post(routes::mongo::update_documents))
         .route("/mongo/delete-document", post(routes::mongo::delete_document))
         .route("/mongo/delete-documents", post(routes::mongo::delete_documents))
+        .route("/mongo/find-one-and-update", post(routes::mongo::find_one_and_update))
+        .route("/mongo/find-one-and-replace", post(routes::mongo::find_one_and_replace))
+        .route("/mongo/find-one-and-delete", post(routes::mongo::find_one_and_delete))
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
@@ -548,6 +560,7 @@ async fn main() {
         // Update
         .route("/version", get(routes::update::get_version))
         .route("/update/check", get(routes::update::check_for_updates))
+        .route("/changelog", get(routes::update::fetch_changelog))
         // Layout
         .route("/layout/sidebar", post(routes::layout::save_sidebar_layout).get(routes::layout::load_sidebar_layout))
         // App settings
@@ -571,7 +584,13 @@ async fn main() {
             post(routes::cloud_sync::forget_webdav_sync_secrets_passphrase),
         )
         .route("/cloud-sync/webdav/upload", post(routes::cloud_sync::webdav_sync_upload))
-        .route("/cloud-sync/webdav/download", post(routes::cloud_sync::webdav_sync_download));
+        .route("/cloud-sync/webdav/download", post(routes::cloud_sync::webdav_sync_download))
+        .route("/cloud-sync/snippet/test", post(routes::cloud_sync::snippet_sync_test))
+        .route("/cloud-sync/snippet/token-status", post(routes::cloud_sync::snippet_token_status))
+        .route("/cloud-sync/snippet/save-token", post(routes::cloud_sync::save_snippet_saved_token))
+        .route("/cloud-sync/snippet/forget-token", post(routes::cloud_sync::forget_snippet_saved_token))
+        .route("/cloud-sync/snippet/upload", post(routes::cloud_sync::snippet_sync_upload))
+        .route("/cloud-sync/snippet/download", post(routes::cloud_sync::snippet_sync_download));
 
     let api = add_mq_routes(api)
         .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))
@@ -581,8 +600,7 @@ async fn main() {
     let mut app = Router::new()
         .nest("/api", api)
         .layer(DefaultBodyLimit::max(web_body_limit_bytes()))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(cors);
+        .layer(tower_http::trace::TraceLayer::new_for_http());
 
     // Static file serving
     if let Ok(static_dir) = std::env::var("DBX_STATIC_DIR") {

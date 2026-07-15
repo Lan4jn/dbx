@@ -25,6 +25,18 @@ function postgresConnection(): ConnectionConfig {
   } as ConnectionConfig;
 }
 
+function oracleConnection(): ConnectionConfig {
+  return {
+    ...postgresConnection(),
+    id: "oracle-1",
+    name: "Oracle 11g",
+    db_type: "oracle",
+    port: 1521,
+    username: "APP",
+    database: "ORCL",
+  } as ConnectionConfig;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => {
@@ -147,6 +159,66 @@ describe("connectionStore completion assistant", () => {
     expect(tables).toEqual([{ name: "TEST_USERS", schema: "SYSDBA", type: "table" }]);
   });
 
+  it("maps global Oracle tables with safe qualification and schema priority", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [
+        { name: "DEPT_DICT", kind: "table", schema: "APP", data_type: "TABLE" },
+        { name: "DEPT_DICT", kind: "view", schema: "COMM", data_type: "VIEW" },
+        { name: "V_DEPT_DICT", kind: "view", schema: "SYS", data_type: "VIEW" },
+        { name: "DEPT_DICT_ALIAS", kind: "table", schema: "PUBLIC", data_type: "SYNONYM" },
+      ],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listTables: vi.fn().mockResolvedValue([]),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const tables = await store.listCompletionTables("oracle-1", "ORCL", "DEPT_D", 20, "APP", true);
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(expect.objectContaining({ schema: "APP", parent_schema: null, global_search: true, mask: "DEPT_D" }));
+    expect(tables).toEqual([
+      expect.objectContaining({ name: "DEPT_DICT", schema: "APP", applyName: "DEPT_DICT", boost: 2400 }),
+      expect.objectContaining({ name: "DEPT_DICT", schema: "COMM", applyName: "COMM.DEPT_DICT", boost: 0 }),
+      expect.objectContaining({ name: "V_DEPT_DICT", schema: "SYS", applyName: "SYS.V_DEPT_DICT", boost: -1200 }),
+      expect.objectContaining({ name: "DEPT_DICT_ALIAS", schema: "PUBLIC", applyName: "DEPT_DICT_ALIAS", detail: "PUBLIC · synonym", boost: 1200 }),
+    ]);
+  });
+
+  it("maps Oracle package members without scanning every schema", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "CALCULATE_BONUS", kind: "function", schema: "HR", parent_schema: "HR", parent_name: "PAYROLL", data_type: "FUNCTION" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listObjects: vi.fn().mockResolvedValue([]),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const objects = await store.listCompletionObjects("oracle-1", "ORCL", "CALC", 20, "HR", "PAYROLL", false, "APP");
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(expect.objectContaining({ object_kinds: ["routine"], mask: "CALC", schema: "APP", parent_schema: "HR", parent_name: "PAYROLL", global_search: false }));
+    expect(objects).toEqual([expect.objectContaining({ name: "CALCULATE_BONUS", schema: "HR", type: "function", parentSchema: "HR", parentName: "PAYROLL", applyName: "HR.CALCULATE_BONUS", boost: 0 })]);
+  });
+
   it("limits concurrent completion column metadata requests per connection database", async () => {
     const gates = [deferred<any[]>(), deferred<any[]>(), deferred<any[]>(), deferred<any[]>()];
     let activeColumns = 0;
@@ -184,5 +256,50 @@ describe("connectionStore completion assistant", () => {
 
     await Promise.all(requests);
     expect(maxActiveColumns).toBe(2);
+  });
+
+  it("evicts old completion database entries", async () => {
+    const listDatabases = vi.fn(async (connectionId: string) => [{ name: `db_${connectionId}` }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      listDatabases,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+
+    for (let index = 0; index < 51; index++) {
+      const id = `pg-${index}`;
+      store.addEphemeralConnection({ ...postgresConnection(), id, name: `Postgres ${index}` });
+      await store.listCompletionDatabases(id);
+    }
+
+    await store.listCompletionDatabases("pg-0");
+
+    expect(listDatabases).toHaveBeenCalledTimes(52);
+  });
+
+  it("evicts old completion schema entries", async () => {
+    const listSchemas = vi.fn(async (_connectionId: string, database: string) => [`schema_${database}`]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      listSchemas,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.addEphemeralConnection(postgresConnection());
+
+    for (let index = 0; index < 51; index++) {
+      await store.listCompletionSchemas("pg-1", `db_${index}`);
+    }
+
+    await store.listCompletionSchemas("pg-1", "db_0");
+
+    expect(listSchemas).toHaveBeenCalledTimes(52);
   });
 });
