@@ -53,7 +53,10 @@ export const useNativeWindowDecorations = forward("useNativeWindowDecorations");
 
 // Connection
 export const testConnection = forward("testConnection");
+export const testConnectionWithInfo = forward("testConnectionWithInfo");
 export const connectDb = forward("connectDb");
+export const connectionDatabaseInfo = forward("connectionDatabaseInfo");
+export const saveConnectionDatabaseInfo = forward("saveConnectionDatabaseInfo");
 export const connectionFinalProxyPort = forward("connectionFinalProxyPort");
 export const disconnectDb = forward("disconnectDb");
 export const checkConnectionHealth = forward("checkConnectionHealth");
