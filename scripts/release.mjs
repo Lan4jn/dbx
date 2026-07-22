@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { evaluateAgentVersionBump, getAgentVersionChanges, isAgentPublishRelevantFile, parseLegacyStandaloneProjects } from "../.github/scripts/bump-agent-versions.mjs";
 
 const REPO = "t8y2/dbx";
 const PACKAGES_WORKFLOW = "mcp-release.yml";
@@ -10,19 +11,32 @@ const PACKAGE_TAG_PREFIX = "packages-v";
 const AGENT_TAG_PREFIX = "agents-v";
 const APP_TAG_PREFIX = "v";
 const PACKAGE_RELEASE_PATHS = [
-  "packages/node-core/src/",
-  "packages/node-core/README.md",
-  "packages/node-core/package.json",
-  "packages/node-core/tsconfig.json",
   "packages/cli/src/",
   "packages/cli/README.md",
   "packages/cli/package.json",
-  "packages/cli/tsconfig.json",
-  "packages/mcp-server/src/",
+  "packages/cli/bin/",
+  "packages/cli-darwin-arm64/",
+  "packages/cli-darwin-x64/",
+  "packages/cli-linux-arm64-gnu/",
+  "packages/cli-linux-x64-gnu/",
+  "packages/cli-win32-arm64/",
+  "packages/cli-win32-x64/",
+  "packages/mcp-server/bin/",
   "packages/mcp-server/README.md",
   "packages/mcp-server/package.json",
   "packages/mcp-server/server.json",
-  "packages/mcp-server/tsconfig.json",
+  "packages/mcp-darwin-arm64/",
+  "packages/mcp-darwin-x64/",
+  "packages/mcp-linux-arm64-gnu/",
+  "packages/mcp-linux-x64-gnu/",
+  "packages/mcp-win32-arm64/",
+  "packages/mcp-win32-x64/",
+  "crates/dbx-mcp/",
+  "crates/dbx-cli/",
+  "crates/dbx-core/src/mongo_shell.rs",
+  "Cargo.toml",
+  "Cargo.lock",
+  ".github/workflows/mcp-release.yml",
 ];
 const AGENT_RELEASE_PATHS = [
   "agents/build.gradle",
@@ -162,6 +176,7 @@ async function releaseAgents(bump) {
   console.log(kv("Release target", "Agents", bold));
   console.log(kv("Current agent tag", `${latest.tag}${latest.source ? ` (${latest.source})` : ""}`, yellow));
   printReleaseStatus(status);
+  printAgentVersionChanges(latest.tag, status.changedFiles);
   if (!status.needed && !force) {
     console.log(yellow("No agents release needed; publish-relevant agent runtime files have not changed."));
     console.log(dim("Use --force to create the tag anyway."));
@@ -255,9 +270,14 @@ function getLatestPackageVersion() {
   if (tag) return tag.versionText;
 
   const packageVersions = [
-    "packages/node-core/package.json",
     "packages/cli/package.json",
     "packages/mcp-server/package.json",
+    "packages/mcp-darwin-arm64/package.json",
+    "packages/mcp-darwin-x64/package.json",
+    "packages/mcp-linux-arm64-gnu/package.json",
+    "packages/mcp-linux-x64-gnu/package.json",
+    "packages/mcp-win32-arm64/package.json",
+    "packages/mcp-win32-x64/package.json",
   ].map((path) => JSON.parse(readFileSync(path, "utf8")).version);
 
   const uniqueVersions = [...new Set(packageVersions)];
@@ -330,7 +350,7 @@ function getAgentReleaseStatus(latest = getLatestAgentTag()) {
     };
   }
 
-  const changedFiles = getChangedFilesSince(latest.tag, AGENT_RELEASE_PATHS);
+  const changedFiles = getChangedFilesSince(latest.tag, AGENT_RELEASE_PATHS).filter(isAgentPublishRelevantFile);
   return {
     needed: changedFiles.length > 0,
     baseline: latest.tag,
@@ -366,6 +386,33 @@ function printReleaseStatus(status) {
     if (status.changedFiles.length > 20) {
       console.log(dim(`  ... and ${status.changedFiles.length - 20} more`));
     }
+  }
+}
+
+function printAgentVersionChanges(baselineTag, changedFiles) {
+  if (changedFiles.length === 0 || !refExists(`refs/tags/${baselineTag}`)) return;
+
+  const currentVersions = JSON.parse(readFileSync("agents/versions.json", "utf8"));
+  const previousVersions = JSON.parse(run("git", ["show", `${baselineTag}:agents/versions.json`]).stdout);
+  const legacyStandaloneModules = parseLegacyStandaloneProjects(readFileSync("agents/build.gradle", "utf8"));
+  const result = evaluateAgentVersionBump({
+    versions: currentVersions,
+    prevVersions: previousVersions,
+    changedFiles,
+    legacyStandaloneModules,
+    manualVersionsChanged: changedFiles.includes("agents/versions.json"),
+  });
+  const changes = getAgentVersionChanges(previousVersions, result.versions)
+    .map(({ moduleName, previousVersion, nextVersion }) => `${moduleName}: ${previousVersion ?? "new"} -> ${nextVersion}`);
+
+  if (changes.length === 0) {
+    console.log(dim("No automatic driver version changes detected."));
+    return;
+  }
+
+  console.log(dim("Expected driver version changes:"));
+  for (const change of changes) {
+    console.log(`  ${dim("-")} ${change}`);
   }
 }
 

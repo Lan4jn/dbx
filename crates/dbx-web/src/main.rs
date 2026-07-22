@@ -19,6 +19,15 @@ use dbx_core::connection::AppState;
 use dbx_core::storage::Storage;
 use state::WebState;
 use tokio::sync::RwLock;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
+
+const XLSX_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+fn web_compression_predicate() -> impl Predicate {
+    // XLSX exports are already compressed ZIP archives, so gzip would only add CPU overhead.
+    DefaultPredicate::new().and(NotForContentType::const_new(XLSX_CONTENT_TYPE))
+}
 
 fn web_body_limit_bytes() -> usize {
     const DEFAULT_MB: usize = 1024;
@@ -57,46 +66,6 @@ fn normalize_public_base_path(value: Option<String>) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{normalize_public_base_path, web_agent_dir_from_env};
-
-    #[test]
-    fn normalize_public_base_path_defaults_to_root() {
-        assert_eq!(normalize_public_base_path(None), "/");
-        assert_eq!(normalize_public_base_path(Some("".to_string())), "/");
-        assert_eq!(normalize_public_base_path(Some("/".to_string())), "/");
-    }
-
-    #[test]
-    fn normalize_public_base_path_trims_and_preserves_segments() {
-        assert_eq!(normalize_public_base_path(Some("dbx".to_string())), "/dbx");
-        assert_eq!(normalize_public_base_path(Some("/dbx/".to_string())), "/dbx");
-        assert_eq!(normalize_public_base_path(Some("/tools/dbx/?v=1".to_string())), "/tools/dbx");
-    }
-
-    #[test]
-    #[should_panic(expected = "DBX_PUBLIC_BASE_PATH contains invalid characters")]
-    fn normalize_public_base_path_rejects_invalid_characters() {
-        normalize_public_base_path(Some("/dbx admin".to_string()));
-    }
-
-    #[test]
-    fn web_agent_dir_defaults_under_data_dir() {
-        let data_dir = std::path::PathBuf::from("/app/data");
-        assert_eq!(web_agent_dir_from_env(&data_dir, None), data_dir.join("agents"));
-    }
-
-    #[test]
-    fn web_agent_dir_uses_explicit_env_override() {
-        let data_dir = std::path::PathBuf::from("/app/data");
-        assert_eq!(
-            web_agent_dir_from_env(&data_dir, Some("/custom/agents".to_string())),
-            std::path::PathBuf::from("/custom/agents")
-        );
-    }
-}
-
 #[cfg(feature = "mq-admin")]
 fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
     router
@@ -116,12 +85,21 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/topics/update-partitions", post(routes::mq::update_partitions))
         .route("/mq/topics/stats", post(routes::mq::get_topic_stats))
         .route("/mq/topics/internal-stats", post(routes::mq::get_topic_internal_stats))
+        .route("/mq/topics/route", post(routes::mq::get_topic_route))
+        .route("/mq/topics/alter-config", post(routes::mq::alter_topic_config))
+        .route("/mq/topics/skip-accumulation", post(routes::mq::skip_topic_accumulation))
+        .route("/mq/messages/view", post(routes::mq::view_message))
+        .route("/mq/messages/query-by-key", post(routes::mq::query_messages_by_key))
+        .route("/mq/messages/query-by-topic", post(routes::mq::query_messages_by_topic))
+        .route("/mq/messages/trace", post(routes::mq::query_message_trace))
         .route("/mq/subscriptions/list", post(routes::mq::list_subscriptions))
         .route("/mq/subscriptions/create", post(routes::mq::create_subscription))
         .route("/mq/subscriptions/delete", post(routes::mq::delete_subscription))
         .route("/mq/subscriptions/skip-messages", post(routes::mq::skip_messages))
         .route("/mq/subscriptions/reset-cursor", post(routes::mq::reset_cursor))
         .route("/mq/subscriptions/clear-backlog", post(routes::mq::clear_backlog))
+        .route("/mq/consumers/group-config/get", post(routes::mq::get_consumer_group_config))
+        .route("/mq/consumers/group-config/alter", post(routes::mq::alter_consumer_group_config))
         .route("/mq/subscriptions/peek-messages", post(routes::mq::peek_messages))
         .route("/mq/subscriptions/expire-messages", post(routes::mq::expire_messages))
         .route("/mq/producers/list", post(routes::mq::list_producers))
@@ -218,7 +196,10 @@ async fn main() {
         .route("/auth/logout", post(auth::logout))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
+        .route("/connection/test-info", post(routes::connection::test_connection_with_info))
         .route("/connection/connect", post(routes::connection::connect_db))
+        .route("/connection/database-info", post(routes::connection::connected_database_info))
+        .route("/connection/database-info/save", post(routes::connection::save_connection_database_info))
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
@@ -226,6 +207,8 @@ async fn main() {
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
+        .route("/connection/mcp/add", post(routes::connection::mcp_add_connection))
+        .route("/connection/mcp/remove", post(routes::connection::mcp_remove_connection))
         .route("/plugins", get(routes::plugins::list_plugins))
         // JDBC
         .route("/jdbc/drivers", get(routes::jdbc::list_jdbc_drivers).post(routes::jdbc::import_jdbc_drivers))
@@ -262,7 +245,8 @@ async fn main() {
         .route("/agents/upgrade-all", post(routes::agents::upgrade_all_agents))
         .route("/agents/uninstall", post(routes::agents::uninstall_agent))
         .route("/agents/import-offline", post(routes::agents::import_agents_from_zip))
-        .route("/agents/import-jar", post(routes::agents::import_agent_jar))
+        .route("/agents/import-driver", post(routes::agents::import_agent_driver_file))
+        .route("/agents/import-jar", post(routes::agents::import_agent_driver_file))
         .route(
             "/agents/java-runtime",
             get(routes::agents::get_agent_java_runtime_config).post(routes::agents::set_agent_java_runtime_config),
@@ -279,6 +263,7 @@ async fn main() {
         .route("/schema/sqlserver/linked-server-catalogs", get(routes::schema::list_sqlserver_linked_server_catalogs))
         .route("/schema/sqlserver/linked-server-schemas", get(routes::schema::list_sqlserver_linked_server_schemas))
         .route("/schema/sqlserver/linked-server-tables", get(routes::schema::list_sqlserver_linked_server_tables))
+        .route("/schema/sqlserver/column-metadata", get(routes::schema::get_sqlserver_column_metadata))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/objects", get(routes::schema::list_objects))
@@ -311,6 +296,9 @@ async fn main() {
                 .get(routes::tab_runtime_cache::load_tab_runtime_cache)
                 .delete(routes::tab_runtime_cache::delete_tab_runtime_cache),
         )
+        .route("/tab-runtime-cache/metadata", get(routes::tab_runtime_cache::list_tab_runtime_cache_metadata))
+        .route("/tab-runtime-cache/prune", post(routes::tab_runtime_cache::prune_tab_runtime_cache))
+        .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-multi", post(routes::query::execute_multi))
@@ -330,7 +318,7 @@ async fn main() {
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
         .route("/query/build-rename-object-sql", post(routes::query::build_rename_object_sql))
         .route("/query/build-create-database-sql", post(routes::query::build_create_database_sql))
-        .route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql))
+        .route("/query/build-sqlite-attach-database-sql", post(routes::query::build_sqlite_attach_database_sql))
         .route("/query/build-drop-object-sql", post(routes::query::build_drop_object_sql))
         .route("/query/build-drop-table-sql", post(routes::query::build_drop_table_sql))
         .route("/query/build-drop-table-child-object-sql", post(routes::query::build_drop_table_child_object_sql))
@@ -462,6 +450,7 @@ async fn main() {
         .route("/mongo/create-database", post(routes::mongo::create_database))
         .route("/mongo/drop-database", post(routes::mongo::drop_database))
         .route("/mongo/drop-collection", post(routes::mongo::drop_collection))
+        .route("/mongo/rename-collection", post(routes::mongo::rename_collection))
         .route("/document-store/list-databases", post(routes::document_store::list_databases))
         .route("/document-store/list-collections", post(routes::document_store::list_collections))
         .route("/document-store/find-documents", post(routes::document_store::find_documents))
@@ -476,11 +465,13 @@ async fn main() {
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
+        .route("/mongo/parse-shell-command", post(routes::mongo::parse_shell_command))
         .route("/mongo/find-one", post(routes::mongo::find_one))
         .route("/mongo/count-documents", post(routes::mongo::count_documents))
         .route("/mongo/server-version", post(routes::mongo::server_version))
         .route("/mongo/collection-stats", post(routes::mongo::collection_stats))
         .route("/mongo/aggregate-documents", post(routes::mongo::aggregate_documents))
+        .route("/mongo/distinct", post(routes::mongo::distinct))
         .route("/mongo/create-index", post(routes::mongo::create_index))
         .route("/mongo/drop-indexes", post(routes::mongo::drop_indexes))
         .route("/mongo/insert-document", post(routes::mongo::insert_document))
@@ -511,6 +502,10 @@ async fn main() {
         .route("/ai/config", post(routes::ai::save_ai_config).get(routes::ai::load_ai_config))
         .route("/ai/provider-config", post(routes::ai::save_ai_provider_config))
         .route("/ai/provider-configs", get(routes::ai::load_ai_provider_configs))
+        .route("/ai/configs", post(routes::ai::save_ai_configs).get(routes::ai::load_ai_configs))
+        .route("/ai/default-config", post(routes::ai::set_default_ai_config))
+        .route("/ai/config-item", post(routes::ai::save_ai_config_item))
+        .route("/ai/config/{config_id}", delete(routes::ai::delete_ai_config))
         .route("/ai/conversation", post(routes::ai::save_ai_conversation))
         .route("/ai/conversations", get(routes::ai::load_ai_conversations))
         .route("/ai/conversation/{id}", delete(routes::ai::delete_ai_conversation))
@@ -568,6 +563,10 @@ async fn main() {
             "/app-settings/pinned-tree-node-ids",
             get(routes::app_settings::load_pinned_tree_node_ids).post(routes::app_settings::save_pinned_tree_node_ids),
         )
+        .route(
+            "/app-settings/mcp-policy",
+            get(routes::app_settings::load_mcp_global_policy).put(routes::app_settings::save_mcp_global_policy),
+        )
         .route("/app-settings/config/decrypt", post(routes::app_settings::decrypt_config))
         // Cloud sync
         .route("/cloud-sync/webdav/test", post(routes::cloud_sync::webdav_sync_test))
@@ -592,6 +591,11 @@ async fn main() {
         .route("/cloud-sync/snippet/upload", post(routes::cloud_sync::snippet_sync_upload))
         .route("/cloud-sync/snippet/download", post(routes::cloud_sync::snippet_sync_download));
 
+    // Do not expose DuckDB-only handlers from builds that intentionally omit bundled DuckDB.
+    #[cfg(feature = "duckdb-bundled")]
+    let api =
+        api.route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql));
+
     let api = add_mq_routes(api)
         .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))
         .with_state(web_state.clone());
@@ -600,6 +604,7 @@ async fn main() {
     let mut app = Router::new()
         .nest("/api", api)
         .layer(DefaultBodyLimit::max(web_body_limit_bytes()))
+        .layer(CompressionLayer::new().compress_when(web_compression_predicate()))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     // Static file serving
@@ -629,5 +634,71 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind address");
-    axum::serve(listener, app).await.expect("Server error");
+    let shutdown_state = web_state.app.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::warn!("Failed to listen for shutdown signal: {error}");
+            }
+        })
+        .await
+        .expect("Server error");
+    shutdown_state.shutdown_background_tasks(std::time::Duration::from_secs(3)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_public_base_path, web_agent_dir_from_env, web_compression_predicate, XLSX_CONTENT_TYPE};
+    use axum::body::Body;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::Response;
+    use tower_http::compression::predicate::Predicate;
+
+    fn compression_response(content_type: &str) -> Response<Body> {
+        Response::builder().header(CONTENT_TYPE, content_type).body(Body::from(vec![b'x'; 64])).unwrap()
+    }
+
+    #[test]
+    fn web_compression_skips_streams_and_precompressed_exports() {
+        let predicate = web_compression_predicate();
+
+        assert!(predicate.should_compress(&compression_response("application/json")));
+        assert!(!predicate.should_compress(&compression_response("text/event-stream")));
+        assert!(!predicate.should_compress(&compression_response(XLSX_CONTENT_TYPE)));
+    }
+
+    #[test]
+    fn normalize_public_base_path_defaults_to_root() {
+        assert_eq!(normalize_public_base_path(None), "/");
+        assert_eq!(normalize_public_base_path(Some("".to_string())), "/");
+        assert_eq!(normalize_public_base_path(Some("/".to_string())), "/");
+    }
+
+    #[test]
+    fn normalize_public_base_path_trims_and_preserves_segments() {
+        assert_eq!(normalize_public_base_path(Some("dbx".to_string())), "/dbx");
+        assert_eq!(normalize_public_base_path(Some("/dbx/".to_string())), "/dbx");
+        assert_eq!(normalize_public_base_path(Some("/tools/dbx/?v=1".to_string())), "/tools/dbx");
+    }
+
+    #[test]
+    #[should_panic(expected = "DBX_PUBLIC_BASE_PATH contains invalid characters")]
+    fn normalize_public_base_path_rejects_invalid_characters() {
+        normalize_public_base_path(Some("/dbx admin".to_string()));
+    }
+
+    #[test]
+    fn web_agent_dir_defaults_under_data_dir() {
+        let data_dir = std::path::PathBuf::from("/app/data");
+        assert_eq!(web_agent_dir_from_env(&data_dir, None), data_dir.join("agents"));
+    }
+
+    #[test]
+    fn web_agent_dir_uses_explicit_env_override() {
+        let data_dir = std::path::PathBuf::from("/app/data");
+        assert_eq!(
+            web_agent_dir_from_env(&data_dir, Some("/custom/agents".to_string())),
+            std::path::PathBuf::from("/custom/agents")
+        );
+    }
 }

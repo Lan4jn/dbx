@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
-import type { PeekedMessage, TopicInfo, TopicRef, SendMessageRequest, SendMessageResponse } from "@/types/mq";
+import { useI18n } from "vue-i18n";
+import type { MqSystemKind, PeekedMessage, TopicInfo, TopicRef, SendMessageRequest, SendMessageResponse } from "@/types/mq";
 import { mqSendMessage, mqListTopics, mqPeekMessages } from "@/lib/backend/api";
 import { formatError } from "@/lib/backend/errorUtils";
+import { parseNonNegativeSafeInteger } from "@/lib/mq/mqPeekFilters";
+import RocketMqTopicSelect from "./shared/RocketMqTopicSelect.vue";
 
 interface Props {
   connectionId: string;
@@ -10,14 +13,19 @@ interface Props {
   namespace?: string;
   topic?: TopicInfo;
   readOnly?: boolean;
-  isKafkaCluster?: boolean;
+  mqSystemKind?: MqSystemKind;
+  isFlatMqCluster?: boolean;
   supportsPeekMessages?: boolean;
+  /** Hide outer toolbar when embedded in a dialog. */
+  embedded?: boolean;
 }
 
 const props = defineProps<Props>();
+const { t } = useI18n();
 
 const topicName = ref("");
 const messageKey = ref("");
+const messageTag = ref("");
 const messageValue = ref("");
 const headersText = ref("");
 const loading = ref(false);
@@ -25,17 +33,20 @@ const error = ref<string>();
 const success = ref<SendMessageResponse>();
 const availableTopics = ref<TopicInfo[]>([]);
 const topicsLoading = ref(false);
+const rocketMqTopicSelectRef = ref<InstanceType<typeof RocketMqTopicSelect>>();
 const headersExpanded = ref(false);
+const peekAdvancedExpanded = ref(false);
 const peekLoading = ref(false);
 const peekError = ref<string>();
 const peekMessages = ref<PeekedMessage[]>([]);
-const peekPartition = ref(0);
-const peekOffset = ref(0);
+const peekPartition = ref("");
+const peekOffset = ref("");
 const peekCount = ref(20);
 
 let successTimer: ReturnType<typeof setTimeout> | undefined;
 
-const readOnlyMessage = "当前连接为只读模式，不能发送消息";
+const readOnlyMessage = computed(() => t("mqMessages.readOnlyCannotSend"));
+const isRocketMqCluster = computed(() => props.mqSystemKind === "rocketmq");
 
 const topicOptions = computed(() => {
   return availableTopics.value.map((t) => ({
@@ -58,7 +69,12 @@ const selectedTopicRef = computed<TopicRef | null>(() => {
   };
 });
 
-const canBrowseMessages = computed(() => props.isKafkaCluster === true && props.supportsPeekMessages !== false);
+const canBrowseMessages = computed(() => props.isFlatMqCluster === true && props.supportsPeekMessages !== false && !isRocketMqCluster.value);
+
+function flatMqPeekGroupName(): string {
+  if (props.mqSystemKind === "rocketmq") return "__dbx_rocketmq_viewer__";
+  return "__dbx_kafka_viewer__";
+}
 const topicListId = computed(() => `mq-topic-options-${props.connectionId}`);
 
 function clearSuccessLater() {
@@ -74,13 +90,17 @@ onUnmounted(() => {
 
 function guardWritable() {
   if (props.readOnly) {
-    error.value = readOnlyMessage;
+    error.value = readOnlyMessage.value;
     return false;
   }
   return true;
 }
 
 async function loadTopics() {
+  if (isRocketMqCluster.value) {
+    await rocketMqTopicSelectRef.value?.loadTopics();
+    return;
+  }
   if (!props.tenant || !props.namespace) return;
   topicsLoading.value = true;
   try {
@@ -99,6 +119,13 @@ async function loadTopics() {
     console.warn("Failed to load topics:", e);
   } finally {
     topicsLoading.value = false;
+  }
+}
+
+function handleRocketMqTopicsLoaded(topics: TopicInfo[]) {
+  availableTopics.value = topics;
+  if (props.topic && !topicName.value) {
+    topicName.value = props.topic.shortName;
   }
 }
 
@@ -123,17 +150,20 @@ async function sendMessage() {
 
   const topic = topicName.value.trim();
   if (!topic) {
-    error.value = "请选择目标主题";
+    error.value = t("mqMessages.selectTargetTopic");
     return;
   }
   if (!messageValue.value) {
-    error.value = "消息内容不能为空";
+    error.value = t("mqMessages.messageContentRequired");
     return;
   }
 
   loading.value = true;
   try {
     const headers = parseHeaders();
+    if (isRocketMqCluster.value && messageTag.value.trim()) {
+      headers.TAGS = messageTag.value.trim();
+    }
     const payloadBase64 = btoa(unescape(encodeURIComponent(messageValue.value)));
     const req: SendMessageRequest = {
       topic,
@@ -144,8 +174,8 @@ async function sendMessage() {
     };
     success.value = await mqSendMessage(props.connectionId, req);
     if (canBrowseMessages.value) {
-      peekPartition.value = success.value.partition;
-      peekOffset.value = success.value.offset;
+      peekPartition.value = String(success.value.partition);
+      peekOffset.value = String(success.value.offset);
       void loadMessages();
     }
     messageValue.value = "";
@@ -161,19 +191,34 @@ async function sendMessage() {
 async function loadMessages() {
   const topic = selectedTopicRef.value;
   if (!topic) {
-    peekError.value = "Select a topic before loading messages";
+    peekError.value = t("mqMessages.selectTopicBeforeLoad");
     return;
   }
   peekLoading.value = true;
   peekError.value = undefined;
   try {
     const count = Math.max(1, Math.min(100, Number(peekCount.value) || 20));
-    const partition = Math.max(0, Number(peekPartition.value) || 0);
-    const offset = Math.max(0, Number(peekOffset.value) || 0);
     peekCount.value = count;
-    peekPartition.value = partition;
-    peekOffset.value = offset;
-    peekMessages.value = await mqPeekMessages(props.connectionId, topic, "__dbx_kafka_viewer__", count, { partition, offset });
+    const options: { partition?: number; offset?: number } = {};
+    const partitionText = peekPartition.value.trim();
+    const offsetText = peekOffset.value.trim();
+    if (partitionText !== "") {
+      const partition = parseNonNegativeSafeInteger(partitionText);
+      if (partition == null) {
+        throw new Error(t("mqMessages.partitionMustBeNonNegativeInt"));
+      }
+      options.partition = partition;
+      peekPartition.value = String(partition);
+    }
+    if (offsetText !== "") {
+      const offset = parseNonNegativeSafeInteger(offsetText);
+      if (offset == null) {
+        throw new Error(t("mqMessages.offsetMustBeNonNegativeInt"));
+      }
+      options.offset = offset;
+      peekOffset.value = String(offset);
+    }
+    peekMessages.value = await mqPeekMessages(props.connectionId, topic, flatMqPeekGroupName(), count, options);
   } catch (e: unknown) {
     peekError.value = formatError(e);
   } finally {
@@ -234,105 +279,125 @@ watch(
 </script>
 
 <template>
-  <div class="send-message-panel">
-    <div class="panel-toolbar">
-      <h3>发送消息</h3>
-      <button @click="clearForm" :disabled="loading" class="btn-sm">清空</button>
+  <div class="send-message-panel" :class="{ embedded: embedded }">
+    <div v-if="!embedded" class="panel-toolbar">
+      <h3>{{ t("mqMessages.title") }}</h3>
+      <button @click="clearForm" :disabled="loading" class="btn-sm">{{ t("mqMessages.clear") }}</button>
     </div>
 
-    <div v-if="!tenant || !namespace" class="panel-placeholder">请先选择命名空间或主题</div>
+    <div v-if="!tenant || !namespace" class="panel-placeholder">
+      {{ isRocketMqCluster ? t("mqRocketmq.connectionNotReady") : t("mqMessages.selectNamespaceOrTopicFirst") }}
+    </div>
 
     <div v-else class="send-form">
       <div v-if="readOnly" class="readonly-hint">{{ readOnlyMessage }}</div>
       <div v-if="error" class="panel-error">{{ error }}</div>
       <div v-if="success" class="panel-success">
         <span class="success-icon">✓</span>
-        <span>消息发送成功 — 分区: {{ success.partition }}，偏移: {{ success.offset }}</span>
+        <span>{{ t("mqMessages.sendSuccess", { partition: success.partition, offset: success.offset }) }}</span>
       </div>
 
-      <!-- 主题选择 -->
       <div class="form-group">
-        <label>目标主题 <span class="required">*</span></label>
-        <div class="topic-select-row">
-          <input v-model="topicName" :list="topicListId" :disabled="readOnly || topicsLoading" class="topic-input" :placeholder="topicsLoading ? '加载中...' : '输入或搜索主题...'" autocomplete="off" />
-          <datalist :id="topicListId">
-            <option v-for="t in topicOptions" :key="t.value" :value="t.value" :label="t.partitions != null ? `${t.label} (${t.partitions} 分区)` : t.label" />
-          </datalist>
-          <button @click="loadTopics" :disabled="topicsLoading" class="btn-icon" title="刷新主题列表">
-            <span v-if="topicsLoading" class="spin">⟳</span>
-            <span v-else>⟳</span>
-          </button>
-        </div>
-        <div v-if="!availableTopics.length && !topicsLoading" class="form-hint">暂无可用主题</div>
-        <div v-else class="form-hint">可输入关键词搜索，也可以直接粘贴 topic 名称。</div>
+        <label>{{ t("mqMessages.targetTopic") }} <span class="required">*</span></label>
+        <RocketMqTopicSelect v-if="isRocketMqCluster" ref="rocketMqTopicSelectRef" v-model="topicName" :connection-id="connectionId" :tenant="tenant" :namespace="namespace" grouping="business" :show-type-filter="false" :disabled="readOnly" @loaded="handleRocketMqTopicsLoaded" />
+        <template v-else>
+          <div class="topic-select-row">
+            <input v-model="topicName" :list="topicListId" :disabled="readOnly || topicsLoading" class="topic-input" :placeholder="topicsLoading ? t('mqMessages.topicLoading') : t('mqMessages.topicSearchPlaceholder')" autocomplete="off" />
+            <datalist :id="topicListId">
+              <option v-for="t in topicOptions" :key="t.value" :value="t.value" :label="t.partitions != null ? $t('mqMessages.topicOptionWithPartitions', { label: t.label, partitions: t.partitions }) : t.label" />
+            </datalist>
+            <button @click="loadTopics" :disabled="topicsLoading" class="btn-icon" :title="t('mqMessages.refreshTopicList')">
+              <span v-if="topicsLoading" class="spin">⟳</span>
+              <span v-else>⟳</span>
+            </button>
+          </div>
+          <div v-if="!availableTopics.length && !topicsLoading" class="form-hint">{{ t("mqMessages.noTopicsAvailable") }}</div>
+          <div v-else class="form-hint">{{ t("mqMessages.topicSearchHint") }}</div>
+        </template>
       </div>
 
       <!-- 消息键 -->
       <div class="form-group">
-        <label>消息键 (Key)</label>
-        <input v-model="messageKey" type="text" placeholder="可选" :disabled="readOnly" />
+        <label>{{ t("mqMessages.messageKey") }}</label>
+        <input v-model="messageKey" type="text" :placeholder="t('mqMessages.optional')" :disabled="readOnly" />
+      </div>
+
+      <div v-if="isRocketMqCluster" class="form-group">
+        <label>{{ t("mqMessages.messageTag") }}</label>
+        <input v-model="messageTag" type="text" :placeholder="t('mqMessages.optional')" :disabled="readOnly" />
       </div>
 
       <!-- 消息内容 -->
       <div class="form-group">
         <div class="label-row">
-          <label>消息内容 <span class="required">*</span></label>
-          <button @click="formatJson" :disabled="readOnly || !messageValue" class="btn-sm">格式化 JSON</button>
+          <label>{{ t("mqMessages.messageContent") }} <span class="required">*</span></label>
+          <button @click="formatJson" :disabled="readOnly || !messageValue" class="btn-sm">{{ t("mqMessages.formatJson") }}</button>
         </div>
-        <textarea v-model="messageValue" :disabled="readOnly" placeholder='{"key": "value"}' rows="8" class="code-textarea" />
+        <textarea v-model="messageValue" :disabled="readOnly" :placeholder="t('mqMessages.jsonBodyPlaceholder')" rows="8" class="code-textarea" />
       </div>
 
       <!-- 消息头（可折叠） -->
       <div class="form-group">
         <button type="button" class="collapse-toggle" @click="headersExpanded = !headersExpanded">
           <span class="collapse-arrow" :class="{ expanded: headersExpanded }">▶</span>
-          <span>消息头 (Headers)</span>
+          <span>{{ t("mqMessages.messageHeaders") }}</span>
           <span v-if="headersText.trim() && !headersExpanded" class="collapse-badge">·</span>
         </button>
         <div v-if="headersExpanded" class="collapse-body">
-          <textarea v-model="headersText" :disabled="readOnly" placeholder="key: value（每行一个）" rows="3" class="headers-textarea" />
+          <textarea v-model="headersText" :disabled="readOnly" :placeholder="t('mqMessages.headersPlaceholder')" rows="3" class="headers-textarea" />
         </div>
       </div>
 
       <!-- 发送按钮 -->
       <div class="form-actions">
         <button @click="sendMessage" :disabled="loading || readOnly || !topicName || !messageValue" class="btn-primary">
-          {{ loading ? "发送中..." : "发送消息" }}
+          {{ loading ? t("mqMessages.sending") : t("mqMessages.sendMessage") }}
         </button>
       </div>
 
       <section v-if="canBrowseMessages" class="message-browser">
         <div class="message-browser-header">
-          <h4>消息列表</h4>
+          <h4>{{ t("mqMessages.messageList") }}</h4>
           <button type="button" class="btn-sm" :disabled="peekLoading || !selectedTopicRef" @click="loadMessages">
-            {{ peekLoading ? "加载中..." : "加载消息" }}
+            {{ peekLoading ? t("mqMessages.loading") : t("mqMessages.loadMessages") }}
           </button>
         </div>
 
+        <p class="peek-default-hint">{{ t("mqMessages.peekDefaultHint", { count: peekCount }) }}</p>
+
         <div class="peek-controls">
           <label>
-            <span>分区</span>
-            <input v-model.number="peekPartition" type="number" min="0" :disabled="peekLoading" />
-          </label>
-          <label>
-            <span>Offset</span>
-            <input v-model.number="peekOffset" type="number" min="0" :disabled="peekLoading" />
-          </label>
-          <label>
-            <span>数量</span>
+            <span>{{ t("mqMessages.count") }}</span>
             <input v-model.number="peekCount" type="number" min="1" max="100" :disabled="peekLoading" />
           </label>
         </div>
 
+        <button type="button" class="collapse-toggle peek-advanced-toggle" @click="peekAdvancedExpanded = !peekAdvancedExpanded">
+          <span class="collapse-arrow" :class="{ expanded: peekAdvancedExpanded }">▶</span>
+          <span>{{ t("mqMessages.advancedFilter") }}</span>
+          <span v-if="(peekPartition || peekOffset) && !peekAdvancedExpanded" class="collapse-badge">·</span>
+        </button>
+        <div v-if="peekAdvancedExpanded" class="peek-controls collapse-body">
+          <label>
+            <span>{{ t("mqMessages.partition") }}</span>
+            <input v-model="peekPartition" type="number" min="0" :placeholder="t('mqMessages.partitionPlaceholderAll')" :disabled="peekLoading" />
+          </label>
+          <label>
+            <span>{{ t("mqMessages.offset") }}</span>
+            <input v-model="peekOffset" type="number" min="0" :placeholder="t('mqMessages.offsetPlaceholderEarliest')" :disabled="peekLoading" />
+          </label>
+        </div>
+
         <div v-if="peekError" class="panel-error">{{ peekError }}</div>
-        <div v-else-if="peekLoading" class="message-empty">消息加载中...</div>
-        <div v-else-if="!peekMessages.length" class="message-empty">暂无消息</div>
+        <div v-else-if="peekLoading" class="message-empty">{{ t("mqMessages.messagesLoading") }}</div>
+        <div v-else-if="!peekMessages.length" class="message-empty">{{ t("mqMessages.noMessages") }}</div>
         <div v-else class="message-list">
-          <article v-for="message in peekMessages" :key="message.messageId || message.position" class="message-row">
+          <article v-for="message in peekMessages" :key="`${message.properties?.partition ?? 'p'}-${message.messageId || message.position}`" class="message-row">
             <div class="message-meta">
               <span>#{{ message.position }}</span>
-              <span>offset {{ message.messageId || "-" }}</span>
-              <span v-if="message.key">key {{ message.key }}</span>
+              <span v-if="message.properties?.partition != null">{{ t("mqMessages.metaPartition", { partition: message.properties.partition }) }}</span>
+              <span>{{ t("mqMessages.metaOffset", { offset: message.messageId || "-" }) }}</span>
+              <span v-if="message.key">{{ t("mqMessages.metaKey", { key: message.key }) }}</span>
               <span>{{ formatMessageTimestamp(message.publishTime) }}</span>
             </div>
             <pre class="message-payload">{{ messagePayload(message) }}</pre>
@@ -351,6 +416,10 @@ watch(
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.send-message-panel.embedded {
+  height: auto;
 }
 
 .panel-toolbar {
@@ -632,6 +701,19 @@ input[type="number"]:focus {
   opacity: 0.9;
 }
 
+.query-mode-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.query-mode-tabs .btn-sm.active {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-primary-alpha);
+}
+
 .message-browser {
   margin-top: 4px;
   padding: 14px;
@@ -655,9 +737,23 @@ input[type="number"]:focus {
   font-weight: 600;
 }
 
+.peek-default-hint {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.peek-advanced-toggle {
+  margin-bottom: 10px;
+}
+
 .peek-controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }

@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { applyMongoGridChangesToDocument, buildMongoCopyDocumentFromOriginal, buildMongoCopyInsertDocument, buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, mongoDocumentIdForGrid, parseMongoDocumentInputValue, serializeMongoDocumentId } from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
+import {
+  applyMongoGridChangesToDocument,
+  buildMongoCopyDocumentFromOriginal,
+  buildMongoCopyInsertDocument,
+  buildMongoInsertDocument,
+  buildMongoUpdateDocument,
+  formatMongoShellLiteral,
+  mongoDocumentDisplayValue,
+  mongoDocumentIdForGrid,
+  parseMongoDocumentInputValue,
+  serializeMongoDocumentId,
+} from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
 
 test("parses Mongo shell ISODate literals as extended JSON dates", () => {
   assert.deepEqual(parseMongoDocumentInputValue('ISODate("2026-06-10T13:59:31.287Z")'), {
@@ -11,11 +22,25 @@ test("parses Mongo shell ISODate literals as extended JSON dates", () => {
   });
 });
 
-test("parses legacy Mongo date display values as UTC dates", () => {
-  assert.deepEqual(parseMongoDocumentInputValue("2025-08-14 02:25:43.718"), {
-    $date: "2025-08-14T02:25:43.718Z",
-  });
+test("preserves date-shaped Mongo strings instead of guessing Date", () => {
+  assert.equal(parseMongoDocumentInputValue("2025-08-14 02:25:43.718"), "2025-08-14 02:25:43.718");
+  assert.equal(parseMongoDocumentInputValue("2025-04-01 19:46:03"), "2025-04-01 19:46:03");
   assert.equal(parseMongoDocumentInputValue('"2025-08-14 02:25:43.718"'), "2025-08-14 02:25:43.718");
+});
+
+test("preserves existing date-shaped Mongo string fields on grid update", () => {
+  const original = {
+    _id: "1",
+    create_time: "2025-04-01 19:46:03",
+    last_updated_time: "2025-04-01 19:54:12",
+  };
+  const changes = new Map<number, string | number | boolean | null>([[1, "2025-04-01 19:41:03"]]);
+
+  assert.deepEqual(buildMongoUpdateDocument(changes, ["_id", "create_time", "last_updated_time"], original), {
+    $set: {
+      create_time: "2025-04-01 19:41:03",
+    },
+  });
 });
 
 test("preserves unsafe Mongo int64 input values without JavaScript rounding", () => {
@@ -187,26 +212,20 @@ test("projects original Mongo values without guessing types", () => {
     hidden: "not selected",
   };
 
-  assert.deepEqual(
-    buildMongoCopyDocumentFromOriginal(original, ["ignored", "ignored", "ignored", "ignored", "ignored"], ["numericText", "booleanText", "jsonText", "dateText", "profile"], [false, false, false, false, false]),
-    {
-      numericText: "123",
-      booleanText: "true",
-      jsonText: '{"kind":"literal"}',
-      dateText: "2024-01-01 00:00:00",
-      profile: { role: "admin" },
-    },
-  );
+  assert.deepEqual(buildMongoCopyDocumentFromOriginal(original, ["ignored", "ignored", "ignored", "ignored", "ignored"], ["numericText", "booleanText", "jsonText", "dateText", "profile"], [false, false, false, false, false]), {
+    numericText: "123",
+    booleanText: "true",
+    jsonText: '{"kind":"literal"}',
+    dateText: "2024-01-01 00:00:00",
+    profile: { role: "admin" },
+  });
 });
 
 test("applies only explicit Mongo grid edits to copied original documents", () => {
-  assert.deepEqual(
-    buildMongoCopyDocumentFromOriginal({ _id: "1", count: "123", profile: { role: "admin" } }, ["1", "456", '{"role":"maintainer"}'], ["_id", "count", "profile"], [false, true, false], { excludePrimaryKeys: true }),
-    {
-      count: 456,
-      profile: { role: "admin" },
-    },
-  );
+  assert.deepEqual(buildMongoCopyDocumentFromOriginal({ _id: "1", count: "123", profile: { role: "admin" } }, ["1", "456", '{"role":"maintainer"}'], ["_id", "count", "profile"], [false, true, false], { excludePrimaryKeys: true }), {
+    count: 456,
+    profile: { role: "admin" },
+  });
 });
 
 test("formats extended JSON dates as Mongo shell ISODate literals", () => {
@@ -222,16 +241,42 @@ test("formats extended JSON dates as Mongo shell ISODate literals", () => {
 
 test("formats extended JSON object ids as Mongo shell ObjectId literals", () => {
   assert.equal(formatMongoShellLiteral({ $oid: "6743e4bfa3f6f84bc3fff6c8" }), 'ObjectId("6743e4bfa3f6f84bc3fff6c8")');
+  assert.equal(formatMongoShellLiteral("6743e4bfa3f6f84bc3fff6c8"), '"6743e4bfa3f6f84bc3fff6c8"');
 });
 
 test("serializes typed Mongo document ids while keeping their grid display compact", () => {
-  const id = { $numberLong: "2048938405781032962" };
-  assert.equal(serializeMongoDocumentId(id), '{"$numberLong":"2048938405781032962"}');
-  assert.equal(mongoDocumentIdForGrid(id), "2048938405781032962");
+  const longId = { $numberLong: "2048938405781032962" };
+  const objectId = { $oid: "6743e4bfa3f6f84bc3fff6c8" };
+  assert.equal(serializeMongoDocumentId(longId), '{"$numberLong":"2048938405781032962"}');
+  assert.equal(mongoDocumentIdForGrid(longId), "2048938405781032962");
+  assert.equal(serializeMongoDocumentId(objectId), '{"$oid":"6743e4bfa3f6f84bc3fff6c8"}');
+  assert.equal(mongoDocumentIdForGrid(objectId), "6743e4bfa3f6f84bc3fff6c8");
+  assert.equal(serializeMongoDocumentId(42), "42");
+  assert.equal(serializeMongoDocumentId(42.5), "42.5");
   assert.equal(serializeMongoDocumentId("2048938405781032962"), '__dbx_mongo_string_id__"2048938405781032962"');
   assert.equal(serializeMongoDocumentId('{"$numberLong":"2048938405781032962"}'), '__dbx_mongo_string_id__"{\\"$numberLong\\":\\"2048938405781032962\\"}"');
 });
 
 test("formats extended JSON int64 values as Mongo shell NumberLong literals", () => {
   assert.equal(formatMongoShellLiteral({ snowflake: { $numberLong: "9007199254740993" } }), '{"snowflake":NumberLong("9007199254740993")}');
+});
+
+test("keeps normal Mongo values readable and unsafe Int64 editable", () => {
+  assert.equal(mongoDocumentDisplayValue(42), 42);
+  assert.equal(mongoDocumentDisplayValue(3.5), 3.5);
+  assert.equal(mongoDocumentDisplayValue('ISODate("2026-07-14T00:00:00Z")'), 'ISODate("2026-07-14T00:00:00Z")');
+  assert.equal(mongoDocumentDisplayValue({ $numberLong: "9007199254740993" }), 'NumberLong("9007199254740993")');
+  assert.deepEqual(parseMongoDocumentInputValue('NumberLong("9007199254740993")'), { $numberLong: "9007199254740993" });
+});
+
+test("builds edits for Int32, Double, Date, and unsafe Int64", () => {
+  const changes = new Map<number, string | number | boolean | null>([
+    [1, 42],
+    [2, 3.5],
+    [3, 'ISODate("2026-07-14T00:00:00Z")'],
+    [4, 'NumberLong("9007199254740993")'],
+  ]);
+  assert.deepEqual(buildMongoUpdateDocument(changes, ["_id", "int32", "double", "createdAt", "unsafe"]), {
+    $set: { int32: 42, double: 3.5, createdAt: { $date: "2026-07-14T00:00:00Z" }, unsafe: { $numberLong: "9007199254740993" } },
+  });
 });

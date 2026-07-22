@@ -142,6 +142,33 @@ pub fn duckdb_list_schemas_with_attached(
     Ok(schemas)
 }
 
+#[cfg(feature = "duckdb-bundled")]
+pub fn duckdb_object_source_with_attached(
+    con: &duckdb::Connection,
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &db::ObjectSourceKind,
+    attached_names: &[String],
+) -> Result<String, String> {
+    if !matches!(object_type, db::ObjectSourceKind::View) {
+        return Err("DuckDB object source only supports views".to_string());
+    }
+
+    let database = duckdb_catalog_name(con, database, attached_names)?;
+    let mut stmt = con
+        .prepare("SELECT sql FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ?")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query_map(duckdb::params![database.as_str(), schema, name], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+
+    match rows.next() {
+        Some(row) => row.map_err(|e| e.to_string()),
+        None => Err(format!("DuckDB view source not found: {database}.{schema}.{name}")),
+    }
+}
+
 /// Identifies quack catalogs by the storage-extension `type` that
 /// `duckdb_databases()` reports, rather than by the attach aliases parsed from
 /// the init script: `ATTACH 'quack:host:port'` without an `AS` alias gets a
@@ -1588,7 +1615,7 @@ fn oracle_object_info_can_have_table_comment(object: &db::ObjectInfo) -> bool {
 }
 
 fn oracle_type_is_table_or_view(value: &str) -> bool {
-    let normalized = value.to_ascii_uppercase().replace(' ', "_").replace('-', "_");
+    let normalized = value.to_ascii_uppercase().replace([' ', '-'], "_");
     matches!(normalized.as_str(), "TABLE" | "BASE_TABLE" | "VIEW")
 }
 
@@ -1892,7 +1919,7 @@ async fn list_tables_once(
         try_sqlserver!(connections, &pool_key, list_tables, schema, filter, limit, offset);
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
-            let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
+            let use_agent_table_paging = db_config.as_ref().is_some_and(supports_agent_table_paging);
             let filter_locally_after_oracle_comments =
                 is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
@@ -1902,14 +1929,14 @@ async fn list_tables_once(
             let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
             let agent_limit = if filter_locally_after_oracle_comments {
                 None
-            } else if use_oracle_agent_paging {
+            } else if use_agent_table_paging {
                 limit
             } else {
                 None
             };
             let agent_offset = if filter_locally_after_oracle_comments {
                 None
-            } else if use_oracle_agent_paging {
+            } else if use_agent_table_paging {
                 offset
             } else {
                 None
@@ -1939,7 +1966,7 @@ async fn list_tables_once(
                     }
                     let final_offset = if filter_locally_after_oracle_comments {
                         offset
-                    } else if oracle_agent_paging_likely_applied(use_oracle_agent_paging, limit, tables.len()) {
+                    } else if agent_paging_likely_applied(use_agent_table_paging, limit, tables.len()) {
                         Some(0)
                     } else {
                         offset
@@ -2000,6 +2027,11 @@ async fn list_tables_once(
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
     match pool {
+        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_starrocks_config) => {
+            db::mysql::list_starrocks_tables(p, database)
+                .await
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types))
+        }
         PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
             db::mysql::list_tables_show(p, database)
                 .await
@@ -2222,6 +2254,7 @@ async fn external_driver_presto_like_objects(
             name: table.name,
             object_type: table.table_type,
             schema: Some(schema.to_string()),
+            valid: None,
             signature: None,
             comment: table.comment,
             created_at: None,
@@ -2432,7 +2465,7 @@ mod tests {
     #[cfg(feature = "duckdb-bundled")]
     use super::{
         duckdb_attach_database, duckdb_completion_assistant_search, duckdb_list_databases,
-        duckdb_query_tables_in_database,
+        duckdb_object_source_with_attached, duckdb_query_tables_in_database,
     };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
     use std::collections::HashMap;
@@ -2504,6 +2537,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            database_info: None,
         }
     }
 
@@ -2572,12 +2606,23 @@ mod tests {
     }
 
     #[test]
-    fn oracle_agent_paging_detection_avoids_double_offset_only_when_page_sized() {
-        assert!(super::oracle_agent_paging_likely_applied(true, Some(500), 500));
-        assert!(super::oracle_agent_paging_likely_applied(true, Some(500), 120));
-        assert!(!super::oracle_agent_paging_likely_applied(true, Some(500), 501));
-        assert!(!super::oracle_agent_paging_likely_applied(false, Some(500), 120));
-        assert!(!super::oracle_agent_paging_likely_applied(true, None, 120));
+    fn agent_table_paging_supports_tdengine_and_default_oracle_only() {
+        assert!(super::supports_agent_table_paging(&test_connection_config(DatabaseType::Tdengine)));
+        assert!(super::supports_agent_table_paging(&test_connection_config(DatabaseType::Oracle)));
+        assert!(!super::supports_agent_table_paging(&test_connection_config(DatabaseType::Dameng)));
+
+        let mut legacy_oracle = test_connection_config(DatabaseType::Oracle);
+        legacy_oracle.driver_profile = Some("oracle-legacy".to_string());
+        assert!(!super::supports_agent_table_paging(&legacy_oracle));
+    }
+
+    #[test]
+    fn agent_paging_detection_avoids_double_offset_only_when_page_sized() {
+        assert!(super::agent_paging_likely_applied(true, Some(500), 500));
+        assert!(super::agent_paging_likely_applied(true, Some(500), 120));
+        assert!(!super::agent_paging_likely_applied(true, Some(500), 501));
+        assert!(!super::agent_paging_likely_applied(false, Some(500), 120));
+        assert!(!super::agent_paging_likely_applied(true, None, 120));
     }
 
     #[test]
@@ -2603,6 +2648,7 @@ mod tests {
             name: name.to_string(),
             object_type: object_type.to_string(),
             schema: Some("app".to_string()),
+            valid: None,
             signature: None,
             comment: None,
             created_at: None,
@@ -2745,6 +2791,39 @@ mod tests {
     }
 
     #[test]
+    fn filter_table_infos_pages_starrocks_materialized_views_independently() {
+        let tables = vec![
+            test_table_info("orders"),
+            super::db::TableInfo {
+                name: "orders_view".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            super::db::TableInfo {
+                name: "daily_orders_mv".to_string(),
+                table_type: "MATERIALIZED_VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            super::db::TableInfo {
+                name: "monthly_orders_mv".to_string(),
+                table_type: "MATERIALIZED_VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+        let object_types = vec!["MATERIALIZED_VIEW".to_string()];
+
+        let filtered = filter_table_infos(tables, Some("orders"), Some(1), Some(1), Some(&object_types));
+
+        assert_eq!(filtered.into_iter().map(|table| table.name).collect::<Vec<_>>(), vec!["monthly_orders_mv"]);
+    }
+
+    #[test]
     fn filter_object_infos_filters_object_type_before_offset_and_limit() {
         let objects = vec![
             test_object_info("sync_user", "PROCEDURE"),
@@ -2758,6 +2837,21 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "fetch_name");
+    }
+
+    #[test]
+    fn filter_object_infos_pages_starrocks_materialized_views_independently() {
+        let objects = vec![
+            test_object_info("orders", "TABLE"),
+            test_object_info("orders_view", "VIEW"),
+            test_object_info("daily_orders_mv", "MATERIALIZED_VIEW"),
+            test_object_info("monthly_orders_mv", "MATERIALIZED_VIEW"),
+        ];
+        let object_types = vec!["MATERIALIZED_VIEW".to_string()];
+
+        let filtered = filter_object_infos(objects, Some("orders"), Some(1), Some(1), Some(&object_types));
+
+        assert_eq!(filtered.into_iter().map(|object| object.name).collect::<Vec<_>>(), vec!["monthly_orders_mv"]);
     }
 
     #[test]
@@ -2953,6 +3047,83 @@ mod tests {
         let name = columns.iter().find(|column| column.name == "name").unwrap();
 
         assert_eq!(name.comment.as_deref(), Some("Display name"));
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[test]
+    fn duckdb_object_source_filters_by_schema_and_view_name() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE SCHEMA reporting; \
+             CREATE VIEW main.active_orders AS SELECT 'main' AS origin; \
+             CREATE VIEW reporting.active_orders AS SELECT 'reporting' AS origin;",
+        )
+        .unwrap();
+
+        let main_source =
+            duckdb_object_source_with_attached(&con, "main", "main", "active_orders", &db::ObjectSourceKind::View, &[])
+                .unwrap();
+        let reporting_source = duckdb_object_source_with_attached(
+            &con,
+            "main",
+            "reporting",
+            "active_orders",
+            &db::ObjectSourceKind::View,
+            &[],
+        )
+        .unwrap();
+
+        assert!(main_source.contains("'main'"));
+        assert!(reporting_source.contains("'reporting'"));
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[test]
+    fn duckdb_object_source_rejects_unsupported_or_missing_objects() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+
+        let unsupported = duckdb_object_source_with_attached(
+            &con,
+            "main",
+            "main",
+            "calculate_total",
+            &db::ObjectSourceKind::Function,
+            &[],
+        )
+        .unwrap_err();
+        let missing =
+            duckdb_object_source_with_attached(&con, "main", "main", "missing_view", &db::ObjectSourceKind::View, &[])
+                .unwrap_err();
+
+        assert_eq!(unsupported, "DuckDB object source only supports views");
+        assert!(missing.contains("DuckDB view source not found"));
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[test]
+    fn duckdb_catalog_view_source_can_replace_existing_view() {
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        con.execute_batch("CREATE VIEW active_orders AS SELECT 1 AS value;").unwrap();
+        let source =
+            duckdb_object_source_with_attached(&con, "main", "main", "active_orders", &db::ObjectSourceKind::View, &[])
+                .unwrap();
+        let edited_source = source.replace("SELECT 1", "SELECT 2");
+        assert_ne!(edited_source, source);
+
+        let statements = crate::object_source_sql::build_executable_object_source_statements(
+            crate::object_source_sql::EditableObjectSourceSqlInput {
+                database_type: DatabaseType::DuckDb,
+                object_type: db::ObjectSourceKind::View,
+                schema: Some("main".to_string()),
+                name: "active_orders".to_string(),
+                source: edited_source,
+            },
+        )
+        .unwrap();
+        con.execute_batch(&statements.join("\n")).unwrap();
+
+        let value = con.query_row("SELECT value FROM active_orders", [], |row| row.get::<_, i32>(0)).unwrap();
+        assert_eq!(value, 2);
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -3320,6 +3491,7 @@ mod tests {
                 name: "ORDERS".to_string(),
                 object_type: "TABLE".to_string(),
                 schema: Some("DBX_TEST".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -3331,6 +3503,7 @@ mod tests {
                 name: "ORDERS_VIEW".to_string(),
                 object_type: "VIEW".to_string(),
                 schema: Some("DBX_TEST".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -3342,6 +3515,7 @@ mod tests {
                 name: "REFRESH_ORDERS".to_string(),
                 object_type: "PROCEDURE".to_string(),
                 schema: Some("DBX_TEST".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -3410,7 +3584,7 @@ pub async fn list_objects_core(
             .await
             .map(|outcome| {
                 let final_offset = if outcome.paging_applied
-                    || oracle_agent_paging_likely_applied(use_oracle_agent_paging, limit, outcome.objects.len())
+                    || agent_paging_likely_applied(use_oracle_agent_paging, limit, outcome.objects.len())
                 {
                     Some(0)
                 } else {
@@ -3765,6 +3939,7 @@ async fn list_objects_once(
                         name: table.name,
                         object_type: table.table_type,
                         schema: None,
+                        valid: None,
                         signature: None,
                         comment: table.comment,
                         created_at: None,
@@ -3920,6 +4095,8 @@ async fn list_objects_once(
                 db::ob_oracle::list_objects(p, schema).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(is_manticoresearch_config) {
                 db::manticoresearch::list_objects(p, database).await.map(unpaged_object_list)
+            } else if db_config.as_ref().is_some_and(is_starrocks_config) {
+                db::mysql::list_starrocks_table_objects(p, database).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(is_doris_family_config) {
                 db::mysql::list_table_objects_show(p, database).await.map(unpaged_object_list)
             } else {
@@ -3942,6 +4119,7 @@ async fn list_objects_once(
                         name: table.name,
                         object_type: table.table_type,
                         schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
+                        valid: None,
                         signature: None,
                         comment: table.comment,
                         created_at: None,
@@ -4094,6 +4272,20 @@ async fn retry_metadata_connection<T, F, Fut>(
     state: &AppState,
     connection_id: &str,
     database: Option<&str>,
+    operation: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    retry_metadata_connection_for_session(state, connection_id, database, None, operation).await
+}
+
+async fn retry_metadata_connection_for_session<T, F, Fut>(
+    state: &AppState,
+    connection_id: &str,
+    database: Option<&str>,
+    client_session_id: Option<&str>,
     mut operation: F,
 ) -> Result<T, String>
 where
@@ -4103,7 +4295,7 @@ where
     let result = operation().await;
     match result {
         Err(error) if is_retryable_metadata_error(&error) => {
-            state.reconnect_pool(connection_id, database).await?;
+            state.reconnect_pool_for_session(connection_id, database, client_session_id).await?;
             operation().await
         }
         _ => result,
@@ -4121,8 +4313,21 @@ pub async fn get_columns_core(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    retry_metadata_connection(state, connection_id, Some(database), || async {
-        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    get_columns_core_for_session(state, connection_id, database, schema, table, None).await
+}
+
+pub async fn get_columns_core_for_session(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    client_session_id: Option<&str>,
+) -> Result<Vec<db::ColumnInfo>, String> {
+    retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || async {
+        let pool_key = state
+            .get_or_create_pool_for_session(connection_id, Some(database), client_session_id)
+            .await?;
         #[cfg(feature = "duckdb-bundled")]
         let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
         let db_config = connection_config(state, connection_id).await;
@@ -4350,8 +4555,27 @@ pub async fn get_columns_core(
             PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::get_columns(client, schema, table)
                 .await
                 .map(deduplicate_column_infos),
+            PoolKind::Elasticsearch(client) => {
+                db::elasticsearch_driver::get_columns(client, table).await.map(deduplicate_column_infos)
+            }
             _ => Ok(vec![]),
         }
+    })
+    .await
+}
+
+pub async fn get_sqlserver_column_metadata_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<db::sqlserver::SqlServerColumnMetadata>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        try_sqlserver!(connections, &pool_key, get_column_metadata, schema, table);
+        Err("SQL Server column metadata requires a native SQL Server connection".to_string())
     })
     .await
 }
@@ -4811,7 +5035,7 @@ pub async fn get_table_ddl_core(
             }
         }
         PoolKind::Postgres(p) => pg_ddl(p, schema, table).await,
-        PoolKind::Sqlite(p) => sqlite_ddl(p, table).await,
+        PoolKind::Sqlite(p) => sqlite_ddl(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
         _ => Err("DDL not supported for this database type".to_string()),
@@ -4833,13 +5057,22 @@ fn is_default_oracle_agent_config(config: &ConnectionConfig) -> bool {
         && !matches!(config.driver_profile.as_deref(), Some("oracle-legacy" | "oracle-10g"))
 }
 
-fn oracle_agent_paging_likely_applied(enabled: bool, limit: Option<usize>, returned_len: usize) -> bool {
+fn supports_agent_table_paging(config: &ConnectionConfig) -> bool {
+    // Keep paging opt-in until each legacy agent is known to apply metadata constraints server-side.
+    matches!(config.db_type, DatabaseType::Tdengine) || is_default_oracle_agent_config(config)
+}
+
+fn agent_paging_likely_applied(enabled: bool, limit: Option<usize>, returned_len: usize) -> bool {
     enabled && limit.is_some_and(|limit| returned_len <= limit)
 }
 
 fn is_doris_family_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch)
         || matches!(config.driver_profile.as_deref(), Some("doris" | "selectdb" | "starrocks" | "manticoresearch"))
+}
+
+fn is_starrocks_config(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::StarRocks || matches!(config.driver_profile.as_deref(), Some("starrocks"))
 }
 
 /// Doris-family engines that support multi-catalog federation (`SHOW CATALOGS`).
@@ -4919,9 +5152,12 @@ fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => "view",
         db::ObjectSourceKind::Procedure
         | db::ObjectSourceKind::Function
+        | db::ObjectSourceKind::Trigger
         | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
-        | db::ObjectSourceKind::PackageBody => "routine",
+        | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody => "routine",
     }
 }
 
@@ -4930,9 +5166,12 @@ fn sqlserver_object_type_filter(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View => "'V'",
         db::ObjectSourceKind::Procedure => "'P'",
         db::ObjectSourceKind::Function => "'FN','IF','TF','FS','FT'",
+        db::ObjectSourceKind::Trigger => "'TR'",
         db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody
         | db::ObjectSourceKind::MaterializedView => "''",
     }
 }
@@ -4955,7 +5194,16 @@ pub fn postgres_object_source_sql(
     kind: &db::ObjectSourceKind,
     signature: Option<&str>,
 ) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, signature, true)
+    postgres_object_source_sql_inner(schema, name, kind, signature, true, false)
+}
+
+fn opengauss_object_source_sql(
+    schema: &str,
+    name: &str,
+    kind: &db::ObjectSourceKind,
+    signature: Option<&str>,
+) -> String {
+    postgres_object_source_sql_inner(schema, name, kind, signature, true, true)
 }
 
 fn postgres_object_source_sql_without_relispopulated(
@@ -4964,12 +5212,18 @@ fn postgres_object_source_sql_without_relispopulated(
     kind: &db::ObjectSourceKind,
     signature: Option<&str>,
 ) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, signature, false)
+    postgres_object_source_sql_inner(schema, name, kind, signature, false, false)
 }
 
-fn postgres_function_object_source_sql_without_prokind(schema: &str, name: &str) -> String {
+fn postgres_function_object_source_sql_without_prokind(
+    schema: &str,
+    name: &str,
+    unwrap_opengauss_record: bool,
+) -> String {
+    let source_expression =
+        if unwrap_opengauss_record { "(pg_get_functiondef(p.oid)).definition" } else { "pg_get_functiondef(p.oid)" };
     format!(
-        "SELECT pg_get_functiondef(p.oid) \
+        "SELECT {source_expression} \
          FROM pg_proc p \
          JOIN pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = {} AND p.proname = {} AND NOT p.proisagg AND NOT p.proiswindow \
@@ -4979,12 +5233,41 @@ fn postgres_function_object_source_sql_without_prokind(schema: &str, name: &str)
     )
 }
 
+fn opengauss_routine_source_fallback_sqls(
+    schema: &str,
+    name: &str,
+    object_type: &db::ObjectSourceKind,
+    signature: Option<&str>,
+    primary_err: &str,
+) -> Vec<(&'static str, String)> {
+    if !matches!(object_type, db::ObjectSourceKind::Function) {
+        return vec![("text-return", postgres_object_source_sql(schema, name, object_type, signature))];
+    }
+
+    let mut fallbacks = Vec::with_capacity(3);
+    if !postgres_missing_prokind_error(primary_err) {
+        fallbacks.push(("text-return", postgres_object_source_sql(schema, name, object_type, signature)));
+    }
+    // Legacy Gauss-family catalogs vary independently in pg_get_functiondef's return type and prokind support.
+    // Keep both no-prokind expressions so a server with both compatibility differences still succeeds.
+    fallbacks.push((
+        "record-return without prokind",
+        postgres_function_object_source_sql_without_prokind(schema, name, true),
+    ));
+    fallbacks.push((
+        "text-return without prokind",
+        postgres_function_object_source_sql_without_prokind(schema, name, false),
+    ));
+    fallbacks
+}
+
 fn postgres_object_source_sql_inner(
     schema: &str,
     name: &str,
     kind: &db::ObjectSourceKind,
     signature: Option<&str>,
     include_relispopulated: bool,
+    unwrap_opengauss_record: bool,
 ) -> String {
     match kind {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => {
@@ -5015,11 +5298,16 @@ fn postgres_object_source_sql_inner(
         }
         db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function => {
             let prokind = if matches!(kind, db::ObjectSourceKind::Procedure) { "p" } else { "f" };
+            let source_expression = if unwrap_opengauss_record {
+                "(pg_get_functiondef(p.oid)).definition"
+            } else {
+                "pg_get_functiondef(p.oid)"
+            };
             let signature_filter = signature
                 .map(|value| format!(" AND pg_get_function_identity_arguments(p.oid) = {}", sql_string(value)))
                 .unwrap_or_default();
             format!(
-                "SELECT pg_get_functiondef(p.oid) \
+                "SELECT {source_expression} \
                  FROM pg_proc p \
                  JOIN pg_namespace n ON n.oid = p.pronamespace \
                  WHERE n.nspname = {} AND p.proname = {} AND p.prokind = '{}'{} \
@@ -5054,7 +5342,11 @@ fn postgres_object_source_sql_inner(
                 sql_string(name)
             )
         }
-        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "SELECT NULL WHERE FALSE".to_string(),
+        db::ObjectSourceKind::Trigger
+        | db::ObjectSourceKind::Package
+        | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody => "SELECT NULL WHERE FALSE".to_string(),
     }
 }
 
@@ -5064,9 +5356,12 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
         db::ObjectSourceKind::MaterializedView => "MATERIALIZED_VIEW",
         db::ObjectSourceKind::Procedure => "PROCEDURE",
         db::ObjectSourceKind::Function => "FUNCTION",
+        db::ObjectSourceKind::Trigger => "TRIGGER",
         db::ObjectSourceKind::Sequence => "SEQUENCE",
         db::ObjectSourceKind::Package => "PACKAGE",
         db::ObjectSourceKind::PackageBody => "PACKAGE_BODY",
+        db::ObjectSourceKind::Type => "TYPE",
+        db::ObjectSourceKind::TypeBody => "TYPE_BODY",
     };
     if schema.trim().is_empty() {
         format!("SELECT DBMS_METADATA.GET_DDL({}, {}) FROM DUAL", sql_string(object_type), sql_string(name))
@@ -5080,9 +5375,10 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
     }
 }
 
-pub fn sqlite_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> String {
+pub fn sqlite_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
     format!(
-        "SELECT sql FROM sqlite_master WHERE type = {} AND name = {}",
+        "SELECT sql FROM {}.sqlite_master WHERE type = {} AND name = {}",
+        db::sqlite::sqlite_quote_schema_ident(schema),
         sql_string(sqlite_object_type(kind)),
         sql_string(name)
     )
@@ -5094,9 +5390,12 @@ pub fn mysql_object_source_sql(database: &str, name: &str, kind: &db::ObjectSour
         db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {qualified_name}"),
         db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {qualified_name}"),
         db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {qualified_name}"),
-        db::ObjectSourceKind::Sequence
+        db::ObjectSourceKind::Trigger
+        | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody
         | db::ObjectSourceKind::MaterializedView => String::new(),
     }
 }
@@ -5170,6 +5469,8 @@ async fn get_object_source_once(
 ) -> Result<db::ObjectSource, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
+    #[cfg(feature = "duckdb-bundled")]
+    let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
     let source = {
         let connections = state.connections.read().await;
         if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
@@ -5234,10 +5535,35 @@ async fn get_object_source_once(
                     // only view
                     db::questdb::questdb_object_source(pool, name).await?
                 }
-                PoolKind::Postgres(pool) => postgres_object_source(pool, schema, name, &object_type, signature).await?,
+                PoolKind::Postgres(pool) => {
+                    let unwrap_opengauss_record = db_config.as_ref().is_some_and(is_opengauss_family_config);
+                    postgres_object_source(pool, schema, name, &object_type, signature, unwrap_opengauss_record).await?
+                }
                 PoolKind::Sqlite(pool) => first_string_cell(
-                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(name, &object_type)).await?,
+                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(schema, name, &object_type)).await?,
                 )?,
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDb(con) => {
+                    let con = con.lock().map_err(|e| e.to_string())?;
+                    duckdb_object_source_with_attached(
+                        &con,
+                        database,
+                        schema,
+                        name,
+                        &object_type,
+                        &duckdb_attached_names,
+                    )?
+                }
+                #[cfg(feature = "duckdb-bundled")]
+                PoolKind::DuckDbWorker(client) => {
+                    let client = client.clone();
+                    let database = database.to_string();
+                    let schema = schema.to_string();
+                    let name = name.to_string();
+                    let object_type = object_type.clone();
+                    drop(connections);
+                    client.get_object_source(database, schema, name, object_type).await?
+                }
                 PoolKind::Rqlite(client) => {
                     return db::rqlite_driver::object_source(client, name, &object_type).await;
                 }
@@ -5312,6 +5638,7 @@ async fn oracle_agent_list_objects(
                 name,
                 object_type,
                 schema,
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -5566,8 +5893,13 @@ async fn postgres_object_source(
     name: &str,
     object_type: &db::ObjectSourceKind,
     signature: Option<&str>,
+    unwrap_opengauss_record: bool,
 ) -> Result<String, String> {
-    let sql = postgres_object_source_sql(schema, name, object_type, signature);
+    let sql = if unwrap_opengauss_record {
+        opengauss_object_source_sql(schema, name, object_type, signature)
+    } else {
+        postgres_object_source_sql(schema, name, object_type, signature)
+    };
     match db::postgres::execute_query(pool, &sql).await.and_then(first_string_cell) {
         Ok(source) => Ok(source),
         Err(primary_err)
@@ -5581,10 +5913,25 @@ async fn postgres_object_source(
                 .map_err(|fallback_err| format!("{primary_err}; relispopulated fallback failed: {fallback_err}"))
         }
         Err(primary_err)
+            if unwrap_opengauss_record
+                && matches!(object_type, db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function) =>
+        {
+            let mut errors = vec![primary_err];
+            for (label, fallback_sql) in
+                opengauss_routine_source_fallback_sqls(schema, name, object_type, signature, &errors[0])
+            {
+                match db::postgres::execute_query(pool, &fallback_sql).await.and_then(first_string_cell) {
+                    Ok(source) => return Ok(source),
+                    Err(fallback_err) => errors.push(format!("{label} fallback failed: {fallback_err}")),
+                }
+            }
+            Err(errors.join("; "))
+        }
+        Err(primary_err)
             if postgres_missing_prokind_error(&primary_err)
                 && matches!(object_type, db::ObjectSourceKind::Function) =>
         {
-            let fallback_sql = postgres_function_object_source_sql_without_prokind(schema, name);
+            let fallback_sql = postgres_function_object_source_sql_without_prokind(schema, name, false);
             db::postgres::execute_query(pool, &fallback_sql)
                 .await
                 .and_then(first_string_cell)
@@ -5667,12 +6014,62 @@ mod object_source_tests {
 
     #[test]
     fn builds_postgres_function_source_sql_without_prokind_for_legacy_catalogs() {
-        let sql = postgres_function_object_source_sql_without_prokind("public", "recalc_score");
+        let sql = postgres_function_object_source_sql_without_prokind("public", "recalc_score", false);
 
         assert_eq!(
             sql,
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND NOT p.proisagg AND NOT p.proiswindow ORDER BY p.oid LIMIT 1"
         );
+    }
+
+    #[test]
+    fn builds_opengauss_routine_source_sql_from_record_definition() {
+        assert_eq!(
+            opengauss_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function, None),
+            "SELECT (pg_get_functiondef(p.oid)).definition FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' ORDER BY p.oid LIMIT 1"
+        );
+        assert_eq!(
+            opengauss_object_source_sql(
+                "public",
+                "refresh_cache",
+                &ObjectSourceKind::Procedure,
+                Some("integer"),
+            ),
+            "SELECT (pg_get_functiondef(p.oid)).definition FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'refresh_cache' AND p.prokind = 'p' AND pg_get_function_identity_arguments(p.oid) = 'integer' ORDER BY p.oid LIMIT 1"
+        );
+
+        assert_eq!(
+            postgres_function_object_source_sql_without_prokind("public", "recalc_score", true),
+            "SELECT (pg_get_functiondef(p.oid)).definition FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND NOT p.proisagg AND NOT p.proiswindow ORDER BY p.oid LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn composes_opengauss_text_return_and_missing_prokind_fallbacks() {
+        let text_return = opengauss_routine_source_fallback_sqls(
+            "public",
+            "recalc_score",
+            &ObjectSourceKind::Function,
+            None,
+            "column notation .definition applied to type text",
+        );
+        assert_eq!(text_return.len(), 3);
+        assert_eq!(text_return[0].0, "text-return");
+        assert!(text_return[0].1.contains("p.prokind = 'f'"));
+        assert_eq!(text_return[2].0, "text-return without prokind");
+        assert!(!text_return[2].1.contains("p.prokind"));
+        assert!(!text_return[2].1.contains(".definition"));
+
+        let missing_prokind = opengauss_routine_source_fallback_sqls(
+            "public",
+            "recalc_score",
+            &ObjectSourceKind::Function,
+            None,
+            "column p.prokind does not exist",
+        );
+        assert_eq!(missing_prokind.len(), 2);
+        assert_eq!(missing_prokind[0].0, "record-return without prokind");
+        assert_eq!(missing_prokind[1].0, "text-return without prokind");
     }
 
     #[test]
@@ -6042,15 +6439,14 @@ fn ensure_display_ddl_terminated(sql: String) -> String {
     }
 }
 
-pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, table: &str) -> Result<String, String> {
+pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &str) -> Result<String, String> {
     let pool = pool.clone();
+    let schema = db::sqlite::sqlite_quote_schema_ident(schema);
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
-            conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| e.to_string())
+            let sql = format!("SELECT sql FROM {}.sqlite_master WHERE type='table' AND name=?1", schema);
+            conn.query_row(&sql, [table], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())
         })
     })
     .await

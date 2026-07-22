@@ -12,8 +12,8 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::connection::DatabaseType;
-use crate::sql::starts_with_executable_sql_keyword;
+use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
+use crate::sql::{starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_for_database};
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
@@ -73,21 +73,27 @@ where
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }
 
+/// 字节转 String：合法 UTF-8（绝大多数场景）时直接复用入参缓冲零拷贝，
+/// 仅在非法序列时退化为 lossy 替换。from_utf8_lossy(&b).to_string() 即使
+/// 对合法输入也会多一次分配+拷贝。
+fn bytes_to_string_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
 fn get_str(row: &mysql_async::Row, idx: usize) -> String {
     row_get::<String, _>(row, idx)
-        .or_else(|| row_get::<Vec<u8>, _>(row, idx).map(|b| String::from_utf8_lossy(&b).to_string()))
+        .or_else(|| row_get::<Vec<u8>, _>(row, idx).map(bytes_to_string_lossy))
         .unwrap_or_default()
 }
 
 fn get_str_by_name(row: &mysql_async::Row, name: &str) -> String {
     row_get::<String, _>(row, name)
-        .or_else(|| row_get::<Vec<u8>, _>(row, name).map(|b| String::from_utf8_lossy(&b).to_string()))
+        .or_else(|| row_get::<Vec<u8>, _>(row, name).map(bytes_to_string_lossy))
         .unwrap_or_default()
 }
 
 fn get_opt_str(row: &mysql_async::Row, name: &str) -> Option<String> {
-    row_get::<String, _>(row, name)
-        .or_else(|| row_get::<Vec<u8>, _>(row, name).map(|b| String::from_utf8_lossy(&b).to_string()))
+    row_get::<String, _>(row, name).or_else(|| row_get::<Vec<u8>, _>(row, name).map(bytes_to_string_lossy))
 }
 
 /// First non-empty string value among the named columns (e.g. Doris `CatalogName`
@@ -101,6 +107,55 @@ fn first_nonempty_str_by_name(row: &mysql_async::Row, names: &[&str]) -> String 
         }
     }
     String::new()
+}
+
+fn nonblank(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+async fn query_first_nonblank_string(conn: &mut mysql_async::Conn, sql: &str) -> Option<String> {
+    match conn.query_first::<String, _>(sql).await {
+        Ok(Some(value)) => nonblank(value),
+        Ok(None) => None,
+        Err(error) => {
+            log::debug!("Failed to read optional MySQL database information with `{sql}`: {error}");
+            None
+        }
+    }
+}
+
+pub async fn database_connection_info(
+    pool: &MySqlPool,
+    product_name: impl Into<String>,
+) -> Result<DatabaseConnectionInfo, String> {
+    let product_name = nonblank(product_name.into()).unwrap_or_else(|| "MySQL".to_string());
+    let mut conn = get_conn_with_health_check(pool).await?;
+
+    Ok(DatabaseConnectionInfo {
+        product_name: Some(product_name),
+        product_version: query_first_nonblank_string(&mut conn, "SELECT VERSION()").await,
+        current_database: query_first_nonblank_string(&mut conn, "SELECT COALESCE(DATABASE(), '')").await,
+        server_comment: query_first_nonblank_string(&mut conn, "SELECT @@version_comment").await,
+        server_charset: query_first_nonblank_string(&mut conn, "SELECT @@character_set_server").await,
+        server_collation: query_first_nonblank_string(&mut conn, "SELECT @@collation_server").await,
+        ..DatabaseConnectionInfo::default()
+    })
+}
+
+pub fn protocol_product_name(config: &ConnectionConfig) -> String {
+    config.driver_label.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).unwrap_or_else(
+        || match config.db_type {
+            DatabaseType::Doris => "Doris".to_string(),
+            DatabaseType::StarRocks => "StarRocks".to_string(),
+            DatabaseType::ManticoreSearch => "Manticore Search".to_string(),
+            _ => "MySQL".to_string(),
+        },
+    )
 }
 
 fn get_opt_metadata_string(row: &mysql_async::Row, name: &str) -> Option<String> {
@@ -230,14 +285,22 @@ fn mysql_bytes_to_json(bytes: Vec<u8>, column: &mysql_async::Column) -> serde_js
             .map(serde_json::Value::String)
             .unwrap_or_else(|| super::binary_value_to_json(&bytes));
     }
-    serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string())
+    serde_json::Value::String(bytes_to_string_lossy(bytes))
 }
 
 /// Map a MySQL column to a user-facing type name for the result-grid header.
 /// Returns the bare lowercase type name (no length/precision/signedness), which
 /// is enough for display; unknown variants fall back to a lowercased debug name.
-pub(crate) fn mysql_column_type_name(ty: ColumnType) -> String {
+///
+/// MySQL's wire protocol uses the same `MYSQL_TYPE_*BLOB` codes for TEXT and BLOB
+/// families. Binary charset (63) means BLOB; any other charset means TEXT. Value
+/// decoding already follows that rule — the header type must match, or TEXT
+/// columns flash as `blob` until table metadata arrives.
+pub(crate) fn mysql_column_type_name(column: &mysql_async::Column) -> String {
     use mysql_async::consts::ColumnType::*;
+    let ty = column.column_type();
+    let flags = column.flags();
+    let binary = is_mysql_binary_charset(column);
     match ty {
         MYSQL_TYPE_TINY => "tinyint",
         MYSQL_TYPE_SHORT => "smallint",
@@ -256,12 +319,54 @@ pub(crate) fn mysql_column_type_name(ty: ColumnType) -> String {
         MYSQL_TYPE_JSON => "json",
         MYSQL_TYPE_ENUM => "enum",
         MYSQL_TYPE_SET => "set",
-        MYSQL_TYPE_TINY_BLOB => "tinyblob",
-        MYSQL_TYPE_MEDIUM_BLOB => "mediumblob",
-        MYSQL_TYPE_LONG_BLOB => "longblob",
-        MYSQL_TYPE_BLOB => "blob",
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => "varchar",
-        MYSQL_TYPE_STRING => "char",
+        MYSQL_TYPE_TINY_BLOB => {
+            if binary {
+                "tinyblob"
+            } else {
+                "tinytext"
+            }
+        }
+        MYSQL_TYPE_MEDIUM_BLOB => {
+            if binary {
+                "mediumblob"
+            } else {
+                "mediumtext"
+            }
+        }
+        MYSQL_TYPE_LONG_BLOB => {
+            if binary {
+                "longblob"
+            } else {
+                "longtext"
+            }
+        }
+        MYSQL_TYPE_BLOB => {
+            if binary {
+                "blob"
+            } else {
+                "text"
+            }
+        }
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => {
+            if binary {
+                "varbinary"
+            } else {
+                "varchar"
+            }
+        }
+        MYSQL_TYPE_STRING => {
+            // MySQL reports ENUM/SET result columns as STRING plus a flag,
+            // rather than using the dedicated protocol type codes.
+            if flags.contains(mysql_async::consts::ColumnFlags::ENUM_FLAG) {
+                "enum"
+            } else if flags.contains(mysql_async::consts::ColumnFlags::SET_FLAG) {
+                "set"
+            } else if binary {
+                "binary"
+            } else {
+                "char"
+            }
+        }
         MYSQL_TYPE_GEOMETRY => "geometry",
         MYSQL_TYPE_NULL => "null",
         other => return format!("{:?}", other).to_lowercase(),
@@ -597,10 +702,12 @@ enum MySqlSetupMode {
     Compatible,
 }
 
+const MYSQL_GROUP_CONCAT_MAX_LEN: u64 = 1_048_576;
+
 impl MySqlSetupMode {
-    fn group_concat_max_len_query(self) -> Option<&'static str> {
+    fn group_concat_max_len_query(self) -> Option<String> {
         match self {
-            Self::Standard => Some("SET SESSION group_concat_max_len = 1048576"),
+            Self::Standard => Some(format!("SET SESSION group_concat_max_len = {MYSQL_GROUP_CONCAT_MAX_LEN}")),
             Self::Compatible => None,
         }
     }
@@ -644,7 +751,12 @@ fn mysql_group_concat_setup_fallback_mode(setup_mode: MySqlSetupMode, error: &st
     }
 
     let lower = error.to_ascii_lowercase();
-    if lower.contains("group_concat_max_len") && (lower.contains("1193") || lower.contains("unknown system variable")) {
+    let setup_query_rejected =
+        lower.contains("1193") || lower.contains("unknown system variable") || lower.contains("syntax error");
+    let sphinxql_setup_query_rejected = lower.contains("sphinxql")
+        && lower.contains("only 0 and 1 could be used as boolean values")
+        && lower.contains(&format!("near '{MYSQL_GROUP_CONCAT_MAX_LEN}'"));
+    if (lower.contains("group_concat_max_len") && setup_query_rejected) || sphinxql_setup_query_rejected {
         return Some(MySqlSetupMode::Compatible);
     }
 
@@ -685,13 +797,16 @@ fn create_pool(
         }
         (None, MySqlSetupMode::Compatible) => mysql_setup_queries_with_mode(url, extra_setup_queries, setup_mode),
     };
-    let mut builder = mysql_async::OptsBuilder::from_opts(opts)
+    let builder = mysql_async::OptsBuilder::from_opts(opts)
         .ip_or_hostname(tcp_host)
         .stmt_cache_size(0)
         .prefer_socket(false)
-        .pool_opts(Some(pool_opts))
-        .tcp_keepalive(Some(MYSQL_TCP_KEEPALIVE_MS))
-        .setup(setup_queries);
+        .pool_opts(Some(pool_opts));
+    #[cfg(feature = "legacy-mysql-032")]
+    let builder = builder.tcp_keepalive(Some(MYSQL_TCP_KEEPALIVE_MS));
+    #[cfg(not(feature = "legacy-mysql-032"))]
+    let builder = builder.tcp_keepalive(Some(Duration::from_millis(u64::from(MYSQL_TCP_KEEPALIVE_MS))));
+    let mut builder = builder.setup(setup_queries);
     if let Some(ssl_opts) = mysql_ssl_opts(base_ssl_opts, url, ca_cert_path, &tls_url.files)? {
         builder = builder.ssl_opts(ssl_opts);
     }
@@ -860,7 +975,7 @@ fn mysql_setup_queries_for_database_with_mode(
     // GROUP_CONCAT results. Skip it for MySQL protocol-compatible databases
     // such as old StarRocks versions that reject unknown MySQL variables.
     if let Some(query) = setup_mode.group_concat_max_len_query() {
-        queries.push(query.to_string());
+        queries.push(query);
     }
     // StarRocks/Doris expose external storage (Paimon, Hive, ...) through a
     // catalog. `SET catalog` must run *before* `USE <database>` (the database
@@ -1975,6 +2090,66 @@ pub async fn list_tables_show(pool: &MySqlPool, database: &str) -> Result<Vec<Ta
     list_tables_show_with_status(pool, database).await.map(|(tables, _)| tables)
 }
 
+fn starrocks_materialized_views_sql(database: &str) -> String {
+    format!(
+        "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = {}",
+        quote_value(database)
+    )
+}
+
+async fn list_starrocks_materialized_view_names(pool: &MySqlPool, database: &str) -> Result<HashSet<String>, String> {
+    let sql = starrocks_materialized_views_sql(database);
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str_by_name(row, "TABLE_NAME").trim().to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect())
+}
+
+fn classify_starrocks_materialized_views(
+    tables: &mut [TableInfo],
+    materialized_view_names: Result<HashSet<String>, String>,
+    database: &str,
+) {
+    let materialized_view_names = match materialized_view_names {
+        Ok(names) => names,
+        Err(err) => {
+            // Older StarRocks versions and restricted accounts may not expose this
+            // information_schema view; keep the base SHOW TABLES result usable.
+            log::warn!("Skipping materialized view classification for StarRocks database `{database}`: {err}");
+            return;
+        }
+    };
+
+    for table in tables {
+        if table.table_type.eq_ignore_ascii_case("VIEW") && materialized_view_names.contains(&table.name) {
+            table.table_type = "MATERIALIZED_VIEW".to_string();
+        }
+    }
+}
+
+async fn list_starrocks_tables_with_status(
+    pool: &MySqlPool,
+    database: &str,
+) -> Result<(Vec<TableInfo>, HashMap<String, TableStatusMeta>), String> {
+    let (tables, materialized_view_names) = tokio::join!(
+        list_tables_show_with_status(pool, database),
+        list_starrocks_materialized_view_names(pool, database)
+    );
+    let (mut tables, status) = tables?;
+    classify_starrocks_materialized_views(&mut tables, materialized_view_names, database);
+    Ok((tables, status))
+}
+
+pub async fn list_starrocks_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
+    list_starrocks_tables_with_status(pool, database).await.map(|(tables, _)| tables)
+}
+
 fn requested_object_type(object_types: Option<&[String]>, object_type: &str) -> bool {
     object_types.map_or(true, |types| {
         types.is_empty() || types.iter().any(|candidate| candidate.eq_ignore_ascii_case(object_type))
@@ -2059,6 +2234,7 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         name: get_str_by_name(row, "object_name"),
         object_type: get_str_by_name(row, "object_type"),
         schema: Some(database.to_string()),
+        valid: None,
         signature: None,
         comment: get_opt_str(row, "object_comment")
             .map(|s| fix_potential_double_encoding(&s))
@@ -2186,14 +2362,51 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
     let (tables, routines) =
         tokio::join!(list_tables_show_with_status(pool, database), list_routine_objects(pool, database));
     let (tables, status) = tables?;
-    let mut objects: Vec<ObjectInfo> = tables
+    let mut objects = table_infos_to_objects(tables, &status, database);
+
+    match routines {
+        Ok(routines) => objects.extend(routines),
+        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
+    }
+
+    Ok(objects)
+}
+
+pub async fn list_starrocks_table_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
+    let (tables, routines) =
+        tokio::join!(list_starrocks_tables_with_status(pool, database), list_routine_objects(pool, database));
+    let (tables, status) = tables?;
+    let mut objects = table_infos_to_objects(tables, &status, database);
+
+    match routines {
+        Ok(routines) => objects.extend(routines),
+        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
+    }
+
+    Ok(objects)
+}
+
+fn table_infos_to_objects(
+    tables: Vec<TableInfo>,
+    status: &HashMap<String, TableStatusMeta>,
+    database: &str,
+) -> Vec<ObjectInfo> {
+    tables
         .into_iter()
         .map(|table| {
             let meta = status.get(&table.name);
             ObjectInfo {
                 name: table.name,
-                object_type: if table.table_type.eq_ignore_ascii_case("VIEW") { "VIEW" } else { "TABLE" }.to_string(),
+                object_type: if table.table_type.eq_ignore_ascii_case("MATERIALIZED_VIEW") {
+                    "MATERIALIZED_VIEW"
+                } else if table.table_type.eq_ignore_ascii_case("VIEW") {
+                    "VIEW"
+                } else {
+                    "TABLE"
+                }
+                .to_string(),
                 schema: Some(database.to_string()),
+                valid: None,
                 signature: None,
                 comment: table.comment,
                 created_at: meta.and_then(|meta| meta.created_at.clone()),
@@ -2202,14 +2415,7 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
                 parent_name: table.parent_name,
             }
         })
-        .collect();
-
-    match routines {
-        Ok(routines) => objects.extend(routines),
-        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
-    }
-
-    Ok(objects)
+        .collect()
 }
 
 async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
@@ -2744,8 +2950,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         });
     }
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
-    let column_types: Vec<String> =
-        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
 
     if should_collect_text_result_set(sql, row_limit, max_rows) {
         let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
@@ -2823,8 +3028,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
 ) -> Result<QueryResult, String> {
     let mut result = conn.exec_iter(sql, ()).await.map_err(|e| e.to_string())?;
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
-    let column_types: Vec<String> =
-        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
 
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut stream = result
@@ -2930,8 +3134,7 @@ async fn stream_query_result_text(
         return Ok(0);
     }
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
-    let column_types: Vec<String> =
-        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
     on_item(MySqlQueryStreamItem::Columns { columns, column_types })?;
 
     let mut stream = result
@@ -2969,8 +3172,7 @@ async fn stream_query_result_prepared(
     if columns.is_empty() {
         return Ok(0);
     }
-    let column_types: Vec<String> =
-        result.columns_ref().iter().map(|c| mysql_column_type_name(c.column_type())).collect();
+    let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
     on_item(MySqlQueryStreamItem::Columns { columns, column_types })?;
 
     let mut stream = result
@@ -3111,8 +3313,11 @@ fn prefers_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
 }
 
 fn is_result_set_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
-    starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL"])
-        || dialect.supports_admin_show_results && is_admin_show_query(sql)
+    starts_with_executable_sql_keyword_for_database(
+        sql,
+        &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL"],
+        DatabaseType::Mysql,
+    ) || dialect.supports_admin_show_results && is_admin_show_query(sql)
 }
 
 fn requires_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
@@ -3120,12 +3325,11 @@ fn requires_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
         return true;
     }
 
-    if !starts_with_executable_sql_keyword(sql, &["SHOW"]) {
+    if !starts_with_executable_sql_keyword_for_database(sql, &["SHOW"], DatabaseType::Mysql) {
         return false;
     }
 
-    let tokens =
-        sql.trim().trim_end_matches(';').split_whitespace().map(|token| token.to_ascii_lowercase()).collect::<Vec<_>>();
+    let tokens = leading_sql_word_tokens(sql, 3);
     if tokens.len() >= 2 && tokens[0] == "show" && tokens[1] == "grants" {
         return true;
     }
@@ -3275,11 +3479,7 @@ pub async fn show_create_table_ddl(pool: &MySqlPool, database: &str, table: &str
     let row = rows.first().ok_or("DDL not found")?;
     row.get_opt::<String, usize>(1)
         .and_then(|result| result.ok())
-        .or_else(|| {
-            row.get_opt::<Vec<u8>, usize>(1)
-                .and_then(|result| result.ok())
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-        })
+        .or_else(|| row.get_opt::<Vec<u8>, usize>(1).and_then(|result| result.ok()).map(bytes_to_string_lossy))
         .ok_or_else(|| "Failed to read DDL".to_string())
 }
 
@@ -3462,11 +3662,7 @@ pub async fn show_create_table_ddl_from(
     let row = rows.first().ok_or("DDL not found")?;
     row.get_opt::<String, usize>(1)
         .and_then(|result| result.ok())
-        .or_else(|| {
-            row.get_opt::<Vec<u8>, usize>(1)
-                .and_then(|result| result.ok())
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-        })
+        .or_else(|| row.get_opt::<Vec<u8>, usize>(1).and_then(|result| result.ok()).map(bytes_to_string_lossy))
         .ok_or_else(|| "Failed to read DDL".to_string())
 }
 
@@ -3822,24 +4018,101 @@ mod tests {
     use mysql_async::consts::ColumnFlags;
 
     #[test]
+    fn bytes_to_string_reuses_valid_utf8_and_falls_back_lossy() {
+        assert_eq!(super::bytes_to_string_lossy("héllo 世界".as_bytes().to_vec()), "héllo 世界");
+        assert_eq!(super::bytes_to_string_lossy(vec![]), "");
+        // 非法 UTF-8 序列退化为替换字符，与 from_utf8_lossy 语义一致
+        let invalid = vec![0x66, 0x6f, 0xff, 0x6f];
+        assert_eq!(super::bytes_to_string_lossy(invalid.clone()), String::from_utf8_lossy(&invalid));
+    }
+
+    #[test]
     fn mysql_column_type_names_map_to_friendly_names() {
         use mysql_async::consts::ColumnType::*;
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_TINY), "tinyint");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_LONG), "int");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_LONGLONG), "bigint");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_NEWDECIMAL), "decimal");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_VARCHAR), "varchar");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_VAR_STRING), "varchar");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_STRING), "char");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_DATETIME), "datetime");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_JSON), "json");
-        assert_eq!(mysql_column_type_name(MYSQL_TYPE_BLOB), "blob");
+        let utf8 = 45u16;
+        let binary = 63u16;
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_TINY, utf8, ColumnFlags::empty(), 4)),
+            "tinyint"
+        );
+        assert_eq!(mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_LONG, utf8, ColumnFlags::empty(), 11)), "int");
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_LONGLONG, utf8, ColumnFlags::empty(), 20)),
+            "bigint"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_NEWDECIMAL, utf8, ColumnFlags::empty(), 10)),
+            "decimal"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_VARCHAR, utf8, ColumnFlags::empty(), 255)),
+            "varchar"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_VAR_STRING, utf8, ColumnFlags::empty(), 255)),
+            "varchar"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_STRING, utf8, ColumnFlags::empty(), 16)),
+            "char"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_STRING, utf8, ColumnFlags::ENUM_FLAG, 16)),
+            "enum"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_STRING, utf8, ColumnFlags::SET_FLAG, 16)),
+            "set"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_DATETIME, utf8, ColumnFlags::empty(), 19)),
+            "datetime"
+        );
+        assert_eq!(mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_JSON, utf8, ColumnFlags::empty(), 0)), "json");
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_BLOB, binary, ColumnFlags::BLOB_FLAG, 65_535)),
+            "blob"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_BLOB, utf8, ColumnFlags::empty(), 65_535)),
+            "text"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_TINY_BLOB, utf8, ColumnFlags::empty(), 255)),
+            "tinytext"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_MEDIUM_BLOB, utf8, ColumnFlags::empty(), 16_777_215)),
+            "mediumtext"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_LONG_BLOB, utf8, ColumnFlags::empty(), 4_294_967_295)),
+            "longtext"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_VAR_STRING, binary, ColumnFlags::BINARY_FLAG, 16)),
+            "varbinary"
+        );
+        assert_eq!(
+            mysql_column_type_name(&mysql_test_column(MYSQL_TYPE_STRING, binary, ColumnFlags::BINARY_FLAG, 16)),
+            "binary"
+        );
     }
 
     #[test]
     fn mysql_with_queries_are_treated_as_result_sets() {
         let sql = "WITH RECURSIVE org_tree AS (SELECT 1 AS id) SELECT id FROM org_tree";
         assert!(is_result_set_query(sql, MySqlQueryDialect::default()));
+    }
+
+    #[test]
+    fn mysql_hash_comments_before_queries_preserve_result_sets_per_issue_3830() {
+        let dialect = MySqlQueryDialect::default();
+
+        assert!(is_result_set_query("# 注释\nSELECT NOW()", dialect));
+        assert!(prefers_text_protocol_query("# 注释\nSELECT NOW()", dialect));
+        assert!(requires_text_protocol_query("# inspect sessions\nSHOW PROCESSLIST", dialect));
+        assert!(!is_result_set_query("# update row\nUPDATE users SET name = 'Ada' WHERE id = 1", dialect));
     }
 
     #[test]
@@ -4024,6 +4297,101 @@ mod tests {
         let filtered = filter_list_tables_fallback(rows, Some("ood"), None, None, Some(&["TABLE".to_string()]));
 
         assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["t_0001"]);
+    }
+
+    #[test]
+    fn starrocks_materialized_views_are_classified_without_duplicating_tables() {
+        let mut tables = vec![
+            TableInfo {
+                name: "orders".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_view".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_mv".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+        let materialized_views = HashSet::from(["orders_mv".to_string(), "orders_mv".to_string()]);
+
+        classify_starrocks_materialized_views(&mut tables, Ok(materialized_views), "analytics");
+
+        assert_eq!(tables.len(), 3);
+        assert_eq!(
+            tables.iter().map(|table| (table.name.as_str(), table.table_type.as_str())).collect::<Vec<_>>(),
+            vec![("orders", "BASE TABLE"), ("orders_view", "VIEW"), ("orders_mv", "MATERIALIZED_VIEW")]
+        );
+    }
+
+    #[test]
+    fn starrocks_materialized_view_lookup_failure_keeps_base_types() {
+        let mut tables = vec![TableInfo {
+            name: "orders_mv".to_string(),
+            table_type: "VIEW".to_string(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }];
+
+        classify_starrocks_materialized_views(&mut tables, Err("permission denied".to_string()), "analytics");
+
+        assert_eq!(tables[0].table_type, "VIEW");
+    }
+
+    #[test]
+    fn starrocks_materialized_view_query_is_scoped_to_database() {
+        let sql = starrocks_materialized_views_sql("tenant's analytics");
+
+        assert_eq!(
+            sql,
+            "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant\\'s analytics'"
+        );
+    }
+
+    #[test]
+    fn starrocks_object_conversion_preserves_table_view_and_materialized_view_types() {
+        let tables = vec![
+            TableInfo {
+                name: "orders".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_view".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "orders_mv".to_string(),
+                table_type: "MATERIALIZED_VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+
+        let objects = table_infos_to_objects(tables, &HashMap::new(), "analytics");
+
+        assert_eq!(
+            objects.iter().map(|object| (object.name.as_str(), object.object_type.as_str())).collect::<Vec<_>>(),
+            vec![("orders", "TABLE"), ("orders_view", "VIEW"), ("orders_mv", "MATERIALIZED_VIEW")]
+        );
     }
 
     #[test]
@@ -4383,7 +4751,6 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     #[test]
     fn mysql_tcp_keepalive_uses_milliseconds_not_seconds() {
         assert_eq!(MYSQL_TCP_KEEPALIVE_MS, 30_000);
-        assert!(MYSQL_TCP_KEEPALIVE_MS >= 1_000);
     }
 
     #[test]
@@ -4505,6 +4872,36 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     }
 
     #[test]
+    fn mysql_cnch_group_concat_syntax_error_retries_without_session_variable() {
+        let error = "MySQL connection failed: Server error: `ERROR HY000 (1105): unknown error: Error 62 (HY000): Code: 62, e.displayText() = DB::Exception: host = cnch-server-2: Syntax error: failed at position 13 ('group_concat_max_len'): group_concat_max_len = 1048576. Expected one of: Dot, token, Equals SQLSTATE: 42000 (version 21.8.7.1)'";
+
+        assert_eq!(
+            mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+    }
+
+    #[test]
+    fn mysql_sphinxql_group_concat_boolean_error_retries_without_session_variable() {
+        let error = "MySQL connection failed: Server error: `ERROR 42000 (1064): sphinxql: only 0 and 1 could be used as boolean values near '1048576'`";
+
+        assert_eq!(
+            mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+    }
+
+    #[test]
+    fn mysql_sphinxql_boolean_error_retry_stays_scoped_to_group_concat_setup() {
+        for error in [
+            "Server error: sphinxql: only 0 and 1 could be used as boolean values near '42'",
+            "Server error: only 0 and 1 could be used as boolean values near '1048576'",
+        ] {
+            assert_eq!(mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error), None);
+        }
+    }
+
+    #[test]
     fn mysql_proxy_parse_tablename_1105_does_not_disable_group_concat() {
         let error = "MySQL connection failed: Server error: `ERROR 07000 (1105): SQL操作失败 (operate fail ) ：解析表名出错 ( parse tablename error ) '";
 
@@ -4579,6 +4976,16 @@ UNIQUE KEY(`tenant_id`, `name``part`)
         let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/db%2Fname?charset=utf8mb4", &[]);
 
         assert_eq!(queries, vec!["USE `db/name`", "SET NAMES utf8mb4", "SET SESSION group_concat_max_len = 1048576"]);
+    }
+
+    #[test]
+    fn mysql_setup_queries_preserve_database_identifier_whitespace() {
+        let queries = mysql_setup_queries("mysql://root:secret@localhost:3306/%20analytics%20?charset=utf8mb4", &[]);
+
+        assert_eq!(
+            queries,
+            vec!["USE ` analytics `", "SET NAMES utf8mb4", "SET SESSION group_concat_max_len = 1048576"]
+        );
     }
 
     #[test]

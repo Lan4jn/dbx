@@ -43,7 +43,7 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
   AND c.CONS_TYPE = 'P'`
 const xuguListColumnsSQL = `
-SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.COMMENTS, c.SCALE, c."VARYING"
+SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.ON_NULL, c.COMMENTS, c.SCALE, c."VARYING"
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
@@ -59,6 +59,53 @@ JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
 ORDER BY i.INDEX_NAME`
+const xuguTableMetadataSQL = `
+SELECT t.TEMP_TYPE, t.ON_COMMIT_DEL, t.PCTFREE, t.COPY_NUM,
+       t.PARTI_TYPE, t.PARTI_NUM, t.PARTI_KEY,
+       t.AUTO_PARTI_TYPE, t.AUTO_PARTI_SPAN,
+       t.SUBPARTI_TYPE, t.SUBPARTI_NUM, t.SUBPARTI_KEY, t.COMMENTS
+FROM ALL_TABLES t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)`
+const xuguTableIdentitySQL = `
+SELECT c.COL_NAME, q.MIN_VAL, q.STEP_VAL
+FROM ALL_COLUMNS c
+JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+JOIN ALL_SEQUENCES q ON q.DB_ID = c.DB_ID AND q.SEQ_ID = c.SERIAL_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+  AND c.IS_SERIAL = TRUE`
+const xuguTableConstraintsSQL = `
+SELECT c.CONS_NAME, c.CONS_TYPE, c.DEFINE,
+       rs.SCHEMA_NAME, rt.TABLE_NAME,
+       c.MATCH_TYPE, c.UPDATE_ACTION, c.DELETE_ACTION,
+       c.DEFERRABLE, c.INITDEFERRED, c.ENABLE
+FROM ALL_CONSTRAINTS c
+JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
+LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+ORDER BY c.CONS_NAME`
+const xuguTablePartitionsSQL = `
+SELECT p.PARTI_NAME, p.PARTI_VAL
+FROM ALL_PARTIS p
+JOIN ALL_TABLES t ON t.DB_ID = p.DB_ID AND t.TABLE_ID = p.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+ORDER BY p.PARTI_NO`
+const xuguTableSubpartitionsSQL = `
+SELECT p.SUBPARTI_NAME, p.SUBPARTI_VAL
+FROM ALL_SUBPARTIS p
+JOIN ALL_TABLES t ON t.DB_ID = p.DB_ID AND t.TABLE_ID = p.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+ORDER BY p.SUBPARTI_NO`
 
 var xuguDataTypes = []string{
 	"BOOLEAN",
@@ -120,11 +167,12 @@ type connectParams struct {
 }
 
 type queryOptions struct {
-	SQL       string `json:"sql"`
-	Database  string `json:"database"`
-	Schema    string `json:"schema"`
-	MaxRows   int    `json:"maxRows"`
-	FetchSize int    `json:"fetchSize"`
+	SQL         string `json:"sql"`
+	Database    string `json:"database"`
+	Schema      string `json:"schema"`
+	MaxRows     int    `json:"maxRows"`
+	FetchSize   int    `json:"fetchSize"`
+	TimeoutSecs int    `json:"timeoutSecs"`
 }
 
 type queryResult struct {
@@ -200,6 +248,7 @@ type objectInfo struct {
 	ObjectType string  `json:"object_type"`
 	Schema     string  `json:"schema"`
 	Comment    *string `json:"comment"`
+	Valid      *bool   `json:"valid,omitempty"`
 }
 
 type metadataListConstraints struct {
@@ -219,6 +268,7 @@ type columnInfo struct {
 	DataType               string  `json:"data_type"`
 	IsNullable             bool    `json:"is_nullable"`
 	ColumnDefault          *string `json:"column_default"`
+	DefaultOnNull          int     `json:"default_on_null,omitempty"`
 	IsPrimaryKey           bool    `json:"is_primary_key"`
 	Extra                  *string `json:"extra"`
 	Comment                *string `json:"comment"`
@@ -257,6 +307,50 @@ type foreignKeyInfo struct {
 	RefColumn string `json:"ref_column"`
 }
 
+// xuguTableMetadata mirrors the ALL_TABLES properties that affect a CREATE
+// TABLE statement. Keeping this separate from tableInfo lets the object tree
+// stay lightweight while the DDL exporter stays faithful to the catalog.
+type xuguTableMetadata struct {
+	TempType          int
+	OnCommitDelete    bool
+	PctFree           int
+	CopyNum           int
+	PartitionType     int
+	PartitionCount    int
+	PartitionKey      string
+	AutoPartitionType int
+	AutoPartitionSpan int
+	SubpartitionType  int
+	SubpartitionCount int
+	SubpartitionKey   string
+	Comment           string
+}
+
+type xuguIdentityInfo struct {
+	Column string
+	Start  int64
+	Step   int64
+}
+
+type xuguConstraintInfo struct {
+	Name              string
+	Type              string
+	Definition        string
+	ReferenceSchema   string
+	ReferenceTable    string
+	MatchType         string
+	UpdateAction      string
+	DeleteAction      string
+	Deferrable        bool
+	InitiallyDeferred bool
+	Enabled           bool
+}
+
+type xuguPartitionInfo struct {
+	Name  string
+	Value string
+}
+
 type triggerInfo struct {
 	Name   string `json:"name"`
 	Event  string `json:"event"`
@@ -275,6 +369,12 @@ type server struct {
 	activeCancelMu    sync.Mutex
 	activeCancel      context.CancelFunc
 	activeRows        map[*sql.Rows]context.CancelFunc
+	activeTimer       *time.Timer
+	activeTimedOut    bool
+	// killSession, if non-nil, is called to force-kill the current
+	// statement on the database server. Tests may replace it with a
+	// stub. The real implementation is set during connectWithControl.
+	killSession func()
 }
 
 type agentSession struct {
@@ -786,6 +886,11 @@ func (s *server) connectWithControl(params connectParams, cancelDB *sql.DB, owns
 	s.params = params
 	s.nodeID = databaseSession.nodeID
 	s.databaseSessionID = databaseSession.sessionID
+	s.killSession = func() {
+		if s.cancelDB != nil && s.databaseSessionID > 0 {
+			_, _ = s.cancelDB.Exec(fmt.Sprintf("CALL DBMS_DBA.KILL_SESSION_TRANS(%d, %d)", s.nodeID, s.databaseSessionID))
+		}
+	}
 	return nil
 }
 
@@ -804,6 +909,7 @@ func (s *server) disconnect() error {
 	s.ownsCancelDB = false
 	s.nodeID = 0
 	s.databaseSessionID = 0
+	s.killSession = nil
 	return err
 }
 
@@ -1245,9 +1351,14 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	var result []objectInfo
 	for rows.Next() {
 		var item objectInfo
+		var valid any
 		item.Schema = schema
-		if err := rows.Scan(&item.Name, &item.ObjectType, &item.Comment); err != nil {
+		if err := rows.Scan(&item.Name, &item.ObjectType, &item.Comment, &valid); err != nil {
 			return nil, err
+		}
+		if valid != nil {
+			value := truthy(valid)
+			item.Valid = &value
 		}
 		result = append(result, item)
 	}
@@ -1298,19 +1409,58 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`,
 func xuguListObjectsQuery(schema string, constraints metadataListConstraints) xuguMetadataListQuery {
 	return xuguConstrainedMetadataListQuery(
 		`
-SELECT t.TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, t.COMMENTS
+SELECT t.TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, t.COMMENTS, NULL AS VALID
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
 UNION ALL
-SELECT v.VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, v.COMMENTS
+SELECT v.VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, v.COMMENTS, NULL AS VALID
 FROM ALL_VIEWS v
 JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`,
-		"OBJECT_NAME, OBJECT_TYPE, COMMENTS",
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT p.PROC_NAME AS OBJECT_NAME,
+       CASE WHEN p.RET_TYPE IS NULL THEN 'PROCEDURE' ELSE 'FUNCTION' END AS OBJECT_TYPE,
+       p.COMMENTS, p.VALID
+FROM ALL_PROCEDURES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE' AS OBJECT_TYPE, p.COMMENTS, p.VALID
+FROM ALL_PACKAGES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE_BODY' AS OBJECT_TYPE, p.COMMENTS, p.ALL_OK
+FROM ALL_PACKAGES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND p.BODY IS NOT NULL
+UNION ALL
+SELECT tr.TRIG_NAME AS OBJECT_NAME, 'TRIGGER' AS OBJECT_TYPE, tr.COMMENTS, tr.VALID
+FROM ALL_TRIGGERS tr
+JOIN ALL_SCHEMAS s ON s.DB_ID = tr.DB_ID AND s.SCHEMA_ID = tr.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT q.SEQ_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, NULL AS COMMENTS, NULL AS VALID
+FROM ALL_SEQUENCES q
+JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE' AS OBJECT_TYPE, u.COMMENTS, u.VALID
+FROM ALL_TYPES u
+JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE_BODY' AS OBJECT_TYPE, u.COMMENTS, u.VALID
+FROM ALL_TYPES u
+JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND u.BODY IS NOT NULL`,
+		"OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID",
 		"OBJECT_NAME",
 		"OBJECT_TYPE",
-		[]any{schema, schema},
+		[]any{schema, schema, schema, schema, schema, schema, schema, schema, schema},
 		constraints,
 	)
 }
@@ -1375,6 +1525,8 @@ func normalizedXuguObjectTypes(values []string) []string {
 			normalized = "TABLE"
 		case "VIEW":
 			normalized = "VIEW"
+		case "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY":
+			// Already normalized.
 		default:
 			continue
 		}
@@ -1429,6 +1581,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 	for rows.Next() {
 		var item columnInfo
 		var notNull any
+		var onNull any
 		var scale *int
 		var varying any
 		if err := rows.Scan(
@@ -1436,6 +1589,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 			&item.DataType,
 			&notNull,
 			&item.ColumnDefault,
+			&onNull,
 			&item.Comment,
 			&scale,
 			&varying,
@@ -1444,6 +1598,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 		}
 		item.DataType = normalizeXuguColumnType(item.DataType, varying)
 		item.IsNullable = !truthy(notNull)
+		item.DefaultOnNull = xuguInt(onNull)
 		item.IsPrimaryKey = primaryKeys[strings.ToUpper(item.Name)]
 		item.NumericPrecision, item.NumericScale, item.CharacterMaximumLength = decodeXuguScale(item.DataType, scale)
 		result = append(result, item)
@@ -1640,7 +1795,13 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 		}
 		builder.WriteString(line)
 	}
-	return map[string]any{"name": name, "object_type": objectType, "schema": schema, "source": builder.String()}, rows.Err()
+	result := map[string]any{"name": name, "object_type": objectType, "schema": schema, "source": builder.String()}
+	normalizedType := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(objectType), "_", " "))
+	if normalizedType == "TYPE" || normalizedType == "TYPE BODY" {
+		// Type source is exposed as catalog SPEC/BODY text, but cannot be safely edited as DDL.
+		result["editable"] = false
+	}
+	return result, rows.Err()
 }
 
 func (s *server) getTableDDL(schema, table string) (string, error) {
@@ -1649,20 +1810,10 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var ddl string
-	rows, err := s.queryRows("SELECT TO_CHAR(DBMS_METADATA.GET_DDL('TABLE', ?, ?)) FROM DUAL", []any{strings.ToUpper(table), schema})
-	if err == nil {
-		defer s.closeRows(rows)
-		if rows.Next() {
-			if scanErr := rows.Scan(&ddl); scanErr == nil && strings.TrimSpace(ddl) != "" {
-				if err := rows.Err(); err != nil {
-					return "", err
-				}
-				return s.appendTableIndexDDL(schema, table, ddl), nil
-			}
-		}
-	}
-	ddl, err = s.buildTableDDL(schema, table)
+	// DBMS_METADATA.GET_DDL can block indefinitely on XuguDB, even when the
+	// table metadata itself is accessible. Reconstruct the DDL from the same
+	// ALL_* catalog views used by the object browser instead.
+	ddl, err := s.buildTableDDL(schema, table)
 	if err != nil {
 		return "", err
 	}
@@ -1769,7 +1920,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 			HasMore:         false,
 		}, err
 	}
-	rows, err := s.queryRows(sqlText, nil)
+	rows, err := s.queryRowsWithTimeout(sqlText, nil, opts.TimeoutSecs)
 	if err != nil {
 		return queryPageResult{}, err
 	}
@@ -1894,7 +2045,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 		maxRows = defaultMaxRows
 	}
 	if isQuerySQL(sqlText) {
-		result, err := s.executeSelect(sqlText, maxRows)
+		result, err := s.executeSelect(sqlText, maxRows, opts.TimeoutSecs)
 		result.ExecutionTimeMS = time.Since(start).Milliseconds()
 		return result, err
 	}
@@ -1902,7 +2053,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	if err != nil {
 		return queryResult{}, err
 	}
-	ctx, cancel := s.beginActiveOperation()
+	ctx, cancel := s.beginActiveOperationWithTimeout(opts.TimeoutSecs)
 	defer s.endActiveOperation(cancel)
 	execResult, err := db.ExecContext(ctx, sqlText)
 	if err != nil {
@@ -1912,8 +2063,8 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	return queryResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, AffectedRows: affected, ExecutionTimeMS: time.Since(start).Milliseconds()}, nil
 }
 
-func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error) {
-	rows, err := s.queryRows(sqlText, nil)
+func (s *server) executeSelect(sqlText string, maxRows int, timeoutSecs int) (queryResult, error) {
+	rows, err := s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -1976,18 +2127,32 @@ func (s *server) setSchema(schema string) error {
 }
 
 func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
+	return s.queryRowsWithTimeout(sqlText, args, 0)
+}
+
+func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs int) (*sql.Rows, error) {
 	db, err := s.requireDB()
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := s.beginActiveOperation()
+	ctx, cancel := s.beginActiveOperationWithTimeout(timeoutSecs)
 	rows, queryErr := db.QueryContext(ctx, sqlText, args...)
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
+	if s.activeTimer != nil {
+		s.activeTimer.Stop()
+		s.activeTimer = nil
+	}
+	timedOut := s.activeTimedOut
 	if queryErr != nil {
 		cancel()
+	} else if timedOut {
+		cancel()
+		if rows != nil {
+			rows.Close()
+		}
+		queryErr = fmt.Errorf("query timed out after %ds", timeoutSecs)
 	} else {
-		// Paged queries may continue fetching after QueryContext returns.
 		s.activeRows[rows] = cancel
 	}
 	s.activeCancelMu.Unlock()
@@ -1995,9 +2160,31 @@ func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
 }
 
 func (s *server) beginActiveOperation() (context.Context, context.CancelFunc) {
+	return s.beginActiveOperationWithTimeout(0)
+}
+
+func (s *server) beginActiveOperationWithTimeout(timeoutSecs int) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
+	var timer *time.Timer
+	if timeoutSecs > 0 {
+		var t *time.Timer
+		t = time.AfterFunc(time.Duration(timeoutSecs)*time.Second, func() {
+			s.activeCancelMu.Lock()
+			if s.activeTimer == t {
+				s.activeTimedOut = true
+				cancel()
+				if s.killSession != nil {
+					s.killSession()
+				}
+			}
+			s.activeCancelMu.Unlock()
+		})
+		timer = t
+	}
 	s.activeCancelMu.Lock()
 	s.activeCancel = cancel
+	s.activeTimer = timer
+	s.activeTimedOut = false
 	s.activeCancelMu.Unlock()
 	return ctx, cancel
 }
@@ -2006,6 +2193,10 @@ func (s *server) endActiveOperation(cancel context.CancelFunc) {
 	cancel()
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
+	if s.activeTimer != nil {
+		s.activeTimer.Stop()
+		s.activeTimer = nil
+	}
 	s.activeCancelMu.Unlock()
 }
 
@@ -2022,13 +2213,13 @@ func (s *server) cancelActiveQuery() {
 	for _, cancel := range cancels {
 		cancel()
 	}
-	if len(cancels) > 0 && s.cancelDB != nil && s.databaseSessionID > 0 {
+	if len(cancels) > 0 && s.killSession != nil {
 		// go-xugu-driver does not implement QueryerContext/ExecerContext and
 		// blocks in network reads, so context cancellation alone cannot interrupt
 		// an in-flight statement. Xugu's control procedure stops the target
 		// session's current transaction while preserving the connection. Runtime
 		// sessions share one control connection per database endpoint.
-		_, _ = s.cancelDB.Exec(fmt.Sprintf("CALL DBMS_DBA.KILL_SESSION_TRANS(%d, %d)", s.nodeID, s.databaseSessionID))
+		s.killSession()
 	}
 }
 
@@ -2053,27 +2244,46 @@ func objectSourceQuery(schema, name, objectType string) (string, []any, error) {
 	case "VIEW":
 		return `
 SELECT TO_CHAR(v.DEFINE)
-FROM SYS_VIEWS v
-JOIN SYS_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
+FROM ALL_VIEWS v
+JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(v.VIEW_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TRIGGER":
 		return `
 SELECT TO_CHAR(t.DEFINE)
-FROM SYS_TRIGGERS t
-JOIN SYS_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+FROM ALL_TRIGGERS t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(t.TRIG_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PROCEDURE", "FUNCTION":
 		return `
 SELECT TO_CHAR(p.DEFINE)
-FROM SYS_PROCEDURES p
-JOIN SYS_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+FROM ALL_PROCEDURES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(p.PROC_NAME) = UPPER(?)`, []any{schema, name}, nil
-	case "PACKAGE", "PACKAGE BODY":
+	case "PACKAGE":
 		return `
-SELECT COALESCE(TO_CHAR(k.SPEC), '') || COALESCE(TO_CHAR(k.BODY), '')
-FROM SYS_PACKAGES k
-JOIN SYS_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
+SELECT COALESCE(TO_CHAR(k.SPEC), '')
+FROM ALL_PACKAGES k
+JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
+	case "PACKAGE BODY", "PACKAGE_BODY":
+		return `
+SELECT COALESCE(TO_CHAR(k.BODY), '')
+FROM ALL_PACKAGES k
+JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
+	case "TYPE":
+		return `
+SELECT COALESCE(TO_CHAR(u.SPEC), '')
+FROM ALL_TYPES u
+JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(u.TYPE_NAME) = UPPER(?)`, []any{schema, name}, nil
+	case "TYPE BODY", "TYPE_BODY":
+		return `
+SELECT COALESCE(TO_CHAR(u.BODY), '')
+FROM ALL_TYPES u
+JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(u.TYPE_NAME) = UPPER(?)
+  AND u.BODY IS NOT NULL`, []any{schema, name}, nil
 	default:
 		return "", nil, fmt.Errorf("object source is not supported for %s", objectType)
 	}
@@ -2087,56 +2297,431 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 	if len(columns) == 0 {
 		return "", fmt.Errorf("table not found: %s.%s", schema, table)
 	}
+	metadata, err := s.tableMetadata(schema, table)
+	if err != nil {
+		return "", err
+	}
+	identities, err := s.tableIdentities(schema, table)
+	if err != nil {
+		return "", err
+	}
+	constraints, err := s.tableConstraints(schema, table)
+	if err != nil {
+		return "", err
+	}
+	partitions, err := s.tablePartitions(schema, table, false)
+	if err != nil {
+		return "", err
+	}
+	subpartitions, err := s.tablePartitions(schema, table, true)
+	if err != nil {
+		return "", err
+	}
+	return renderXuguTableDDL(schema, table, columns, metadata, identities, constraints, partitions, subpartitions), nil
+}
+
+func (s *server) tableMetadata(schema, table string) (xuguTableMetadata, error) {
+	rows, err := s.queryRows(xuguTableMetadataSQL, []any{schema, table})
+	if err != nil {
+		return xuguTableMetadata{}, err
+	}
+	defer s.closeRows(rows)
+	var item xuguTableMetadata
+	if !rows.Next() {
+		return item, rows.Err()
+	}
+	var tempType, onCommitDelete, pctFree, copyNum, partitionType, partitionCount, partitionKey any
+	var autoType, autoSpan, subpartitionType, subpartitionCount, subpartitionKey, comment any
+	if err := rows.Scan(&tempType, &onCommitDelete, &pctFree, &copyNum, &partitionType, &partitionCount, &partitionKey,
+		&autoType, &autoSpan, &subpartitionType, &subpartitionCount, &subpartitionKey, &comment); err != nil {
+		return item, err
+	}
+	item.TempType = xuguInt(tempType)
+	item.OnCommitDelete = truthy(onCommitDelete)
+	item.PctFree = xuguInt(pctFree)
+	item.CopyNum = xuguInt(copyNum)
+	item.PartitionType = xuguInt(partitionType)
+	item.PartitionCount = xuguInt(partitionCount)
+	item.PartitionKey = xuguString(partitionKey)
+	item.AutoPartitionType = xuguInt(autoType)
+	item.AutoPartitionSpan = xuguInt(autoSpan)
+	item.SubpartitionType = xuguInt(subpartitionType)
+	item.SubpartitionCount = xuguInt(subpartitionCount)
+	item.SubpartitionKey = xuguString(subpartitionKey)
+	item.Comment = xuguString(comment)
+	return item, rows.Err()
+}
+
+func (s *server) tableIdentities(schema, table string) (map[string]xuguIdentityInfo, error) {
+	rows, err := s.queryRows(xuguTableIdentitySQL, []any{schema, table})
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	result := map[string]xuguIdentityInfo{}
+	for rows.Next() {
+		var column, start, step any
+		if err := rows.Scan(&column, &start, &step); err != nil {
+			return nil, err
+		}
+		item := xuguIdentityInfo{Column: xuguString(column), Start: int64(xuguInt(start)), Step: int64(xuguInt(step))}
+		result[strings.ToUpper(item.Column)] = item
+	}
+	return result, rows.Err()
+}
+
+func (s *server) tableConstraints(schema, table string) ([]xuguConstraintInfo, error) {
+	rows, err := s.queryRows(xuguTableConstraintsSQL, []any{schema, table})
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	var result []xuguConstraintInfo
+	for rows.Next() {
+		var item xuguConstraintInfo
+		var name, constraintType, definition, referenceSchema, referenceTable any
+		var matchType, updateAction, deleteAction, deferrable, initiallyDeferred, enabled any
+		if err := rows.Scan(&name, &constraintType, &definition, &referenceSchema, &referenceTable,
+			&matchType, &updateAction, &deleteAction, &deferrable, &initiallyDeferred, &enabled); err != nil {
+			return nil, err
+		}
+		item.Name = xuguString(name)
+		item.Type = xuguString(constraintType)
+		item.Definition = xuguString(definition)
+		item.ReferenceSchema = xuguString(referenceSchema)
+		item.ReferenceTable = xuguString(referenceTable)
+		item.MatchType = xuguString(matchType)
+		item.UpdateAction = xuguString(updateAction)
+		item.DeleteAction = xuguString(deleteAction)
+		item.Deferrable = truthy(deferrable)
+		item.InitiallyDeferred = truthy(initiallyDeferred)
+		item.Enabled = truthy(enabled)
+		result = append(result, item)
+	}
+	return emptyIfNil(result), rows.Err()
+}
+
+func (s *server) tablePartitions(schema, table string, subpartition bool) ([]xuguPartitionInfo, error) {
+	query := xuguTablePartitionsSQL
+	if subpartition {
+		query = xuguTableSubpartitionsSQL
+	}
+	rows, err := s.queryRows(query, []any{schema, table})
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	var result []xuguPartitionInfo
+	for rows.Next() {
+		var name, value any
+		if err := rows.Scan(&name, &value); err != nil {
+			return nil, err
+		}
+		result = append(result, xuguPartitionInfo{Name: xuguString(name), Value: xuguString(value)})
+	}
+	return emptyIfNil(result), rows.Err()
+}
+
+// renderXuguTableDDL is deliberately independent from database access.  The
+// exporter can consequently be regression-tested against the catalog data
+// returned by Xugu without requiring a privileged DBMS_METADATA call.
+func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xuguTableMetadata, identities map[string]xuguIdentityInfo, constraints []xuguConstraintInfo, partitions, subpartitions []xuguPartitionInfo) string {
 	var builder strings.Builder
-	builder.WriteString("CREATE TABLE ")
+	switch metadata.TempType {
+	case 2:
+		builder.WriteString("CREATE GLOBAL TEMP TABLE ")
+	case 1:
+		builder.WriteString("CREATE TEMP TABLE ")
+	default:
+		builder.WriteString("CREATE TABLE ")
+	}
 	builder.WriteString(quoteIdentifier(schema))
 	builder.WriteByte('.')
 	builder.WriteString(quoteIdentifier(table))
 	builder.WriteString(" (\n")
-	for i, column := range columns {
-		if i > 0 {
-			builder.WriteString(",\n")
+	items := make([]string, 0, len(columns)+len(constraints))
+	for _, column := range columns {
+		var item strings.Builder
+		item.WriteString("  ")
+		item.WriteString(quoteIdentifier(column.Name))
+		item.WriteByte(' ')
+		item.WriteString(columnTypeDDL(column))
+		if identity, ok := identities[strings.ToUpper(column.Name)]; ok {
+			item.WriteString(fmt.Sprintf(" IDENTITY(%d,%d)", identity.Start, identity.Step))
 		}
-		builder.WriteString("  ")
-		builder.WriteString(quoteIdentifier(column.Name))
-		builder.WriteByte(' ')
-		builder.WriteString(columnTypeDDL(column))
 		if column.ColumnDefault != nil && strings.TrimSpace(*column.ColumnDefault) != "" {
-			builder.WriteString(" DEFAULT ")
-			builder.WriteString(strings.TrimSpace(*column.ColumnDefault))
+			item.WriteString(" DEFAULT ")
+			switch column.DefaultOnNull {
+			case 1:
+				// ON_NULL=1 means that an explicit NULL is replaced during insert.
+				// The explicit spelling also covers the legacy DEFAULT ON NULL form.
+				item.WriteString("ON NULL FOR INSERT ONLY ")
+			case 2:
+				item.WriteString("ON NULL FOR INSERT AND UPDATE ")
+			}
+			item.WriteString(strings.TrimSpace(*column.ColumnDefault))
 		}
 		if !column.IsNullable {
-			builder.WriteString(" NOT NULL")
+			item.WriteString(" NOT NULL")
 		}
 		if column.Comment != nil && strings.TrimSpace(*column.Comment) != "" {
-			builder.WriteString(" COMMENT ")
-			builder.WriteString(quoteStringLiteral(strings.TrimSpace(*column.Comment)))
+			item.WriteString(" COMMENT ")
+			item.WriteString(quoteStringLiteral(strings.TrimSpace(*column.Comment)))
+		}
+		items = append(items, item.String())
+	}
+	for _, constraint := range constraints {
+		if item := renderXuguConstraintDDL(constraint); item != "" {
+			items = append(items, "  "+item)
 		}
 	}
-	primary := make([]string, 0)
-	for _, column := range columns {
-		if column.IsPrimaryKey {
-			primary = append(primary, quoteIdentifier(column.Name))
-		}
-	}
-	if len(primary) > 0 {
-		builder.WriteString(",\n  PRIMARY KEY (")
-		builder.WriteString(strings.Join(primary, ", "))
-		builder.WriteByte(')')
-	}
+	builder.WriteString(strings.Join(items, ",\n"))
 	builder.WriteString("\n)")
-	if comment, err := s.tableComment(schema, table); err == nil && strings.TrimSpace(comment) != "" {
-		builder.WriteString("\nCOMMENT ")
-		builder.WriteString(quoteStringLiteral(strings.TrimSpace(comment)))
+	if metadata.TempType != 0 {
+		if metadata.OnCommitDelete {
+			builder.WriteString(" ON COMMIT DELETE ROWS")
+		} else {
+			builder.WriteString(" ON COMMIT PRESERVE ROWS")
+		}
 	}
-	return builder.String(), nil
+	builder.WriteString(renderXuguPartitionDDL(metadata, partitions, subpartitions))
+	// Xugu's CREATE TABLE grammar places storage attributes after the
+	// partition/subpartition clause (not between the table body and PARTITION).
+	if metadata.PctFree > 0 {
+		builder.WriteString(fmt.Sprintf(" PCTFREE %d", metadata.PctFree))
+	}
+	if metadata.CopyNum > 0 {
+		builder.WriteString(fmt.Sprintf(" COPY NUMBER %d", metadata.CopyNum))
+	}
+	if strings.TrimSpace(metadata.Comment) != "" {
+		builder.WriteString("\nCOMMENT ")
+		builder.WriteString(quoteStringLiteral(strings.TrimSpace(metadata.Comment)))
+	}
+	for _, constraint := range constraints {
+		if !constraint.Enabled && strings.TrimSpace(constraint.Name) != "" {
+			builder.WriteString(";\n\nALTER TABLE ")
+			builder.WriteString(quoteIdentifier(schema))
+			builder.WriteByte('.')
+			builder.WriteString(quoteIdentifier(table))
+			builder.WriteString(" DISABLE CONSTRAINT ")
+			builder.WriteString(quoteIdentifier(constraint.Name))
+		}
+	}
+	return builder.String()
+}
+
+func renderXuguConstraintDDL(constraint xuguConstraintInfo) string {
+	name := strings.TrimSpace(constraint.Name)
+	definition := strings.TrimSpace(constraint.Definition)
+	if name == "" || definition == "" {
+		return ""
+	}
+	prefix := "CONSTRAINT " + quoteIdentifier(name) + " "
+	switch strings.ToUpper(strings.TrimSpace(constraint.Type)) {
+	case "P":
+		return prefix + "PRIMARY KEY (" + definition + ")"
+	case "U":
+		return prefix + "UNIQUE (" + definition + ")"
+	case "C":
+		return prefix + "CHECK (" + definition + ")"
+	case "F":
+		localColumns, referencedColumns := parseForeignKeyColumns(definition)
+		if len(localColumns) == 0 || len(referencedColumns) == 0 || strings.TrimSpace(constraint.ReferenceTable) == "" {
+			return ""
+		}
+		var builder strings.Builder
+		builder.WriteString(prefix)
+		builder.WriteString("FOREIGN KEY (")
+		builder.WriteString(quotedIdentifiers(localColumns))
+		builder.WriteString(") REFERENCES ")
+		if strings.TrimSpace(constraint.ReferenceSchema) != "" {
+			builder.WriteString(quoteIdentifier(constraint.ReferenceSchema))
+			builder.WriteByte('.')
+		}
+		builder.WriteString(quoteIdentifier(constraint.ReferenceTable))
+		builder.WriteString(" (")
+		builder.WriteString(quotedIdentifiers(referencedColumns))
+		builder.WriteByte(')')
+		if match := xuguMatchClause(constraint.MatchType); match != "" {
+			builder.WriteByte(' ')
+			builder.WriteString(match)
+		}
+		if action := xuguReferentialAction(constraint.UpdateAction); action != "" {
+			builder.WriteString(" ON UPDATE ")
+			builder.WriteString(action)
+		}
+		if action := xuguReferentialAction(constraint.DeleteAction); action != "" {
+			builder.WriteString(" ON DELETE ")
+			builder.WriteString(action)
+		}
+		if constraint.Deferrable {
+			builder.WriteString(" DEFERRABLE")
+			if constraint.InitiallyDeferred {
+				builder.WriteString(" INITIALLY DEFERRED")
+			} else {
+				builder.WriteString(" INITIALLY IMMEDIATE")
+			}
+		} else {
+			builder.WriteString(" NOT DEFERRABLE")
+		}
+		return builder.String()
+	default:
+		return ""
+	}
+}
+
+func renderXuguPartitionDDL(metadata xuguTableMetadata, partitions, subpartitions []xuguPartitionInfo) string {
+	var builder strings.Builder
+	if key := strings.TrimSpace(metadata.PartitionKey); key != "" && metadata.PartitionType != 0 {
+		typeName := xuguPartitionType(metadata.PartitionType)
+		if typeName != "" {
+			builder.WriteString(" PARTITION BY ")
+			builder.WriteString(typeName)
+			builder.WriteString(" (")
+			builder.WriteString(key)
+			builder.WriteByte(')')
+			if metadata.AutoPartitionType != 0 && metadata.AutoPartitionSpan > 0 {
+				if interval := xuguAutoPartitionInterval(metadata.AutoPartitionType, metadata.AutoPartitionSpan); interval != "" {
+					builder.WriteString(" INTERVAL ")
+					builder.WriteString(interval)
+				}
+			}
+			if metadata.PartitionType == 3 {
+				// HASH partitions have no RANGE/LIST-style values. ALL_PARTIS can
+				// contain physical hash-partition rows, but only their count belongs
+				// in CREATE TABLE syntax.
+				count := metadata.PartitionCount
+				if count <= 0 {
+					count = len(partitions)
+				}
+				if count > 0 {
+					builder.WriteString(fmt.Sprintf(" PARTITIONS %d", count))
+				}
+			} else if len(partitions) > 0 {
+				builder.WriteString(" PARTITIONS (\n")
+				for i, partition := range partitions {
+					if i > 0 {
+						builder.WriteString(",\n")
+					}
+					builder.WriteString("  ")
+					builder.WriteString(quoteIdentifier(partition.Name))
+					builder.WriteByte(' ')
+					if metadata.PartitionType == 1 {
+						builder.WriteString("VALUES LESS THAN (")
+					} else if metadata.PartitionType == 2 && strings.EqualFold(strings.TrimSpace(partition.Value), "OTHERVALUES") {
+						builder.WriteString("VALUES (")
+					} else {
+						builder.WriteString("VALUES (")
+					}
+					builder.WriteString(strings.TrimSpace(partition.Value))
+					builder.WriteByte(')')
+				}
+				builder.WriteString("\n)")
+			}
+		}
+	}
+	if key := strings.TrimSpace(metadata.SubpartitionKey); key != "" && metadata.SubpartitionType != 0 {
+		typeName := xuguPartitionType(metadata.SubpartitionType)
+		if typeName != "" {
+			builder.WriteString(" SUBPARTITION BY ")
+			builder.WriteString(typeName)
+			builder.WriteString(" (")
+			builder.WriteString(key)
+			builder.WriteByte(')')
+			if metadata.SubpartitionType == 3 {
+				count := metadata.SubpartitionCount
+				if count <= 0 {
+					count = len(subpartitions)
+				}
+				if count > 0 {
+					builder.WriteString(fmt.Sprintf(" SUBPARTITIONS %d", count))
+				}
+			} else if len(subpartitions) > 0 {
+				builder.WriteString(" SUBPARTITIONS (\n")
+				for i, partition := range subpartitions {
+					if i > 0 {
+						builder.WriteString(",\n")
+					}
+					builder.WriteString("  ")
+					builder.WriteString(quoteIdentifier(partition.Name))
+					builder.WriteByte(' ')
+					if metadata.SubpartitionType == 1 {
+						builder.WriteString("VALUES LESS THAN (")
+					} else {
+						builder.WriteString("VALUES (")
+					}
+					builder.WriteString(strings.TrimSpace(partition.Value))
+					builder.WriteByte(')')
+				}
+				builder.WriteString("\n)")
+			}
+		}
+	}
+	return builder.String()
+}
+
+func quotedIdentifiers(values []string) string {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, quoteIdentifier(value))
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func xuguReferentialAction(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "n":
+		return "NO ACTION"
+	case "r":
+		return "RESTRICT"
+	case "c":
+		return "CASCADE"
+	case "u":
+		return "SET NULL"
+	case "d":
+		return "SET DEFAULT"
+	default:
+		return ""
+	}
+}
+
+func xuguMatchClause(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "A":
+		return "MATCH FULL"
+	case "P":
+		return "MATCH PARTIAL"
+	case "U":
+		// SIMPLE is Xugu's default and it is represented by omitting the
+		// clause; unlike FULL/PARTIAL, `MATCH SIMPLE` is not valid Xugu SQL.
+		return ""
+	default:
+		return ""
+	}
+}
+
+func xuguPartitionType(value int) string {
+	switch value {
+	case 1:
+		return "RANGE"
+	case 2:
+		return "LIST"
+	case 3:
+		return "HASH"
+	default:
+		return ""
+	}
+}
+
+func xuguAutoPartitionInterval(kind, span int) string {
+	unit := map[int]string{1: "YEAR", 2: "MONTH", 3: "DAY", 4: "HOUR"}[kind]
+	if unit == "" || span <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d %s", span, unit)
 }
 
 func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
-	indexDDL, err := s.tableIndexDDL(schema, table)
-	if err == nil && strings.TrimSpace(indexDDL) != "" {
-		return appendDDLStatement(ddl, indexDDL)
-	}
 	indexes, err := s.listIndexes(schema, table)
 	if err != nil || len(indexes) == 0 {
 		return ddl
@@ -2177,27 +2762,6 @@ func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
 		return ddl
 	}
 	return appendDDLStatement(ddl, builder.String())
-}
-
-func (s *server) tableIndexDDL(schema, table string) (string, error) {
-	rows, err := s.queryRows(
-		"SELECT TO_CHAR(DBMS_METADATA.GET_DDL('INDEX', ?, ?)) FROM DUAL",
-		[]any{strings.ToUpper(strings.TrimSpace(table)), schema},
-	)
-	if err != nil {
-		return "", err
-	}
-	defer s.closeRows(rows)
-	var ddl string
-	if rows.Next() {
-		if err := rows.Scan(&ddl); err != nil {
-			return "", err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	return ddl, nil
 }
 
 func (s *server) tableComment(schema, table string) (string, error) {
@@ -2336,6 +2900,32 @@ func truthy(value any) bool {
 		return upper == "T" || upper == "TRUE" || upper == "1" || upper == "Y" || upper == "YES"
 	default:
 		return false
+	}
+}
+
+func xuguString(value any) string {
+	value = normalizeValue(value)
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func xuguInt(value any) int {
+	value = normalizeValue(value)
+	switch v := value.(type) {
+	case int64:
+		return int(v)
+	case int:
+		return v
+	case float64:
+		return int(v)
+	case string:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(v))
+		return parsed
+	default:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(fmt.Sprint(v)))
+		return parsed
 	}
 }
 

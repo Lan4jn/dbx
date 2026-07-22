@@ -107,7 +107,7 @@ test("suggests lower-case SQL keywords when configured", () => {
   );
 });
 
-test("suggests PostgreSQL-specific data types and functions", () => {
+test("suggests database-specific data types and functions", () => {
   const typeItems = buildSqlCompletionItems("create table events (payload js", "create table events (payload js".length, {
     tables: [],
     columnsByTable: new Map(),
@@ -128,6 +128,11 @@ test("suggests PostgreSQL-specific data types and functions", () => {
     columnsByTable: new Map(),
     databaseType: "mysql",
   });
+  const mysqlSysdateItems = buildSqlCompletionItems("select sysd", "select sysd".length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+  });
   const postgresDateItems = buildSqlCompletionItems("select date_f", "select date_f".length, {
     tables: [],
     columnsByTable: new Map(),
@@ -138,6 +143,7 @@ test("suggests PostgreSQL-specific data types and functions", () => {
   assert.ok(serialItems.some((item) => item.type === "keyword" && item.label === "SERIAL"));
   assert.ok(functionItems.some((item) => item.type === "function" && item.label === "JSONB_BUILD_OBJECT"));
   assert.ok(mysqlFunctionItems.some((item) => item.type === "function" && item.label === "DATE_FORMAT"));
+  assert.ok(mysqlSysdateItems.some((item) => item.type === "function" && item.label === "SYSDATE"));
   assert.equal(
     postgresDateItems.some((item) => item.type === "function" && item.label === "DATE_FORMAT"),
     false,
@@ -344,6 +350,36 @@ test("leaves safe PostgreSQL column identifiers unquoted when completion inserts
   assert.equal(column?.apply, "article");
 });
 
+test("quotes PostgreSQL reserved-word column identifiers when completion inserts them", () => {
+  // Reserved words absent from the completion keyword phrase list (which has
+  // "ORDER BY" but not "order") must still be quoted as column references.
+  const reservedColumns = ["order", "do", "returning", "ilike", "window", "true"];
+  const reservedColumnsByTable = new Map<string, SqlCompletionColumn[]>([["public.bookings", reservedColumns.map((name) => ({ name, table: "bookings", schema: "public", dataType: "text" }))]]);
+  const sql = "select  from bookings";
+  const items = buildSqlCompletionItems(sql, "select ".length, {
+    tables: [{ name: "bookings", schema: "public", type: "table" }],
+    columnsByTable: reservedColumnsByTable,
+    dialect: "postgres",
+  });
+
+  for (const name of reservedColumns) {
+    const column = items.find((item) => item.type === "column" && item.label === name);
+    assert.equal(column?.apply, `"${name}"`, `expected reserved column "${name}" to be quoted`);
+  }
+});
+
+test("quotes PostgreSQL reserved-word table identifiers when completion inserts them", () => {
+  const sql = "select * from ord";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [{ name: "order", schema: "public", type: "table" }],
+    columnsByTable: new Map(),
+    dialect: "postgres",
+  });
+
+  const table = items.find((item) => item.type === "table" && item.label === "order");
+  assert.equal(table?.apply, '"order"');
+});
+
 test("suggests matching table names after FROM", () => {
   const sql = "select * from us";
   const items = buildSqlCompletionItems(sql, sql.length, {
@@ -412,6 +448,87 @@ test("does not mix routines into an explicit table alias column completion", () 
 
   assert.ok(items.some((item) => item.label === "name" && item.type === "column"));
   assert.equal(items.some((item) => item.label === "name_formatter"), false);
+});
+
+test("suggests matching database functions alongside referenced columns", () => {
+  const sql = "SELECT st_ FROM public.routes";
+  const items = buildSqlCompletionItems(sql, "SELECT st_".length, {
+    tables: [{ name: "routes", schema: "public", type: "table" }],
+    columnsByTable: new Map([
+      [
+        "public.routes",
+        [
+          { name: "start_sid", table: "routes", schema: "public", dataType: "integer" },
+          { name: "start_dept", table: "routes", schema: "public", dataType: "text" },
+        ],
+      ],
+    ]),
+    objects: [
+      { name: "st_area", schema: "public", type: "function", dataType: "double precision", comment: "Returns an area" },
+      { name: "st_x", schema: "public", type: "function", dataType: "double precision" },
+      { name: "st_refresh", schema: "public", type: "procedure" },
+    ],
+    databaseType: "postgres",
+    currentSchema: "public",
+  });
+
+  const area = items.find((item) => item.label === "st_area" && item.type === "function");
+  assert.ok(area);
+  assert.equal(area.detail, "function in public  [double precision]");
+  assert.equal(area.info, "public.st_area\nReturns an area");
+  assert.ok(items.some((item) => item.label === "start_sid" && item.type === "column"));
+  assert.equal(
+    items.some((item) => item.label === "st_refresh"),
+    false,
+  );
+  assert.equal(
+    items.some((item) => item.label === "LAST_VALUE" || item.label === "FIRST_VALUE"),
+    false,
+  );
+  assert.ok(items.findIndex((item) => item.label === "st_area" && item.type === "function") < items.findIndex((item) => item.label === "start_sid" && item.type === "column"));
+});
+
+test("keeps an exact referenced column above an exact database function", () => {
+  const sql = "SELECT st_area FROM public.routes";
+  const items = buildSqlCompletionItems(sql, "SELECT st_area".length, {
+    tables: [{ name: "routes", schema: "public", type: "table" }],
+    columnsByTable: new Map([["public.routes", [{ name: "st_area", table: "routes", schema: "public", dataType: "numeric" }]]]),
+    objects: [{ name: "st_area", schema: "public", type: "function", dataType: "double precision", boost: 2400 }],
+    databaseType: "oracle",
+    currentSchema: "public",
+  });
+
+  const exactMatches = items.filter((item) => item.label === "st_area");
+  assert.deepEqual(
+    exactMatches.map((item) => item.type),
+    ["column", "function"],
+  );
+});
+
+test("does not suggest database functions in exclusive table or column contexts", () => {
+  const input = {
+    tables: [{ name: "routes", schema: "public", type: "table" as const }],
+    columnsByTable: new Map([["public.routes", [{ name: "start_sid", table: "routes", schema: "public" }]]]),
+    objects: [{ name: "st_area", schema: "public", type: "function" as const }],
+    databaseType: "postgres" as const,
+  };
+
+  const tableSql = "SELECT * FROM st_";
+  assert.equal(
+    buildSqlCompletionItems(tableSql, tableSql.length, input).some((item) => item.label === "st_area"),
+    false,
+  );
+
+  const updateSql = "UPDATE public.routes SET st_";
+  const updateContext = getSqlCompletionContext(updateSql, updateSql.length);
+  assert.equal(updateContext.qualifier, undefined);
+  assert.equal(updateContext.contextKind, "column");
+  assert.equal(updateContext.exclusiveColumnSuggestions, true);
+  assert.equal(updateContext.suggestRoutines, false);
+  assert.equal(
+    buildSqlCompletionItems(updateSql, updateSql.length, input).some((item) => item.label === "st_area"),
+    false,
+  );
 });
 
 test("keeps explicit alias column suggestions scoped to the alias table", () => {
@@ -1752,6 +1869,27 @@ test("returns cast signature with AS syntax", () => {
   });
 });
 
+test("uses dialect-specific argument order for CONVERT completion and signature help", () => {
+  const sql = "select conv";
+  const sqlServerItems = buildSqlCompletionItems(sql, sql.length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+  });
+  const mysqlItems = buildSqlCompletionItems(sql, sql.length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+  });
+
+  assert.equal(sqlServerItems.find((item) => item.label === "CONVERT")?.apply, "CONVERT(${type}, ${expression})");
+  assert.equal(mysqlItems.find((item) => item.label === "CONVERT")?.apply, "CONVERT(${expression}, ${type})");
+
+  const functionSql = "select convert(";
+  assert.deepEqual(getSqlFunctionSignatureHelp(functionSql, functionSql.length, "sqlserver")?.parameters, ["type", "expression"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp(functionSql, functionSql.length, "mysql")?.parameters, ["expression", "type"]);
+});
+
 test("returns null signature help outside function calls", () => {
   assert.equal(getSqlFunctionSignatureHelp("select created_at from users", "select created_at".length), null);
 });
@@ -2091,7 +2229,7 @@ test("filters data type keywords out of SELECT context", () => {
 
 // --- Qualified column names for duplicates ---
 
-test("shows qualified column names when multiple tables share column name", () => {
+test("uses row-source aliases when multiple tables share column names", () => {
   const sql = "select  from public.users u join public.orders o on u.id = o.user_id";
   const items = buildSqlCompletionItems(sql, "select ".length, {
     tables,
@@ -2099,12 +2237,12 @@ test("shows qualified column names when multiple tables share column name", () =
   });
   const columns = items.filter((item) => item.type === "column");
   assert.ok(
-    columns.some((item) => item.label === "users.id"),
-    "should show users.id",
+    columns.some((item) => item.label === "u.id" && item.apply === "u.id"),
+    "should show u.id",
   );
   assert.ok(
-    columns.some((item) => item.label === "orders.id"),
-    "should show orders.id",
+    columns.some((item) => item.label === "o.id" && item.apply === "o.id"),
+    "should show o.id",
   );
   assert.ok(
     columns.some((item) => item.label === "name"),

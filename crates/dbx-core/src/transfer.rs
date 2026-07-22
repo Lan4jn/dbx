@@ -344,12 +344,7 @@ pub(crate) fn wrap_dameng_identity_insert_sql(insert_sql: &str, table: &str, sch
 
 pub(crate) fn wrap_dameng_identity_insert_sql_for_table(insert_sql: &str, full_table: &str) -> String {
     let trimmed = insert_sql.trim().trim_end_matches(';').trim();
-    format!(
-        "{};\n{};\n{};",
-        format!("SET IDENTITY_INSERT {full_table} ON"),
-        trimmed,
-        format!("SET IDENTITY_INSERT {full_table} OFF")
-    )
+    format!("SET IDENTITY_INSERT {full_table} ON;\n{trimmed};\nSET IDENTITY_INSERT {full_table} OFF;")
 }
 
 async fn execute_transfer_write_statement(
@@ -1038,7 +1033,7 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
                     }
                 }
             }
-            DatabaseType::SqlServer => {
+            DatabaseType::SqlServer | DatabaseType::Dameng => {
                 if *b {
                     "1".to_string()
                 } else {
@@ -1073,8 +1068,8 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             if let Some(numeric_literal) = format_mysql_numeric_string_literal(s, db_type, column_type) {
                 return numeric_literal;
             }
-            if let Some(date_literal) = format_oracle_date_sql_literal(s, db_type, column_type) {
-                return date_literal;
+            if let Some(temporal_literal) = format_oracle_temporal_sql_literal(s, db_type, column_type) {
+                return temporal_literal;
             }
 
             let literal = format_literal_string(s, db_type, column_type);
@@ -1178,21 +1173,46 @@ fn format_mysql_binary_sql_literal(value: &str, db_type: &DatabaseType, column_t
     }
 }
 
-fn format_oracle_date_sql_literal(value: &str, db_type: &DatabaseType, column_type: Option<&str>) -> Option<String> {
+fn format_oracle_temporal_sql_literal(
+    value: &str,
+    db_type: &DatabaseType,
+    column_type: Option<&str>,
+) -> Option<String> {
     if !matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
         return None;
     }
-    if temporal_column_kind(column_type) != Some("date") {
-        return None;
-    }
+    let kind = temporal_column_kind(column_type)?;
+    let normalized_column_type = column_type?.trim().to_ascii_lowercase();
     let parts = oracle_export_date_parts(value)?;
-    Some(format_oracle_date_sql_literal_parts(&parts))
+    match kind {
+        "date" => Some(format_oracle_date_sql_literal_parts(&parts)),
+        "datetime"
+            if (normalized_column_type.contains("with time zone")
+                || normalized_column_type.contains("with local time zone"))
+                && parts.zone.is_some() =>
+        {
+            let fraction = parts.fraction.unwrap_or_default();
+            let mask = if fraction.is_empty() { "YYYY-MM-DD HH24:MI:SS" } else { "YYYY-MM-DD HH24:MI:SS.FF" };
+            let zone = match parts.zone.unwrap_or_default() {
+                "Z" | "z" => "+00:00",
+                zone => zone,
+            };
+            Some(format!("TO_TIMESTAMP_TZ('{} {}{fraction} {zone}', '{mask} TZH:TZM')", parts.date, parts.time))
+        }
+        "datetime" => {
+            let fraction = parts.fraction.unwrap_or_default();
+            let mask = if fraction.is_empty() { "YYYY-MM-DD HH24:MI:SS" } else { "YYYY-MM-DD HH24:MI:SS.FF" };
+            Some(format!("TO_TIMESTAMP('{} {}{fraction}', '{mask}')", parts.date, parts.time))
+        }
+        _ => None,
+    }
 }
 
 struct OracleExportDateParts<'a> {
     date: &'a str,
     time: &'a str,
     fraction: Option<&'a str>,
+    zone: Option<&'a str>,
 }
 
 fn format_oracle_date_sql_literal_parts(parts: &OracleExportDateParts<'_>) -> String {
@@ -1218,7 +1238,7 @@ fn oracle_export_date_parts(value: &str) -> Option<OracleExportDateParts<'_>> {
         return None;
     }
     if bytes.len() == 10 {
-        return Some(OracleExportDateParts { date, time: "00:00:00", fraction: None });
+        return Some(OracleExportDateParts { date, time: "00:00:00", fraction: None, zone: None });
     }
     let separator = *bytes.get(10)?;
     if separator != b'T' && separator != b' ' {
@@ -1233,7 +1253,7 @@ fn oracle_export_date_parts(value: &str) -> Option<OracleExportDateParts<'_>> {
     }
     let rest = &value[19..];
     if rest.is_empty() || is_timezone_suffix(rest) {
-        return Some(OracleExportDateParts { date, time, fraction: None });
+        return Some(OracleExportDateParts { date, time, fraction: None, zone: (!rest.is_empty()).then_some(rest) });
     }
     if let Some(after_dot) = rest.strip_prefix('.') {
         let digit_count = after_dot.bytes().take_while(|byte| byte.is_ascii_digit()).count();
@@ -1242,7 +1262,12 @@ fn oracle_export_date_parts(value: &str) -> Option<OracleExportDateParts<'_>> {
         }
         let zone = &after_dot[digit_count..];
         if zone.is_empty() || is_timezone_suffix(zone) {
-            return Some(OracleExportDateParts { date, time, fraction: Some(&value[19..19 + 1 + digit_count]) });
+            return Some(OracleExportDateParts {
+                date,
+                time,
+                fraction: Some(&value[19..19 + 1 + digit_count]),
+                zone: (!zone.is_empty()).then_some(zone),
+            });
         }
     }
     None
@@ -4109,7 +4134,7 @@ where
                 can_reuse_source_table_ddl(source_db_type, target_db_type, preserves_target_table_name);
             let ddl = if can_reuse_source_ddl {
                 let source_ddl = crate::schema::get_table_ddl_core(
-                    &state,
+                    state,
                     &request.source_connection_id,
                     &request.source_database,
                     &request.source_schema,
@@ -4564,6 +4589,9 @@ where
             db::ObjectSourceKind::Sequence | db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => {
                 object.source.clone()
             }
+            db::ObjectSourceKind::Trigger | db::ObjectSourceKind::Type | db::ObjectSourceKind::TypeBody => {
+                object.source.clone()
+            }
         };
         let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
             database_type: DatabaseType::Postgres,
@@ -4789,6 +4817,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            database_info: None,
         }
     }
 
@@ -5188,19 +5217,13 @@ mod tests {
 
     #[test]
     fn transfer_create_table_result_treats_existing_table_as_preexisting() {
-        assert_eq!(
-            transfer_create_table_created(
-                Err("ERROR: relation \"items\" already exists (SQLSTATE 42P07)".to_string()),
-                "create"
-            )
-            .unwrap(),
-            false
-        );
-        assert_eq!(
-            transfer_create_table_created(Err("错误: 关系 \"items\" 已经存在".to_string()), "create").unwrap(),
-            false
-        );
-        assert_eq!(transfer_create_table_created(Ok(()), "create").unwrap(), true);
+        assert!(!transfer_create_table_created(
+            Err("ERROR: relation \"items\" already exists (SQLSTATE 42P07)".to_string()),
+            "create"
+        )
+        .unwrap());
+        assert!(!transfer_create_table_created(Err("错误: 关系 \"items\" 已经存在".to_string()), "create").unwrap());
+        assert!(transfer_create_table_created(Ok(()), "create").unwrap());
         assert_eq!(
             transfer_create_table_created(Err("permission denied for schema public".to_string()), "create")
                 .unwrap_err(),
@@ -5986,11 +6009,19 @@ mod tests {
 
         assert_eq!(
             sql,
-            "INSERT INTO \"APP\".\"events\" (\"id\", \"created_on\", \"created_at\", \"raw_text\") VALUES\n(1, TO_DATE('2022-08-25 09:58:43', 'YYYY-MM-DD HH24:MI:SS'), '2022-08-25T09:58:43Z', '2022-08-25T09:58:43Z')"
+            "INSERT INTO \"APP\".\"events\" (\"id\", \"created_on\", \"created_at\", \"raw_text\") VALUES\n(1, TO_DATE('2022-08-25 09:58:43', 'YYYY-MM-DD HH24:MI:SS'), TO_TIMESTAMP('2022-08-25 09:58:43', 'YYYY-MM-DD HH24:MI:SS'), '2022-08-25T09:58:43Z')"
         );
         assert_eq!(
             escape_value_typed(&json!("2022-08-25T00:00:00Z"), &DatabaseType::Oracle, Some("DATE")),
             "DATE '2022-08-25'"
+        );
+        assert_eq!(
+            escape_value_typed(
+                &json!("2022-08-25T09:58:43.123456+08:00"),
+                &DatabaseType::Oracle,
+                Some("TIMESTAMP(6) WITH TIME ZONE")
+            ),
+            "TO_TIMESTAMP_TZ('2022-08-25 09:58:43.123456 +08:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"
         );
     }
 
@@ -6103,6 +6134,25 @@ mod tests {
         );
 
         assert_eq!(sql, "INSERT INTO [dbo].[flags] ([enabled], [deleted]) VALUES\n(1, 0)");
+    }
+
+    #[test]
+    fn dameng_insert_formats_bit_booleans_as_numeric_literals() {
+        let sql = generate_insert_typed(
+            &[String::from("enabled"), String::from("deleted"), String::from("optional")],
+            &[Some(String::from("BIT")), Some(String::from("bit")), Some(String::from("BIT"))],
+            &[vec![json!(true), json!(false), serde_json::Value::Null]],
+            "flags",
+            "DBX_TEST",
+            &DatabaseType::Dameng,
+        );
+
+        assert_eq!(
+            sql,
+            "INSERT INTO \"DBX_TEST\".\"flags\" (\"enabled\", \"deleted\", \"optional\") VALUES\n(1, 0, NULL)"
+        );
+        assert!(!sql.contains("TRUE"));
+        assert!(!sql.contains("FALSE"));
     }
 
     #[test]

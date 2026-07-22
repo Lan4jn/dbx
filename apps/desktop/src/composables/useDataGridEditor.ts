@@ -1,4 +1,4 @@
-import { ref, computed, nextTick, watch, getCurrentInstance, onActivated, onBeforeUnmount, onDeactivated, onMounted, type ComputedRef, type Ref } from "vue";
+import { ref, computed, nextTick, watch, getCurrentInstance, onActivated, onBeforeUnmount, onDeactivated, onMounted, toRaw, type ComputedRef, type Ref } from "vue";
 import * as api from "@/lib/backend/api";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
 import { coerceDataGridCellValue, dataGridCellEditorText } from "@/lib/dataGrid/dataGridCellCoercion";
@@ -95,6 +95,8 @@ export interface UseDataGridEditorOptions {
   pageSize: Ref<number>;
   currentPage: Ref<number>;
   cacheKey?: ComputedRef<string | undefined>;
+  /** 保存成功后结果负载被原地修改时通知宿主，使缓存的字节估算失效。 */
+  onResultPayloadMutated?: () => void;
   emit: {
     (event: "reload", sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number): void;
   };
@@ -137,10 +139,15 @@ const closingPendingSnapshotTabs = new Set<string>();
 const BEFORE_TAB_SWITCH_EVENT = "dbx:before-tab-switch";
 const MAX_PENDING_CHANGES_HISTORY = 100;
 
-function dataGridRowsIdentityChanged(previousRows: CellValue[][] | undefined, nextRows: CellValue[][]): boolean {
+function dataGridRowsIdentityChanged(previousRows: CellValue[][] | undefined, nextRows: CellValue[][], appendedFromRowCount?: number): boolean {
   if (!previousRows) return true;
-  if (previousRows.length !== nextRows.length) return true;
-  return previousRows.some((row, index) => row !== nextRows[index]);
+  if (appendedFromRowCount !== previousRows.length || previousRows.length > nextRows.length) {
+    if (previousRows.length !== nextRows.length) return true;
+    return previousRows.some((row, index) => toRaw(row) !== toRaw(nextRows[index]));
+  }
+  // Infinite scrolling appends rows without changing existing source indexes.
+  // Preserve pending edits only when every previously loaded row is the same object.
+  return previousRows.some((row, index) => toRaw(row) !== toRaw(nextRows[index]));
 }
 
 function cacheKeyBelongsToTab(cacheKey: string, tabId: string) {
@@ -480,12 +487,17 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   // --- Cell value coercion ---
-  function coerceCellValue(value: string, oldValue: CellValue | undefined, columnIndex: number): CellValue {
+  interface ApplyCellValueOptions {
+    preserveEmptyString?: boolean;
+  }
+
+  function coerceCellValue(value: string, oldValue: CellValue | undefined, columnIndex: number, options: ApplyCellValueOptions = {}): CellValue {
     return coerceDataGridCellValue({
       value,
       oldValue,
       databaseType: resolvedDatabaseType.value,
       columnInfo: tableColumnForGridColumn(columnIndex),
+      preserveEmptyString: options.preserveEmptyString,
     }) as CellValue;
   }
 
@@ -722,7 +734,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     await commitEditAndMaybeAutoSave(options);
   }
 
-  function applyCellValue(rowId: number, col: number, value: string | null) {
+  function applyCellValue(rowId: number, col: number, value: string | null, options: ApplyCellValueOptions = {}) {
     if (!canEditColumn(col)) return;
     const item = getRowItem(rowId);
     if (!item || item.isDeleted) return;
@@ -731,7 +743,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       ensureQuickEntryDraftRow();
       const oldVal = quickEntryDraftRow.value[col] ?? null;
       const nextDraftRow = [...quickEntryDraftRow.value];
-      nextDraftRow[col] = value === null ? null : coerceCellValue(value, oldVal, col);
+      nextDraftRow[col] = value === null ? null : coerceCellValue(value, oldVal, col, options);
       if (nextDraftRow[col] === oldVal) return;
       pushUndoSnapshot();
       quickEntryDraftRow.value = draftRowHasValue(nextDraftRow) ? nextDraftRow : emptyDraftRow();
@@ -745,7 +757,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       const row = newRows.value[item.newIndex];
       if (!row) return;
       const oldVal = row[col];
-      const newVal = value === null ? null : coerceCellValue(value, oldVal, col);
+      const newVal = value === null ? null : coerceCellValue(value, oldVal, col, options);
       if (newVal === oldVal) return;
       pushUndoSnapshot();
       row[col] = newVal;
@@ -761,7 +773,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const rowChanges = dirtyRows.value.get(item.sourceIndex);
     const hasPendingCellChange = rowChanges?.has(col) ?? false;
     const currentVal = hasPendingCellChange ? rowChanges!.get(col) : oldVal;
-    const newVal = value === null ? null : coerceCellValue(value, oldVal, col);
+    const newVal = value === null ? null : coerceCellValue(value, oldVal, col, options);
     if (newVal === currentVal) return;
     if (newVal !== oldVal) {
       pushUndoSnapshot();
@@ -1088,6 +1100,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (!tableMeta.value) return null;
     return {
       databaseType: resolvedDatabaseType.value,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(connectionId.value),
       tableMeta: tableMeta.value,
       columns: result.value.columns,
       sourceColumns: sourceColumns.value,
@@ -1118,8 +1131,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       inserted_rows: snapshot.newRows.length,
       updated_rows: snapshot.dirtyRows.size,
       deleted_rows: snapshot.deletedRows.size,
-      statements,
-      rollback_statements: success ? rollbackStatements : [],
+      statement_count: statements.length,
+      rollback_statement_count: success ? rollbackStatements.length : 0,
       error: success ? undefined : historyResult?.error,
     };
     await historyStore.add({
@@ -1208,6 +1221,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
       customHandler.applySavedChanges?.({ dirtyRows: snapshot.dirtyRows, columns: result.value.columns });
       applyDirtyRowsToResult(snapshot);
+      options.onResultPayloadMutated?.();
       clearSavedPendingChanges(snapshot);
       if (!hasPendingChanges.value) exitTransaction();
       clearPendingChangeHistory();
@@ -1269,7 +1283,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       rollbackStatements: rollbackStmts,
     });
 
-    if (useTransaction.value && hasBackendSaveTarget.value) {
+    if (useTransaction.value && stmts.length > 1 && hasBackendSaveTarget.value) {
       try {
         apiResult = await api.executeInTransaction(connectionId.value!, database.value ?? "", stmts, preparedSave?.executionSchema);
       } catch (e: any) {
@@ -1302,6 +1316,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       console.warn("[DBX] failed to record data grid history", e);
     }
     applyDirtyRowsToResult(snapshot);
+    options.onResultPayloadMutated?.();
     snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
     clearSavedPendingChanges(snapshot);
     if (!hasPendingChanges.value) exitTransaction();
@@ -1324,13 +1339,13 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     exitTransaction();
   }
 
-  // Pending changes reference rows by sourceIndex. When the result set changes
-  // (e.g. different WHERE clause, pagination), stale indices point to wrong rows.
+  // Pending changes reference rows by sourceIndex. Replacements (different WHERE,
+  // sort, normal pagination, refresh) invalidate them; prefix-only appends do not.
   let previousResultRows = result.value.rows;
   watch(
-    () => result.value.rows,
-    (rows) => {
-      if (!dataGridRowsIdentityChanged(previousResultRows, rows)) {
+    () => [result.value.rows, (result.value as { appended_from_row_count?: number }).appended_from_row_count] as const,
+    ([rows, appendedFromRowCount]) => {
+      if (!dataGridRowsIdentityChanged(previousResultRows, rows, appendedFromRowCount)) {
         previousResultRows = rows;
         return;
       }

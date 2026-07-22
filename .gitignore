@@ -3,7 +3,6 @@ node_modules/
 .claude/
 .codex/
 .superpowers/
-.codegraph/
 .trellis/
 .worktrees/
 openspec/
@@ -64,6 +63,7 @@ DBX_*_x64-portable.zip
 .agents/skills
 .pnpm-store/*
 .dbx-web
+.npmrc
 src-tauri/target*/
 src-tauri-legacy/target*/
 third-party/webview2-fixed-runtime/

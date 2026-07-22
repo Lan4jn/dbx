@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendTableTreeLoadMoreNode, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
+import { appendTableTreeLoadMoreNode, buildGroupedObjectTreeNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
 import type { ObjectInfo, TableInfo, TreeNode } from "@/types/database";
 
 const context = {
@@ -26,6 +26,40 @@ describe("PostgreSQL overloaded routines", () => {
       ]),
     );
     expect(new Set(nodes.map((node) => node.id)).size).toBe(3);
+  });
+
+  it("keeps grouped routine nodes distinct by identity arguments", () => {
+    const objects: ObjectInfo[] = [
+      { name: "calc", object_type: "FUNCTION", schema: "public", signature: "integer" },
+      { name: "calc", object_type: "FUNCTION", schema: "public", signature: "integer, integer" },
+      { name: "calc", object_type: "FUNCTION", schema: "public", signature: "numeric" },
+    ];
+
+    const groups = buildGroupedObjectTreeNodes({ ...context, schema: "public", objects });
+    const functionGroup = groups.find((node) => node.type === "group-functions");
+
+    expect(functionGroup?.children?.map((node) => ({ label: node.label, objectName: node.objectName, signature: node.signature }))).toEqual([
+      { label: "calc(integer)", objectName: "calc", signature: "integer" },
+      { label: "calc(integer, integer)", objectName: "calc", signature: "integer, integer" },
+      { label: "calc(numeric)", objectName: "calc", signature: "numeric" },
+    ]);
+    expect(new Set(functionGroup?.children?.map((node) => node.id) ?? []).size).toBe(3);
+  });
+});
+
+describe("programmable database objects", () => {
+  it("keeps Xugu trigger/type nodes distinct and preserves an invalid status", () => {
+    const objects: ObjectInfo[] = [
+      { name: "TRG_AUDIT", object_type: "TRIGGER", schema: "APP", valid: false },
+      { name: "ADDRESS_T", object_type: "TYPE", schema: "APP", valid: true },
+      { name: "ADDRESS_T", object_type: "TYPE_BODY", schema: "APP", valid: true },
+    ];
+
+    const nodes = buildSimpleObjectTreeNodes({ ...context, schema: "APP", objects });
+
+    expect(nodes).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "trigger", objectName: "TRG_AUDIT", valid: false }), expect.objectContaining({ type: "type", objectName: "ADDRESS_T", valid: true }), expect.objectContaining({ type: "type-body", objectName: "ADDRESS_T", valid: true })]),
+    );
   });
 });
 

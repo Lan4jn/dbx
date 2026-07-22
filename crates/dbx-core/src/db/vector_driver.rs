@@ -198,7 +198,7 @@ async fn list_milvus_databases(client: &VectorClient) -> Result<Vec<String>, Str
     if !names.iter().any(|name| name == "default") {
         names.push("default".to_string());
     }
-    names.sort_by(|a, b| a.cmp(b));
+    names.sort();
     Ok(names)
 }
 
@@ -520,7 +520,12 @@ pub async fn find_documents(
                 Value::Object(map)
             })
             .collect();
-        return Ok(crate::db::mongo_driver::MongoDocumentResult { documents, total: result.affected_rows });
+        return Ok(crate::db::mongo_driver::MongoDocumentResult {
+            documents,
+            raw_documents: None,
+            extended_documents: None,
+            total: result.affected_rows,
+        });
     }
 
     let query = match client.kind {
@@ -562,7 +567,12 @@ pub async fn find_documents(
             Value::Object(map)
         })
         .collect();
-    Ok(crate::db::mongo_driver::MongoDocumentResult { documents, total: result.affected_rows })
+    Ok(crate::db::mongo_driver::MongoDocumentResult {
+        documents,
+        raw_documents: None,
+        extended_documents: None,
+        total: result.affected_rows,
+    })
 }
 
 pub async fn execute_rest_query(client: &VectorClient, input: &str) -> Result<QueryResult, String> {

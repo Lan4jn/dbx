@@ -1,5 +1,5 @@
 import type { ObjectInfo } from "@/types/database";
-import { createDatabaseObjectNameComparator, normalizeDatabaseObjectName } from "@/lib/table/tableTree";
+import { compareDatabaseObjectNames, normalizeDatabaseObjectName } from "@/lib/table/tableTree";
 import { parseSlashDelimitedRegexQuery } from "@/lib/common/searchPattern";
 
 export type ObjectBrowserRow = {
@@ -7,7 +7,8 @@ export type ObjectBrowserRow = {
   name: string;
   displayName: string;
   schema?: string;
-  type: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+  type: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+  valid?: boolean | null;
   signature?: string | null;
   comment?: string | null;
   created_at?: string | null;
@@ -22,12 +23,17 @@ export type ObjectBrowserRow = {
 
 export type ObjectBrowserSortKey = "name" | "type" | "estimatedRows" | "totalBytes" | "created_at" | "updated_at" | "comment";
 export type ObjectBrowserSortDirection = "asc" | "desc";
+export type ObjectBrowserFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "triggers" | "sequences" | "packages" | "types";
+export type ObjectBrowserFilterCounts = Record<ObjectBrowserFilter, number>;
 
 export function normalizeObjectBrowserType(type: string): ObjectBrowserRow["type"] {
   const value = type.toUpperCase();
   const normalized = value.replace(/[\s-]+/g, "_");
   if (normalized.includes("PACKAGE_BODY")) return "PACKAGE_BODY";
+  if (normalized.includes("TYPE_BODY")) return "TYPE_BODY";
   if (normalized.includes("PACKAGE")) return "PACKAGE";
+  if (normalized.includes("TRIGGER")) return "TRIGGER";
+  if (normalized.includes("TYPE")) return "TYPE";
   if (normalized.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
   if (value.includes("VIEW")) return "VIEW";
   if (value.includes("SEQ")) return "SEQUENCE";
@@ -36,13 +42,13 @@ export function normalizeObjectBrowserType(type: string): ObjectBrowserRow["type
   return "TABLE";
 }
 
-export function buildObjectBrowserRows(options: { objects: ObjectInfo[]; database: string; fallbackSchema: string; needsSchema: boolean }): ObjectBrowserRow[] {
+export function buildObjectBrowserRows(options: { objects: ObjectInfo[]; database: string; fallbackSchema: string; rowSchema?: string }): ObjectBrowserRow[] {
   const seen = new Map<string, number>();
   const rows = options.objects.flatMap((object) => {
     const name = normalizeDatabaseObjectName(object.name);
     if (!name) return [];
     const objectSchema = object.schema ? normalizeDatabaseObjectName(object.schema) : undefined;
-    const schema = objectSchema || (options.needsSchema ? options.fallbackSchema : undefined);
+    const schema = objectSchema || options.rowSchema;
     const type = normalizeObjectBrowserType(object.object_type);
     const signature = routineSignatureForDisplay(type, object.signature);
     const displayName = signature === undefined ? name : `${name}(${signature})`;
@@ -57,6 +63,7 @@ export function buildObjectBrowserRows(options: { objects: ObjectInfo[]; databas
         displayName,
         schema,
         type,
+        valid: object.valid,
         signature,
         comment: object.comment,
         created_at: object.created_at,
@@ -120,13 +127,48 @@ export function filterObjectBrowserRows(rows: ObjectBrowserRow[], query: string)
   return rows.filter((row) => [row.displayName, row.name, row.type, row.comment].filter(Boolean).some((value) => String(value).toLowerCase().includes(q)));
 }
 
+export function countObjectBrowserRowsByFilter(rows: ObjectBrowserRow[]): ObjectBrowserFilterCounts {
+  const counts: ObjectBrowserFilterCounts = {
+    all: rows.length,
+    tables: 0,
+    views: 0,
+    materializedViews: 0,
+    procedures: 0,
+    functions: 0,
+    triggers: 0,
+    sequences: 0,
+    packages: 0,
+    types: 0,
+  };
+
+  for (const row of rows) {
+    if (row.type === "TABLE") counts.tables++;
+    else if (row.type === "VIEW") counts.views++;
+    else if (row.type === "MATERIALIZED_VIEW") counts.materializedViews++;
+    else if (row.type === "PROCEDURE") counts.procedures++;
+    else if (row.type === "FUNCTION") counts.functions++;
+    else if (row.type === "TRIGGER") counts.triggers++;
+    else if (row.type === "SEQUENCE") counts.sequences++;
+    else if (row.type === "PACKAGE" || row.type === "PACKAGE_BODY") counts.packages++;
+    else if (row.type === "TYPE" || row.type === "TYPE_BODY") counts.types++;
+  }
+
+  return counts;
+}
+
+export function summarizeObjectBrowserSearch(rows: ObjectBrowserRow[], query: string): { matchingRows: ObjectBrowserRow[]; counts: ObjectBrowserFilterCounts } {
+  const matchingRows = filterObjectBrowserRows(rows, query);
+  return { matchingRows, counts: countObjectBrowserRowsByFilter(matchingRows) };
+}
+
 export function sortObjectBrowserRows(rows: ObjectBrowserRow[], key: ObjectBrowserSortKey, direction: ObjectBrowserSortDirection): ObjectBrowserRow[] {
   const multiplier = direction === "asc" ? 1 : -1;
-  const compareNames = createDatabaseObjectNameComparator(rows.map((row) => row.displayName));
+  // Sort by natural visible name, matching the sidebar tree ordering
+  // (see fix "keep tables sorted by visible name" and issue #3604).
   return [...rows].sort((left, right) => {
-    const compared = key === "name" ? compareNames(left.displayName, right.displayName) : compareObjectBrowserValue(left[key], right[key], key, direction);
+    const compared = key === "name" ? compareDatabaseObjectNames(left.displayName, right.displayName) : compareObjectBrowserValue(left[key], right[key], key, direction);
     if (compared !== 0) return compared * multiplier;
-    return compareNames(left.displayName, right.displayName);
+    return compareDatabaseObjectNames(left.displayName, right.displayName);
   });
 }
 

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
@@ -24,6 +25,7 @@ pub struct ExecuteQueryRequest {
     pub timeout_secs: Option<u64>,
     pub use_transaction: Option<bool>,
     pub continue_on_error: Option<bool>,
+    pub execution_mode: Option<dbx_core::query::QueryExecutionMode>,
 }
 
 #[derive(Deserialize)]
@@ -136,8 +138,15 @@ pub struct BuildCreateDatabaseSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "duckdb-bundled")]
 pub struct BuildDuckDbAttachDatabaseSqlRequest {
     pub options: dbx_core::db_admin_sql::DuckDbAttachDatabaseSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildSqliteAttachDatabaseSqlRequest {
+    pub options: dbx_core::db_admin_sql::SqliteAttachDatabaseSqlOptions,
 }
 
 #[derive(Deserialize)]
@@ -309,8 +318,10 @@ pub struct BuildDatabaseSqlExportRequest {
 
 pub async fn execute_query(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql).await?;
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let registered = state.app.running_queries.register_task(
@@ -318,6 +329,8 @@ pub async fn execute_query(
         RunningTaskMetadata::query(req.connection_id.clone(), req.database.clone(), req.client_session_id.clone()),
     );
     let cancel_token = registered.token();
+
+    tracing::debug!(connection_id = %req.connection_id, "execute_query");
 
     let result = dbx_core::query::execute_sql_statement_with_options(
         &state.app,
@@ -335,6 +348,7 @@ pub async fn execute_query(
             timeout_secs: req.timeout_secs,
             execution_id: Some(execution_id),
             use_transaction: req.use_transaction,
+            execution_mode: req.execution_mode.unwrap_or_default(),
             ..Default::default()
         },
     )
@@ -347,8 +361,10 @@ pub async fn execute_query(
 
 pub async fn execute_multi(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<Vec<dbx_core::query::ExecuteMultiResult>>, AppError> {
+    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql).await?;
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let registered = state.app.running_queries.register_task(
@@ -356,6 +372,8 @@ pub async fn execute_multi(
         RunningTaskMetadata::query(req.connection_id.clone(), req.database.clone(), req.client_session_id.clone()),
     );
     let cancel_token = registered.token();
+
+    tracing::debug!(connection_id = %req.connection_id, "execute_multi");
 
     let result = dbx_core::query::execute_multi_core_with_options_for_client(
         &state.app,
@@ -374,6 +392,7 @@ pub async fn execute_multi(
             execution_id: Some(execution_id),
             use_transaction: req.use_transaction,
             continue_on_error: req.continue_on_error.unwrap_or(false),
+            execution_mode: req.execution_mode.unwrap_or_default(),
         },
     )
     .await
@@ -385,8 +404,13 @@ pub async fn execute_multi(
 
 pub async fn execute_batch(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    for statement in &req.statements {
+        super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, statement).await?;
+    }
+    tracing::debug!(connection_id = %req.connection_id, "execute_batch");
     let result = dbx_core::query::execute_statements(
         &state.app,
         &req.connection_id,
@@ -444,6 +468,7 @@ pub async fn execute_script(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    tracing::debug!(connection_id = %req.connection_id, "execute_script");
     let db_type = {
         let configs = state.app.configs.read().await;
         configs.get(&req.connection_id).map(|config| config.db_type)
@@ -469,6 +494,7 @@ pub async fn execute_in_transaction(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    tracing::debug!(connection_id = %req.connection_id, "execute_in_transaction");
     let result = dbx_core::query::execute_statements_in_transaction(
         &state.app,
         &req.connection_id,
@@ -583,8 +609,13 @@ pub async fn build_create_database_sql(
     dbx_core::db_admin_sql::build_create_database_sql(req.options).map(Json).map_err(AppError)
 }
 
+#[cfg(feature = "duckdb-bundled")]
 pub async fn build_duckdb_attach_database_sql(Json(req): Json<BuildDuckDbAttachDatabaseSqlRequest>) -> Json<String> {
     Json(dbx_core::db_admin_sql::build_duckdb_attach_database_sql(req.options))
+}
+
+pub async fn build_sqlite_attach_database_sql(Json(req): Json<BuildSqliteAttachDatabaseSqlRequest>) -> Json<String> {
+    Json(dbx_core::db_admin_sql::build_sqlite_attach_database_sql(req.options))
 }
 
 pub async fn build_drop_object_sql(Json(req): Json<BuildDropObjectSqlRequest>) -> Json<String> {

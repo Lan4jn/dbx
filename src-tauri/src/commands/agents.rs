@@ -4,10 +4,10 @@ use tauri::{Emitter, State};
 
 use dbx_core::agent_manager::{AgentDriverInfo, DriverStoreUsage, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
 use dbx_core::agent_service::{
-    build_agent_list, clear_agent_download_cache, fetch_registry_from, import_agent_jar,
-    import_agents_from_zip as import_agents_from_zip_core, install_agent_driver_from, invalidate_registry_cache,
-    reinstall_agent_jre_from, uninstall_agent_driver, uninstall_agent_jre, upgrade_all_agent_drivers_from,
-    AgentProgressEvent, UpgradeAllAgentDriversResult,
+    build_agent_list, clear_agent_download_cache, fetch_registry_from, import_agent_driver,
+    import_agents_from_zip as import_agents_from_zip_core, inspect_offline_zip, install_agent_driver_from,
+    invalidate_registry_cache, reinstall_agent_jre_from, uninstall_agent_driver, uninstall_agent_jre,
+    upgrade_all_agent_drivers_from, AgentProgressEvent, OfflineImportPlan, UpgradeAllAgentDriversResult,
 };
 use dbx_core::connection::AppState;
 use dbx_core::driver_runtime::DriverRuntimeSummary;
@@ -162,6 +162,8 @@ pub async fn import_agents_from_zip(
 ) -> Result<u32, String> {
     let am = &state.agent_manager;
     let zip_path = std::path::PathBuf::from(&path);
+    let plan = inspect_offline_zip(&zip_path)?;
+    ensure_no_offline_import_blockers(state.inner().as_ref(), &plan).await?;
     let app_handle = app.clone();
     let result = import_agents_from_zip_core(am, &zip_path, |event| emit_agent_progress(&app_handle, event))?;
     let count = result.drivers_installed.len() as u32;
@@ -170,12 +172,23 @@ pub async fn import_agents_from_zip(
 }
 
 #[tauri::command]
+pub async fn import_agent_driver_cmd(
+    state: State<'_, Arc<AppState>>,
+    db_type: String,
+    path: String,
+) -> Result<(), String> {
+    ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
+}
+
+#[tauri::command]
 pub async fn import_agent_jar_cmd(
     state: State<'_, Arc<AppState>>,
     db_type: String,
     path: String,
 ) -> Result<(), String> {
-    import_agent_jar(&state.agent_manager, &db_type, std::path::Path::new(&path))
+    ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
 }
 
 #[tauri::command]
@@ -198,7 +211,7 @@ fn emit_agent_progress(app: &tauri::AppHandle, event: AgentProgressEvent) {
 }
 
 async fn ensure_no_agent_update_blockers(state: &AppState, db_types: &[String]) -> Result<(), String> {
-    let blockers = agent_update_blockers(state, db_types).await;
+    let blockers = update_blockers_from_keys(state.prepare_agent_driver_updates(db_types).await, db_types);
     if blockers.is_empty() {
         return Ok(());
     }
@@ -206,12 +219,31 @@ async fn ensure_no_agent_update_blockers(state: &AppState, db_types: &[String]) 
     Err(format!("请先关闭以下数据库连接后再更新驱动: {labels}"))
 }
 
+async fn ensure_no_offline_import_blockers(state: &AppState, plan: &OfflineImportPlan) -> Result<(), String> {
+    let mut driver_keys = plan.driver_keys.clone();
+    if plan.includes_jre {
+        // Replacing a managed JRE affects every running Java Agent, so include
+        // all active runtimes in the same connection-aware update preflight.
+        driver_keys.extend(state.agent_manager.active_daemon_keys().await);
+        driver_keys.extend(state.active_agent_connection_driver_keys().await);
+        driver_keys.sort();
+        driver_keys.dedup();
+    }
+    ensure_no_agent_update_blockers(state, &driver_keys).await
+}
+
 async fn agent_update_blockers(state: &AppState, db_types: &[String]) -> Vec<AgentUpdateBlocker> {
+    update_blockers_from_keys(state.active_agent_connection_driver_keys().await, db_types)
+}
+
+fn update_blockers_from_keys(
+    active_keys: std::collections::HashSet<String>,
+    db_types: &[String],
+) -> Vec<AgentUpdateBlocker> {
     let candidate_keys: std::collections::HashSet<&str> = db_types.iter().map(String::as_str).collect();
     if candidate_keys.is_empty() {
         return Vec::new();
     }
-    let active_keys = state.active_agent_driver_keys().await;
     let mut blockers = active_keys
         .into_iter()
         .filter(|key| candidate_keys.contains(key.as_str()))

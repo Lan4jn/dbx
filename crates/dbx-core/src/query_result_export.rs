@@ -13,8 +13,8 @@ use crate::database_export::is_export_cancelled;
 pub use crate::database_export::ExportStatus;
 use crate::models::connection::DatabaseType;
 use crate::query::{
-    canceled_error, close_query_session, execute_sql_statement_with_options, operation_budget_for_pool_key,
-    QueryExecutionOptions, QUERY_CANCELED,
+    await_stream_with_progress_timeout, canceled_error, close_query_session, execute_sql_statement_with_options,
+    operation_budget_for_pool_key, QueryExecutionOptions, StreamProgressClock, QUERY_CANCELED,
 };
 use crate::query_result_sql::{
     build_query_pagination_execution_plan, QueryPagination, QueryPaginationExecutionPlanOptions,
@@ -81,6 +81,8 @@ pub struct QueryResultExportRequest {
     pub client_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_time_format: Option<String>,
 }
 
 fn split_excel_cell_text(value: &str) -> Vec<String> {
@@ -155,7 +157,7 @@ fn effective_row_limit(format: &str, request: &QueryResultExportRequest) -> Opti
 }
 
 fn xlsx_hard_limit_active(format: &str, request: &QueryResultExportRequest) -> bool {
-    format == "xlsx" && request.row_limit.map_or(true, |limit| limit > XLSX_MAX_DATA_ROWS)
+    format == "xlsx" && request.row_limit.is_none_or(|limit| limit > XLSX_MAX_DATA_ROWS)
 }
 
 fn format_text_export_header(format: &str, columns: &[String]) -> String {
@@ -563,6 +565,11 @@ async fn export_query_result_core_inner(
             result.rows.truncate(this_page);
         }
         let row_count = result.rows.len();
+        let formatted_rows = crate::temporal_format::format_temporal_export_rows_with_string_types(
+            &result.rows,
+            &column_types,
+            request.date_time_format.as_deref(),
+        );
 
         if format == "csv" || format == "txt" {
             if let Some(file) = text_file.as_mut() {
@@ -570,12 +577,12 @@ async fn export_query_result_core_inner(
                     let header = format_text_export_header(&format, &columns);
                     file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
                     if row_count > 0 {
-                        let rows = format_text_export_rows(&format, &result.rows);
+                        let rows = format_text_export_rows(&format, &formatted_rows);
                         write!(file, "\n{rows}").map_err(|e| format!("Failed to write export rows: {e}"))?;
                     }
                     wrote_text_header = true;
                 } else if row_count > 0 {
-                    let rows = format_text_export_rows(&format, &result.rows);
+                    let rows = format_text_export_rows(&format, &formatted_rows);
                     write!(file, "\n{rows}").map_err(|e| format!("Failed to write export rows: {e}"))?;
                 }
             }
@@ -591,7 +598,7 @@ async fn export_query_result_core_inner(
                 )?);
             }
             if let Some(writer) = xlsx.as_mut() {
-                for row in &result.rows {
+                for row in &formatted_rows {
                     writer.write_row(row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                 }
             }
@@ -708,6 +715,7 @@ async fn try_export_postgres_query_result_stream(
         if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
     let progress_row_interval = request.page_size.max(1) as u64;
     let mut columns: Vec<String> = Vec::new();
+    let mut temporal_column_types: Vec<String> = Vec::new();
     let mut rows_exported = 0_u64;
     let mut last_progress_rows = 0_u64;
     let mut last_progress_at = Instant::now();
@@ -735,6 +743,7 @@ async fn try_export_postgres_query_result_stream(
             match item {
                 crate::db::postgres::PostgresQueryStreamItem::Columns { columns: stream_columns, column_types } => {
                     columns = stream_columns;
+                    temporal_column_types = column_types.clone();
                     if let Some(file) = text_file.as_mut() {
                         let header = format_text_export_header(format, &columns);
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
@@ -753,18 +762,23 @@ async fn try_export_postgres_query_result_stream(
                     if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
                         return Err(XLSX_ROW_LIMIT_ERROR.to_string());
                     }
+                    let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
+                        &row,
+                        &temporal_column_types,
+                        request.date_time_format.as_deref(),
+                    );
                     if let Some(file) = text_file.as_mut() {
-                        let rows = format_text_export_rows(format, std::slice::from_ref(&row));
+                        let rows = format_text_export_rows(format, std::slice::from_ref(&formatted));
                         write!(file, "\n{rows}").map_err(|e| format!("Failed to write export rows: {e}"))?;
                     } else if let Some(writer) = xlsx.as_mut() {
-                        writer.write_row(&row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                        writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                     } else {
                         let xlsx_file =
                             File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
                         xlsx =
                             Some(start_query_result_xlsx_workbook(BufWriter::new(xlsx_file), request, &columns, &[])?);
                         if let Some(writer) = xlsx.as_mut() {
-                            writer.write_row(&row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                            writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                         }
                     }
                     rows_exported += 1;
@@ -870,6 +884,7 @@ async fn try_export_mysql_query_result_stream(
         if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
     let progress_row_interval = request.page_size.max(1) as u64;
     let mut columns: Vec<String> = Vec::new();
+    let mut temporal_column_types: Vec<String> = Vec::new();
     let mut rows_exported = 0_u64;
     let mut last_progress_rows = 0_u64;
     let mut last_progress_at = Instant::now();
@@ -930,6 +945,8 @@ async fn try_export_mysql_query_result_stream(
         }
     });
 
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
     let stream_future = crate::db::mysql::stream_query_result_on_conn(
         &mut conn,
         &request.sql,
@@ -946,6 +963,7 @@ async fn try_export_mysql_query_result_stream(
             match item {
                 crate::db::mysql::MySqlQueryStreamItem::Columns { columns: stream_columns, column_types } => {
                     columns = stream_columns;
+                    temporal_column_types = column_types.clone();
                     if let Some(file) = text_file.as_mut() {
                         let header = format_text_export_header(format, &columns);
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
@@ -964,18 +982,23 @@ async fn try_export_mysql_query_result_stream(
                     if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
                         return Err(XLSX_ROW_LIMIT_ERROR.to_string());
                     }
+                    let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
+                        &row,
+                        &temporal_column_types,
+                        request.date_time_format.as_deref(),
+                    );
                     if let Some(file) = text_file.as_mut() {
-                        let rows = format_text_export_rows(format, std::slice::from_ref(&row));
+                        let rows = format_text_export_rows(format, std::slice::from_ref(&formatted));
                         write!(file, "\n{rows}").map_err(|e| format!("Failed to write export rows: {e}"))?;
                     } else if let Some(writer) = xlsx.as_mut() {
-                        writer.write_row(&row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                        writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                     } else {
                         let xlsx_file =
                             File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
                         xlsx =
                             Some(start_query_result_xlsx_workbook(BufWriter::new(xlsx_file), request, &columns, &[])?);
                         if let Some(writer) = xlsx.as_mut() {
-                            writer.write_row(&row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                            writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                         }
                     }
                     rows_exported += 1;
@@ -992,19 +1015,23 @@ async fn try_export_mysql_query_result_stream(
                     }
                 }
             }
+            progress_clock_for_stream.mark();
             Ok(())
         },
     );
-    let stream_result = match query_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, stream_future).await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id).await;
-                Err(format!("Query timed out after {} seconds", timeout.as_secs()))
-            }
-        },
-        None => stream_future.await,
-    };
+    let timeout_error =
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs()));
+    let stream_result = await_stream_with_progress_timeout(
+        stream_future,
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        timeout_error.clone(),
+    )
+    .await;
+    if stream_result.as_ref().is_err_and(|error| error == &timeout_error) {
+        let _ = crate::db::mysql::kill_query_with_opts(kill_opts, mysql_connection_id).await;
+    }
     watcher_done.cancel();
 
     if let Err(error) = stream_result {
@@ -1115,6 +1142,7 @@ async fn try_export_clickhouse_query_result_stream(
         if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
     let progress_row_interval = request.page_size.max(1) as u64;
     let mut columns: Vec<String> = Vec::new();
+    let mut temporal_column_types: Vec<String> = Vec::new();
     let mut rows_exported = 0_u64;
     let mut last_progress_rows = 0_u64;
     let mut last_progress_at = Instant::now();
@@ -1127,8 +1155,11 @@ async fn try_export_clickhouse_query_result_stream(
         None
     };
     let mut xlsx = None;
+    let query_timeout = query_export_timeout(request.timeout_secs);
     let clickhouse_database = if database.is_empty() { "default" } else { database };
 
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
     let stream_future = crate::db::clickhouse_driver::stream_query_with_max_rows(
         &client,
         clickhouse_database,
@@ -1142,6 +1173,7 @@ async fn try_export_clickhouse_query_result_stream(
                     column_types,
                 } => {
                     columns = stream_columns;
+                    temporal_column_types = column_types.clone();
                     if let Some(file) = text_file.as_mut() {
                         let header = format_text_export_header(format, &columns);
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
@@ -1160,18 +1192,23 @@ async fn try_export_clickhouse_query_result_stream(
                     if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
                         return Err(XLSX_ROW_LIMIT_ERROR.to_string());
                     }
+                    let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
+                        &row,
+                        &temporal_column_types,
+                        request.date_time_format.as_deref(),
+                    );
                     if let Some(file) = text_file.as_mut() {
-                        let rows = format_text_export_rows(format, std::slice::from_ref(&row));
+                        let rows = format_text_export_rows(format, std::slice::from_ref(&formatted));
                         write!(file, "\n{rows}").map_err(|e| format!("Failed to write export rows: {e}"))?;
                     } else if let Some(writer) = xlsx.as_mut() {
-                        writer.write_row(&row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                        writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                     } else {
                         let xlsx_file =
                             File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
                         xlsx =
                             Some(start_query_result_xlsx_workbook(BufWriter::new(xlsx_file), request, &columns, &[])?);
                         if let Some(writer) = xlsx.as_mut() {
-                            writer.write_row(&row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                            writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                         }
                     }
                     rows_exported += 1;
@@ -1188,16 +1225,18 @@ async fn try_export_clickhouse_query_result_stream(
                     }
                 }
             }
+            progress_clock_for_stream.mark();
             Ok(())
         },
     );
-    let stream_result = match query_export_timeout(request.timeout_secs) {
-        Some(timeout) => match tokio::time::timeout(timeout, stream_future).await {
-            Ok(result) => result,
-            Err(_) => Err(format!("Query timed out after {} seconds", timeout.as_secs())),
-        },
-        None => stream_future.await,
-    };
+    let stream_result = await_stream_with_progress_timeout(
+        stream_future,
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs())),
+    )
+    .await;
 
     if let Err(error) = stream_result {
         if error == QUERY_CANCELED
@@ -1267,6 +1306,7 @@ async fn try_export_sqlserver_query_result_stream(
     let stream_row_limit =
         if xlsx_hard_limit_active { row_limit.map(|limit| limit.saturating_add(1)) } else { row_limit };
     let mut columns: Vec<String> = Vec::new();
+    let mut temporal_column_types: Vec<String> = Vec::new();
     let mut rows_exported = 0_u64;
     let mut last_progress_rows = 0_u64;
     let mut last_progress_at = Instant::now();
@@ -1280,6 +1320,7 @@ async fn try_export_sqlserver_query_result_stream(
         None
     };
     let mut xlsx = None;
+    let query_timeout = query_export_timeout(request.timeout_secs);
 
     let mut client = match cancel_token.as_ref() {
         Some(token) => {
@@ -1292,6 +1333,8 @@ async fn try_export_sqlserver_query_result_stream(
         None => client.lock().await,
     };
 
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
     let stream_future = crate::db::sqlserver::stream_first_result_set(
         &mut client,
         &request.sql,
@@ -1299,8 +1342,9 @@ async fn try_export_sqlserver_query_result_stream(
         cancel_token.clone(),
         |item| {
             match item {
-                crate::db::sqlserver::SqlServerStreamItem::Columns(stream_columns) => {
+                crate::db::sqlserver::SqlServerStreamItem::Columns { columns: stream_columns, column_types } => {
                     columns = stream_columns.to_vec();
+                    temporal_column_types = column_types.to_vec();
                     if let Some(file) = text_file.as_mut() {
                         let header = format_text_export_header(format, &columns);
                         file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write export header: {e}"))?;
@@ -1315,18 +1359,23 @@ async fn try_export_sqlserver_query_result_stream(
                     if xlsx_hard_limit_active && rows_exported as usize >= XLSX_MAX_DATA_ROWS {
                         return Err(XLSX_ROW_LIMIT_ERROR.to_string());
                     }
+                    let formatted = crate::temporal_format::format_temporal_export_row_with_string_types(
+                        row,
+                        &temporal_column_types,
+                        request.date_time_format.as_deref(),
+                    );
                     if let Some(file) = text_file.as_mut() {
-                        let rows = format_text_export_rows(format, &[row.to_vec()]);
+                        let rows = format_text_export_rows(format, std::slice::from_ref(&formatted));
                         write!(file, "\n{rows}").map_err(|e| format!("Failed to write export rows: {e}"))?;
                     } else if let Some(writer) = xlsx.as_mut() {
-                        writer.write_row(row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                        writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                     } else {
                         let xlsx_file =
                             File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
                         xlsx =
                             Some(start_query_result_xlsx_workbook(BufWriter::new(xlsx_file), request, &columns, &[])?);
                         if let Some(writer) = xlsx.as_mut() {
-                            writer.write_row(row).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
+                            writer.write_row(&formatted).map_err(|e| format!("Failed to write XLSX row: {e}"))?;
                         }
                     }
                     rows_exported += 1;
@@ -1343,15 +1392,20 @@ async fn try_export_sqlserver_query_result_stream(
                     }
                 }
             }
+            // Mark only after the row is fully written so local XLSX work never consumes
+            // the next database inactivity window.
+            progress_clock_for_stream.mark();
             Ok(())
         },
     );
-    match query_export_timeout(request.timeout_secs) {
-        Some(timeout) => tokio::time::timeout(timeout, stream_future)
-            .await
-            .map_err(|_| format!("Query timed out after {} seconds", timeout.as_secs()))??,
-        None => stream_future.await?,
-    };
+    await_stream_with_progress_timeout(
+        stream_future,
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs())),
+    )
+    .await?;
     drop(client);
 
     if rows_exported != last_progress_rows {
@@ -1394,6 +1448,7 @@ mod tests {
             keyset_optimization_enabled: true,
             client_session_id: None,
             execution_id: None,
+            date_time_format: None,
         }
     }
 
@@ -1556,5 +1611,102 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_times_out_when_database_makes_no_progress() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let result = await_stream_with_progress_timeout(
+            std::future::pending::<Result<(), String>>(),
+            Some(Duration::from_millis(20)),
+            progress_clock,
+            None,
+            "query timeout".to_string(),
+        )
+        .await;
+
+        assert_eq!(result, Err("query timeout".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_timeout_resets_after_each_completed_row() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let progress_clock_for_stream = progress_clock.clone();
+        let result = await_stream_with_progress_timeout(
+            async move {
+                for row in 1..=5 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    progress_clock_for_stream.mark();
+                    assert!(row <= 5);
+                }
+                Ok::<_, String>(5_u8)
+            },
+            Some(Duration::from_millis(150)),
+            progress_clock,
+            None,
+            "query timeout".to_string(),
+        )
+        .await;
+
+        assert_eq!(result, Ok(5));
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_count_synchronous_local_writes_as_database_idle_time() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let progress_clock_for_stream = progress_clock.clone();
+        let result = await_stream_with_progress_timeout(
+            async move {
+                std::thread::sleep(Duration::from_millis(50));
+                progress_clock_for_stream.mark();
+                Ok::<_, String>(())
+            },
+            Some(Duration::from_millis(20)),
+            progress_clock,
+            None,
+            "query timeout".to_string(),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn stream_timeout_zero_disables_idle_timeout() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let result = await_stream_with_progress_timeout(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok::<_, String>(())
+            },
+            None,
+            progress_clock,
+            None,
+            "query timeout".to_string(),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn stream_cancellation_wins_over_idle_timeout() {
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let cancel_token = CancellationToken::new();
+        let cancel_token_for_task = cancel_token.clone();
+        let task = tokio::spawn(async move {
+            await_stream_with_progress_timeout(
+                async { std::future::pending::<Result<(), String>>().await },
+                Some(Duration::from_secs(1)),
+                progress_clock,
+                Some(&cancel_token_for_task),
+                "query timeout".to_string(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        cancel_token.cancel();
+
+        assert_eq!(task.await.unwrap(), Err(QUERY_CANCELED.to_string()));
     }
 }

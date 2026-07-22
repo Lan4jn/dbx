@@ -50,6 +50,10 @@ import java.util.stream.Collectors;
 public final class DbxJdbcPlugin {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final int MAX_ROWS = 10_000;
+    private static final String JDBCX_URL_PREFIX = "jdbcx:";
+    private static final String JDBCX_EXTENSION_WHITELIST_PROPERTY = "jdbcx.extension.whitelist";
+    private static final String JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN = "-Ddbx.jdbcx.allowHighPrivilegeExtensions=";
+    private static final String JDBCX_SAFE_EXTENSION_WHITELIST = "help,var,version";
     private static final String[] DEFAULT_TABLE_TYPES = new String[] {
         "TABLE",
         "VIEW",
@@ -226,21 +230,57 @@ public final class DbxJdbcPlugin {
     }
 
     private static String throwableMessage(Throwable error) {
+        List<Throwable> causes = new ArrayList<>();
         Throwable cause = error;
-        while (cause.getCause() != null && cause.getCause() != cause) {
+        while (cause != null && !causes.contains(cause)) {
+            causes.add(cause);
             cause = cause.getCause();
         }
-        return cause.getMessage() == null ? cause.toString() : cause.getMessage();
+        for (int i = causes.size() - 1; i >= 0; i--) {
+            Throwable current = causes.get(i);
+            String message = informativeThrowableMessage(current);
+            if (message != null) {
+                return message;
+            }
+            for (Throwable suppressed : current.getSuppressed()) {
+                message = informativeThrowableMessage(suppressed);
+                if (message != null) {
+                    return message;
+                }
+            }
+        }
+        return causes.isEmpty() ? error.toString() : causes.get(causes.size() - 1).toString();
+    }
+
+    private static String informativeThrowableMessage(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.isBlank()) {
+            return null;
+        }
+        String trimmed = message.trim();
+        if (error instanceof ClassNotFoundException || error instanceof NoClassDefFoundError) {
+            String className = trimmed.replace('/', '.');
+            if (className.startsWith("io.modelcontextprotocol.")) {
+                return "Missing JDBCX MCP runtime class " + className
+                    + ". Install io.github.jdbcx:io.modelcontextprotocol with the version required by the selected JDBCX runtime.";
+            }
+            return "Missing Java class " + className + ". Install the required runtime dependency.";
+        }
+        return trimmed.equals(error.getClass().getName()) || trimmed.equals(error.getClass().getSimpleName())
+            ? null
+            : trimmed;
     }
 
     private static JsonNode handle(String method, JsonNode params, JsonNode connection) throws Exception {
         return switch (method) {
-            case "testConnection", "connect" -> {
+            case "testConnection" -> connectionTestResult(openConnection(connection));
+            case "connect" -> {
                 openConnection(connection);
                 ObjectNode result = MAPPER.createObjectNode();
                 result.put("ok", true);
                 yield result;
             }
+            case "connectionInfo" -> databaseInfoResult(openConnection(connection));
             case "executeQuery" -> executeQuery(
                 connection,
                 requireText(params, "sql"),
@@ -309,6 +349,98 @@ public final class DbxJdbcPlugin {
             );
             default -> throw new IllegalArgumentException("Unsupported JDBC plugin method: " + method);
         };
+    }
+
+    private static ObjectNode connectionTestResult(Connection connection) {
+        ObjectNode result = MAPPER.createObjectNode();
+        result.put("ok", true);
+        ObjectNode databaseInfo = databaseInfo(connection);
+        if (!databaseInfo.isEmpty()) {
+            result.set("databaseInfo", databaseInfo);
+        }
+        return result;
+    }
+
+    private static ObjectNode databaseInfoResult(Connection connection) {
+        ObjectNode result = MAPPER.createObjectNode();
+        ObjectNode databaseInfo = databaseInfo(connection);
+        if (!databaseInfo.isEmpty()) {
+            result.set("databaseInfo", databaseInfo);
+        }
+        return result;
+    }
+
+    private static ObjectNode databaseInfo(Connection connection) {
+        try {
+            DatabaseMetaData metadata = connection.getMetaData();
+            return metadata == null ? MAPPER.createObjectNode() : databaseInfo(metadata);
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+            return MAPPER.createObjectNode();
+        }
+    }
+
+    private static ObjectNode databaseInfo(DatabaseMetaData metadata) {
+        ObjectNode info = MAPPER.createObjectNode();
+        putMetadataText(info, "productName", metadata::getDatabaseProductName);
+        putMetadataText(info, "productVersion", metadata::getDatabaseProductVersion);
+        putIdentifierCase(
+            info,
+            "unquotedIdentifierCase",
+            metadata::storesLowerCaseIdentifiers,
+            metadata::storesUpperCaseIdentifiers,
+            metadata::storesMixedCaseIdentifiers
+        );
+        putIdentifierCase(
+            info,
+            "quotedIdentifierCase",
+            metadata::storesLowerCaseQuotedIdentifiers,
+            metadata::storesUpperCaseQuotedIdentifiers,
+            metadata::storesMixedCaseQuotedIdentifiers
+        );
+        putMetadataText(info, "driverName", metadata::getDriverName);
+        putMetadataText(info, "driverVersion", metadata::getDriverVersion);
+
+        Integer jdbcMajor = readMetadata(metadata::getJDBCMajorVersion);
+        Integer jdbcMinor = readMetadata(metadata::getJDBCMinorVersion);
+        if (jdbcMajor != null && jdbcMinor != null && jdbcMajor >= 0 && jdbcMinor >= 0) {
+            info.put("jdbcVersion", jdbcMajor + "." + jdbcMinor);
+        }
+        return info;
+    }
+
+    private static void putMetadataText(ObjectNode target, String key, SqlSupplier<String> supplier) {
+        String value = readMetadata(supplier);
+        if (value != null && !value.trim().isEmpty()) {
+            target.put(key, value.trim());
+        }
+    }
+
+    private static void putIdentifierCase(
+        ObjectNode target,
+        String key,
+        SqlSupplier<Boolean> lower,
+        SqlSupplier<Boolean> upper,
+        SqlSupplier<Boolean> mixed
+    ) {
+        if (Boolean.TRUE.equals(readMetadata(lower))) {
+            target.put(key, "lower");
+        } else if (Boolean.TRUE.equals(readMetadata(upper))) {
+            target.put(key, "upper");
+        } else if (Boolean.TRUE.equals(readMetadata(mixed))) {
+            target.put(key, "mixed");
+        }
+    }
+
+    private static <T> T readMetadata(SqlSupplier<T> supplier) {
+        try {
+            return supplier.get();
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+            return null;
+        }
+    }
+
+    private interface SqlSupplier<T> {
+        T get() throws SQLException;
     }
 
     private static void registerDrivers(JsonNode connection) throws Exception {
@@ -381,12 +513,37 @@ public final class DbxJdbcPlugin {
             properties.setProperty("password", password);
         }
         applyConnectTimeout(connection, properties);
+        applyJdbcxExtensionSecurity(connection, url, properties);
         if (isOracleUrl(url)) {
             applyOracleProperties(connection, properties);
         }
         sharedConnection = DriverManager.getConnection(url, properties);
         sharedConnectionKey = key;
         return sharedConnection;
+    }
+
+    private static void applyJdbcxExtensionSecurity(JsonNode connection, String url, Properties properties) {
+        if (isJdbcxUrl(url) && !jdbcxHighPrivilegeExtensionsEnabled(connection)) {
+            properties.setProperty(JDBCX_EXTENSION_WHITELIST_PROPERTY, JDBCX_SAFE_EXTENSION_WHITELIST);
+        }
+    }
+
+    private static boolean isJdbcxUrl(String url) {
+        return url != null && url.regionMatches(true, 0, JDBCX_URL_PREFIX, 0, JDBCX_URL_PREFIX.length());
+    }
+
+    private static boolean jdbcxHighPrivilegeExtensionsEnabled(JsonNode connection) {
+        JsonNode options = connection.path("agent_java_options");
+        if (!options.isArray()) {
+            return false;
+        }
+        for (int i = options.size() - 1; i >= 0; i--) {
+            String option = options.path(i).asText("").trim();
+            if (option.startsWith(JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN)) {
+                return Boolean.parseBoolean(option.substring(JDBCX_HIGH_PRIVILEGE_EXTENSIONS_OPT_IN.length()));
+            }
+        }
+        return false;
     }
 
     private static void applyConnectTimeout(JsonNode connection, Properties properties) {
@@ -1162,6 +1319,17 @@ public final class DbxJdbcPlugin {
         if (usePrestoInformationSchemaTables(connection)) {
             return prestoListTables(conn, database, schema, filter, limit, offset, objectTypes);
         }
+        if (isKingbaseUrl(optionalText(connection, "connection_string"))) {
+            return filterMetadataNodes(
+                (ArrayNode) kingbaseListTables(conn, schema, false),
+                filter,
+                limit,
+                offset,
+                objectTypes,
+                "table_type",
+                true
+            );
+        }
         DatabaseMetaData meta = conn.getMetaData();
         String[] types = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
         if (types.length == 0) {
@@ -1201,16 +1369,22 @@ public final class DbxJdbcPlugin {
         if (usePrestoInformationSchemaTables(connection)) {
             return prestoListObjects(conn, database, schema, filter, limit, offset, objectTypes);
         }
+        boolean kingbase = isKingbaseUrl(optionalText(connection, "connection_string"));
+        if (kingbase) {
+            result.addAll((ArrayNode) kingbaseListTables(conn, schema, true));
+        }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
 
-        String[] tableTypes = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
-        if (tableTypes.length > 0) {
-            appendTableObjects(result, meta, catalog, schemaPattern, schema, tableTypes);
-            if (result.isEmpty() && catalog != null) {
-                appendTableObjects(result, meta, null, schemaPattern, schema, tableTypes);
+        if (!kingbase) {
+            String[] tableTypes = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
+            if (tableTypes.length > 0) {
+                appendTableObjects(result, meta, catalog, schemaPattern, schema, tableTypes);
+                if (result.isEmpty() && catalog != null) {
+                    appendTableObjects(result, meta, null, schemaPattern, schema, tableTypes);
+                }
             }
         }
 
@@ -1723,9 +1897,192 @@ public final class DbxJdbcPlugin {
         };
     }
 
+    private static JsonNode kingbaseListTables(Connection conn, String schema, boolean objectNodes) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        String effectiveSchema = kingbaseEffectiveSchema(conn, schema);
+        KingbaseTableCatalogMode catalogMode = kingbaseTableCatalogMode(conn);
+        String sql = switch (catalogMode) {
+            case SYS_CATALOG -> kingbaseCastSafeTablesSql();
+            case POSTGRES_CATALOG -> kingbasePostgresTablesSql();
+            case INFORMATION_SCHEMA -> kingbaseCompatibilityTablesSql();
+        };
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, effectiveSchema);
+            if (catalogMode == KingbaseTableCatalogMode.SYS_CATALOG) {
+                ps.setString(2, effectiveSchema);
+                ps.setString(3, effectiveSchema);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String tableName = rs.getString("table_name");
+                    String tableType = normalizeInformationSchemaTableType(rs.getString("table_type"));
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", tableName);
+                    if (objectNodes) {
+                        item.put("object_type", tableType);
+                        item.put("schema", effectiveSchema);
+                    } else {
+                        item.put("table_type", tableType);
+                    }
+                    putNullable(item, "comment", rs.getString("remarks"));
+                    result.add(item);
+                }
+            }
+        }
+        return result;
+    }
+
+    private enum KingbaseTableCatalogMode {
+        SYS_CATALOG,
+        POSTGRES_CATALOG,
+        INFORMATION_SCHEMA
+    }
+
+    private static KingbaseTableCatalogMode kingbaseTableCatalogMode(Connection conn) {
+        if (!kingbaseCatalogExists(conn, "sys_catalog.sys_namespace")) {
+            return kingbaseCatalogExists(conn, "pg_catalog.pg_namespace")
+                ? KingbaseTableCatalogMode.POSTGRES_CATALOG
+                : KingbaseTableCatalogMode.INFORMATION_SCHEMA;
+        }
+        return kingbaseMysqlCompatibilityMode(conn)
+            ? KingbaseTableCatalogMode.INFORMATION_SCHEMA
+            : KingbaseTableCatalogMode.SYS_CATALOG;
+    }
+
+    private static boolean kingbaseMysqlCompatibilityMode(Connection conn) {
+        try (Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery(
+                 "SELECT setting FROM sys_catalog.sys_settings WHERE LOWER(name) = 'database_mode'"
+             )) {
+            if (rs.next()) {
+                return "mysql".equalsIgnoreCase(rs.getString(1));
+            }
+        } catch (Exception ignored) {
+            // Older Kingbase versions do not expose database_mode.
+        }
+        try (Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery(
+                 "SELECT 1 FROM sys_catalog.sys_settings WHERE LOWER(name) = 'sql_mode'"
+             )) {
+            return rs.next();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean kingbaseCatalogExists(Connection conn, String catalog) {
+        try (Statement statement = conn.createStatement();
+             ResultSet ignored = statement.executeQuery("SELECT 1 FROM " + catalog + " WHERE 1 = 0")) {
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static String kingbaseCompatibilityTablesSql() {
+        return """
+            SELECT CAST(table_name AS varchar(256)) AS table_name,
+                CASE UPPER(CAST(table_type AS varchar(64)))
+                    WHEN 'VIEW' THEN 'VIEW'
+                    WHEN 'MATERIALIZED VIEW' THEN 'MATERIALIZED_VIEW'
+                    ELSE 'TABLE'
+                END AS table_type,
+                NULL AS remarks
+            FROM information_schema.tables
+            WHERE CAST(table_schema AS varchar(256)) = ?
+                AND UPPER(CAST(table_type AS varchar(64))) IN ('BASE TABLE', 'TABLE', 'VIEW', 'MATERIALIZED VIEW')
+            ORDER BY CAST(table_name AS varchar(256))
+            """;
+    }
+
+    private static String kingbasePostgresTablesSql() {
+        return """
+            SELECT CAST(c.relname AS varchar(256)) AS table_name,
+                CASE c.relkind
+                    WHEN 'v' THEN 'VIEW'
+                    WHEN 'm' THEN 'MATERIALIZED_VIEW'
+                    WHEN 'f' THEN 'FOREIGN TABLE'
+                    ELSE 'TABLE'
+                END AS table_type,
+                CAST(obj_description(c.oid) AS varchar(4000)) AS remarks
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ?
+                AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+            ORDER BY c.relname
+            """;
+    }
+
+    private static String kingbaseCastSafeTablesSql() {
+        return """
+            SELECT table_name, table_type, remarks
+            FROM (
+                SELECT CAST(c.relname AS varchar(256)) AS table_name,
+                    'TABLE' AS table_type,
+                    CAST(d.description AS varchar(4000)) AS remarks
+                FROM sys_catalog.sys_class c
+                JOIN sys_catalog.sys_namespace n
+                    ON CAST(n.oid AS varchar(64)) = CAST(c.relnamespace AS varchar(64))
+                LEFT JOIN sys_catalog.sys_description d
+                    ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+                WHERE CAST(n.nspname AS varchar(256)) = ?
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM sys_catalog.sys_tables t
+                            WHERE CAST(t.schemaname AS varchar(256)) = CAST(n.nspname AS varchar(256))
+                                AND CAST(t.tablename AS varchar(256)) = CAST(c.relname AS varchar(256))
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM sys_catalog.sys_foreign_table ft
+                            WHERE CAST(ft.ftrelid AS varchar(64)) = CAST(c.oid AS varchar(64))
+                        )
+                    )
+                UNION ALL
+                SELECT CAST(v.viewname AS varchar(256)) AS table_name,
+                    'VIEW' AS table_type,
+                    CAST(d.description AS varchar(4000)) AS remarks
+                FROM sys_catalog.sys_views v
+                JOIN sys_catalog.sys_namespace n
+                    ON CAST(n.nspname AS varchar(256)) = CAST(v.schemaname AS varchar(256))
+                JOIN sys_catalog.sys_class c
+                    ON CAST(c.relnamespace AS varchar(64)) = CAST(n.oid AS varchar(64))
+                    AND CAST(c.relname AS varchar(256)) = CAST(v.viewname AS varchar(256))
+                LEFT JOIN sys_catalog.sys_description d
+                    ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+                WHERE CAST(v.schemaname AS varchar(256)) = ?
+                UNION ALL
+                SELECT CAST(mv.matviewname AS varchar(256)) AS table_name,
+                    'MATERIALIZED_VIEW' AS table_type,
+                    CAST(d.description AS varchar(4000)) AS remarks
+                FROM sys_catalog.sys_matviews mv
+                JOIN sys_catalog.sys_namespace n
+                    ON CAST(n.nspname AS varchar(256)) = CAST(mv.schemaname AS varchar(256))
+                JOIN sys_catalog.sys_class c
+                    ON CAST(c.relnamespace AS varchar(64)) = CAST(n.oid AS varchar(64))
+                    AND CAST(c.relname AS varchar(256)) = CAST(mv.matviewname AS varchar(256))
+                LEFT JOIN sys_catalog.sys_description d
+                    ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+                WHERE CAST(mv.schemaname AS varchar(256)) = ?
+            ) metadata_tables
+            ORDER BY table_name
+            """;
+    }
+
+    private static String kingbaseEffectiveSchema(Connection conn, String schema) {
+        String effectiveSchema = emptyToNull(schema);
+        if (effectiveSchema != null) {
+            return effectiveSchema;
+        }
+        try {
+            effectiveSchema = emptyToNull(conn.getSchema());
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+        }
+        return effectiveSchema == null ? "PUBLIC" : effectiveSchema;
+    }
+
     private static JsonNode kingbaseGetColumns(Connection conn, String schema, String table) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
-        String effectiveSchema = emptyToNull(schema) == null ? "PUBLIC" : schema;
+        String effectiveSchema = kingbaseEffectiveSchema(conn, schema);
         Set<String> primaryKeys = kingbasePrimaryKeys(conn, effectiveSchema, table);
         String sql = "SELECT a.attname AS column_name, " +
             "format_type(a.atttypid, a.atttypmod) AS data_type, " +
@@ -1905,11 +2262,16 @@ public final class DbxJdbcPlugin {
     }
 
     private static String connectionKey(JsonNode connection) {
-        return optionalText(connection, "connection_string")
+        String connectionString = optionalText(connection, "connection_string");
+        String jdbcxSecurityKey = isJdbcxUrl(connectionString)
+            ? "|jdbcxHighPrivilegeExtensions=" + jdbcxHighPrivilegeExtensionsEnabled(connection)
+            : "";
+        return connectionString
             + "|" + optionalText(connection, "url_params")
             + "|" + optionalText(connection, "username")
             + "|" + optionalText(connection, "password")
-            + "|" + connection.path("sysdba").asBoolean(false);
+            + "|" + connection.path("sysdba").asBoolean(false)
+            + jdbcxSecurityKey;
     }
 
     private static Set<String> primaryKeys(DatabaseMetaData meta, String database, String schema, String table) throws SQLException {

@@ -4,15 +4,14 @@ use crate::models::connection::ConnectionConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum NacosAuthConfig {
+    #[default]
     None,
-    UsernamePassword { username: String, password: String },
-}
-
-impl Default for NacosAuthConfig {
-    fn default() -> Self {
-        Self::None
-    }
+    UsernamePassword {
+        username: String,
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +171,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            database_info: None,
         }
     }
 

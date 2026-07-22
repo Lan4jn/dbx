@@ -1,13 +1,28 @@
-import { describe, expect, it } from "vitest";
-import { normalizeDesktopSettings, normalizeEditorSettings } from "@/stores/settingsStore";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { enforceRightSidebarPanelExclusivity, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, normalizeDesktopSettings, normalizeEditorSettings, normalizeMcpGlobalPolicy, transitionRightSidebarPanels, type RightSidebarPanelState } from "@/stores/settingsStore";
+import { createPinia, setActivePinia } from "pinia";
+import type { AiConfigItem } from "@/types/ai";
 
 describe("normalizeEditorSettings", () => {
+  it("defaults SQL execution to the current statement and migrates legacy execute-all settings", () => {
+    expect(normalizeEditorSettings({}).executeMode).toBe("current");
+    expect(normalizeEditorSettings({ executeMode: "all" }).executeMode).toBe("current");
+    expect(normalizeEditorSettings({ executeMode: "all", executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION }).executeMode).toBe("all");
+  });
+
   it("enables automatic table aliases by default", () => {
     expect(normalizeEditorSettings({}).autoAliasTables).toBe(true);
   });
 
   it("preserves disabled automatic table aliases", () => {
     expect(normalizeEditorSettings({ autoAliasTables: false }).autoAliasTables).toBe(false);
+  });
+
+  it("defaults sidebar connection sorting to manual order and preserves valid alphabetical modes", () => {
+    expect(normalizeEditorSettings({}).sidebarConnectionSortMode).toBe("manual");
+    expect(normalizeEditorSettings({ sidebarConnectionSortMode: "asc" }).sidebarConnectionSortMode).toBe("asc");
+    expect(normalizeEditorSettings({ sidebarConnectionSortMode: "desc" }).sidebarConnectionSortMode).toBe("desc");
+    expect(normalizeEditorSettings({ sidebarConnectionSortMode: "invalid" as any }).sidebarConnectionSortMode).toBe("manual");
   });
 
   it("shows the current statement frame by default", () => {
@@ -67,9 +82,9 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: true } as any).openTabsRestoreMode).toBe("all");
   });
 
-  it("preserves mirror update download sources and rejects invalid values", () => {
+  it("preserves CNB, migrates AtomGit to CNB, and rejects invalid values", () => {
     expect(normalizeEditorSettings({ updateDownloadSource: "cnb" }).updateDownloadSource).toBe("cnb");
-    expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" }).updateDownloadSource).toBe("atomgit");
+    expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" as any }).updateDownloadSource).toBe("cnb");
     expect(normalizeEditorSettings({ updateDownloadSource: "mirror" as any }).updateDownloadSource).toBe("official");
   });
 
@@ -77,6 +92,20 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).dataGridSearchMode).toBe("filter");
     expect(normalizeEditorSettings({ dataGridSearchMode: "highlight" }).dataGridSearchMode).toBe("highlight");
     expect(normalizeEditorSettings({ dataGridSearchMode: "invalid" as any }).dataGridSearchMode).toBe("filter");
+  });
+
+  it("defaults persistent data grid view options off and preserves enabled values", () => {
+    const defaults = normalizeEditorSettings({});
+    expect(defaults.dataGridMultiRowTranspose).toBe(false);
+    expect(defaults.dataGridHideNullColumns).toBe(false);
+
+    const enabled = normalizeEditorSettings({ dataGridMultiRowTranspose: true, dataGridHideNullColumns: true });
+    expect(enabled.dataGridMultiRowTranspose).toBe(true);
+    expect(enabled.dataGridHideNullColumns).toBe(true);
+
+    const invalid = normalizeEditorSettings({ dataGridMultiRowTranspose: "true" as any, dataGridHideNullColumns: 1 as any });
+    expect(invalid.dataGridMultiRowTranspose).toBe(false);
+    expect(invalid.dataGridHideNullColumns).toBe(false);
   });
 
   it("shows cell detail metadata by default and preserves collapsed state", () => {
@@ -95,6 +124,41 @@ describe("normalizeEditorSettings", () => {
     expect(settings.toolbarItems.sqlFileTree).toBe(false);
     expect(settings.toolbarItems.history).toBe(false);
     expect(settings.toolbarItems.sqlLibrary).toBe(true);
+    expect(settings.toolbarItems.exclusiveRightSidebarPanels).toBe(true);
+  });
+
+  it("preserves disabled right sidebar panel exclusivity", () => {
+    expect(
+      normalizeEditorSettings({
+        toolbarItems: {
+          exclusiveRightSidebarPanels: false,
+        } as any,
+      }).toolbarItems.exclusiveRightSidebarPanels,
+    ).toBe(false);
+  });
+});
+
+describe("right sidebar panel transitions", () => {
+  const state = (overrides: Partial<RightSidebarPanelState> = {}): RightSidebarPanelState => ({
+    ai: false,
+    history: false,
+    sqlLibrary: false,
+    sqlFile: false,
+    ...overrides,
+  });
+
+  it("allows multiple panels when exclusivity is disabled", () => {
+    expect(transitionRightSidebarPanels(state({ ai: true }), "history", true, false)).toEqual(state({ ai: true, history: true }));
+  });
+
+  it("switches panels and allows the active panel to toggle closed", () => {
+    const switched = transitionRightSidebarPanels(state({ ai: true }), "sqlLibrary", true, true);
+    expect(switched).toEqual(state({ sqlLibrary: true }));
+    expect(transitionRightSidebarPanels(switched, "sqlLibrary", false, true)).toEqual(state());
+  });
+
+  it("collapses synchronized multi-panel state to the preferred open panel", () => {
+    expect(enforceRightSidebarPanelExclusivity(state({ ai: true, history: true, sqlFile: true }), "history")).toEqual(state({ history: true }));
   });
 });
 
@@ -113,6 +177,37 @@ describe("normalizeDesktopSettings", () => {
   });
 });
 
+describe("normalizeMcpGlobalPolicy", () => {
+  it("defaults to all connections with writes allowed", () => {
+    expect(normalizeMcpGlobalPolicy(undefined)).toEqual({
+      readOnly: false,
+      allowDangerousSql: false,
+      allowedConnectionIds: null,
+      configured: false,
+    });
+  });
+
+  it("normalizes and deduplicates an explicit connection allowlist", () => {
+    expect(
+      normalizeMcpGlobalPolicy({
+        readOnly: true,
+        allowDangerousSql: true,
+        allowedConnectionIds: [" connection-1 ", "connection-1", "", "connection-2"],
+        configured: true,
+      }),
+    ).toEqual({
+      readOnly: true,
+      allowDangerousSql: true,
+      allowedConnectionIds: ["connection-1", "connection-2"],
+      configured: true,
+    });
+  });
+
+  it("preserves an empty allowlist as deny all", () => {
+    expect(normalizeMcpGlobalPolicy({ allowedConnectionIds: [] }).allowedConnectionIds).toEqual([]);
+  });
+});
+
 describe("normalizeEditorSettings - continueOnErrorOnBatch", () => {
   it("defaults continueOnErrorOnBatch to false", () => {
     expect(normalizeEditorSettings({}).continueOnErrorOnBatch).toBe(false);
@@ -125,5 +220,216 @@ describe("normalizeEditorSettings - continueOnErrorOnBatch", () => {
   it("treats non-boolean values as false", () => {
     expect(normalizeEditorSettings({ continueOnErrorOnBatch: "yes" } as any).continueOnErrorOnBatch).toBe(false);
     expect(normalizeEditorSettings({ continueOnErrorOnBatch: 1 } as any).continueOnErrorOnBatch).toBe(false);
+  });
+});
+
+describe("normalizeEditorSettings - tabLayout", () => {
+  it("defaults tabLayout to scroll", () => {
+    expect(normalizeEditorSettings({}).tabLayout).toBe("scroll");
+  });
+
+  it("preserves explicit scroll mode", () => {
+    expect(normalizeEditorSettings({ tabLayout: "scroll" }).tabLayout).toBe("scroll");
+  });
+
+  it("preserves explicit wrap mode", () => {
+    expect(normalizeEditorSettings({ tabLayout: "wrap" }).tabLayout).toBe("wrap");
+  });
+
+  it("falls back to scroll for invalid values", () => {
+    expect(normalizeEditorSettings({ tabLayout: "invalid" } as any).tabLayout).toBe("scroll");
+    expect(normalizeEditorSettings({ tabLayout: undefined } as any).tabLayout).toBe("scroll");
+    expect(normalizeEditorSettings({ tabLayout: null } as any).tabLayout).toBe("scroll");
+    expect(normalizeEditorSettings({ tabLayout: 123 } as any).tabLayout).toBe("scroll");
+  });
+});
+
+// --- Helpers for Pinia store tests ---
+
+function makeTestConfig(overrides: Partial<AiConfigItem> & { id: string }): AiConfigItem {
+  return {
+    provider: "openai",
+    apiKey: "",
+    authMethod: "api-key",
+    endpoint: "https://api.openai.com/v1/chat/completions",
+    model: "gpt-4o-mini",
+    apiStyle: "completions",
+    name: overrides.id,
+    ...overrides,
+  } as AiConfigItem;
+}
+
+describe("settingsStore MCP policy persistence", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("rolls an optimistic policy update back when persistence fails", async () => {
+    let rejectSave!: (reason?: unknown) => void;
+    const saveMcpGlobalPolicy = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSave = reject;
+        }),
+    );
+    vi.doMock("@/lib/backend/api", () => ({ saveMcpGlobalPolicy }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    const previous = {
+      readOnly: true,
+      allowDangerousSql: false,
+      allowedConnectionIds: ["connection-1"],
+      configured: true,
+    };
+    store.mcpGlobalPolicy = previous;
+
+    const update = store.updateMcpGlobalPolicy({ readOnly: false, allowedConnectionIds: [] });
+    expect(store.mcpGlobalPolicy).toEqual({
+      readOnly: false,
+      allowDangerousSql: false,
+      allowedConnectionIds: [],
+      configured: true,
+    });
+
+    rejectSave(new Error("save failed"));
+    await expect(update).rejects.toThrow("save failed");
+    expect(store.mcpGlobalPolicy).toEqual(previous);
+  });
+});
+
+describe("settingsStore sidebar connection sort persistence", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("persists the selected alphabetical sort mode", async () => {
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.updateEditorSettings({ sidebarConnectionSortMode: "desc" });
+
+    expect(store.editorSettings.sidebarConnectionSortMode).toBe("desc");
+    expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ sidebarConnectionSortMode: "desc" }));
+  });
+});
+
+// --- activeModel lifecycle tests ---
+
+describe("settingsStore activeModel lifecycle", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("updateActiveModel persists the model and does not change any config isDefault", async () => {
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+
+    store.aiConfigs = [makeTestConfig({ id: "c1", model: "model-a", isDefault: true }), makeTestConfig({ id: "c2", model: "model-b", isDefault: false })];
+    store.isAiConfigLoaded = true;
+
+    store.updateActiveModel({ configId: "c1", modelId: "model-a" });
+    expect(store.activeModel).toEqual({ configId: "c1", modelId: "model-a" });
+
+    store.updateActiveModel({ configId: "c2", modelId: "model-b" });
+    expect(store.activeModel).toEqual({ configId: "c2", modelId: "model-b" });
+
+    // 核心保障：不改变任何配置的 isDefault
+    expect(store.aiConfigs[0].isDefault).toBe(true);
+    expect(store.aiConfigs[1].isDefault).toBe(false);
+  });
+
+  it("setDefaultAiConfig(id) on success points activeModel to the new default config", async () => {
+    const setDefaultAiConfig = vi.fn().mockResolvedValue(undefined);
+
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      setDefaultAiConfig,
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+
+    store.aiConfigs = [makeTestConfig({ id: "c1", model: "model-a", isDefault: true }), makeTestConfig({ id: "c2", model: "model-b", isDefault: false })];
+    store.isAiConfigLoaded = true;
+
+    // 先手动切到非默认的配置
+    store.updateActiveModel({ configId: "c2", modelId: "model-b" });
+    expect(store.activeModel).toEqual({ configId: "c2", modelId: "model-b" });
+
+    await store.setDefaultAiConfig("c2");
+
+    expect(setDefaultAiConfig).toHaveBeenCalledWith("c2");
+    expect(store.aiConfigs[0].isDefault).toBe(false);
+    expect(store.aiConfigs[1].isDefault).toBe(true);
+    expect(store.activeModel).toEqual({ configId: "c2", modelId: "model-b" });
+  });
+
+  it("setDefaultAiConfig does not mutate state when backend call fails", async () => {
+    const error = new Error("backend error");
+    const setDefaultAiConfig = vi.fn().mockRejectedValue(error);
+
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      setDefaultAiConfig,
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+
+    store.aiConfigs = [makeTestConfig({ id: "c1", model: "model-a", isDefault: true }), makeTestConfig({ id: "c2", model: "model-b", isDefault: false })];
+    store.isAiConfigLoaded = true;
+    store.updateActiveModel({ configId: "c1", modelId: "model-a" });
+
+    await expect(store.setDefaultAiConfig("c2")).rejects.toThrow("backend error");
+
+    // isDefault 不变
+    expect(store.aiConfigs[0].isDefault).toBe(true);
+    expect(store.aiConfigs[1].isDefault).toBe(false);
+    // activeModel 不变
+    expect(store.activeModel).toEqual({ configId: "c1", modelId: "model-a" });
+  });
+
+  it("reloadAiConfigs sets activeModel to null when config list is empty", async () => {
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.isAiConfigLoaded = false;
+    await store.reloadAiConfigs();
+    expect(store.activeModel).toBeNull();
+  });
+
+  it("reloadAiConfigs points activeModel to isDefault config, not first in list", async () => {
+    const configs = [makeTestConfig({ id: "c1", model: "model-a", isDefault: false }), makeTestConfig({ id: "c2", model: "model-b", isDefault: true }), makeTestConfig({ id: "c3", model: "model-c", isDefault: false })];
+
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue(configs),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.isAiConfigLoaded = false;
+    await store.reloadAiConfigs();
+    expect(store.activeModel).toEqual({ configId: "c2", modelId: "model-b" });
   });
 });
