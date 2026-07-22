@@ -223,6 +223,12 @@ pub struct SqlFileProgress {
     pub affected_rows: u64,
     pub elapsed_ms: u128,
     pub statement_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_processed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_statement: Option<String>,
     pub error: Option<String>,
 }
 
@@ -1323,6 +1329,21 @@ pub fn statement_summary(statement: &str) -> String {
     collapsed.chars().take(MAX_LEN).collect()
 }
 
+pub fn sql_file_statement_fragment(statement: &str, max_bytes: usize) -> String {
+    if statement.len() <= max_bytes {
+        return statement.to_string();
+    }
+    if max_bytes <= 3 {
+        return ".".repeat(max_bytes);
+    }
+
+    let mut end = max_bytes - 3;
+    while end > 0 && !statement.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &statement[..end])
+}
+
 pub fn prepare_sql_file_statement(
     statement: &str,
     db_type: &DatabaseType,
@@ -2384,10 +2405,42 @@ mod tests {
         contains_or_fuzzy_match, decode_sql_file_bytes, find_statement_at_cursor_for_database, fuzzy_filter_enabled,
         fuzzy_like_pattern_with_escape, fuzzy_subsequence_match, optimize_sql_file_import_statements,
         prepare_sql_file_statement, split_sql_script, split_sql_statement_ranges_with_options,
-        split_sql_statements_for_database, starts_with_executable_sql_keyword,
-        starts_with_executable_sql_keyword_for_database, SqlDialectProfile, SqlFileStatementAction, SqlParsingOptions,
-        SqlStatementSplitter,
+        split_sql_statements_for_database, sql_file_statement_fragment, starts_with_executable_sql_keyword,
+        starts_with_executable_sql_keyword_for_database, SqlDialectProfile, SqlFileProgress, SqlFileStatementAction,
+        SqlFileStatus, SqlParsingOptions, SqlStatementSplitter,
     };
+
+    #[test]
+    fn sql_file_statement_fragment_is_utf8_safe_and_bounded() {
+        assert_eq!(sql_file_statement_fragment("SELECT 1", 2048), "SELECT 1");
+
+        let fragment = sql_file_statement_fragment(&"数据库".repeat(500), 2048);
+        assert!(fragment.len() <= 2048);
+        assert!(fragment.ends_with("..."));
+        assert!(std::str::from_utf8(fragment.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn sql_file_progress_serializes_optional_byte_fields() {
+        let progress = SqlFileProgress {
+            execution_id: "execution".to_string(),
+            status: SqlFileStatus::Running,
+            statement_index: 2,
+            success_count: 1,
+            failure_count: 0,
+            affected_rows: 3,
+            elapsed_ms: 4,
+            statement_summary: "SELECT".to_string(),
+            bytes_processed: Some(128),
+            total_bytes: Some(256),
+            current_statement: Some("SELECT 1".to_string()),
+            error: None,
+        };
+        let value = serde_json::to_value(progress).unwrap();
+        assert_eq!(value["bytesProcessed"], 128);
+        assert_eq!(value["totalBytes"], 256);
+        assert_eq!(value["currentStatement"], "SELECT 1");
+    }
 
     #[test]
     fn fuzzy_subsequence_match_matches_ordered_characters() {

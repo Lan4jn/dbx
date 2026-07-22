@@ -12,9 +12,9 @@ use crate::query::{
     QueryExecutionOptions,
 };
 use crate::sql::{
-    optimize_sql_file_import_statements, prepare_sql_file_statement, split_sql_batches, statement_summary,
-    SqlFileImportStatement, SqlFileImportStatementKind, SqlFileProgress, SqlFileRequest, SqlFileStatementAction,
-    SqlFileStatus, SqlParsingOptions, SqlStatementSplitter,
+    optimize_sql_file_import_statements, prepare_sql_file_statement, split_sql_batches, sql_file_statement_fragment,
+    statement_summary, SqlFileImportStatement, SqlFileImportStatementKind, SqlFileProgress, SqlFileRequest,
+    SqlFileStatementAction, SqlFileStatus, SqlParsingOptions, SqlStatementSplitter,
 };
 use crate::types::QueryResult;
 
@@ -35,6 +35,23 @@ const SQL_FILE_READ_CHUNK_BYTES: usize = 256 * 1024;
 const SQL_FILE_STATEMENT_BATCH_SIZE: usize = 256;
 const SQL_FILE_PREVIEW_ENCODING_SAMPLE_BYTES: usize = 1024 * 1024;
 const SQL_FILE_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+const SQL_FILE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const SQL_FILE_CURRENT_STATEMENT_MAX_BYTES: usize = 2 * 1024;
+
+async fn await_with_progress_heartbeat<F, T, H>(future: F, interval: Duration, mut heartbeat: H) -> T
+where
+    F: std::future::Future<Output = T>,
+    H: FnMut(),
+{
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = timer.tick() => heartbeat(),
+        }
+    }
+}
 
 pub struct SqlFileProgressEmitter<F, C = fn() -> Instant> {
     emit: F,
@@ -63,6 +80,11 @@ where
 
     pub fn emit(&mut self, progress: SqlFileProgress) {
         if sql_file_progress_is_immediate(progress.status) {
+            if progress.status == SqlFileStatus::StatementDone {
+                self.pending_regular = None;
+                (self.emit)(progress);
+                return;
+            }
             // Preserve ordering and final counters before terminal or failure events.
             self.flush_pending();
             (self.emit)(progress);
@@ -99,6 +121,7 @@ fn sql_file_progress_is_immediate(status: SqlFileStatus) -> bool {
     matches!(
         status,
         SqlFileStatus::Started
+            | SqlFileStatus::StatementDone
             | SqlFileStatus::StatementFailed
             | SqlFileStatus::Done
             | SqlFileStatus::Error
@@ -111,12 +134,31 @@ struct SqlFileExecutionProgress {
     success_count: usize,
     failure_count: usize,
     affected_rows: u64,
+    bytes_processed: Option<u64>,
+    total_bytes: Option<u64>,
 }
 
 impl SqlFileExecutionProgress {
-    fn new() -> Self {
-        Self { statement_index: 0, success_count: 0, failure_count: 0, affected_rows: 0 }
+    fn new(total_bytes: Option<u64>) -> Self {
+        Self {
+            statement_index: 0,
+            success_count: 0,
+            failure_count: 0,
+            affected_rows: 0,
+            bytes_processed: total_bytes.map(|_| 0),
+            total_bytes,
+        }
     }
+
+    fn byte_progress(&self) -> SqlFileByteProgress {
+        SqlFileByteProgress { bytes_processed: self.bytes_processed, total_bytes: self.total_bytes }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SqlFileByteProgress {
+    bytes_processed: Option<u64>,
+    total_bytes: Option<u64>,
 }
 
 struct MySqlSqlFileExecutor {
@@ -333,7 +375,9 @@ pub async fn execute_sql_file_content(
     // MySQL-family imports need one pinned connection so `USE` and session
     // state survive across the whole file.
     let mut mysql_executor = MySqlSqlFileExecutor::build(state, request, import_target.as_ref()).await?;
-    let mut progress = SqlFileExecutionProgress::new();
+    let total_bytes = Some(file_content.len() as u64);
+    let mut progress = SqlFileExecutionProgress::new(total_bytes);
+    progress.bytes_processed = total_bytes;
     execute_planned_statements_with_progress(
         state,
         request,
@@ -362,7 +406,8 @@ pub async fn execute_sql_file_path(
         import_target.as_ref().map(|target| SqlParsingOptions::for_database_type(target.db_type)).unwrap_or_default();
     let mut splitter = StreamingSqlFileSplitter::new(import_target.as_ref().map(|target| target.db_type), options);
     let mut mysql_executor = MySqlSqlFileExecutor::build(state, request, import_target.as_ref()).await?;
-    let mut progress = SqlFileExecutionProgress::new();
+    let total_bytes = tokio::fs::metadata(file_path).await.ok().map(|metadata| metadata.len());
+    let mut progress = SqlFileExecutionProgress::new(total_bytes);
     let mut pending_statements = Vec::with_capacity(SQL_FILE_STATEMENT_BATCH_SIZE);
     let mut decoder = match SqlFileStreamDecoder::open(file_path).await {
         Ok(decoder) => decoder,
@@ -398,6 +443,7 @@ pub async fn execute_sql_file_path(
             return Ok(());
         }
         pending_statements.extend(splitter.push_chunk(&chunk));
+        progress.bytes_processed = Some(decoder.bytes_read()).filter(|_| progress.total_bytes.is_some());
         if pending_statements.len() >= SQL_FILE_STATEMENT_BATCH_SIZE {
             execute_sql_file_statement_batch(
                 state,
@@ -415,6 +461,7 @@ pub async fn execute_sql_file_path(
     }
 
     pending_statements.extend(splitter.finish());
+    progress.bytes_processed = progress.total_bytes.or(progress.bytes_processed);
     execute_sql_file_statement_batch(
         state,
         request,
@@ -450,6 +497,7 @@ struct SqlFileStreamDecoder {
     decoder: encoding_rs::Decoder,
     pending_bytes: Vec<u8>,
     reached_eof: bool,
+    bytes_read: u64,
 }
 
 impl SqlFileStreamDecoder {
@@ -470,7 +518,12 @@ impl SqlFileStreamDecoder {
             decoder: encoding.new_decoder_without_bom_handling(),
             pending_bytes,
             reached_eof: false,
+            bytes_read: prefix_len as u64,
         })
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 
     async fn next_chunk(&mut self) -> Result<Option<String>, String> {
@@ -484,6 +537,7 @@ impl SqlFileStreamDecoder {
                 self.reached_eof = true;
                 break;
             }
+            self.bytes_read += read as u64;
             self.pending_bytes.extend_from_slice(&buffer[..read]);
         }
 
@@ -673,9 +727,10 @@ fn emit_sql_file_terminal_progress(
     progress: &SqlFileExecutionProgress,
     emit: &mut impl FnMut(SqlFileProgress),
 ) {
-    emit(sql_file_progress(
+    let status = if token.is_cancelled() { SqlFileStatus::Cancelled } else { SqlFileStatus::Done };
+    let mut terminal = sql_file_progress(
         &request.execution_id,
-        if token.is_cancelled() { SqlFileStatus::Cancelled } else { SqlFileStatus::Done },
+        status,
         progress.statement_index,
         progress.success_count,
         progress.failure_count,
@@ -683,7 +738,14 @@ fn emit_sql_file_terminal_progress(
         started_at,
         "",
         None,
-    ));
+    );
+    terminal.bytes_processed = if status == SqlFileStatus::Done {
+        progress.total_bytes.or(progress.bytes_processed)
+    } else {
+        progress.bytes_processed
+    };
+    terminal.total_bytes = progress.total_bytes;
+    emit(terminal);
 }
 
 fn split_sql_file_import_statements(file_content: &str, db_type: Option<DatabaseType>) -> Vec<String> {
@@ -721,8 +783,23 @@ pub fn sql_file_progress(
         affected_rows,
         elapsed_ms: started_at.elapsed().as_millis(),
         statement_summary: statement_summary.to_string(),
+        bytes_processed: None,
+        total_bytes: None,
+        current_statement: None,
         error,
     }
+}
+
+fn sql_file_progress_with_details(
+    mut progress: SqlFileProgress,
+    byte_progress: SqlFileByteProgress,
+    current_statement: &str,
+) -> SqlFileProgress {
+    progress.bytes_processed = byte_progress.bytes_processed;
+    progress.total_bytes = byte_progress.total_bytes;
+    progress.current_statement =
+        Some(sql_file_statement_fragment(current_statement, SQL_FILE_CURRENT_STATEMENT_MAX_BYTES));
+    progress
 }
 
 pub fn sql_file_error_progress(execution_id: &str, started_at: Instant, error: String) -> SqlFileProgress {
@@ -946,6 +1023,7 @@ async fn execute_planned_statements_with_progress(
         }
 
         let next_statement_index = progress.statement_index + planned_statement.source_statement_count;
+        let byte_progress = progress.byte_progress();
         if execute_statement_with_progress(
             state,
             request,
@@ -956,6 +1034,7 @@ async fn execute_planned_statements_with_progress(
             &mut progress.success_count,
             &mut progress.failure_count,
             &mut progress.affected_rows,
+            byte_progress,
             mysql_executor.as_deref_mut(),
             emit,
         )
@@ -979,77 +1058,50 @@ async fn execute_statement_with_progress(
     success_count: &mut usize,
     failure_count: &mut usize,
     affected_rows: &mut u64,
+    byte_progress: SqlFileByteProgress,
     mut mysql_executor: Option<&mut MySqlSqlFileExecutor>,
     emit: &mut impl FnMut(SqlFileProgress),
 ) -> Result<bool, String> {
     if token.is_cancelled() {
         let summary = statement_summary(&statement.sql);
-        emit(sql_file_progress(
-            &request.execution_id,
-            SqlFileStatus::Cancelled,
-            statement_index,
-            *success_count,
-            *failure_count,
-            *affected_rows,
-            started_at,
-            &summary,
-            None,
+        emit(sql_file_progress_with_details(
+            sql_file_progress(
+                &request.execution_id,
+                SqlFileStatus::Cancelled,
+                statement_index,
+                *success_count,
+                *failure_count,
+                *affected_rows,
+                started_at,
+                &summary,
+                None,
+            ),
+            byte_progress,
+            &statement.sql,
         ));
         return Ok(true);
     }
 
     if statement.kind == SqlFileImportStatementKind::Skip {
         let summary = statement_summary(&statement.sql);
-        emit(sql_file_progress(
-            &request.execution_id,
-            SqlFileStatus::Running,
-            statement_index,
-            *success_count,
-            *failure_count,
-            *affected_rows,
-            started_at,
-            &summary,
-            None,
+        emit(sql_file_progress_with_details(
+            sql_file_progress(
+                &request.execution_id,
+                SqlFileStatus::Running,
+                statement_index,
+                *success_count,
+                *failure_count,
+                *affected_rows,
+                started_at,
+                &summary,
+                None,
+            ),
+            byte_progress,
+            &statement.sql,
         ));
         *success_count += statement.source_statement_count;
-        emit(sql_file_progress(
-            &request.execution_id,
-            SqlFileStatus::StatementDone,
-            statement_index,
-            *success_count,
-            *failure_count,
-            *affected_rows,
-            started_at,
-            &summary,
-            None,
-        ));
-        return Ok(false);
-    }
-
-    let summary = statement_summary(&statement.sql);
-    emit(sql_file_progress(
-        &request.execution_id,
-        SqlFileStatus::Running,
-        statement_index,
-        *success_count,
-        *failure_count,
-        *affected_rows,
-        started_at,
-        &summary,
-        None,
-    ));
-
-    let result = {
-        let mysql_executor = mysql_executor.as_deref_mut();
-        execute_sql_file_statement_with_executor(state, request, &statement.sql, token, statement_index, mysql_executor)
-            .await
-    };
-
-    match result {
-        Ok(result) => {
-            *success_count += statement.source_statement_count;
-            *affected_rows += result.affected_rows;
-            emit(sql_file_progress(
+        emit(sql_file_progress_with_details(
+            sql_file_progress(
                 &request.execution_id,
                 SqlFileStatus::StatementDone,
                 statement_index,
@@ -1059,6 +1111,71 @@ async fn execute_statement_with_progress(
                 started_at,
                 &summary,
                 None,
+            ),
+            byte_progress,
+            &statement.sql,
+        ));
+        return Ok(false);
+    }
+
+    let summary = statement_summary(&statement.sql);
+    emit(sql_file_progress_with_details(
+        sql_file_progress(
+            &request.execution_id,
+            SqlFileStatus::Running,
+            statement_index,
+            *success_count,
+            *failure_count,
+            *affected_rows,
+            started_at,
+            &summary,
+            None,
+        ),
+        byte_progress,
+        &statement.sql,
+    ));
+
+    let execution = {
+        let mysql_executor = mysql_executor.as_deref_mut();
+        execute_sql_file_statement_with_executor(state, request, &statement.sql, token, statement_index, mysql_executor)
+    };
+    let result = await_with_progress_heartbeat(execution, SQL_FILE_HEARTBEAT_INTERVAL, || {
+        emit(sql_file_progress_with_details(
+            sql_file_progress(
+                &request.execution_id,
+                SqlFileStatus::Running,
+                statement_index,
+                *success_count,
+                *failure_count,
+                *affected_rows,
+                started_at,
+                &summary,
+                None,
+            ),
+            byte_progress,
+            &statement.sql,
+        ));
+    })
+    .await;
+
+    match result {
+        Ok(result) => {
+            *success_count += statement.source_statement_count;
+            *affected_rows += result.affected_rows;
+            emit(sql_file_progress_with_details(
+                sql_file_progress(
+                    &request.execution_id,
+                    SqlFileStatus::StatementDone,
+                    statement_index,
+                    *success_count,
+                    *failure_count,
+                    *affected_rows,
+                    started_at,
+                    &summary,
+                    None,
+                ),
+                byte_progress,
+                &statement.sql,
             ));
             Ok(false)
         }
@@ -1074,6 +1191,7 @@ async fn execute_statement_with_progress(
                     success_count,
                     failure_count,
                     affected_rows,
+                    byte_progress,
                     mysql_executor,
                     emit,
                 )
@@ -1095,7 +1213,7 @@ async fn execute_statement_with_progress(
 
             *failure_count = decision.failure_count;
             for progress in decision.progress {
-                emit(progress);
+                emit(sql_file_progress_with_details(progress, byte_progress, &statement.sql));
             }
             decision.result
         }
@@ -1113,55 +1231,61 @@ async fn execute_merged_statement_fallback_with_progress(
     success_count: &mut usize,
     failure_count: &mut usize,
     affected_rows: &mut u64,
+    byte_progress: SqlFileByteProgress,
     mut mysql_executor: Option<&mut MySqlSqlFileExecutor>,
     emit: &mut impl FnMut(SqlFileProgress),
 ) -> Result<bool, String> {
     for (offset, source_sql) in statement.source_sqls.iter().enumerate() {
         let statement_index = first_statement_index + offset;
         if token.is_cancelled() {
-            emit(sql_file_progress(
-                &request.execution_id,
-                SqlFileStatus::Cancelled,
-                statement_index,
-                *success_count,
-                *failure_count,
-                *affected_rows,
-                started_at,
-                &statement_summary(source_sql),
-                None,
+            emit(sql_file_progress_with_details(
+                sql_file_progress(
+                    &request.execution_id,
+                    SqlFileStatus::Cancelled,
+                    statement_index,
+                    *success_count,
+                    *failure_count,
+                    *affected_rows,
+                    started_at,
+                    &statement_summary(source_sql),
+                    None,
+                ),
+                byte_progress,
+                source_sql,
             ));
             return Ok(true);
         }
 
         let summary = statement_summary(source_sql);
-        emit(sql_file_progress(
-            &request.execution_id,
-            SqlFileStatus::Running,
-            statement_index,
-            *success_count,
-            *failure_count,
-            *affected_rows,
-            started_at,
-            &summary,
-            None,
+        emit(sql_file_progress_with_details(
+            sql_file_progress(
+                &request.execution_id,
+                SqlFileStatus::Running,
+                statement_index,
+                *success_count,
+                *failure_count,
+                *affected_rows,
+                started_at,
+                &summary,
+                None,
+            ),
+            byte_progress,
+            source_sql,
         ));
 
-        match execute_sql_file_statement_with_executor(
+        let execution = execute_sql_file_statement_with_executor(
             state,
             request,
             source_sql,
             token,
             statement_index,
             mysql_executor.as_deref_mut(),
-        )
-        .await
-        {
-            Ok(result) => {
-                *success_count += 1;
-                *affected_rows += result.affected_rows;
-                emit(sql_file_progress(
+        );
+        let result = await_with_progress_heartbeat(execution, SQL_FILE_HEARTBEAT_INTERVAL, || {
+            emit(sql_file_progress_with_details(
+                sql_file_progress(
                     &request.execution_id,
-                    SqlFileStatus::StatementDone,
+                    SqlFileStatus::Running,
                     statement_index,
                     *success_count,
                     *failure_count,
@@ -1169,6 +1293,31 @@ async fn execute_merged_statement_fallback_with_progress(
                     started_at,
                     &summary,
                     None,
+                ),
+                byte_progress,
+                source_sql,
+            ));
+        })
+        .await;
+
+        match result {
+            Ok(result) => {
+                *success_count += 1;
+                *affected_rows += result.affected_rows;
+                emit(sql_file_progress_with_details(
+                    sql_file_progress(
+                        &request.execution_id,
+                        SqlFileStatus::StatementDone,
+                        statement_index,
+                        *success_count,
+                        *failure_count,
+                        *affected_rows,
+                        started_at,
+                        &summary,
+                        None,
+                    ),
+                    byte_progress,
+                    source_sql,
                 ));
             }
             Err(error) => {
@@ -1187,7 +1336,7 @@ async fn execute_merged_statement_fallback_with_progress(
 
                 *failure_count = decision.failure_count;
                 for progress in decision.progress {
-                    emit(progress);
+                    emit(sql_file_progress_with_details(progress, byte_progress, source_sql));
                 }
                 if decision.result? {
                     return Ok(true);
@@ -1345,6 +1494,9 @@ mod tests {
             affected_rows: statement_index as u64,
             elapsed_ms: statement_index as u128,
             statement_summary: format!("statement {statement_index}"),
+            bytes_processed: None,
+            total_bytes: None,
+            current_statement: None,
             error: None,
         }
     }
@@ -1366,11 +1518,10 @@ mod tests {
             emitter.emit(test_progress(SqlFileStatus::Done, 1_000));
         }
 
-        let regular_count = emitted
-            .iter()
-            .filter(|progress| matches!(progress.status, SqlFileStatus::Running | SqlFileStatus::StatementDone))
-            .count();
-        assert_eq!(regular_count, 11);
+        let running_count = emitted.iter().filter(|progress| progress.status == SqlFileStatus::Running).count();
+        let completed_count = emitted.iter().filter(|progress| progress.status == SqlFileStatus::StatementDone).count();
+        assert_eq!(running_count, 10);
+        assert_eq!(completed_count, 1_000);
         assert_eq!(emitted.last().unwrap().status, SqlFileStatus::Done);
         assert_eq!(emitted[emitted.len() - 2].statement_index, 1_000);
     }
@@ -1386,6 +1537,7 @@ mod tests {
 
             for status in [
                 SqlFileStatus::Started,
+                SqlFileStatus::StatementDone,
                 SqlFileStatus::StatementFailed,
                 SqlFileStatus::Error,
                 SqlFileStatus::Cancelled,
@@ -1399,12 +1551,30 @@ mod tests {
             emitted.iter().map(|progress| progress.status).collect::<Vec<_>>(),
             vec![
                 SqlFileStatus::Started,
+                SqlFileStatus::StatementDone,
                 SqlFileStatus::StatementFailed,
                 SqlFileStatus::Error,
                 SqlFileStatus::Cancelled,
                 SqlFileStatus::Done,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn await_with_progress_heartbeat_ticks_until_the_future_completes() {
+        let heartbeat_count = Cell::new(0usize);
+        let result = await_with_progress_heartbeat(
+            async {
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                42
+            },
+            Duration::from_millis(5),
+            || heartbeat_count.set(heartbeat_count.get() + 1),
+        )
+        .await;
+
+        assert_eq!(result, 42);
+        assert!(heartbeat_count.get() >= 2);
     }
 
     #[test]
