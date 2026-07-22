@@ -9,6 +9,11 @@ export interface SqlErrorPresentation extends SqlErrorLocation {
   caretColumn: number;
 }
 
+export interface SqlDocumentRange {
+  from: number;
+  to: number;
+}
+
 interface SqlLineRange {
   start: number;
   end: number;
@@ -75,13 +80,20 @@ export function buildSqlErrorPresentation(message: string, sql: string): SqlErro
   const line = lines[location.line];
   if (!line) return null;
   const column = Math.min(Math.max(0, offset - line.start), line.text.length);
+  const excerpt = sqlErrorLineExcerpt(line.text, column);
   return {
     line: location.line,
     column,
     offset,
-    lineText: line.text,
-    caretColumn: column,
+    lineText: excerpt.text,
+    caretColumn: excerpt.caretColumn,
   };
+}
+
+export function sqlErrorDocumentRange(presentation: SqlErrorPresentation | null, sourceRange: SqlDocumentRange | undefined): SqlDocumentRange | null {
+  if (!presentation || !sourceRange) return null;
+  const from = Math.min(Math.max(sourceRange.from + presentation.offset, sourceRange.from), sourceRange.to);
+  return { from, to: Math.min(from + 1, sourceRange.to) };
 }
 
 function offsetToLineColumn(lines: SqlLineRange[], offset: number): SqlErrorLocation {
@@ -110,4 +122,18 @@ function sqlLineRanges(sql: string): SqlLineRange[] {
   }
   lines.push({ start, end: sql.length, text: sql.slice(start) });
   return lines;
+}
+
+function sqlErrorLineExcerpt(lineText: string, column: number): { text: string; caretColumn: number } {
+  const maxContentLength = 160;
+  if (lineText.length <= maxContentLength) return { text: lineText, caretColumn: column };
+
+  const start = Math.max(0, Math.min(column - Math.floor(maxContentLength / 2), lineText.length - maxContentLength));
+  const end = Math.min(lineText.length, start + maxContentLength);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < lineText.length ? "..." : "";
+  return {
+    text: `${prefix}${lineText.slice(start, end)}${suffix}`,
+    caretColumn: prefix.length + column - start,
+  };
 }
