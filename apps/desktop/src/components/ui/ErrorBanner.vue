@@ -60,6 +60,7 @@ async function copy() {
       <div class="text-sm font-medium">{{ displayTitle }}</div>
       <div class="text-xs break-all cursor-text text-destructive/80 select-text">{{ message }}</div>
     </div>
+    <slot name="details" />
     <div class="shrink-0 flex flex-wrap items-center justify-center gap-2 text-foreground">
       <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click.stop="copy">
         <Copy class="h-3.5 w-3.5" />

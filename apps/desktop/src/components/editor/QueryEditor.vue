@@ -619,6 +619,18 @@ function previewStatementRange(range: { from: number; to: number } | null) {
   });
 }
 
+function focusRange(range: { from: number; to: number }) {
+  const currentView = view.value;
+  if (!currentView || !editorViewModule) return;
+  const from = Math.max(0, Math.min(range.from, currentView.state.doc.length));
+  const to = Math.max(from, Math.min(range.to, currentView.state.doc.length));
+  currentView.dispatch({
+    selection: { anchor: from, head: to },
+    effects: editorViewModule.EditorView.scrollIntoView(from, { y: "center" }),
+  });
+  currentView.focus();
+}
+
 function onPickerActiveIndexChange(index: number) {
   pickerActiveIndex.value = index;
   const candidate = pickerCandidates.value[index];
@@ -4142,6 +4154,7 @@ defineExpose({
   requestExecute,
   pasteClipboardAsSqlInCondition,
   previewStatementRange,
+  focusRange,
   refreshCompletionCache,
 });
 </script>

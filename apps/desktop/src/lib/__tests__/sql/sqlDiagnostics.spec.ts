@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSqlErrorPresentation } from "@/lib/sql/sqlDiagnostics";
+import { buildSqlErrorPresentation, sqlErrorDocumentRange } from "@/lib/sql/sqlDiagnostics";
 
 describe("buildSqlErrorPresentation", () => {
   it("resolves one-based line and column locations", () => {
@@ -47,5 +47,32 @@ describe("buildSqlErrorPresentation", () => {
   it("returns null for unrecognized errors or invalid lines", () => {
     expect(buildSqlErrorPresentation("syntax error near FROM", "select 1")).toBeNull();
     expect(buildSqlErrorPresentation("syntax error at line 9", "select 1")).toBeNull();
+  });
+
+  it("bounds long SQL lines while keeping the caret visible", () => {
+    const sql = `${"a".repeat(220)} broken_token ${"z".repeat(220)}`;
+    const presentation = buildSqlErrorPresentation("line 1, column 225", sql);
+
+    expect(presentation?.lineText.length).toBeLessThanOrEqual(166);
+    expect(presentation?.lineText).toContain("broken_token");
+    expect(presentation?.lineText[presentation.caretColumn]).toBe("k");
+  });
+});
+
+describe("sqlErrorDocumentRange", () => {
+  it("maps a statement-local error offset into the editor document", () => {
+    const sql = "select 1;\nselect fro users;";
+    const sourceFrom = sql.indexOf("select fro");
+    const presentation = buildSqlErrorPresentation("line 1, column 8", "select fro users;");
+
+    expect(sqlErrorDocumentRange(presentation, { from: sourceFrom, to: sql.length })).toEqual({
+      from: sourceFrom + 7,
+      to: sourceFrom + 8,
+    });
+  });
+
+  it("returns null when source metadata is unavailable", () => {
+    const presentation = buildSqlErrorPresentation("line 1, column 1", "select 1");
+    expect(sqlErrorDocumentRange(presentation, undefined)).toBeNull();
   });
 });
