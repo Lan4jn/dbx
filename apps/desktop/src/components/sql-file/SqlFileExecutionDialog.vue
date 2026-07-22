@@ -21,6 +21,7 @@ import { requiresSqlFileTargetDatabaseSelection } from "@/lib/connection/connect
 import { cancelSqlFileExecution, executeSqlFiles, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/backend/api";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { useExportTracker } from "@/composables/useExportTracker";
+import { nextSqlFileProgressPercent, sqlFileCurrentStatement } from "@/lib/sql/sqlFileProgress";
 import { Check, CheckSquare, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
 
 const { t } = useI18n();
@@ -90,6 +91,7 @@ const cancelRequested = ref(false);
 const executionStarted = ref(false);
 const executionId = ref("");
 const progress = ref<SqlFileProgress | null>(null);
+const displayedProgressPercent = ref(0);
 const terminalStatus = ref<SqlFileStatus | "idle">("idle");
 const terminalError = ref("");
 const refreshedTarget = ref(false);
@@ -144,13 +146,13 @@ const statusIcon = computed(() => {
   return FileCode;
 });
 
-const progressPercent = computed(() => {
-  if (!progress.value) return 0;
-  if (terminalStatus.value === "done") return 100;
-  const attempted = progress.value.successCount + progress.value.failureCount;
-  const current = Math.max(progress.value.statementIndex, attempted);
-  if (current <= 0) return running.value ? 8 : 0;
-  return Math.min(95, Math.max(8, Math.round((attempted / current) * 100)));
+const progressPercent = computed(() => displayedProgressPercent.value);
+const currentStatement = computed(() => sqlFileCurrentStatement(progress.value));
+const progressBytesLabel = computed(() => {
+  const processed = progress.value?.bytesProcessed;
+  const total = progress.value?.totalBytes;
+  if (typeof processed !== "number" || typeof total !== "number" || total <= 0) return "";
+  return `${formatBytes(Math.min(processed, total))} / ${formatBytes(total)}`;
 });
 function previewLineCount(item: SqlFilePreview) {
   return item.preview.split(/\r\n|\r|\n/).length;
@@ -216,6 +218,7 @@ function resetExecution() {
   executionStarted.value = false;
   executionId.value = "";
   progress.value = null;
+  displayedProgressPercent.value = 0;
   terminalStatus.value = "idle";
   terminalError.value = "";
   refreshedTarget.value = false;
@@ -383,6 +386,7 @@ async function startExecution() {
   terminalStatus.value = "running";
   terminalError.value = "";
   progress.value = null;
+  displayedProgressPercent.value = 0;
   const taskLabel = previews.value.length === 1 ? previews.value[0]!.fileName : `${previews.value[0]!.fileName} (+${previews.value.length - 1})`;
   addSqlFileTask(batchId, taskLabel, filePathDisplay.value);
 
@@ -405,6 +409,7 @@ async function startExecution() {
       (next) => {
         if (next.executionId !== batchId) return;
         progress.value = next;
+        displayedProgressPercent.value = nextSqlFileProgressPercent(displayedProgressPercent.value, next);
         terminalStatus.value = next.status;
         terminalError.value = next.error ?? terminalError.value;
         updateSqlFileTask(batchId, next);
@@ -483,7 +488,15 @@ async function startExecution() {
       affectedRows: lastProgress?.affectedRows ?? 0,
       elapsedMs: lastProgress?.elapsedMs ?? 0,
       statementSummary: lastProgress?.statementSummary ?? "",
+      bytesProcessed: lastProgress?.bytesProcessed ?? null,
+      totalBytes: lastProgress?.totalBytes ?? null,
+      currentStatement: lastProgress?.currentStatement ?? null,
       error: terminalError.value,
+    });
+    displayedProgressPercent.value = nextSqlFileProgressPercent(displayedProgressPercent.value, {
+      status: terminalStatus.value,
+      bytesProcessed: lastProgress?.bytesProcessed,
+      totalBytes: lastProgress?.totalBytes,
     });
     if (!cancelRequested.value) {
       toast(terminalError.value, 5000);
@@ -681,7 +694,7 @@ watch(
               </span>
             </div>
             <span v-if="progress" class="text-muted-foreground shrink-0">
-              {{ formatElapsed(progress.elapsedMs) }}
+              <template v-if="progressBytesLabel">{{ progressBytesLabel }} · </template>{{ formatElapsed(progress.elapsedMs) }}
             </span>
           </div>
 
@@ -763,10 +776,10 @@ watch(
             </div>
           </template>
 
-          <div v-if="progress?.statementSummary" class="space-y-1">
+          <div v-if="currentStatement" class="space-y-1">
             <Label class="text-xs">{{ t("sqlFile.currentStatement") }}</Label>
             <div class="max-h-20 max-w-full overflow-auto rounded-md border bg-muted/15 p-2 text-xs font-mono whitespace-pre">
-              {{ progress.statementSummary }}
+              {{ currentStatement }}
             </div>
           </div>
 
