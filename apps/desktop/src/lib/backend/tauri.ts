@@ -2129,6 +2129,9 @@ export interface SqlFileProgress {
   affectedRows: number;
   elapsedMs: number;
   statementSummary: string;
+  bytesProcessed?: number | null;
+  totalBytes?: number | null;
+  currentStatement?: string | null;
   error?: string | null;
 }
 
