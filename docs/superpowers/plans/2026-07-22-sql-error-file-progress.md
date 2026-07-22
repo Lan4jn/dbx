@@ -241,4 +241,3 @@ git status --short
 git add apps/desktop/src
 git commit -m "feat(sql-file): display live statement progress"
 ```
-
