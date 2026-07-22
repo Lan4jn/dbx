@@ -1709,18 +1709,25 @@ mod tests {
     #[tokio::test]
     async fn await_with_progress_heartbeat_ticks_until_the_future_completes() {
         let heartbeat_count = Cell::new(0usize);
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let mut complete_tx = Some(complete_tx);
         let result = await_with_progress_heartbeat(
             async {
-                tokio::time::sleep(Duration::from_millis(16)).await;
+                complete_rx.await.unwrap();
                 42
             },
-            Duration::from_millis(5),
-            || heartbeat_count.set(heartbeat_count.get() + 1),
+            Duration::from_millis(1),
+            || {
+                heartbeat_count.set(heartbeat_count.get() + 1);
+                if heartbeat_count.get() == 3 {
+                    complete_tx.take().unwrap().send(()).unwrap();
+                }
+            },
         )
         .await;
 
         assert_eq!(result, 42);
-        assert!(heartbeat_count.get() >= 2);
+        assert!(heartbeat_count.get() >= 3);
     }
 
     #[test]
