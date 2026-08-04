@@ -214,8 +214,18 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { simpleDataGridOrderByMatchesSort, simpleDataGridOrderByReferencesMissingColumn, type DataGridSortDirection, type DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
+import { resolveGridFocusRestoreTarget } from "@/lib/dataGrid/dataGridFocusRestore";
 import { buildOrderedGridRows, type GridInsertRowPosition, type GridNewRowPlacement } from "@/lib/dataGrid/gridNewRowPlacement";
-import { DATA_GRID_CONDITION_TOOLBAR_MIN_WIDTH, isDataGridToolbarCompact, type DataGridReloadIntent, type DataGridToolbarActionCapability, type DataGridToolbarAddRowCapability, type DataGridToolbarAutoRefreshCapability, type DataGridToolbarSaveCapability } from "@/lib/dataGrid/dataGridToolbar";
+import {
+  DATA_GRID_CONDITION_TOOLBAR_MIN_WIDTH,
+  dataGridDeleteRowToolbarState,
+  isDataGridToolbarCompact,
+  type DataGridReloadIntent,
+  type DataGridToolbarActionCapability,
+  type DataGridToolbarAddRowCapability,
+  type DataGridToolbarAutoRefreshCapability,
+  type DataGridToolbarSaveCapability,
+} from "@/lib/dataGrid/dataGridToolbar";
 import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
@@ -3420,6 +3430,25 @@ const addRowToolbarCapability = computed<DataGridToolbarAddRowCapability>(() => 
   onTrigger: addRow,
   onSelect: handleAddRowMenuSelect,
 }));
+const deleteRowToolbarTargetCount = computed(() => deletableRowIds(selectedOrCurrentRowIds()).length);
+const deleteRowToolbarState = computed(() =>
+  dataGridDeleteRowToolbarState({
+    editable: !!props.editable,
+    canDeleteRows: canDeleteRows.value,
+    canDeleteExistingRows: canDeleteExistingRows.value,
+    deletableTargetCount: deleteRowToolbarTargetCount.value,
+    isSaving: isSaving.value,
+  }),
+);
+const deleteRowToolbarCapability = computed<DataGridToolbarActionCapability>(() => ({
+  label: deleteRowToolbarTargetCount.value > 1 ? t("grid.deleteRows", { count: deleteRowToolbarTargetCount.value }) : t("grid.deleteRow"),
+  tooltip: `${t("grid.deleteRow")} (${formatShortcut(settingsStore.editorSettings.shortcuts.deleteCurrentRow)})`,
+  visible: deleteRowToolbarState.value.visible,
+  disabled: deleteRowToolbarState.value.disabled,
+  onTrigger: () => {
+    deleteCurrentRow();
+  },
+}));
 const previewToolbarCapability = computed<DataGridToolbarActionCapability>(() => ({
   label: t(previewLabelKey.value),
   visible: saveToolbarState.value.showActions && pendingChangeCount.value > 0,
@@ -5390,6 +5419,8 @@ watch(
 function pauseCanvasGridWork() {
   dataGridIsActive = false;
   stopLoadingElapsedTimer();
+  gridFocusActivationToken += 1;
+  gridRef.value?.setAttribute("data-grid-active", "false");
   if (gridSurfaceBusy.value) finishDataGridNativeSelectionBlock(dataGridNativeSelectionBlockOwner);
   canvasRuntime.pause();
   gridScrollbarsRuntime.pause();
@@ -5404,6 +5435,7 @@ function pauseCanvasGridWork() {
 function resumeCanvasGridWork() {
   dataGridIsActive = true;
   startLoadingElapsedTimer();
+  gridRef.value?.setAttribute("data-grid-active", "true");
   if (gridSurfaceBusy.value) beginDataGridNativeSelectionBlock(dataGridNativeSelectionBlockOwner);
   canvasRuntime.resume();
   gridScrollbarsRuntime.resume();
@@ -5418,6 +5450,30 @@ function resumeCanvasGridWork() {
 function clearInternalClipboardCopy() {
   clearDataGridClipboardCopy();
 }
+
+// Remember the last element that held focus inside the grid. Switching to
+// another tab moves focus onto the tab strip (or body) and the kept-alive
+// grid never gets it back on its own, which breaks arrow-key cell navigation
+// after returning to the tab.
+let lastFocusedWithinGrid: HTMLElement | null = null;
+let gridFocusActivationToken = 0;
+
+function onGridFocusIn(event: FocusEvent) {
+  if (event.target instanceof HTMLElement) lastFocusedWithinGrid = event.target;
+}
+
+function restoreGridFocusAfterActivation() {
+  if (!lastFocusedWithinGrid) return;
+  const activationToken = ++gridFocusActivationToken;
+  nextTick(() => {
+    if (!dataGridIsActive || activationToken !== gridFocusActivationToken) return;
+    if (editingCell.value) return; // the cell editor restores its own input focus
+    const target = resolveGridFocusRestoreTarget(gridRef.value, lastFocusedWithinGrid, document.activeElement);
+    target?.focus({ preventScroll: true });
+  });
+}
+
+onActivated(restoreGridFocusAfterActivation);
 
 onMounted(resumeCanvasGridWork);
 onActivated(resumeCanvasGridWork);
@@ -8402,7 +8458,18 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 </script>
 
 <template>
-  <div ref="gridRef" data-grid-root class="h-full flex flex-col overflow-hidden outline-none" :class="{ 'data-grid--editing-cell': !!editingCell, 'data-grid--dark': isDark }" :style="gridStyle" tabindex="0" @keydown="onGridKeydown" @paste="onGridPaste">
+  <div
+    ref="gridRef"
+    data-grid-root
+    data-grid-active="true"
+    class="h-full flex flex-col overflow-hidden outline-none"
+    :class="{ 'data-grid--editing-cell': !!editingCell, 'data-grid--dark': isDark }"
+    :style="gridStyle"
+    tabindex="0"
+    @keydown="onGridKeydown"
+    @paste="onGridPaste"
+    @focusin="onGridFocusIn"
+  >
     <CustomContextMenu :items="gridContextMenuItems" v-slot="{ onContextMenu }">
       <div v-if="hasData || canShowWhereSearch" class="flex-1 flex flex-col overflow-hidden" @contextmenu="onContextMenu">
         <!-- Search bar -->
@@ -8483,6 +8550,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
             :refresh="refreshToolbarCapability"
             :auto-refresh="autoRefreshToolbarCapability"
             :add-row="addRowToolbarCapability"
+            :delete-row="deleteRowToolbarCapability"
             :preview="previewToolbarCapability"
             :save="saveToolbarCapability"
             :rollback="rollbackToolbarCapability"

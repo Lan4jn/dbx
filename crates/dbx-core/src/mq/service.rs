@@ -476,9 +476,9 @@ pub async fn mq_peek_messages_core(
     sub: String,
     count: u32,
     options: Option<PeekMessagesOptions>,
-) -> Result<Vec<PeekedMessage>, String> {
+) -> Result<PeekMessagesResult, String> {
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(PeekMessagesResult::default());
     }
     if count > MAX_PEEK_MESSAGES {
         return Err(format!("Peek message count must be between 1 and {MAX_PEEK_MESSAGES}"));

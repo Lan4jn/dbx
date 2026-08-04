@@ -444,7 +444,7 @@ impl MessageQueueAdmin for RocketMqAdmin {
         _sub: &str,
         count: u32,
         options: PeekMessagesOptions,
-    ) -> Result<Vec<PeekedMessage>, String> {
+    ) -> Result<PeekMessagesResult, String> {
         let conn_params = build_connection_params(&self.config);
         let mut params = serde_json::json!({
             "topic": topic.topic,
@@ -462,7 +462,9 @@ impl MessageQueueAdmin for RocketMqAdmin {
         let result: serde_json::Value = self.call("mq_peek_messages", params).await?;
 
         let messages = result.get("messages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        Ok(messages.into_iter().enumerate().map(|(idx, m)| peeked_message_from_agent_json(idx, &m)).collect())
+        Ok(PeekMessagesResult::complete(
+            messages.into_iter().enumerate().map(|(idx, m)| peeked_message_from_agent_json(idx, &m)).collect(),
+        ))
     }
 
     async fn expire_messages(&self, _topic: &TopicRef, _sub: &str, _expire_seconds: i64) -> Result<(), String> {

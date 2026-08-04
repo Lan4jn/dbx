@@ -151,7 +151,8 @@ async function runQuery() {
       } else {
         const group = consumerGroup.value.trim() || "__dbx_rocketmq_dlq__";
         const peeked = await mqPeekMessages(props.connectionId, topic, group, 64);
-        queryMessages.value = peeked.map((msg) => rocketMqDisplayFromPeeked(msg, topic.topic));
+        const messages = Array.isArray(peeked) ? peeked : peeked.messages;
+        queryMessages.value = messages.map((msg) => rocketMqDisplayFromPeeked(msg, topic.topic));
       }
     } else if (activeQueryMode.value === "msgId") {
       const id = queryMsgId.value.trim();

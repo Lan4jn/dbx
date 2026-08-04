@@ -160,7 +160,7 @@ pub trait MessageQueueAdmin: Send + Sync {
         sub: &str,
         count: u32,
         options: PeekMessagesOptions,
-    ) -> Result<Vec<PeekedMessage>, String>;
+    ) -> Result<PeekMessagesResult, String>;
     async fn expire_messages(&self, topic: &TopicRef, sub: &str, expire_seconds: i64) -> Result<(), String>;
 
     /// RocketMQ: read subscription group config from broker metadata.
