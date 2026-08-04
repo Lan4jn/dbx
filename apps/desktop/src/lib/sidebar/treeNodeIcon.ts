@@ -1,5 +1,5 @@
 import type { Component } from "vue";
-import { Archive, Braces, Columns3, Database, Eye, FileCode, FolderClosed, FolderOpen, Key, Link, ListTree, Network, Package, Plus, ScrollText, Server, Table, TableProperties, UsersRound, Zap } from "@lucide/vue";
+import { Archive, Braces, Columns3, Database, Eye, FileCode, FolderClosed, FolderOpen, Gauge, Key, Link, Link2, ListTree, Network, Package, Plus, ScrollText, Server, ShieldCheck, Table, TableProperties, UsersRound, Zap } from "@lucide/vue";
 import type { ColumnInfo, TreeNode } from "@/types/database";
 
 export type TreeNodeIconInfo = {
@@ -30,6 +30,10 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
     case "nacos-namespace":
     case "etcd-root":
       return { icon: FolderOpen, colorClass: "text-sky-500" };
+    case "etcd-dashboard":
+      return { icon: Gauge, colorClass: "text-sky-500" };
+    case "etcd-access-control":
+      return { icon: ShieldCheck, colorClass: "text-sky-500" };
     case "zookeeper-root":
       return { icon: Database, colorClass: "text-blue-500" };
     case "table":
@@ -53,6 +57,15 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
       return { icon: Zap, colorClass: "text-orange-400" };
     case "trigger":
       return { icon: Zap, colorClass: "text-orange-300" };
+    case "group-constraints":
+    case "constraint":
+      return { icon: Key, colorClass: "text-amber-500" };
+    case "group-table-partitions":
+    case "group-table-subpartitions":
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-green-400" };
+    case "partition":
+    case "subpartition":
+      return { icon: TableProperties, colorClass: "text-green-400" };
     case "object-browser":
       return { icon: TableProperties, colorClass: "text-primary" };
     case "user-admin":
@@ -76,6 +89,8 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
       return { icon: Braces, colorClass: "text-amber-500" };
     case "sequence":
       return { icon: ListTree, colorClass: "text-emerald-500" };
+    case "synonym":
+      return { icon: Link2, colorClass: "text-sky-500" };
     case "package":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "package-body":
@@ -92,6 +107,8 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
       return { icon: Braces, colorClass: "text-amber-500" };
     case "group-sequences":
       return { icon: ListTree, colorClass: "text-emerald-500" };
+    case "group-synonyms":
+      return { icon: Link2, colorClass: "text-sky-500" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "group-partitions":

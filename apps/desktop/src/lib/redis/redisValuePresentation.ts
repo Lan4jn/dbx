@@ -4,10 +4,10 @@ import { formatJsonSource, parseJsonPreservingLargeNumbers } from "@/lib/common/
 import type { RedisBlob, RedisCollectionPage, RedisHashItem, RedisListItem, RedisSetItem, RedisValue, RedisZsetItem } from "@/lib/backend/api";
 import { parseJavaSerializedDetail, type RedisJavaSerializedDetail } from "@/lib/redis/javaSerialized";
 
-export type RedisValueFormat = "utf8" | "ascii" | "binary" | "json" | "javaserialize" | "hex" | "base64";
+export type RedisValueFormat = "utf8" | "ascii" | "binary" | "json" | "javaserialize" | "hex" | "base64" | "decompressed";
 export type RedisMemberDetailFormat = "json" | "text";
 
-export const REDIS_VALUE_FORMAT_DISPLAY_ORDER: RedisValueFormat[] = ["utf8", "ascii", "binary", "json", "javaserialize", "hex", "base64"];
+export const REDIS_VALUE_FORMAT_DISPLAY_ORDER: RedisValueFormat[] = ["utf8", "ascii", "binary", "json", "javaserialize", "hex", "base64", "decompressed"];
 
 export interface RedisMemberDetail {
   text: string;
@@ -249,7 +249,24 @@ export function canRenderRedisValueFormat(detail: RedisMemberDetail, format: Red
 }
 
 export function redisMemberCopyText(value: unknown): string {
-  return isRedisBlob(value) ? redisBlobRawText(value) : formatRedisMemberDetail(value).rawText;
+  const text = isRedisBlob(value) ? redisBlobRawText(value) : formatRedisMemberDetail(value).rawText;
+  return redisClipboardSafeText(text);
+}
+
+export function redisClipboardSafeText(value: string): string {
+  let output = "";
+  for (const ch of value) {
+    if (ch === "\n" || ch === "\r" || ch === "\t" || !isUtf8ControlCharacter(ch)) {
+      output += ch;
+      continue;
+    }
+
+    // Native clipboard text backends may treat embedded controls such as NUL as string terminators.
+    // Keep ordinary whitespace intact, but copy other controls as visible byte-style escapes.
+    const codePoint = ch.codePointAt(0)!;
+    output += codePoint <= 0xff ? `\\x${codePoint.toString(16).padStart(2, "0")}` : `\\u{${codePoint.toString(16)}}`;
+  }
+  return output;
 }
 
 export function getRedisMemberSelectionKey(title: string, value: unknown, identity = title): string {
@@ -310,7 +327,7 @@ export function redisValueSize(value: RedisValue): number {
     case "zset":
       return value.data.total;
     case "stream":
-      return value.data.entries.length;
+      return value.data.total ?? value.data.entries.length;
     default:
       return 0;
   }

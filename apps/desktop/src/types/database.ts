@@ -1,3 +1,5 @@
+import type { BackendError } from "@/lib/backend/errorUtils";
+
 export type DatabaseType =
   | "mysql"
   | "postgres"
@@ -12,6 +14,8 @@ export type DatabaseType =
   | "mongodb"
   | "oracle"
   | "elasticsearch"
+  | "easysearch"
+  | "hbase"
   | "qdrant"
   | "milvus"
   | "weaviate"
@@ -25,6 +29,7 @@ export type DatabaseType =
   | "gaussdb"
   | "kingbase"
   | "highgo"
+  | "uxdb"
   | "vastbase"
   | "goldendb"
   | "kwdb"
@@ -65,6 +70,10 @@ export type DatabaseType =
   | "mq"
   | "nacos";
 
+export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "elasticsearch" || dbType === "easysearch";
+}
+
 export interface SqlSnippet {
   id: string;
   label: string;
@@ -104,6 +113,7 @@ export interface CompletionAssistantCandidate {
   parent_name?: string | null;
   comment?: string | null;
   data_type?: string | null;
+  signature?: string | null;
 }
 
 export interface CompletionAssistantResponse {
@@ -115,6 +125,7 @@ export interface CompletionAssistantResponse {
 export interface ConnectionConfig {
   id: string;
   name: string;
+  note?: string;
   db_type: DatabaseType;
   driver_profile?: string;
   driver_label?: string;
@@ -127,6 +138,7 @@ export interface ConnectionConfig {
   database?: string;
   visible_databases?: string[];
   visible_schemas?: Record<string, string[]>;
+  show_system_schemas?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
   init_script?: string;
   color?: string;
@@ -140,7 +152,7 @@ export interface ConnectionConfig {
   client_cert_path?: string;
   client_key_path?: string;
   sysdba?: boolean;
-  oracle_connection_type?: "service_name" | "sid";
+  oracle_connection_type?: "service_name" | "sid" | "tns";
   connection_string?: string;
   jdbc_driver_class?: string;
   jdbc_driver_paths?: string[];
@@ -153,6 +165,7 @@ export interface ConnectionConfig {
   redis_cluster_nodes?: string;
   redis_key_separator?: string;
   redis_scan_page_size?: number;
+  redis_database_aliases?: Record<string, string>;
   etcd_endpoints?: string;
   gbase_server?: string;
   informix_server?: string;
@@ -218,11 +231,14 @@ export interface SshTunnelConfig {
    * back to key > password > agent based on which fields are non-empty,
    * independent of this selector (see `db/ssh_tunnel.rs`).
    *
+   * `"key+password"` tries private key auth first and falls back to
+   * password auth if the key is rejected.
+   *
    * `"agent"` is a legacy value: it's no longer offered as a dropdown
    * choice for new connections, but is preserved and displayed read-only
    * for connections that already have `use_ssh_agent` configured.
    */
-  auth_method?: "password" | "key" | "agent" | "none";
+  auth_method?: "password" | "key" | "key+password" | "agent" | "none";
   /**
    * When set, this layer references a shared tunnel profile; the profile's
    * configuration replaces this layer's fields at connect time (only `id`
@@ -248,6 +264,8 @@ export interface ProxyTunnelConfig {
   port: number;
   username?: string;
   password?: string;
+  /** Optional target host:port for tunnel testing. When empty, self-connect. */
+  test_target?: string;
   /** See {@link SshTunnelConfig.profile_id}. */
   profile_id?: string;
 }
@@ -349,6 +367,16 @@ export interface DatabaseInfo {
   name: string;
 }
 
+export interface DatabaseStorageInfo {
+  name: string;
+  size_bytes: number | null;
+}
+
+export interface SqlServerCompletionContext {
+  default_schema: string;
+  supports_session_database_switch: boolean;
+}
+
 export interface SchemaInfo {
   name: string;
   comment?: string | null;
@@ -377,12 +405,13 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectInfo {
   name: string;
   object_type: DatabaseObjectType | string;
   schema?: string | null;
+  valid?: boolean | null;
   signature?: string | null;
   comment?: string | null;
   created_at?: string | null;
@@ -398,7 +427,7 @@ export interface ObjectStatistics {
   total_bytes?: number | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -414,6 +443,7 @@ export interface ColumnInfo {
   is_nullable: boolean;
   column_default: string | null;
   is_primary_key: boolean;
+  is_unique?: boolean;
   extra: string | null;
   comment?: string | null;
   numeric_precision?: number | null;
@@ -422,6 +452,13 @@ export interface ColumnInfo {
   enum_values?: string[] | null;
   character_set?: string | null;
   collation?: string | null;
+}
+
+export interface SqlServerColumnMetadata extends ColumnInfo {
+  is_identity: boolean;
+  is_computed: boolean;
+  is_hidden: boolean;
+  generated_always_type: number;
 }
 
 export interface IndexInfo {
@@ -450,6 +487,42 @@ export interface TriggerInfo {
   event: string;
   timing: string;
   statement?: string | null;
+}
+
+export interface ConstraintInfo {
+  name: string;
+  constraint_type: string;
+  definition: string;
+  columns: string[];
+  ref_schema?: string | null;
+  ref_table?: string | null;
+  ref_columns: string[];
+  match_type?: string | null;
+  on_update?: string | null;
+  on_delete?: string | null;
+  deferrable: boolean;
+  initially_deferred: boolean;
+  enabled: boolean;
+  valid: boolean;
+}
+
+export interface PartitionInfo {
+  name: string;
+  position: number;
+  value: string;
+  partition_type: string;
+  partition_key: string;
+  online?: boolean | null;
+  auto_partition_type?: string | null;
+  auto_partition_span?: number | null;
+}
+
+export interface SubpartitionInfo {
+  name: string;
+  position: number;
+  value: string;
+  partition_type: string;
+  partition_key: string;
 }
 
 export interface FunctionInfo {
@@ -492,12 +565,28 @@ export interface OwnerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /** One SRID per geometry/geography column (first non-null observed). */
+  spatial_columns?: SpatialColumn[];
+  /**
+   * Per-cell SRID metadata, parallel to `rows`: spatial_values[row][column] is
+   * that cell's geometry SRID, or null for non-spatial cells / unknown SRIDs.
+   * Every geometry value keeps its own SRID so mixed-SRID results stay correct.
+   */
+  spatial_values?: (number | null)[][];
+  /** Internal marker for a result built by appending a page to existing rows. */
+  appended_from_row_count?: number;
   /** Set for synthesized query execution failures. */
   execution_error?: true;
+  /** Structured backend error; authoritative when execution_error is true. */
+  error?: BackendError;
   /** Zero-based index of the submitted statement that produced this result. */
   statement_index?: number;
   /** Internal row identifiers appended to editable query results. */
   hidden_column_indexes?: number[];
+  /** Local value filters survive DataGrid component eviction when switching tabs. */
+  local_column_filters?: Record<string, string[]>;
+  /** Manually hidden columns survive DataGrid component eviction when switching tabs. */
+  local_hidden_column_keys?: string[];
   /**
    * Database type name for each column, parallel to `columns`. Optional and may
    * be shorter/empty when a driver cannot supply types (schemaless stores,
@@ -515,16 +604,55 @@ export interface QueryResult {
    * preview. This is populated only for MongoDB document query results.
    */
   mongo_documents?: unknown[];
+  /** Type-preserving Extended JSON documents used when copying MongoDB values. */
+  mongo_copy_documents?: unknown[];
   affected_rows: number;
   execution_time_ms: number;
+  /** Whether a backend-reported result total is exact. */
+  total_is_exact?: boolean;
   truncated?: boolean;
   session_id?: string | null;
   has_more?: boolean;
+  /** For Elasticsearch REST search results parsed into a _source table,
+   *  this carries the raw HTTP response body so the UI can toggle between
+   *  the tabular view and the original JSON. */
+  elasticsearch_raw_body?: string;
   sourceLabel?: string;
   sourceStatement?: string;
   /** Absolute offsets in the editor document at execution time. */
   sourceFrom?: number;
   sourceTo?: number;
+}
+
+export type BatchStatementExecutionStatus = "pending" | "running" | "success" | "error" | "skipped" | "cancelled";
+
+export interface BatchStatementExecutionItem {
+  statementIndex: number;
+  sql: string;
+  from: number;
+  to: number;
+  status: BatchStatementExecutionStatus;
+  executionTimeMs?: number;
+  affectedRows?: number;
+  error?: string;
+  errorDetails?: BackendError;
+}
+
+export interface BatchSqlExecution {
+  executionId: string;
+  submittedSql: string;
+  editorFingerprint: string;
+  sourceOffset: number;
+  completed: number;
+  total: number;
+  startedAt: number;
+  finishedAt?: number;
+  items: BatchStatementExecutionItem[];
+}
+
+export interface SpatialColumn {
+  column_index: number;
+  srid: number | null;
 }
 
 export interface QueryResultRun {
@@ -536,6 +664,7 @@ export interface QueryResultRun {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  batchSqlExecution?: BatchSqlExecution;
   resultBaseSql?: string;
   /** Fingerprint of the complete editor document when this result run started. */
   resultEditorFingerprint?: string;
@@ -546,6 +675,7 @@ export interface QueryResultRun {
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
+  resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -555,6 +685,7 @@ export interface QueryResultRun {
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
   resultAccessedAt?: number;
+  resultEstimatedBytes?: number;
   resultCacheKey?: string;
   resultCacheState?: "memory" | "disk" | "missing";
   resultEvicted?: boolean;
@@ -563,6 +694,26 @@ export interface QueryResultRun {
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
+}
+
+export interface ParticipantInfo {
+  id: string;
+  name: string;
+  role: string;
+}
+
+export interface TransactionLog {
+  transaction_id: string;
+  status: string;
+  participants: ParticipantInfo[];
+  created_at: string;
+  updated_at: string;
+  metadata: unknown;
+  /** camelCase fields from SchemaDiffDeployResult */
+  transactionId?: string;
+  executedCount?: number;
+  statementCount?: number;
+  error?: string;
 }
 
 export interface SqlTextSpan {
@@ -574,6 +725,7 @@ export interface SqlTextSpan {
 
 export interface SqlTableReference {
   name: string;
+  database?: string | null;
   schema?: string | null;
   alias?: string | null;
   span: SqlTextSpan;
@@ -613,19 +765,27 @@ export type TreeNodeType =
   | "materialized_view"
   | "procedure"
   | "function"
+  | "type"
+  | "type-body"
   | "sequence"
+  | "synonym"
   | "package"
   | "package-body"
   | "group-columns"
   | "group-indexes"
   | "group-fkeys"
   | "group-triggers"
+  | "group-constraints"
+  | "group-table-partitions"
+  | "group-table-subpartitions"
   | "group-tables"
   | "group-views"
   | "group-materialized-views"
   | "group-procedures"
   | "group-functions"
+  | "group-types"
   | "group-sequences"
+  | "group-synonyms"
   | "group-packages"
   | "group-partitions"
   | "group-extensions"
@@ -642,10 +802,15 @@ export type TreeNodeType =
   | "index"
   | "fkey"
   | "trigger"
+  | "constraint"
+  | "partition"
+  | "subpartition"
   | "redis-db"
   | "mq-tenant"
   | "nacos-namespace"
   | "etcd-root"
+  | "etcd-dashboard"
+  | "etcd-access-control"
   | "zookeeper-root"
   | "mongo-db"
   | "mongo-gridfs"
@@ -694,6 +859,8 @@ export interface TreeNode {
   signature?: string;
   tableType?: string;
   comment?: string | null;
+  valid?: boolean | null;
+  sizeBytes?: number | null;
   objectCount?: number;
   loadedKeyCount?: number;
   totalKeyCount?: number;
@@ -703,12 +870,17 @@ export interface TreeNode {
   tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ExtensionInfo | VectorCollectionMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta;
   loadMore?: {
     parentId: string;
     offset: number;
     pageSize: number;
   };
+}
+
+export interface TableNameFilter {
+  includePatterns: string[];
+  excludePatterns: string[];
 }
 
 export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
@@ -728,6 +900,8 @@ export interface TableStructureEditorDraft {
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
+  triggersLoaded?: boolean;
+  loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
   scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   initialized: boolean;
 }
@@ -769,6 +943,7 @@ export interface QueryTab {
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
+  resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -778,6 +953,7 @@ export interface QueryTab {
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
   resultAccessedAt?: number;
+  resultEstimatedBytes?: number;
   resultCacheKey?: string;
   resultCacheState?: "memory" | "disk" | "missing";
   pinned?: boolean;
@@ -798,6 +974,8 @@ export interface QueryTab {
   isExecuting: boolean;
   isCancelling?: boolean;
   queryExecutionStartedAt?: number;
+  /** Ephemeral per-statement progress for the latest multi-statement execution. */
+  batchSqlExecution?: BatchSqlExecution;
   editorViewport?: {
     scrollTop: number;
     scrollLeft: number;
@@ -809,13 +987,44 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  /** Per-run connection session for sequential MySQL explain formats. */
+  /** Per-run connection session for explain flows that require session state. */
   explainClientSessionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs" | "processlist" | "mysql-dashboard";
+  /** Invalidates tab-scoped completion metadata after session context changes. */
+  completionContextVersion?: number;
+  mode:
+    | "data"
+    | "query"
+    | "redis"
+    | "redis-dashboard"
+    | "mongo"
+    | "mongo-gridfs"
+    | "mongo-bucket"
+    | "vector"
+    | "hbase"
+    | "etcd"
+    | "etcd-dashboard"
+    | "etcd-access-control"
+    | "zookeeper"
+    | "mq"
+    | "nacos"
+    | "nacos-dashboard"
+    | "objects"
+    | "structure"
+    | "users"
+    | "dameng-jobs"
+    | "processlist"
+    | "mysql-dashboard"
+    | "postgres-dashboard";
+  /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
+  hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
   mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
+  nacosTargetDataId?: string;
+  nacosTargetGroup?: string;
+  nacosTargetKeyword?: string;
+  nacosTargetRequestId?: number;
   structureTableName?: string;
   structureInitialTab?: TableInfoTab;
   structureInitialTabRequestId?: number;
@@ -831,6 +1040,7 @@ export interface QueryTab {
     schema?: string;
     name: string;
     objectType: ObjectSourceKind;
+    signature?: string;
   };
   tableMeta?: {
     schema?: string;
@@ -842,6 +1052,11 @@ export interface QueryTab {
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
+  /** 冷缓存打开表数据时元数据仍在途：行标识未知，编辑/保存必须等待其落地 */
+  tableMetaPending?: boolean;
+  /** 取消请求单调计数：isCancelling 是瞬态的（取消失败/查询先完成会被清），
+   * 需要跨越 executeTabSql 生命周期判断"执行期间用户是否请求过停止"时比对它 */
+  cancelRequestCount?: number;
   tableInfoTab?: TableInfoTab;
   queryAnalysis?: {
     catalog?: string;
@@ -933,10 +1148,33 @@ export interface VectorCollectionMeta {
   collectionId?: string;
 }
 
+export interface MilvusFieldInfo {
+  name: string;
+  dataType: string;
+  dimension?: number;
+  primaryKey: boolean;
+  autoId: boolean;
+  nullable: boolean;
+  hasDefaultValue: boolean;
+  isFunctionOutput: boolean;
+}
+
+export interface MilvusCollectionSchema {
+  fields: MilvusFieldInfo[];
+}
+
+/** Mongo collection node metadata (not SQL tableType). */
+export type MongoCollectionKind = "collection" | "view" | "timeseries";
+
+export interface MongoCollectionMeta {
+  collectionKind: MongoCollectionKind;
+}
+
 export interface CollectionInfo {
   name: string;
   id: string;
   dimension?: number;
-  kind?: "collection" | "bucket";
+  milvusSchema?: MilvusCollectionSchema;
+  kind?: MongoCollectionKind | "bucket";
   bucketName?: string;
 }

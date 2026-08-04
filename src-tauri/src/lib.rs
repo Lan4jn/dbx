@@ -4,18 +4,25 @@ mod db;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
 mod models;
-mod webview2_runtime;
+#[cfg(any(target_os = "windows", test))]
+mod startup_recovery;
+#[cfg(all(not(target_os = "windows"), not(test)))]
+#[path = "startup_recovery_noop.rs"]
+mod startup_recovery;
 mod window_state_guard;
 
 use commands::connection::AppState;
+use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
+use dbx_core::sql_dialect::hot_reload::DialectHotReload;
 use dbx_core::storage::{maybe_import_user_data_db, DesktopIconTheme, DesktopSettings, Storage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use tauri::menu::Menu;
 #[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::webview::PageLoadEvent;
 use tauri::RunEvent;
 use tauri::{
     menu::MenuBuilder,
@@ -36,6 +43,7 @@ const APP_MENU_COPY_SUPPORT_INFO_ID: &str = "app-menu-copy-support-info";
 
 pub struct CloseBehaviorState {
     confirmed_exit: AtomicBool,
+    frontend_ready: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +55,7 @@ pub(crate) struct DataDirState {
 
 impl CloseBehaviorState {
     fn new() -> Self {
-        Self { confirmed_exit: AtomicBool::new(false) }
+        Self { confirmed_exit: AtomicBool::new(false), frontend_ready: AtomicBool::new(false) }
     }
 
     pub(crate) fn allow_next_exit(&self) {
@@ -57,13 +65,45 @@ impl CloseBehaviorState {
     fn take_confirmed_exit(&self) -> bool {
         self.confirmed_exit.swap(false, Ordering::Relaxed)
     }
+
+    pub(crate) fn set_frontend_ready(&self, ready: bool) {
+        self.frontend_ready.store(ready, Ordering::Release);
+    }
+
+    fn is_frontend_ready(&self) -> bool {
+        self.frontend_ready.load(Ordering::Acquire)
+    }
+}
+
+/// UI language pushed from the frontend i18n layer; native menus follow it and
+/// fall back to the OS locale until the first `set_app_locale` call arrives.
+pub struct AppLocaleState {
+    locale: std::sync::Mutex<Option<String>>,
+}
+
+impl AppLocaleState {
+    fn new() -> Self {
+        Self { locale: std::sync::Mutex::new(None) }
+    }
+
+    pub(crate) fn set(&self, locale: String) {
+        *self.locale.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(locale);
+    }
+
+    fn get(&self) -> String {
+        self.locale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| sys_locale::get_locale().unwrap_or_default())
+    }
 }
 #[cfg(target_os = "macos")]
-const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/tray-macos-template.png");
+const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
 #[cfg(target_os = "macos")]
-const ABOUT_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/icon.png");
+const ABOUT_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.png");
 #[cfg(not(target_os = "macos"))]
-const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("../src-tauri/icons/icon-black.png");
+const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
 #[cfg(target_os = "macos")]
 const MACOS_DEFAULT_APP_ICON: &[u8] = include_bytes!("../icons/icon.icns");
 #[cfg(target_os = "macos")]
@@ -80,6 +120,25 @@ fn should_hide_window_on_close(target_os: &str) -> bool {
 fn should_setup_desktop_tray(target_os: &str, show_tray_icon: bool, linux_appindicator_available: bool) -> bool {
     show_tray_icon
         && (matches!(target_os, "macos" | "windows") || (target_os == "linux" && linux_appindicator_available))
+}
+
+fn should_enable_single_instance(debug_build: bool) -> bool {
+    let _ = debug_build;
+    false
+}
+
+fn startup_data_dir_mode(mode: &data_dir::DataDirMode) -> &'static str {
+    match mode {
+        data_dir::DataDirMode::Default => "default",
+        data_dir::DataDirMode::EnvOverride => "env_override",
+        data_dir::DataDirMode::ConfiguredOverride => "configured_override",
+        data_dir::DataDirMode::Portable { .. } => "portable",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn development_dock_badge_label(debug_build: bool) -> Option<&'static str> {
+    debug_build.then_some("DEV")
 }
 
 #[cfg(target_os = "linux")]
@@ -107,18 +166,29 @@ fn should_show_main_window_after_setup() -> bool {
     true
 }
 
+fn should_show_main_window_before_setup_tasks() -> bool {
+    true
+}
+
+fn append_startup_probe(message: impl AsRef<str>) {
+    startup_recovery::record(message);
+}
+
+pub(crate) fn clear_startup_probe_after_frontend_ready() {
+    startup_recovery::mark_frontend_ready();
+}
+
 fn should_confirm_app_exit_request(target_os: &str, exit_code: Option<i32>, confirmed_exit: bool) -> bool {
     should_hide_window_on_close(target_os) && exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
 }
 
-pub(crate) fn use_native_window_decorations_for_platform(target_os: &str) -> bool {
-    cfg!(feature = "legacy-native-window-decorations") && target_os == "windows"
+fn should_fallback_to_native_quit(target: &str, frontend_ready: bool) -> bool {
+    target == "quit" && !frontend_ready
 }
 
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
     match target_os {
-        "windows" => Some(use_native_window_decorations_for_platform(target_os)),
-        "linux" => Some(false),
+        "windows" | "linux" => Some(false),
         _ => None,
     }
 }
@@ -134,9 +204,20 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
         icon: Some(ABOUT_APP_ICON),
         ..Default::default()
     };
-    let copy_support_info_item =
-        MenuItem::with_id(app_handle, APP_MENU_COPY_SUPPORT_INFO_ID, "Copy Support Info", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app_handle, APP_MENU_QUIT_ID, format!("Quit {app_name}"), true, Some("Cmd+Q"))?;
+    let copy_support_info_item = MenuItem::with_id(
+        app_handle,
+        APP_MENU_COPY_SUPPORT_INFO_ID,
+        app_menu_copy_support_info_label(&current_app_locale(app_handle)),
+        true,
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(
+        app_handle,
+        APP_MENU_QUIT_ID,
+        app_menu_quit_label(&current_app_locale(app_handle), &app_name),
+        true,
+        Some("Cmd+Q"),
+    )?;
 
     Menu::with_items(
         app_handle,
@@ -234,9 +315,12 @@ fn linux_selected_drm_render_device<'a>(
     devices.iter().find(|device| device.boot_vga).or_else(|| devices.first())
 }
 
-#[cfg(target_os = "linux")]
-fn linux_drm_render_devices() -> Vec<LinuxDrmRenderDevice> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_drm_render_devices_from_paths(
+    sys_class_drm: &std::path::Path,
+    dev_dri: &std::path::Path,
+) -> Vec<LinuxDrmRenderDevice> {
+    let Ok(entries) = std::fs::read_dir(sys_class_drm) else {
         return Vec::new();
     };
     let mut devices = entries
@@ -248,20 +332,25 @@ fn linux_drm_render_devices() -> Vec<LinuxDrmRenderDevice> {
             if render_index.is_empty() || !render_index.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
             }
+            let device_file = dev_dri.join(node_name);
+            if std::fs::OpenOptions::new().read(true).write(true).open(&device_file).is_err() {
+                return None;
+            }
             let device_path = entry.path().join("device");
             let driver = std::fs::read_link(device_path.join("driver"))
                 .ok()
                 .and_then(|path| path.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase));
             let boot_vga = std::fs::read_to_string(device_path.join("boot_vga")).is_ok_and(|value| value.trim() == "1");
-            Some(LinuxDrmRenderDevice {
-                device_file: std::path::Path::new("/dev/dri").join(node_name),
-                driver,
-                boot_vga,
-            })
+            Some(LinuxDrmRenderDevice { device_file, driver, boot_vga })
         })
         .collect::<Vec<_>>();
     devices.sort_by(|left, right| left.device_file.cmp(&right.device_file));
     devices
+}
+
+#[cfg(target_os = "linux")]
+fn linux_drm_render_devices() -> Vec<LinuxDrmRenderDevice> {
+    linux_drm_render_devices_from_paths(std::path::Path::new("/sys/class/drm"), std::path::Path::new("/dev/dri"))
 }
 
 #[cfg(target_os = "linux")]
@@ -282,7 +371,10 @@ fn linux_nvidia_driver() -> LinuxNvidiaDriver {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_webkit_rendering_workarounds(driver: LinuxNvidiaDriver) -> &'static [(&'static str, &'static str)] {
+fn linux_webkit_rendering_workarounds(
+    driver: LinuxNvidiaDriver,
+    has_render_device: bool,
+) -> &'static [(&'static str, &'static str)] {
     match driver {
         LinuxNvidiaDriver::Proprietary => {
             // NVIDIA's proprietary driver needs both DMABuf and explicit-sync
@@ -292,6 +384,14 @@ fn linux_webkit_rendering_workarounds(driver: LinuxNvidiaDriver) -> &'static [(&
         LinuxNvidiaDriver::Nouveau => {
             // WebKitGTK's DMABuf renderer can produce a fully black WebView on
             // Nouveau while the DOM remains interactive.
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        }
+        LinuxNvidiaDriver::None if !has_render_device => {
+            // No DRM render node means Mesa can only render through llvmpipe.
+            // WebKitGTK's DMABuf compositing then drives llvmpipe's gallivm
+            // LLVM JIT, which can fail to materialize the compositing shaders
+            // (blank/white window on GPU-less VMs and servers), so disable the
+            // DMABuf renderer there as well.
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         }
         LinuxNvidiaDriver::None => {
@@ -347,9 +447,7 @@ fn linux_appimage_system_gtk_immodules_cache(
     let Some(gtk_im_module_file) = gtk_im_module_file else {
         return Some(system_cache_path);
     };
-    let Some(appdir) = appdir else {
-        return None;
-    };
+    let appdir = appdir?;
 
     if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
         Some(system_cache_path)
@@ -360,7 +458,8 @@ fn linux_appimage_system_gtk_immodules_cache(
 
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_rendering_workarounds() {
-    for (key, value) in linux_webkit_rendering_workarounds(linux_nvidia_driver()) {
+    let has_render_device = !linux_drm_render_devices().is_empty();
+    for (key, value) in linux_webkit_rendering_workarounds(linux_nvidia_driver(), has_render_device) {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, value);
         }
@@ -392,6 +491,30 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn main_window_probe_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> String {
+    let Some(window) = app.get_webview_window("main") else {
+        return "main_window=missing".to_string();
+    };
+    format!(
+        "main_window visible={:?} minimized={:?} maximized={:?} fullscreen={:?} position={:?} size={:?}",
+        window.is_visible(),
+        window.is_minimized(),
+        window.is_maximized(),
+        window.is_fullscreen(),
+        window.outer_position(),
+        window.outer_size()
+    )
+}
+
+fn prepare_main_window_for_display<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(decorations) = native_window_decorations_override(std::env::consts::OS) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.set_decorations(decorations);
+        }
+    }
+    window_state_guard::enforce_main_window_bounds(app);
 }
 
 fn clear_main_webview_focus<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -451,6 +574,16 @@ pub(crate) fn hide_main_window_for_close<R: tauri::Runtime>(app: &tauri::AppHand
 }
 
 pub(crate) fn request_app_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, target: &str) {
+    let frontend_ready = app.try_state::<CloseBehaviorState>().is_some_and(|state| state.is_frontend_ready());
+    if should_fallback_to_native_quit(target, frontend_ready) {
+        // A missing WebView2 runtime can prevent the frontend listener from ever
+        // loading. Only the explicit tray Quit fallback bypasses the prompt.
+        if let Some(state) = app.try_state::<CloseBehaviorState>() {
+            state.allow_next_exit();
+        }
+        app.exit(0);
+        return;
+    }
     show_main_window(app);
     let _ = app.emit(APP_CLOSE_REQUESTED_EVENT, target);
 }
@@ -466,12 +599,120 @@ fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
     show_main_window(app);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocaleFamily {
+    English,
+    SimplifiedChinese,
+    TraditionalChinese,
+    Japanese,
+    Korean,
+    Spanish,
+    Italian,
+    Portuguese,
+}
+
+// Mirrors the frontend language mapping in apps/desktop/src/i18n/index.ts
+// (localeFromLanguageTag) so native menus agree with the UI language.
+fn locale_family(locale: &str) -> LocaleFamily {
+    let normalized = locale.replace('_', "-").to_ascii_lowercase();
+    let is_language = |language: &str| normalized == language || normalized.starts_with(&format!("{language}-"));
+    if is_language("zh") {
+        if normalized.contains("hant")
+            || normalized.starts_with("zh-tw")
+            || normalized.starts_with("zh-hk")
+            || normalized.starts_with("zh-mo")
+        {
+            LocaleFamily::TraditionalChinese
+        } else {
+            LocaleFamily::SimplifiedChinese
+        }
+    } else if is_language("ja") {
+        LocaleFamily::Japanese
+    } else if is_language("ko") {
+        LocaleFamily::Korean
+    } else if is_language("es") {
+        LocaleFamily::Spanish
+    } else if is_language("it") {
+        LocaleFamily::Italian
+    } else if is_language("pt") {
+        LocaleFamily::Portuguese
+    } else {
+        LocaleFamily::English
+    }
+}
+
+fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese => ("显示 DBX", "退出 DBX"),
+        LocaleFamily::TraditionalChinese => ("顯示 DBX", "退出 DBX"),
+        LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
+        LocaleFamily::Korean => ("DBX 표시", "DBX 종료"),
+        LocaleFamily::Spanish => ("Mostrar DBX", "Salir de DBX"),
+        LocaleFamily::Italian => ("Mostra DBX", "Esci da DBX"),
+        LocaleFamily::Portuguese => ("Mostrar DBX", "Sair do DBX"),
+        LocaleFamily::English => ("Show DBX", "Quit DBX"),
+    }
+}
+
+// Matches the frontend supportInfoCopy translations in apps/desktop/src/i18n/locales/*.ts.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese => "复制支持信息",
+        LocaleFamily::TraditionalChinese => "複製支援資訊",
+        LocaleFamily::Japanese => "サポート情報をコピー",
+        LocaleFamily::Korean => "지원 정보 복사",
+        LocaleFamily::Spanish => "Copiar información",
+        LocaleFamily::Italian => "Copia informazioni",
+        LocaleFamily::Portuguese => "Copiar informações",
+        LocaleFamily::English => "Copy Support Info",
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese | LocaleFamily::TraditionalChinese => format!("退出 {app_name}"),
+        LocaleFamily::Japanese => format!("{app_name}を終了"),
+        LocaleFamily::Korean => format!("{app_name} 종료"),
+        LocaleFamily::Spanish => format!("Salir de {app_name}"),
+        LocaleFamily::Italian => format!("Esci da {app_name}"),
+        LocaleFamily::Portuguese => format!("Sair do {app_name}"),
+        LocaleFamily::English => format!("Quit {app_name}"),
+    }
+}
+
+fn current_app_locale<R: tauri::Runtime, M: Manager<R>>(manager: &M) -> String {
+    match manager.try_state::<AppLocaleState>() {
+        Some(state) => state.get(),
+        None => sys_locale::get_locale().unwrap_or_default(),
+    }
+}
+
+fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<tauri::menu::Menu<R>> {
+    let (show_label, quit_label) = tray_menu_labels_for_locale(&current_app_locale(manager));
+    MenuBuilder::new(manager).text("show", show_label).separator().text("quit", quit_label).build()
+}
+
+/// Rebuilds the tray menu (and the macOS app menu) so native labels follow the
+/// UI language after the frontend reports a locale change.
+pub(crate) fn refresh_native_menus(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
+        tray.set_menu(Some(build_tray_menu(app)?))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.set_menu(build_app_menu(app)?)?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     _icon_theme: DesktopIconTheme,
 ) -> tauri::Result<()> {
-    let menu = MenuBuilder::new(manager).text("show", "Show DBX").separator().text("quit", "Quit DBX").build()?;
+    let menu = build_tray_menu(manager)?;
     let mut tray =
         TrayIconBuilder::<R>::with_id(DESKTOP_TRAY_ID).tooltip("DBX").menu(&menu).show_menu_on_left_click(false);
     #[cfg(target_os = "macos")]
@@ -536,10 +777,25 @@ fn apply_macos_app_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconThe
     })
 }
 
+#[cfg(target_os = "macos")]
+fn apply_macos_development_dock_badge(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSString;
+
+    let badge_label = development_dock_badge_label(cfg!(debug_assertions));
+    app.run_on_main_thread(move || {
+        let marker = unsafe { MainThreadMarker::new_unchecked() };
+        let application = NSApplication::sharedApplication(marker);
+        let badge_label = badge_label.map(NSString::from_str);
+        application.dockTile().setBadgeLabel(badge_label.as_deref());
+    })
+}
+
 fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return apply_macos_app_icon_theme(app, icon_theme);
+        apply_macos_app_icon_theme(app, icon_theme)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -602,16 +858,53 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
-        linux_nvidia_driver_from_state, linux_selected_drm_render_device, linux_webkit_rendering_workarounds,
-        native_window_decorations_override, should_confirm_app_exit_request, should_hide_window_on_close,
-        should_setup_desktop_tray, should_show_main_window_after_setup, use_native_window_decorations_for_platform,
+        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_system_gtk_immodules_cache,
+        linux_appimage_wayland_backend_override, linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state,
+        linux_selected_drm_render_device, linux_webkit_rendering_workarounds, native_window_decorations_override,
+        should_confirm_app_exit_request, should_enable_single_instance, should_fallback_to_native_quit,
+        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        should_show_main_window_before_setup_tasks, startup_data_dir_mode, tray_menu_labels_for_locale,
         uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
+    use crate::data_dir::DataDirMode;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
     const TEST_GTK3_IMMODULES_CACHE: &str = "/usr/lib/test/gtk-3.0/3.0.0/immodules.cache";
+
+    #[test]
+    fn tray_menu_labels_follow_locale() {
+        assert_eq!(tray_menu_labels_for_locale("zh-CN"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh_CN"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-Hans-CN"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh"), ("显示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-TW"), ("顯示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-Hant-HK"), ("顯示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 DBX", "退出 DBX"));
+        assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
+        assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("DBX 표시", "DBX 종료"));
+        assert_eq!(tray_menu_labels_for_locale("es-ES"), ("Mostrar DBX", "Salir de DBX"));
+        assert_eq!(tray_menu_labels_for_locale("it-IT"), ("Mostra DBX", "Esci da DBX"));
+        assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
+        assert_eq!(tray_menu_labels_for_locale("en-US"), ("Show DBX", "Quit DBX"));
+        // Unknown and empty locales fall back to English; "ita" must not match "it".
+        assert_eq!(tray_menu_labels_for_locale("ita"), ("Show DBX", "Quit DBX"));
+        assert_eq!(tray_menu_labels_for_locale(""), ("Show DBX", "Quit DBX"));
+    }
+
+    #[test]
+    fn app_menu_labels_follow_locale() {
+        assert_eq!(app_menu_quit_label("zh-CN", "DBX"), "退出 DBX");
+        assert_eq!(app_menu_quit_label("zh-TW", "DBX"), "退出 DBX");
+        assert_eq!(app_menu_quit_label("ja-JP", "DBX"), "DBXを終了");
+        assert_eq!(app_menu_quit_label("ko-KR", "DBX"), "DBX 종료");
+        assert_eq!(app_menu_quit_label("en-US", "DBX"), "Quit DBX");
+        assert_eq!(app_menu_quit_label("", "DBX"), "Quit DBX");
+        assert_eq!(app_menu_copy_support_info_label("zh-CN"), "复制支持信息");
+        assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
+        assert_eq!(app_menu_copy_support_info_label("ko-KR"), "지원 정보 복사");
+        assert_eq!(app_menu_copy_support_info_label("en-US"), "Copy Support Info");
+    }
 
     #[test]
     fn hides_window_on_close_for_windows_and_macos() {
@@ -633,6 +926,29 @@ mod tests {
         assert!(!should_setup_desktop_tray("windows", false, true));
         assert!(!should_setup_desktop_tray("macos", false, true));
         assert!(!should_setup_desktop_tray("linux", false, true));
+    }
+
+    #[test]
+    fn keeps_single_instance_for_release_builds_only() {
+        assert!(!should_enable_single_instance(true));
+        assert!(!should_enable_single_instance(false));
+    }
+
+    #[test]
+    fn startup_data_dir_diagnostics_never_include_paths() {
+        let private_path = PathBuf::from(r"C:\Users\private-user\DBXData");
+        assert_eq!(startup_data_dir_mode(&DataDirMode::Default), "default");
+        assert_eq!(startup_data_dir_mode(&DataDirMode::EnvOverride), "env_override");
+        let label = startup_data_dir_mode(&DataDirMode::Portable { exe_dir: private_path });
+        assert_eq!(label, "portable");
+        assert!(!label.contains("private-user"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn labels_debug_builds_in_the_macos_dock() {
+        assert_eq!(super::development_dock_badge_label(true), Some("DEV"));
+        assert_eq!(super::development_dock_badge_label(false), None);
     }
 
     #[cfg(target_os = "macos")]
@@ -672,6 +988,11 @@ mod tests {
     }
 
     #[test]
+    fn shows_main_window_while_startup_setup_continues() {
+        assert!(should_show_main_window_before_setup_tasks());
+    }
+
+    #[test]
     fn only_user_requested_app_exit_needs_frontend_confirmation() {
         assert!(should_confirm_app_exit_request("windows", None, false));
         assert!(should_confirm_app_exit_request("macos", Some(0), false));
@@ -681,23 +1002,17 @@ mod tests {
     }
 
     #[test]
-    fn overrides_native_window_decorations_for_desktop_platforms() {
-        assert_eq!(
-            native_window_decorations_override("windows"),
-            Some(cfg!(feature = "legacy-native-window-decorations"))
-        );
-        assert_eq!(native_window_decorations_override("linux"), Some(false));
-        assert_eq!(native_window_decorations_override("macos"), None);
+    fn only_quit_uses_native_fallback_before_frontend_ready() {
+        assert!(should_fallback_to_native_quit("quit", false));
+        assert!(!should_fallback_to_native_quit("quit", true));
+        assert!(!should_fallback_to_native_quit("settings", false));
     }
 
     #[test]
-    fn native_window_decorations_are_feature_gated_for_legacy_windows() {
-        assert_eq!(
-            use_native_window_decorations_for_platform("windows"),
-            cfg!(feature = "legacy-native-window-decorations")
-        );
-        assert!(!use_native_window_decorations_for_platform("linux"));
-        assert!(!use_native_window_decorations_for_platform("macos"));
+    fn overrides_native_window_decorations_for_desktop_platforms() {
+        assert_eq!(native_window_decorations_override("windows"), Some(false));
+        assert_eq!(native_window_decorations_override("linux"), Some(false));
+        assert_eq!(native_window_decorations_override("macos"), None);
     }
 
     #[test]
@@ -713,6 +1028,25 @@ mod tests {
 
     fn drm_render_device(path: &str, driver: &str, boot_vga: bool) -> LinuxDrmRenderDevice {
         LinuxDrmRenderDevice { device_file: PathBuf::from(path), driver: Some(driver.to_string()), boot_vga }
+    }
+
+    #[test]
+    fn discovers_only_usable_linux_drm_render_device_files() {
+        let root = std::env::temp_dir().join(format!("dbx-drm-render-devices-{}", uuid::Uuid::new_v4()));
+        let sys_class_drm = root.join("sys/class/drm");
+        let dev_dri = root.join("dev/dri");
+        std::fs::create_dir_all(sys_class_drm.join("renderD128/device")).unwrap();
+        std::fs::create_dir_all(sys_class_drm.join("renderD129/device")).unwrap();
+        std::fs::create_dir_all(&dev_dri).unwrap();
+
+        assert!(linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri).is_empty());
+
+        std::fs::write(dev_dri.join("renderD129"), []).unwrap();
+        let devices = linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_file, dev_dri.join("renderD129"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -768,14 +1102,20 @@ mod tests {
     #[test]
     fn applies_driver_specific_linux_webkit_rendering_workarounds() {
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Proprietary),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Proprietary, true),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]
         );
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Nouveau),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Nouveau, true),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         );
-        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None), &[]);
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true), &[]);
+        // Without any DRM render node (GPU-less VM / server) Mesa falls back to
+        // llvmpipe, whose DMABuf compositing path can crash the WebKit process.
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, false),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
     }
 
     #[test]
@@ -875,14 +1215,9 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    if webview2_runtime::handle_webview2_uninstall_arg() {
-        return;
-    }
-    webview2_runtime::configure_bundled_webview2_fallback();
-    #[cfg(feature = "legacy-ring-crypto")]
-    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
-    #[cfg(not(feature = "legacy-ring-crypto"))]
+    startup_recovery::initialize();
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
+    append_startup_probe("runtime prerequisites configured");
     #[cfg(target_os = "linux")]
     apply_linux_webkit_rendering_workarounds();
 
@@ -892,11 +1227,43 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_fs::init());
+
+    let builder = if should_enable_single_instance(cfg!(debug_assertions)) {
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let links = commands::deep_link::connection_deep_links_from_args(args.clone());
+            open_connection_deep_links(app, links);
+
+            let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
+            if !paths.is_empty() {
+                if let Some(state) = app.try_state::<commands::external_sql::ExternalSqlOpenState>() {
+                    state.push(paths.clone());
+                }
+                let _ = app.emit("dbx-open-sql-files", paths);
+            }
+
+            let db_paths = commands::external_db::db_file_paths_from_args(args, std::path::Path::new(&cwd));
+            if !db_paths.is_empty() {
+                if let Some(state) = app.try_state::<commands::external_db::ExternalDbOpenState>() {
+                    state.push(db_paths.clone());
+                }
+                let _ = app.emit("dbx-open-db-files", db_paths);
+            }
+            show_main_window(app);
+        }))
+    } else {
+        builder
+    };
+
+    let builder = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build());
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_guard::persisted_main_window_state_flags())
+                .build(),
+        );
 
     // macOS app menu (Cmd+Q / Dock Quit). Skip on Linux/Windows so an empty menu bar
     // is not installed where there was none before.
@@ -912,16 +1279,38 @@ pub fn run() {
     });
 
     builder
+        .manage(CloseBehaviorState::new())
+        .manage(AppLocaleState::new())
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Started {
+                if let Some(state) = webview.app_handle().try_state::<CloseBehaviorState>() {
+                    state.set_frontend_ready(false);
+                }
+            }
+        })
         .setup(move |app| {
             let setup_start = Instant::now();
             eprintln!("[STARTUP] plugins registered in {:?}", startup_begin.elapsed());
+            append_startup_probe(format!("setup entered after {:?}", startup_begin.elapsed()));
 
+            if should_show_main_window_before_setup_tasks() {
+                prepare_main_window_for_display(app.handle());
+                show_main_window(app.handle());
+                append_startup_probe(format!(
+                    "early main window show requested; {}",
+                    main_window_probe_state(app.handle())
+                ));
+            }
+
+            append_startup_probe("resolving app data dir");
             let default_data_dir =
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
             let app_config_dir = app.path().app_config_dir().ok();
             let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir, app_config_dir.as_deref());
             let data_dir = data_dir_resolution.data_dir.clone();
             std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+            let data_dir_mode = startup_data_dir_mode(&data_dir_resolution.mode);
+            append_startup_probe(format!("data dir ready mode={data_dir_mode}"));
             let alternative_data_dir = data_dir::alternative_data_dir(&data_dir_resolution);
             match maybe_import_user_data_db(&data_dir, alternative_data_dir.as_deref()) {
                 Ok(result) => eprintln!("[STARTUP] data db fallback import: {result:?}"),
@@ -930,12 +1319,15 @@ pub fn run() {
             let db_path = data_dir.join("dbx.db");
 
             let t = Instant::now();
+            append_startup_probe(format!("opening storage file=dbx.db data_dir_mode={data_dir_mode}"));
             let storage = tauri::async_runtime::block_on(async {
                 let s = Storage::open(&db_path).await.expect("Failed to open storage");
                 eprintln!("[STARTUP]   Storage::open in {:?}", t.elapsed());
+                append_startup_probe(format!("storage opened in {:?}", t.elapsed()));
                 let t2 = Instant::now();
                 s.migrate_from_json(&data_dir).await.expect("Failed to migrate JSON data");
                 eprintln!("[STARTUP]   migrate_from_json in {:?}", t2.elapsed());
+                append_startup_probe(format!("json migration completed in {:?}", t2.elapsed()));
                 s
             });
             let desktop_settings = tauri::async_runtime::block_on(storage.load_desktop_settings()).unwrap_or_default();
@@ -956,6 +1348,37 @@ pub fn run() {
             )?;
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
+            append_startup_probe(format!("storage ready in {:?}", t.elapsed()));
+
+            // Initialize core dialect registry and load external plugin dialects
+            let dialect_init_start = Instant::now();
+            register_core_dialects();
+            let registry = DialectRegistry::global();
+            let plugin_dirs = vec![data_dir.join("plugins").join("dialects")];
+            let load_result = DialectPluginLoader::scan_and_load(registry, &plugin_dirs);
+            eprintln!(
+                "[STARTUP] dialect plugins loaded: {} success, {} errors, {} skipped in {:?}",
+                load_result.loaded.len(),
+                load_result.errors.len(),
+                load_result.skipped.len(),
+                dialect_init_start.elapsed()
+            );
+            append_startup_probe(format!(
+                "dialect plugins loaded: {} success, {} errors, {} skipped in {:?}",
+                load_result.loaded.len(),
+                load_result.errors.len(),
+                load_result.skipped.len(),
+                dialect_init_start.elapsed()
+            ));
+
+            // Start dialect YAML hot-reload watcher
+            let watch_dirs = plugin_dirs.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = DialectHotReload::run_forever(watch_dirs, DialectRegistry::global()).await {
+                    log::error!("[STARTUP] dialect hot-reload watcher exited: {e}");
+                }
+            });
+            eprintln!("[STARTUP] dialect hot-reload watcher started");
 
             let default_agent_dir = data_dir_resolution.uses_custom_data_dir().then(|| data_dir.join("agents"));
             let (plugin_dir, agent_dir) = commands::app_settings::resolve_driver_store_dirs_from_settings(
@@ -983,12 +1406,15 @@ pub fn run() {
                 mode: data_dir_resolution.mode.clone(),
             });
             app.manage(state.clone());
-            commands::redis_pubsub_server::start_pubsub_server(state.clone());
+            app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
-            app.manage(CloseBehaviorState::new());
+            app.manage(commands::update::PendingUpdateState::default());
+            app.manage(commands::ssh_prompt::SshPromptState::new());
+            commands::ssh_prompt::install_ssh_prompt_bridge(app.handle());
+            commands::ssh_prompt::install_ssh_notice_bridge(app.handle());
             #[cfg(target_os = "macos")]
             macos_app_delegate::install_dock_quit_handler(app.handle());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
@@ -997,12 +1423,13 @@ pub fn run() {
             let app_handle = app.handle().clone();
             commands::mcp_bridge::start(app_handle, state, data_dir);
             eprintln!("[STARTUP] setup complete in {:?} (total {:?})", setup_start.elapsed(), startup_begin.elapsed());
+            append_startup_probe(format!(
+                "setup tasks complete in {:?} total {:?}",
+                setup_start.elapsed(),
+                startup_begin.elapsed()
+            ));
 
-            if let Some(decorations) = native_window_decorations_override(std::env::consts::OS) {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_decorations(decorations);
-                }
-            }
+            prepare_main_window_for_display(app.handle());
             if should_setup_desktop_tray(
                 std::env::consts::OS,
                 desktop_settings.show_tray_icon,
@@ -1011,13 +1438,19 @@ pub fn run() {
                 setup_desktop_tray(app, desktop_settings.icon_theme)?;
             }
             apply_desktop_icon_theme(app.handle(), desktop_settings.icon_theme)?;
-            window_state_guard::enforce_main_window_bounds(app.handle());
+            #[cfg(target_os = "macos")]
+            apply_macos_development_dock_badge(app.handle())?;
             if should_show_main_window_after_setup() {
                 show_main_window(app.handle());
+                append_startup_probe(format!(
+                    "final main window show requested; {}",
+                    main_window_probe_state(app.handle())
+                ));
             }
             #[cfg(any(windows, target_os = "linux"))]
             let _ = app.deep_link().register_all();
 
+            append_startup_probe("setup finished");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1028,11 +1461,11 @@ pub fn run() {
                 let app = window.app_handle();
                 if app.try_state::<CloseBehaviorState>().is_none() {
                     api.prevent_close();
-                    hide_main_window_for_close(&app, window);
+                    hide_main_window_for_close(app, window);
                     return;
                 }
                 api.prevent_close();
-                request_app_close(&app, "settings");
+                request_app_close(app, "settings");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1042,21 +1475,39 @@ pub fn run() {
             commands::ai::ai_cancel_stream,
             commands::ai::ai_test_connection,
             commands::ai::ai_list_models,
+            commands::ai::ai_resolve_model_effort,
             commands::ai::save_ai_config,
             commands::ai::load_ai_config,
             commands::ai::save_ai_provider_config,
             commands::ai::load_ai_provider_configs,
+            commands::ai::save_ai_chat_selection,
+            commands::ai::load_ai_chat_selection,
             commands::ai::save_ai_conversation,
             commands::ai::load_ai_conversations,
             commands::ai::delete_ai_conversation,
+            commands::ai_multi_config::save_ai_configs,
+            commands::ai_multi_config::load_ai_configs,
+            commands::ai_multi_config::set_default_ai_config,
+            commands::ai_multi_config::save_ai_config_item,
+            commands::ai_multi_config::delete_ai_config,
+            commands::prompt_template::load_prompt_templates,
+            commands::prompt_template::save_prompt_template,
+            commands::prompt_template::delete_prompt_template,
+            commands::prompt_template::get_ai_global_custom_instructions,
+            commands::prompt_template::set_ai_global_custom_instructions,
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
-            commands::app_settings::use_native_window_decorations,
-            commands::app_settings::complete_app_close,
-            commands::app_settings::request_app_close_from_window_controls,
+            commands::app_settings::load_max_agent_turns,
+            commands::app_settings::save_max_agent_turns,
+            commands::app_settings::load_max_retries,
+            commands::app_settings::save_max_retries,
+            commands::app_settings::set_app_locale,
             commands::app_settings::load_data_dir_config,
             commands::app_settings::set_data_dir_config,
             commands::app_settings::clear_data_dir_config,
+            commands::app_settings::complete_app_close,
+            commands::app_settings::mark_frontend_ready,
+            commands::app_settings::request_app_close_from_window_controls,
             commands::window_controls::set_macos_traffic_light_position,
             commands::app_settings::set_driver_store_dir,
             commands::app_settings::set_plugin_store_dir,
@@ -1064,6 +1515,8 @@ pub fn run() {
             commands::app_settings::get_driver_store_path,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
+            commands::app_settings::load_mcp_global_policy,
+            commands::app_settings::save_mcp_global_policy,
             commands::app_settings::load_editor_settings,
             commands::app_settings::save_editor_settings,
             commands::app_settings::load_open_tabs_state,
@@ -1085,6 +1538,9 @@ pub fn run() {
             commands::cloud_sync::snippet_token_status,
             commands::cloud_sync::save_snippet_saved_token,
             commands::cloud_sync::forget_snippet_saved_token,
+            commands::cloud_sync::snippet_sync_settings,
+            commands::cloud_sync::save_snippet_sync_id,
+            commands::cloud_sync::retry_snippet_legacy_cleanup,
             commands::cloud_sync::snippet_sync_upload,
             commands::cloud_sync::snippet_sync_download,
             commands::connection::test_connection,
@@ -1117,6 +1573,8 @@ pub fn run() {
             commands::plugins::install_jdbc_plugin_local,
             commands::plugins::uninstall_jdbc_plugin,
             commands::schema::list_databases,
+            commands::schema::list_database_storage,
+            commands::schema::get_sqlserver_completion_context,
             commands::schema::list_doris_catalogs,
             commands::schema::list_doris_catalog_databases,
             commands::schema::list_sqlserver_linked_servers,
@@ -1134,9 +1592,14 @@ pub fn run() {
             commands::schema::list_schema_infos,
             commands::schema::list_data_types,
             commands::schema::get_columns,
+            commands::schema::get_all_columns,
+            commands::schema::get_sqlserver_column_metadata,
             commands::schema::list_indexes,
             commands::schema::list_foreign_keys,
             commands::schema::list_triggers,
+            commands::schema::list_constraints,
+            commands::schema::list_partitions,
+            commands::schema::list_subpartitions,
             commands::schema::get_table_ddl,
             commands::schema::list_functions,
             commands::schema::list_sequences,
@@ -1146,11 +1609,15 @@ pub fn run() {
             commands::schema::list_available_extensions,
             commands::schema_diff::prepare_schema_diff,
             commands::schema_diff::generate_schema_sync_sql,
+            commands::dialect_cmd::list_dialect_data_types,
             commands::schema_cache::save_schema_cache,
             commands::schema_cache::load_schema_cache,
             commands::schema_cache::delete_schema_cache_prefix,
             commands::tab_runtime_cache::save_tab_runtime_cache,
             commands::tab_runtime_cache::load_tab_runtime_cache,
+            commands::tab_runtime_cache::list_tab_runtime_cache_metadata,
+            commands::tab_runtime_cache::prune_tab_runtime_cache,
+            commands::tab_runtime_cache::delete_tab_runtime_cache_owner,
             commands::tab_runtime_cache::delete_tab_runtime_cache,
             commands::query::execute_query,
             commands::query::execute_multi,
@@ -1160,6 +1627,7 @@ pub fn run() {
             commands::query::execute_batch,
             commands::query::execute_script,
             commands::query::execute_in_transaction,
+            commands::query::execute_script_with_2pc,
             commands::query::begin_manual_transaction,
             commands::query::execute_in_manual_transaction,
             commands::query::commit_manual_transaction,
@@ -1177,8 +1645,9 @@ pub fn run() {
             commands::query::build_search_result_where,
             commands::query::build_rename_object_sql,
             commands::query::build_create_database_sql,
-            #[cfg(feature = "duckdb-bundled")]
+            #[cfg(feature = "duckdb-sidecar")]
             commands::query::build_duckdb_attach_database_sql,
+            commands::query::build_sqlite_attach_database_sql,
             commands::query::build_drop_object_sql,
             commands::query::build_drop_table_sql,
             commands::query::build_drop_table_child_object_sql,
@@ -1202,6 +1671,7 @@ pub fn run() {
             commands::query::build_single_column_alter_sql,
             commands::query::analyze_editable_query_editability,
             commands::query::prepare_data_grid_save,
+            commands::query::extract_data_grid_selection,
             commands::query::build_data_grid_copy_update_statements,
             commands::query::build_data_grid_copy_insert_statement,
             commands::query::build_data_grid_context_filter_condition,
@@ -1219,10 +1689,12 @@ pub fn run() {
             commands::data_compare::build_data_compare_sync_plan,
             commands::sql_file::preview_sql_file,
             commands::sql_file::execute_sql_file,
+            commands::sql_file::execute_sql_files,
             commands::sql_file::cancel_sql_file_execution,
             commands::external_sql::pending_open_sql_files,
             commands::external_sql::read_external_sql_file,
             commands::external_sql::write_external_sql_file,
+            commands::external_sql::save_external_sql_file,
             commands::list_sql_files::list_sql_files_in_folder,
             commands::external_db::pending_open_db_files,
             commands::keychain::read_keychain_password,
@@ -1236,6 +1708,11 @@ pub fn run() {
             commands::redis_cmd::redis_scan_keys_batch,
             commands::redis_cmd::redis_scan_values,
             commands::redis_cmd::redis_get_value,
+            commands::redis_cmd::redis_get_ttl,
+            commands::redis_cmd::redis_get_stream_entries,
+            commands::redis_cmd::redis_get_stream_groups,
+            commands::redis_cmd::redis_get_stream_consumers,
+            commands::redis_cmd::redis_get_stream_pending,
             commands::redis_cmd::redis_set_string,
             commands::redis_cmd::redis_delete_key,
             commands::redis_cmd::redis_hash_set,
@@ -1251,6 +1728,7 @@ pub fn run() {
             commands::redis_cmd::redis_json_set,
             commands::redis_cmd::redis_check_json_module,
             commands::redis_cmd::redis_set_ttl,
+            commands::redis_cmd::redis_set_expire_at,
             commands::redis_cmd::redis_delete_keys,
             commands::redis_cmd::redis_flush_db,
             commands::redis_cmd::redis_execute_command,
@@ -1259,10 +1737,23 @@ pub fn run() {
             commands::redis_pubsub_server::redis_pubsub_server_port,
             commands::redis_cmd::redis_slowlog_get,
             commands::redis_cmd::redis_cluster_master_nodes,
+            commands::etcd_cmd::etcd_supports_ttl,
             commands::etcd_cmd::etcd_list_prefix,
             commands::etcd_cmd::etcd_get,
             commands::etcd_cmd::etcd_put,
             commands::etcd_cmd::etcd_delete,
+            commands::etcd_cmd::etcd_rename,
+            commands::etcd_cmd::etcd_history,
+            commands::etcd_cmd::etcd_status,
+            commands::etcd_cmd::etcd_preflight,
+            commands::etcd_cmd::etcd_compact,
+            commands::etcd_cmd::etcd_defrag,
+            commands::etcd_cmd::etcd_watch_start,
+            commands::etcd_cmd::etcd_watch_poll,
+            commands::etcd_cmd::etcd_watch_stop,
+            commands::etcd_cmd::etcd_lease_list,
+            commands::etcd_cmd::etcd_lease_call,
+            commands::etcd_cmd::etcd_auth_call,
             commands::zookeeper_cmd::zookeeper_list_prefix,
             commands::zookeeper_cmd::zookeeper_get,
             commands::zookeeper_cmd::zookeeper_put,
@@ -1278,10 +1769,20 @@ pub fn run() {
             commands::nacos_cmd::nacos_list_config_history,
             commands::nacos_cmd::nacos_get_config_history,
             commands::nacos_cmd::nacos_rollback_config,
+            commands::nacos_cmd::nacos_get_rnacos_console_captcha,
+            commands::nacos_cmd::nacos_login_rnacos_console,
             commands::nacos_cmd::nacos_list_services,
             commands::nacos_cmd::nacos_list_instances,
             commands::nacos_cmd::nacos_update_instance,
+            commands::nacos_cmd::nacos_get_dashboard,
             commands::nacos_cmd::nacos_raw_request,
+            commands::nacos_cmd::nacos_search_config_content,
+            commands::nacos_cmd::nacos_cancel_operation,
+            commands::nacos_cmd::nacos_export_configs,
+            commands::nacos_cmd::nacos_preview_config_import,
+            commands::nacos_cmd::nacos_apply_config_import,
+            commands::nacos_cmd::nacos_preview_config_transfer,
+            commands::nacos_cmd::nacos_apply_config_transfer,
             commands::saved_sql::load_saved_sql_library,
             commands::saved_sql::load_saved_sql_file,
             commands::saved_sql::save_saved_sql_folder,
@@ -1293,6 +1794,7 @@ pub fn run() {
             commands::saved_sql::sync_saved_sql_directory,
             commands::fs_open::reveal_path_in_file_manager,
             commands::fs_open::is_sqlite_database_file,
+            commands::fs_open::delete_database_backup_files,
             commands::sqlite_backup::backup_sqlite_database,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
@@ -1300,9 +1802,11 @@ pub fn run() {
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
+            commands::mongo_cmd::mongo_rename_collection,
             commands::document_cmd::document_list_databases,
             commands::document_cmd::document_list_collections,
             commands::document_cmd::document_find_documents,
+            commands::document_cmd::elasticsearch_count_documents,
             commands::document_cmd::document_list_gridfs_buckets,
             commands::document_cmd::document_create_gridfs_bucket,
             commands::document_cmd::document_delete_gridfs_bucket,
@@ -1311,11 +1815,13 @@ pub fn run() {
             commands::document_cmd::document_upload_gridfs_file,
             commands::document_cmd::document_delete_gridfs_file,
             commands::mongo_cmd::mongo_find_documents,
+            commands::mongo_cmd::mongo_parse_shell_command,
             commands::mongo_cmd::mongo_find_one,
             commands::mongo_cmd::mongo_count_documents,
             commands::mongo_cmd::mongo_server_version,
             commands::mongo_cmd::mongo_collection_stats,
             commands::mongo_cmd::mongo_aggregate_documents,
+            commands::mongo_cmd::mongo_distinct,
             commands::mongo_cmd::mongo_create_index,
             commands::mongo_cmd::mongo_drop_indexes,
             commands::document_cmd::document_insert_document,
@@ -1325,6 +1831,13 @@ pub fn run() {
             commands::mongo_cmd::mongo_update_document,
             commands::mongo_cmd::mongo_update_documents,
             commands::document_cmd::document_delete_document,
+            commands::hbase_cmd::hbase_get_table_schema,
+            commands::hbase_cmd::hbase_scan_rows,
+            commands::hbase_cmd::hbase_get_row,
+            commands::hbase_cmd::hbase_put_row,
+            commands::hbase_cmd::hbase_delete_row,
+            commands::hbase_cmd::hbase_create_table,
+            commands::hbase_cmd::hbase_delete_table,
             commands::mongo_cmd::mongo_delete_document,
             commands::mongo_cmd::mongo_delete_documents,
             commands::mongo_cmd::mongo_find_one_and_update,
@@ -1363,6 +1876,18 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_topic_internal_stats,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_exchanges,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_create_exchange,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_delete_exchange,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_bindings,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_bind,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_unbind,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_list_subscriptions,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_create_subscription,
@@ -1375,6 +1900,10 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_clear_backlog,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_consumer_group_config,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_alter_consumer_group_config,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_peek_messages,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_expire_messages,
@@ -1384,6 +1913,12 @@ pub fn run() {
             commands::mq_cmd::mq_list_consumers,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_unload_topic,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_client_connections,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_client_channels,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_close_client_connection,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_set_publish_rate,
             #[cfg(feature = "mq-admin")]
@@ -1403,6 +1938,28 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_list_permissions,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_users,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_create_user,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_delete_user,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_user_permissions,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_grant_user_permission,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_revoke_user_permission,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_policies,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_set_policy,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_delete_policy,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_overview,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_list_nodes,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_issue_token,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_list_token_records,
@@ -1411,11 +1968,27 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_cluster_info,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_topic_route,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_alter_topic_config,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_skip_topic_accumulation,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_view_message,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_messages_by_key,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_messages_by_topic,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_message_trace,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_send_message,
             commands::history::save_history,
             commands::history::load_history,
+            commands::history::search_history,
+            commands::history::load_history_connection_options,
             commands::history::clear_history,
             commands::history::delete_history_entry,
             commands::mcp::check_mcp_server_status,
@@ -1423,10 +1996,13 @@ pub fn run() {
             commands::update::check_for_updates,
             commands::update::fetch_changelog,
             commands::update::get_system_proxy_url,
-            commands::update::download_and_install_update,
+            commands::update::download_update,
+            commands::update::cancel_update_download,
+            commands::update::install_downloaded_update,
             commands::transfer::start_transfer,
             commands::transfer::preview_transfer_ownership,
             commands::transfer::cancel_transfer,
+            commands::database_export::begin_database_backup_snapshot,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,
             commands::table_export::start_table_export,
@@ -1458,16 +2034,28 @@ pub fn run() {
             commands::agents::reinstall_jre,
             commands::agents::invalidate_agent_registry_cache,
             commands::agents::import_agents_from_zip,
+            commands::agents::import_agent_driver_cmd,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
             commands::ssh_config::list_ssh_config_hosts,
+            commands::ssh_prompt::ssh_prompt_ready,
+            commands::ssh_prompt::ssh_prompt_not_ready,
+            commands::ssh_prompt::resolve_ssh_prompt,
             commands::tunnel_profiles::load_tunnel_profiles,
             commands::tunnel_profiles::save_tunnel_profiles,
             commands::tunnel_profiles::test_tunnel_profile,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .inspect(|app| {
+            append_startup_probe(format!("tauri application built after {:?}", startup_begin.elapsed()));
+            startup_recovery::start_watchdog(app.handle());
+        })
+        .unwrap_or_else(|error| {
+            append_startup_probe(format!("tauri application build failed: {error}"));
+            panic!("error while building tauri application: {error}");
+        })
         .run(|app_handle, event| {
+            startup_recovery::record_run_event();
             #[cfg(not(target_os = "macos"))]
             let _ = (&app_handle, &event);
 
@@ -1479,6 +2067,16 @@ pub fn run() {
                 if should_confirm_app_exit_request(std::env::consts::OS, *code, confirmed_exit) {
                     api.prevent_exit();
                     request_app_close(app_handle, "quit");
+                } else {
+                    tauri::async_runtime::block_on(async {
+                        if let Some(server) = app_handle.try_state::<commands::redis_pubsub_server::PubSubServerState>()
+                        {
+                            server.shutdown(Duration::from_secs(1)).await;
+                        }
+                        if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+                            state.shutdown(Duration::from_secs(3)).await;
+                        }
+                    });
                 }
             }
 

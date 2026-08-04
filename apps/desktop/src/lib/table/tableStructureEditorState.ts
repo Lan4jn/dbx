@@ -273,6 +273,8 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   ],
   questdb: ["boolean", "ipv4", "byte", "short", "char", "int", "float", "symbol", "varchar", "string", "long", "date", "timestamp", "timestamp_ns", "double", "uuid", "binary", "long256", "geohash", "array", "interval", "decimal"],
   xugu: ["BOOLEAN", "INTEGER", "SMALLINT", "BIGINT", "FLOAT", "NUMERIC", "CHAR", "VARCHAR", "CLOB", "DATE", "TIME", "TIMESTAMP", "BINARY", "VARBINARY", "BLOB", "XML", "BOOL", "INT", "SHORT", "LONGINT", "LONG", "REAL", "DECIMAL", "TEXT", "NCHAR", "NVARCHAR", "NVARCHAR2"],
+  duckdb: ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "FLOAT", "DOUBLE", "DECIMAL", "VARCHAR", "TEXT", "BLOB", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "UUID", "JSON"],
+  h2: ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "IDENTITY", "DECIMAL", "NUMERIC", "REAL", "DOUBLE", "FLOAT", "CHAR", "CHARACTER", "VARCHAR", "VARCHAR_IGNORECASE", "CLOB", "BINARY", "VARBINARY", "BLOB", "DATE", "TIME", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "UUID", "ARRAY", "JSON"],
 };
 
 const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
@@ -287,12 +289,20 @@ const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
   opengauss: "postgres",
   questdb: "questdb",
   redshift: "postgres",
+  vertica: "postgres",
   highgo: "postgres",
+  uxdb: "postgres",
   vastbase: "postgres",
   kingbase: "postgres",
+  firebird: "postgres",
   dameng: "oracle",
   "oceanbase-oracle": "oracle",
   iris: "oracle",
+  yashandb: "oracle",
+  rqlite: "sqlite",
+  turso: "sqlite",
+  "cloudflare-d1": "sqlite",
+  access: "h2",
 };
 
 export function getDataTypeOptions(dbType: DatabaseType | undefined): string[] {
@@ -466,7 +476,7 @@ export function parseExtraToColumnExtra(extra: string | null | undefined, databa
     if (lower.includes("on update current_timestamp")) {
       result.onUpdateCurrentTimestamp = true;
     }
-  } else if (databaseType === "postgres" || databaseType === "gaussdb" || databaseType === "kwdb" || databaseType === "opengauss" || databaseType === "questdb" || databaseType === "highgo" || databaseType === "vastbase" || databaseType === "kingbase") {
+  } else if (databaseType === "postgres" || databaseType === "gaussdb" || databaseType === "kwdb" || databaseType === "opengauss" || databaseType === "questdb" || databaseType === "highgo" || databaseType === "uxdb" || databaseType === "vastbase" || databaseType === "kingbase") {
     const identityMatch = lower.match(/generated\s+(by\s+default|always)\s+as\s+identity/i);
     if (identityMatch) {
       const sequenceMatch = lower.match(/start\s+with\s*(-?\d+)\s+increment\s+by\s*(-?\d+)/i);
@@ -632,17 +642,41 @@ function stripSqlServerDefaultOuterParens(defaultValue: string): string {
 }
 
 function columnDefaultForEditor(column: ColumnInfo, databaseType?: DatabaseType): string {
-  const defaultValue = column.column_default ?? "";
+  if (column.column_default === null) return "";
+  const defaultValue = column.column_default;
+  if (databaseType === "mysql" && defaultValue === "" && isMysqlCharacterDataType(column.data_type)) {
+    // MySQL metadata uses an empty string for DEFAULT '', so keep it distinct from no default.
+    return "''";
+  }
   if (databaseType === "postgres") return stripPostgresStringDefaultCast(defaultValue, column.data_type);
   if (databaseType === "sqlserver") return stripSqlServerDefaultOuterParens(defaultValue);
   return defaultValue;
+}
+
+const CHARACTER_LENGTH_METADATA_TYPES = new Set(["binary", "char", "character", "character varying", "nchar", "nvarchar", "nvarchar2", "varbinary", "varchar", "varchar2"]);
+const NUMERIC_PRECISION_METADATA_TYPES = new Set(["decimal", "number", "numeric"]);
+
+function columnDataTypeForEditor(column: ColumnInfo, databaseType?: DatabaseType): string {
+  const parsed = splitDataType(column.data_type);
+  if (parsed.params) return column.data_type;
+
+  const baseType = parsed.baseType.trim().replace(/\s+/g, " ");
+  const normalized = baseType.toLowerCase();
+  if (CHARACTER_LENGTH_METADATA_TYPES.has(normalized) && Number.isInteger(column.character_maximum_length) && Number(column.character_maximum_length) > 0) {
+    return combineDataTypeForDatabase(databaseType, baseType, String(column.character_maximum_length));
+  }
+  if (NUMERIC_PRECISION_METADATA_TYPES.has(normalized) && Number.isInteger(column.numeric_precision) && Number(column.numeric_precision) > 0) {
+    const scale = Number.isInteger(column.numeric_scale) && Number(column.numeric_scale) >= 0 ? `,${column.numeric_scale}` : "";
+    return combineDataTypeForDatabase(databaseType, baseType, `${column.numeric_precision}${scale}`);
+  }
+  return column.data_type;
 }
 
 export function createColumnDrafts(columns: ColumnInfo[], databaseType?: DatabaseType): EditableStructureColumn[] {
   return columns.map((column, index) => {
     const defaultValue = columnDefaultForEditor(column, databaseType);
     const enumValues = isMysqlEnumDataType(databaseType, column.data_type) ? [...(column.enum_values ?? [])] : undefined;
-    const dataType = enumValues?.length ? mysqlEnumDataType(enumValues) : column.data_type;
+    const dataType = enumValues?.length ? mysqlEnumDataType(enumValues) : columnDataTypeForEditor(column, databaseType);
     return {
       id: `existing:${column.name}`,
       name: column.name,
@@ -733,6 +767,16 @@ export function rehydrateColumnDraftsFromMetadata(draftColumns: EditableStructur
   return [...nextColumns, ...missingMetadataDrafts];
 }
 
+/** Canonicalize index method for structure editor options (e.g. Postgres `btree` → `BTREE`). */
+export function normalizeStructureIndexType(indexType: string | null | undefined): string {
+  return (indexType ?? "").trim().toUpperCase();
+}
+
+/** Case-insensitive index-type equality (draft is uppercased; API may still return lowercase amname). */
+export function sameStructureIndexType(left: string | null | undefined, right: string | null | undefined): boolean {
+  return normalizeStructureIndexType(left) === normalizeStructureIndexType(right);
+}
+
 export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[] {
   return indexes.map((index) => ({
     id: `existing:${index.name}`,
@@ -742,7 +786,8 @@ export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[
     isUnique: index.is_unique,
     isPrimary: index.is_primary,
     filter: index.filter ?? "",
-    indexType: index.index_type ?? "",
+    // Match Select options (BTREE/GIN/…); Postgres pg_am.amname is lowercase.
+    indexType: normalizeStructureIndexType(index.index_type),
     includedColumns: index.included_columns ? [...index.included_columns] : [],
     comment: index.comment ?? "",
     original: index,
@@ -789,6 +834,10 @@ export function createTriggerDrafts(triggers: TriggerInfo[]): EditableStructureT
     original: trigger,
     markedForDrop: false,
   }));
+}
+
+export function canEditStructuredTriggerDraft(databaseType: DatabaseType | undefined, trigger: EditableStructureTrigger): boolean {
+  return !trigger.original || (databaseType !== undefined && databaseType !== "oracle");
 }
 
 export function toColumnNames(columns: string[]): string {
@@ -992,6 +1041,7 @@ function isTemporalPrecisionType(dbType: DatabaseType | undefined, baseType: str
     case "kwdb":
     case "opengauss":
     case "highgo":
+    case "uxdb":
     case "vastbase":
     case "kingbase":
     case "redshift":
@@ -1063,7 +1113,31 @@ export function defaultNewColumnDataType(dbType: DatabaseType | undefined, dataT
     const baseType = dataTypeOptions[0] ?? "text";
     return combineDataTypeForDatabase(dbType, baseType, getDefaultLengthForType(dbType, baseType));
   }
+
+  const options = dataTypeOptions.length > 0 ? dataTypeOptions : getDataTypeOptions(dbType);
+  const dialectKey = dbType ? (DATA_TYPE_OPTION_ALIASES[dbType] ?? dbType) : "";
+
+  if (dialectKey === "sqlite" || dialectKey === "duckdb") {
+    const textType = options.find((type) => /^text$/i.test(type.trim()));
+    return textType ?? "text";
+  }
+
+  if (options.length > 0) {
+    const preferred = options.find((type) => /^(varchar|character varying|nvarchar)$/i.test(type.trim())) ?? options.find((type) => /^(string|clob|lvarchar|text)$/i.test(type.trim())) ?? options.find((type) => /^varchar/i.test(type.trim()));
+    if (preferred) {
+      return combineDataTypeForDatabase(dbType, preferred, getDefaultLengthForType(dbType, preferred));
+    }
+  }
+
   return dbType === "sqlite" ? "text" : "varchar(255)";
+}
+
+/** Index at which to insert a new column (after the selected row, or append when none). */
+export function resolveInsertColumnIndex(columns: readonly { id: string; markedForDrop?: boolean }[], selectedColumnId: string | null | undefined): number {
+  if (!selectedColumnId) return columns.length;
+  // Dropped rows are not valid insertion anchors.
+  const index = columns.findIndex((column) => column.id === selectedColumnId && !column.markedForDrop);
+  return index >= 0 ? index + 1 : columns.length;
 }
 
 function isMysqlDeprecatedDefaultParameterType(baseType: string): boolean {
@@ -1077,7 +1151,7 @@ export function isDataTypeLengthDisabled(_dbType: DatabaseType | undefined, base
     return key !== "geohash" && key !== "decimal";
   } else if (_dbType === "manticoresearch") {
     return key !== "bit" && key !== "float_vector";
-  } else if (_dbType === "postgres" || _dbType === "gaussdb" || _dbType === "kwdb" || _dbType === "opengauss" || _dbType === "highgo" || _dbType === "vastbase" || _dbType === "kingbase") {
+  } else if (_dbType === "postgres" || _dbType === "gaussdb" || _dbType === "kwdb" || _dbType === "opengauss" || _dbType === "highgo" || _dbType === "uxdb" || _dbType === "vastbase" || _dbType === "kingbase") {
     return POSTGRES_TYPE_LENGTH_DISABLES.includes(key);
   } else if (isOracleLikeStructureType(_dbType)) {
     // Dameng/Oracle integer aliases have fixed precision; MySQL-style display widths generate invalid DDL.

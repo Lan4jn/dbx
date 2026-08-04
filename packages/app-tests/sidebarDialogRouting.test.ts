@@ -4,6 +4,7 @@ import { test } from "vitest";
 
 const connectionTree = readFileSync("apps/desktop/src/components/sidebar/ConnectionTree.vue", "utf8");
 const treeItem = readFileSync("apps/desktop/src/components/sidebar/TreeItem.vue", "utf8");
+const runtimeHost = readFileSync("apps/desktop/src/components/sidebar/SidebarTreeRuntimeHost.vue", "utf8");
 const dialogHost = readFileSync("apps/desktop/src/components/sidebar/SidebarTreeItemDialogs.vue", "utf8");
 const dialogState = readFileSync("apps/desktop/src/components/sidebar/sidebarTreeDialogState.ts", "utf8");
 const visibleDatabasesDialog = readFileSync("apps/desktop/src/components/sidebar/VisibleDatabasesDialog.vue", "utf8");
@@ -14,7 +15,7 @@ function occurrences(source: string, value: string): number {
 }
 
 test("sidebar routes destructive confirmations through one tree-level host", () => {
-  assert.match(treeItem, /emit\("open-danger-dialog", route\.createRequest\(\)\)/);
+  assert.match(runtimeHost, /emit\("open-danger-dialog", route\.createRequest\(\)\)/);
   assert.match(connectionTree, /function openSidebarDangerDialog\(request: SidebarDangerDialogRequest\)/);
   assert.equal(occurrences(connectionTree, "<SidebarDangerConfirmDialog"), 1);
   assert.doesNotMatch(treeItem, /<DangerConfirmDialog/);
@@ -32,11 +33,17 @@ test("remaining form dialogs render once at tree level and keep confirm/cancel b
   assert.equal(occurrences(connectionTree, "<SidebarTreeItemDialogs"), 1);
   assert.doesNotMatch(treeItem, /<Dialog(?:\s|>)/);
   assert.doesNotMatch(treeItem, /<InstallExtensionDialog/);
+  assert.match(dialogHost, /<p class="min-w-0 break-words text-sm text-muted-foreground \[overflow-wrap:anywhere\]">\s*\{\{ connectionDeleteConfirmMessage\(\) \}\}/);
   assert.match(dialogHost, /v-model:open="showCreateDatabaseDialog"/);
   assert.match(dialogHost, /@click="showCreateDatabaseDialog = false"/);
   assert.match(dialogHost, /@click="confirmCreateDatabase"/);
   assert.match(dialogHost, /v-model:open="showPasteDialog"/);
   assert.match(dialogHost, /@click="confirmPasteTable"/);
+});
+
+test("dialog controller routing preserves shared open-flag refs instead of spreading them", () => {
+  assert.match(runtimeHost, /createRoutedSidebarDialogController\(/);
+  assert.doesNotMatch(runtimeHost, /reactive<Record<string, any>>\(\{ \.\.\.controller/);
 });
 
 test("saved object dialogs refresh the immutable active target", () => {
@@ -54,9 +61,10 @@ test("shared dialog state is owner-gated and confirm handlers use snapshots", ()
   assert.match(dialogState, /export const sidebarTreeDialogOwner = shallowRef<symbol \| null>\(null\)/);
   assert.match(dialogState, /export const sidebarDangerTarget = shallowRef<TreeNode \| null>\(null\)/);
   assert.match(dialogState, /export const sidebarFormTarget = shallowRef<TreeNode \| null>\(null\)/);
-  assert.match(treeItem, /sidebarTreeDialogOwner\.value !== treeItemDialogOwner/);
-  assert.match(treeItem, /const node = sidebarDangerTarget\.value \?\? props\.node/);
-  assert.match(treeItem, /const node = sidebarFormTarget\.value \?\? props\.node/);
-  assert.match(treeItem, /batchDropTargets\.value = targets\.slice\(\)/);
-  assert.match(treeItem, /batchTruncateTargets\.value = targets\.slice\(\)/);
+  assert.match(runtimeHost, /sidebarTreeDialogOwner\.value !== treeItemDialogOwner/);
+  assert.match(runtimeHost, /const node = sidebarDangerTarget\.value \?\? activeNode\.value/);
+  assert.match(runtimeHost, /const node = sidebarFormTarget\.value \?\? activeNode\.value/);
+  assert.match(runtimeHost, /batchDropTargets\.value = targets\.slice\(\)/);
+  assert.match(runtimeHost, /batchTruncateTargets\.value = targets\.slice\(\)/);
+  assert.match(runtimeHost, /activateActionTarget\(target\)/);
 });

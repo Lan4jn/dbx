@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::commands::connection::{ensure_connection_writable, AppState};
-use dbx_core::db::mongo_driver::MongoDocumentResult;
+use dbx_core::db::document_result::DocumentQueryResult;
 use dbx_core::document_ops::CollectionInfo;
 
 pub(crate) async fn run_cancellable<T, F>(
@@ -57,8 +57,9 @@ pub async fn document_find_documents(
     filter: Option<String>,
     projection: Option<String>,
     sort: Option<String>,
+    collation: Option<String>,
     execution_id: Option<String>,
-) -> Result<MongoDocumentResult, String> {
+) -> Result<DocumentQueryResult, String> {
     let app = state.inner().clone();
     run_cancellable(
         &app,
@@ -73,7 +74,25 @@ pub async fn document_find_documents(
             filter.as_deref(),
             projection.as_deref(),
             sort.as_deref(),
+            collation.as_deref(),
         ),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn elasticsearch_count_documents(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    index: String,
+    filter: Option<String>,
+    execution_id: Option<String>,
+) -> Result<u64, String> {
+    let app = state.inner().clone();
+    run_cancellable(
+        &app,
+        execution_id,
+        dbx_core::document_ops::count_elasticsearch_documents_core(&app, &connection_id, &index, filter.as_deref()),
     )
     .await
 }
@@ -85,9 +104,18 @@ pub async fn document_insert_document(
     database: String,
     collection: String,
     doc_json: String,
+    routing: Option<String>,
 ) -> Result<String, String> {
     ensure_connection_writable(&state, &connection_id, "Insert").await?;
-    dbx_core::document_ops::insert_document_core(&state, &connection_id, &database, &collection, &doc_json).await
+    dbx_core::document_ops::insert_document_core(
+        &state,
+        &connection_id,
+        &database,
+        &collection,
+        &doc_json,
+        routing.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -121,15 +149,17 @@ pub async fn document_delete_document(
     collection: String,
     id: String,
     routing: Option<String>,
+    document_type: Option<String>,
 ) -> Result<u64, String> {
     ensure_connection_writable(&state, &connection_id, "Delete").await?;
-    dbx_core::document_ops::delete_document_core(
+    dbx_core::document_ops::delete_document_core_with_type(
         &state,
         &connection_id,
         &database,
         &collection,
         &id,
         routing.as_deref(),
+        document_type.as_deref(),
     )
     .await
 }

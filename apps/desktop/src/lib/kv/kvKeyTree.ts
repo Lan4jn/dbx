@@ -1,15 +1,18 @@
-import type { KvKeySummary } from "@/lib/backend/api";
+import type { KvKeySummary, KvValue } from "@/lib/backend/api";
 
 export interface KvKeyTreeLeafNode {
   kind: "leaf";
   id: string;
   label: string;
   key: string;
+  leadingSlash: boolean;
+  keyIdentity?: string | null;
+  keyBytes?: KvValue | null;
   pathSegments: string[];
-  createRevision?: number | null;
-  modRevision?: number | null;
-  version?: number | null;
-  lease?: number | null;
+  createRevision?: string | number | null;
+  modRevision?: string | number | null;
+  version?: string | number | null;
+  lease?: string | number | null;
   valueSize?: number | null;
 }
 
@@ -17,8 +20,17 @@ export interface KvKeyTreeGroupNode {
   kind: "group";
   id: string;
   label: string;
+  leadingSlash: boolean;
   pathSegments: string[];
   children: KvKeyTreeNode[];
+  key?: string;
+  keyIdentity?: string | null;
+  keyBytes?: KvValue | null;
+  createRevision?: string | number | null;
+  modRevision?: string | number | null;
+  version?: string | number | null;
+  lease?: string | number | null;
+  valueSize?: number | null;
 }
 
 export type KvKeyTreeNode = KvKeyTreeLeafNode | KvKeyTreeGroupNode;
@@ -28,16 +40,31 @@ export interface KvKeyTreeRow {
   depth: number;
 }
 
-function keySegments(key: string): string[] {
-  return key.split("/").filter(Boolean);
+function keyPath(key: string): { segments: string[]; leadingSlash: boolean } {
+  return {
+    segments: key.split("/").filter(Boolean),
+    leadingSlash: key.startsWith("/"),
+  };
 }
 
-function groupId(pathSegments: string[]): string {
-  return `group:${pathSegments.join("\u0000")}`;
+function groupId(pathSegments: string[], leadingSlash: boolean): string {
+  return `group:${leadingSlash ? "/" : ""}${pathSegments.join("\u0000")}`;
 }
 
-function leafId(key: string): string {
-  return `leaf:${key}`;
+function nodePathIdentity(pathSegments: string[], leadingSlash: boolean): string {
+  return `${leadingSlash ? "/" : ""}${pathSegments.join("\u0000")}`;
+}
+
+function treeLabel(segment: string, index: number, leadingSlash: boolean): string {
+  return leadingSlash && index === 0 ? `/${segment}` : segment;
+}
+
+function summaryIdentity(key: KvKeySummary): string {
+  return key.keyIdentity ?? key.key;
+}
+
+function leafId(key: KvKeySummary): string {
+  return `leaf:${summaryIdentity(key)}`;
 }
 
 function sortNodes(nodes: KvKeyTreeNode[]): KvKeyTreeNode[] {
@@ -54,13 +81,16 @@ export function buildKvKeyTree(keys: KvKeySummary[]): KvKeyTreeNode[] {
   const groups = new Map<string, KvKeyTreeGroupNode>();
 
   for (const key of keys) {
-    const segments = keySegments(key.key);
+    const { segments, leadingSlash } = keyPath(key.key);
     if (segments.length <= 1) {
       root.push({
         kind: "leaf",
-        id: leafId(key.key),
-        label: segments[0] || key.key || "/",
+        id: leafId(key),
+        label: segments[0] ? treeLabel(segments[0], 0, leadingSlash) : key.key || "/",
         key: key.key,
+        leadingSlash,
+        keyIdentity: key.keyIdentity,
+        keyBytes: key.keyBytes,
         pathSegments: segments,
         createRevision: key.createRevision,
         modRevision: key.modRevision,
@@ -73,23 +103,56 @@ export function buildKvKeyTree(keys: KvKeySummary[]): KvKeyTreeNode[] {
 
     let current = root;
     const groupSegments: string[] = [];
-    for (const segment of segments.slice(0, -1)) {
+    for (const [index, segment] of segments.slice(0, -1).entries()) {
       groupSegments.push(segment);
-      const id = groupId(groupSegments);
+      const id = groupId(groupSegments, leadingSlash);
       let group = groups.get(id);
       if (!group) {
-        group = { kind: "group", id, label: segment, pathSegments: [...groupSegments], children: [] };
+        const leafIndex = current.findIndex((candidate) => candidate.kind === "leaf" && nodePathIdentity(candidate.pathSegments, candidate.leadingSlash) === nodePathIdentity(groupSegments, leadingSlash));
+        const existingLeaf = leafIndex >= 0 ? (current.splice(leafIndex, 1)[0] as KvKeyTreeLeafNode) : null;
+        group = {
+          kind: "group",
+          id,
+          label: treeLabel(segment, index, leadingSlash),
+          leadingSlash,
+          pathSegments: [...groupSegments],
+          children: [],
+          key: existingLeaf?.key,
+          keyIdentity: existingLeaf?.keyIdentity,
+          keyBytes: existingLeaf?.keyBytes,
+          createRevision: existingLeaf?.createRevision,
+          modRevision: existingLeaf?.modRevision,
+          version: existingLeaf?.version,
+          lease: existingLeaf?.lease,
+          valueSize: existingLeaf?.valueSize,
+        };
         groups.set(id, group);
         current.push(group);
       }
       current = group.children;
     }
 
+    const existingGroup = groups.get(groupId(segments, leadingSlash));
+    if (existingGroup) {
+      existingGroup.key = key.key;
+      existingGroup.keyIdentity = key.keyIdentity;
+      existingGroup.keyBytes = key.keyBytes;
+      existingGroup.createRevision = key.createRevision;
+      existingGroup.modRevision = key.modRevision;
+      existingGroup.version = key.version;
+      existingGroup.lease = key.lease;
+      existingGroup.valueSize = key.valueSize;
+      continue;
+    }
+
     current.push({
       kind: "leaf",
-      id: leafId(key.key),
+      id: leafId(key),
       label: segments[segments.length - 1],
       key: key.key,
+      leadingSlash,
+      keyIdentity: key.keyIdentity,
+      keyBytes: key.keyBytes,
       pathSegments: segments,
       createRevision: key.createRevision,
       modRevision: key.modRevision,
@@ -133,4 +196,12 @@ export function flattenVisibleKvKeyTree(nodes: KvKeyTreeNode[], expandedGroupIds
     }
   }
   return rows;
+}
+
+export function kvKeyTreeNodePath(node: KvKeyTreeNode): string {
+  if (node.kind === "leaf") return node.key;
+  if (node.key) return node.key;
+
+  const joined = node.pathSegments.join("/");
+  return node.leadingSlash ? `/${joined}` : joined;
 }

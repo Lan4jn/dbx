@@ -12,7 +12,7 @@ fn quote_identifier(value: &str) -> String {
 fn row_get<T, I>(row: &mysql_async::Row, index: I) -> Option<T>
 where
     T: mysql_async::prelude::FromValue,
-    I: mysql_common::prelude::ColumnIndex,
+    I: mysql_async::prelude::ColumnIndex,
 {
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }
@@ -40,6 +40,7 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
             name: table.name,
             object_type: "TABLE".to_string(),
             schema: Some(database.to_string()),
+            valid: None,
             signature: None,
             comment: table.comment,
             created_at: None,
@@ -100,6 +101,7 @@ fn plugin_object(
         name: name.to_string(),
         object_type: "FUNCTION".to_string(),
         schema: Some(database.to_string()),
+        valid: None,
         signature: None,
         comment: if comment_parts.is_empty() { None } else { Some(comment_parts.join(", ")) },
         created_at: None,

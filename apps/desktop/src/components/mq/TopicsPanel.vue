@@ -1,9 +1,27 @@
 <script setup lang="ts">
 import { ref, watch, computed } from "vue";
 import { useI18n } from "vue-i18n";
-import type { NamespaceRef, TopicRef, TopicInfo, ListTopicsOpts } from "@/types/mq";
-import { mqListTopics, mqCreateTopic, mqDeleteTopic, mqUpdatePartitions } from "@/lib/backend/api";
+import { RecycleScroller } from "vue-virtual-scroller";
+import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
+import type { NamespaceRef, TopicRef, TopicInfo, ListTopicsOpts, MqSystemKind, RocketMqTopicMessageType } from "@/types/mq";
+import { mqListTopics, mqCreateTopic, mqDeleteTopic, mqUpdatePartitions, mqGetClusterInfo } from "@/lib/backend/api";
+import type { ClusterInfo } from "@/types/mq";
+import RocketMqTopicDialogs, { type RocketMqTopicDialogKind } from "./rocketmq/RocketMqTopicDialogs.vue";
+import SendMessagePanel from "./SendMessagePanel.vue";
+import ExchangesPanel from "./ExchangesPanel.vue";
+import MqTypeFilterBar from "./shared/MqTypeFilterBar.vue";
+import type { MqTab } from "@/lib/mq/mqConsoleDefaults";
+import { isAllVhostsNamespace, resolveMqRowNamespace } from "@/lib/mq/mqConsoleDefaults";
 import { formatError } from "@/lib/backend/errorUtils";
+import { DEFAULT_ROCKETMQ_TOPIC_TYPE_FILTERS, isProtectedRocketMqTopic, isRocketMqBusinessMessageType, matchesRocketMqTypeFilters, resolveRocketMqMessageType, ROCKETMQ_CREATABLE_TOPIC_MESSAGE_TYPES, ROCKETMQ_TOPIC_MESSAGE_TYPES } from "@/lib/mq/rocketmqTopicTypes";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
+
+const TOPIC_ROW_HEIGHT = 44;
+
+type VirtualTopicRow = {
+  id: string;
+  topic: TopicInfo;
+};
 
 interface Props {
   connectionId: string;
@@ -11,12 +29,15 @@ interface Props {
   namespace?: string;
   readOnly?: boolean;
   supportsPartitionedTopics?: boolean;
-  isKafkaCluster?: boolean;
+  isFlatMqCluster?: boolean;
+  mqSystemKind?: MqSystemKind;
+  supportsExchanges?: boolean;
 }
 
 const props = defineProps<Props>();
 const emit = defineEmits<{
   topicSelected: [topic: TopicInfo];
+  navigateTab: [payload: { tab: MqTab; topic?: TopicInfo; subscription?: string; preferDlqTopic?: boolean }];
 }>();
 
 const { t } = useI18n();
@@ -30,25 +51,142 @@ const showPartitionsDialog = ref(false);
 const selectedTopic = ref<TopicInfo>();
 const editingTopic = ref<TopicInfo>();
 const topicSearch = ref("");
+const deleteTarget = ref<TopicInfo>();
+const showDeleteDialog = ref(false);
+const deleting = ref(false);
+
+const clusterInfo = ref<ClusterInfo>();
+const activeRocketMqDialog = ref<RocketMqTopicDialogKind | null>(null);
+const rocketMqDialogTopic = ref<TopicInfo>();
+const showSendDialog = ref(false);
+const sendDialogTopic = ref<TopicInfo>();
+
+const ROCKETMQ_PERM_OPTIONS = [
+  { value: 6, labelKey: "mqTopics.permReadWrite" },
+  { value: 4, labelKey: "mqTopics.permRead" },
+  { value: 2, labelKey: "mqTopics.permWrite" },
+] as const;
 
 const formData = ref({
   topicName: "",
   persistent: true,
   partitioned: false,
   partitions: 4,
+  messageType: "NORMAL" as RocketMqTopicMessageType,
+  brokerName: "",
+  readQueueNums: 8,
+  writeQueueNums: 8,
+  perm: 6,
 });
 
 const newPartitions = ref(4);
 
 const includeNonPersistent = ref(false);
+const includeSystemTopics = ref(false);
+const messageTypeFilters = ref<Record<RocketMqTopicMessageType, boolean>>({
+  ...DEFAULT_ROCKETMQ_TOPIC_TYPE_FILTERS,
+});
+
+const isRocketMqCluster = computed(() => props.mqSystemKind === "rocketmq");
+const isKafkaCluster = computed(() => props.mqSystemKind === "kafka");
+const isRabbitMqCluster = computed(() => props.mqSystemKind === "rabbitmq");
+// RabbitMQ "all vhosts" mode: rows carry their own vhost in `namespace`.
+const showNamespaceColumn = computed(() => isRabbitMqCluster.value && isAllVhostsNamespace(props.namespace));
+// RabbitMQ splits the topics tab into Queues (topics table) and Exchanges views.
+const showRabbitMqSubTabs = computed(() => isRabbitMqCluster.value && props.supportsExchanges === true);
+const rabbitMqSubTab = ref<"queues" | "exchanges">("queues");
+const rocketMqTopicTypeOptions = ROCKETMQ_TOPIC_MESSAGE_TYPES;
+const rocketMqCreatableTopicTypes = ROCKETMQ_CREATABLE_TOPIC_MESSAGE_TYPES;
+const rocketMqClusterName = computed(() => clusterInfo.value?.clusterId ?? "-");
+const rocketMqBrokerOptions = computed(() => clusterInfo.value?.brokers ?? []);
+const rocketMqMasterBrokers = computed(() => rocketMqBrokerOptions.value.filter((broker) => !broker.role || broker.role === "MASTER"));
+
+const typeFilteredTopics = computed(() => {
+  let rows = topics.value;
+  if (isRocketMqCluster.value) {
+    rows = rows.filter((topic) => matchesRocketMqTypeFilters(topic, messageTypeFilters.value));
+  } else if (props.isFlatMqCluster && !includeSystemTopics.value) {
+    rows = rows.filter((topic) => !topic.internal);
+  }
+  return rows;
+});
 
 const filteredTopics = computed(() => {
   const query = topicSearch.value.trim().toLowerCase();
-  if (!query) return topics.value;
-  return topics.value.filter((topic) => {
+  if (!query) return typeFilteredTopics.value;
+  return typeFilteredTopics.value.filter((topic) => {
     return topic.name.toLowerCase().includes(query) || topic.shortName.toLowerCase().includes(query);
   });
 });
+
+/** Stable ids for RecycleScroller; avoids mounting all topic rows at once. */
+const virtualTopicRows = computed<VirtualTopicRow[]>(() =>
+  filteredTopics.value.map((topic) => ({
+    id: showNamespaceColumn.value ? `${topic.namespace ?? ""}:${topic.name}` : topic.name,
+    topic,
+  })),
+);
+
+const topicsGridTemplate = computed(() => {
+  const cols: string[] = ["minmax(180px, 1.6fr)"];
+  if (showNamespaceColumn.value) cols.push("minmax(100px, 0.8fr)");
+  cols.push("120px");
+  if (!isRocketMqCluster.value) cols.push("140px");
+  // RocketMQ keeps tiled row actions (status/route/consumers/…) — reserve a wider actions column.
+  cols.push(isRocketMqCluster.value ? "minmax(560px, 2.2fr)" : "minmax(200px, 1fr)");
+  return cols.join(" ");
+});
+
+/** Min content width from grid track mins + gaps + padding; enables shared horizontal scroll. */
+const topicsTableMinWidthPx = computed(() => {
+  let min = 180 + 120; // name + type
+  if (showNamespaceColumn.value) min += 100;
+  if (!isRocketMqCluster.value) min += 140;
+  min += isRocketMqCluster.value ? 560 : 200;
+  let colCount = 3;
+  if (showNamespaceColumn.value) colCount += 1;
+  if (!isRocketMqCluster.value) colCount += 1;
+  min += (colCount - 1) * 8; // column-gap
+  min += 24; // horizontal padding
+  return min;
+});
+
+const userTopicCount = computed(() => {
+  if (isRocketMqCluster.value) {
+    return topics.value.filter((topic) => isRocketMqBusinessMessageType(resolveRocketMqMessageType(topic))).length;
+  }
+  return topics.value.filter((topic) => !topic.internal).length;
+});
+
+function topicRowSelected(topic: TopicInfo): boolean {
+  return selectedTopic.value?.name === topic.name && selectedTopic.value?.namespace === topic.namespace;
+}
+
+function topicTypeLabel(topic: TopicInfo): string {
+  if (isRocketMqCluster.value) {
+    const type = resolveRocketMqMessageType(topic);
+    return t(`mqTopics.rocketmqType.${type.toLowerCase()}`);
+  }
+  if (topic.internal) return t("mqTopics.systemTopic");
+  if (topic.partitioned) return t("mqTopics.partitionedTopic");
+  return t("mqTopics.normalTopic");
+}
+
+function topicTypeBadgeClass(topic: TopicInfo): string {
+  if (isRocketMqCluster.value) {
+    const type = resolveRocketMqMessageType(topic);
+    if (type === "SYSTEM" || type === "RETRY" || type === "DLQ") return "badge-warning";
+    if (type === "DELAY" || type === "FIFO" || type === "TRANSACTION") return "badge-info";
+    return "badge-default";
+  }
+  if (topic.internal) return "badge-warning";
+  if (topic.partitioned) return "badge-info";
+  return "badge-default";
+}
+
+function isTopicProtected(topic: TopicInfo): boolean {
+  return isRocketMqCluster.value ? isProtectedRocketMqTopic(topic) : !!topic.internal;
+}
 const editingCurrentPartitions = computed(() => editingTopic.value?.partitions ?? 0);
 const canSubmitPartitionUpdate = computed(() => {
   const current = editingCurrentPartitions.value;
@@ -86,16 +224,86 @@ async function loadTopics() {
   }
 }
 
+async function loadClusterInfo() {
+  if (!isRocketMqCluster.value) return;
+  try {
+    clusterInfo.value = await mqGetClusterInfo(props.connectionId);
+  } catch (e: unknown) {
+    console.warn("[DBX] Failed to load RocketMQ cluster info:", e);
+  }
+}
+
 function openCreateDialog() {
   if (!guardWritable()) return;
   dialogError.value = undefined;
+  const defaultBroker = rocketMqMasterBrokers.value[0]?.brokerName ?? rocketMqBrokerOptions.value[0]?.brokerName ?? "";
   formData.value = {
     topicName: "",
     persistent: true,
-    partitioned: props.isKafkaCluster ?? false,
+    partitioned: props.isFlatMqCluster ?? false,
     partitions: 4,
+    messageType: "NORMAL",
+    brokerName: defaultBroker,
+    readQueueNums: 8,
+    writeQueueNums: 8,
+    perm: 6,
   };
   showCreateDialog.value = true;
+}
+
+function openRocketMqDialog(kind: RocketMqTopicDialogKind, topic: TopicInfo) {
+  rocketMqDialogTopic.value = topic;
+  activeRocketMqDialog.value = kind;
+}
+
+function closeRocketMqDialog() {
+  activeRocketMqDialog.value = null;
+  rocketMqDialogTopic.value = undefined;
+}
+
+function handleRocketMqNavigate(payload: { tab: "subscriptions" | "messages"; subscription?: string }) {
+  if (!rocketMqDialogTopic.value) return;
+  if (payload.tab === "messages") {
+    openSendDialog(rocketMqDialogTopic.value);
+    closeRocketMqDialog();
+    return;
+  }
+  emit("navigateTab", {
+    tab: payload.tab,
+    topic: rocketMqDialogTopic.value,
+    subscription: payload.subscription,
+  });
+  closeRocketMqDialog();
+}
+
+function openSendDialog(topic: TopicInfo) {
+  sendDialogTopic.value = topic;
+  showSendDialog.value = true;
+}
+
+function closeSendDialog() {
+  showSendDialog.value = false;
+  sendDialogTopic.value = undefined;
+}
+
+function navigateToMessages(topic: TopicInfo) {
+  if (isRocketMqCluster.value) {
+    openSendDialog(topic);
+    return;
+  }
+  emit("navigateTab", { tab: "messages", topic });
+}
+
+function navigateToMessageQuery(topic: TopicInfo, preferDlqTopic = false) {
+  emit("navigateTab", {
+    tab: "messages",
+    topic,
+    preferDlqTopic,
+  });
+}
+
+function isDlqTopic(topic: TopicInfo): boolean {
+  return resolveRocketMqMessageType(topic) === "DLQ";
 }
 
 function openPartitionsDialog(topic: TopicInfo) {
@@ -125,6 +333,13 @@ async function handleCreate() {
       topic: formData.value.topicName,
       persistent: formData.value.persistent,
     };
+    if (isRocketMqCluster.value) {
+      topicRef.messageType = formData.value.messageType;
+      topicRef.brokerName = formData.value.brokerName || undefined;
+      topicRef.readQueueNums = formData.value.readQueueNums;
+      topicRef.writeQueueNums = formData.value.writeQueueNums;
+      topicRef.perm = formData.value.perm;
+    }
     const partitions = props.supportsPartitionedTopics !== false && formData.value.partitioned ? formData.value.partitions : undefined;
     await mqCreateTopic(props.connectionId, topicRef, partitions);
     showCreateDialog.value = false;
@@ -137,28 +352,40 @@ async function handleCreate() {
   }
 }
 
-async function handleDelete(topic: TopicInfo) {
+function handleDelete(topic: TopicInfo) {
   if (!guardWritable()) return;
-  if (!confirm(t("mqTopics.confirmDelete", { name: topic.shortName }))) return;
-  if (!props.tenant || !props.namespace) return;
-  loading.value = true;
+  deleteTarget.value = topic;
+  showDeleteDialog.value = true;
+}
+
+async function confirmDelete() {
+  const topic = deleteTarget.value;
+  if (!topic || !props.tenant || !props.namespace) return;
+  const namespace = resolveMqRowNamespace(topic, props.namespace);
+  if (!namespace) {
+    error.value = t("mqAdmin.selectNamespaceToWrite");
+    showDeleteDialog.value = false;
+    return;
+  }
+  deleting.value = true;
   error.value = undefined;
   try {
     const topicRef: TopicRef = {
       tenant: props.tenant,
-      namespace: props.namespace,
+      namespace,
       topic: topic.shortName,
       persistent: topic.persistent,
     };
     await mqDeleteTopic(props.connectionId, topicRef, false);
-    if (selectedTopic.value?.name === topic.name) {
+    if (selectedTopic.value?.name === topic.name && selectedTopic.value?.namespace === topic.namespace) {
       selectedTopic.value = undefined;
     }
+    showDeleteDialog.value = false;
     await loadTopics();
   } catch (e: unknown) {
     error.value = formatError(e);
   } finally {
-    loading.value = false;
+    deleting.value = false;
   }
 }
 
@@ -212,6 +439,15 @@ watch(
   () => {
     selectedTopic.value = undefined;
     loadTopics();
+    if (isRocketMqCluster.value) void loadClusterInfo();
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.mqSystemKind,
+  () => {
+    if (isRocketMqCluster.value) void loadClusterInfo();
   },
   { immediate: true },
 );
@@ -229,140 +465,256 @@ watch(newPartitions, () => {
 
 <template>
   <div class="topics-panel">
-    <div class="panel-toolbar">
-      <div class="toolbar-left">
-        <h3>{{ t("mqTopics.title") }}</h3>
-        <input v-model="topicSearch" type="search" class="topic-search" :placeholder="t('mqTopics.searchPlaceholder')" :disabled="loading && !topics.length" />
-        <span v-if="topics.length" class="topic-count">{{ filteredTopics.length }} / {{ topics.length }}</span>
-        <label class="checkbox-label">
-          <input type="checkbox" v-model="includeNonPersistent" />
-          {{ t("mqTopics.includeNonPersistent") }}
+    <div v-if="showRabbitMqSubTabs" class="rabbitmq-subtabs">
+      <button :class="{ active: rabbitMqSubTab === 'queues' }" @click="rabbitMqSubTab = 'queues'">{{ t("mqTopics.tabQueues") }}</button>
+      <button :class="{ active: rabbitMqSubTab === 'exchanges' }" @click="rabbitMqSubTab = 'exchanges'">{{ t("mqTopics.tabExchanges") }}</button>
+    </div>
+
+    <ExchangesPanel v-if="showRabbitMqSubTabs && rabbitMqSubTab === 'exchanges'" :connection-id="connectionId" :tenant="tenant" :namespace="namespace" :read-only="readOnly" />
+
+    <template v-else>
+      <div class="panel-toolbar">
+        <div class="toolbar-left">
+          <h3>{{ t("mqTopics.title") }}</h3>
+          <input v-model="topicSearch" type="search" class="topic-search" :placeholder="t('mqTopics.searchPlaceholder')" :disabled="loading && !topics.length" />
+          <span v-if="topics.length" class="topic-count"> {{ filteredTopics.length }} / {{ typeFilteredTopics.length }} </span>
+          <label v-if="isKafkaCluster" class="checkbox-label">
+            <input v-model="includeSystemTopics" type="checkbox" />
+            {{ t("mqTopics.includeSystemTopics") }}
+          </label>
+          <label v-else-if="!isRocketMqCluster" class="checkbox-label">
+            <input v-model="includeNonPersistent" type="checkbox" />
+            {{ t("mqTopics.includeNonPersistent") }}
+          </label>
+        </div>
+        <div class="toolbar-actions">
+          <button @click="loadTopics" :disabled="loading || !tenant || !namespace" class="btn-secondary">
+            {{ loading ? t("mqTopics.refreshing") : t("mqTopics.refresh") }}
+          </button>
+          <button @click="openCreateDialog" :disabled="loading || readOnly || !tenant || !namespace || showNamespaceColumn" :title="showNamespaceColumn ? t('mqAdmin.selectNamespaceToCreate') : undefined" class="btn-primary">+ {{ t("mqTopics.createTopic") }}</button>
+        </div>
+      </div>
+
+      <MqTypeFilterBar v-if="isRocketMqCluster && tenant && namespace" :label="t('mqTopics.typeFilter')">
+        <label v-for="type in rocketMqTopicTypeOptions" :key="type" class="checkbox-label compact">
+          <input v-model="messageTypeFilters[type]" type="checkbox" />
+          {{ t(`mqTopics.rocketmqType.${type.toLowerCase()}`) }}
         </label>
+      </MqTypeFilterBar>
+
+      <div v-if="!tenant || !namespace" class="panel-placeholder">{{ t("mqTopics.selectTenantNamespace") }}</div>
+
+      <div v-else-if="error" class="panel-error">{{ error }}</div>
+
+      <div v-else-if="loading && !topics.length" class="panel-loading">{{ t("mqTopics.loading") }}</div>
+
+      <div v-else-if="!topics.length" class="panel-placeholder">{{ t("mqTopics.noTopics") }}</div>
+
+      <div v-else-if="!filteredTopics.length" class="panel-placeholder">
+        {{ isRocketMqCluster && userTopicCount === 0 ? t("mqTopics.noUserTopics") : isKafkaCluster && !includeSystemTopics && userTopicCount === 0 ? t("mqTopics.noUserTopics") : t("mqTopics.noMatches") }}
       </div>
-      <div class="toolbar-actions">
-        <button @click="loadTopics" :disabled="loading || !tenant || !namespace" class="btn-secondary">
-          {{ loading ? t("mqTopics.refreshing") : t("mqTopics.refresh") }}
-        </button>
-        <button @click="openCreateDialog" :disabled="loading || readOnly || !tenant || !namespace" class="btn-primary">+ {{ t("mqTopics.createTopic") }}</button>
-      </div>
-    </div>
 
-    <div v-if="!tenant || !namespace" class="panel-placeholder">{{ t("mqTopics.selectTenantNamespace") }}</div>
-
-    <div v-else-if="error" class="panel-error">{{ error }}</div>
-
-    <div v-else-if="loading && !topics.length" class="panel-loading">{{ t("mqTopics.loading") }}</div>
-
-    <div v-else-if="!topics.length" class="panel-placeholder">{{ t("mqTopics.noTopics") }}</div>
-
-    <div v-else-if="!filteredTopics.length" class="panel-placeholder">{{ t("mqTopics.noMatches") }}</div>
-
-    <div v-else class="topics-table">
-      <table>
-        <thead>
-          <tr>
-            <th>{{ t("mqTopics.name") }}</th>
-            <th>{{ t("mqTopics.type") }}</th>
-            <th>{{ t("mqTopics.partitions") }}</th>
-            <th>{{ t("mqTopics.actions") }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="topic in filteredTopics" :key="topic.name" :class="{ selected: selectedTopic?.name === topic.name }" @click="selectTopic(topic)">
-            <td class="topic-name">
-              <div class="topic-name-cell">
-                <span>{{ topic.shortName }}</span>
-                <span v-if="!topic.persistent" class="badge badge-warning">{{ t("mqTopics.nonPersistent") }}</span>
+      <div v-else class="topics-table">
+        <!-- Shared horizontal scroller keeps header/body columns aligned when the grid min-width exceeds the panel. -->
+        <div class="topics-table-hscroll" :style="{ '--topics-table-min-width': `${topicsTableMinWidthPx}px` }">
+          <div class="topics-table-header" :style="{ gridTemplateColumns: topicsGridTemplate }">
+            <div class="topics-col">{{ t("mqTopics.name") }}</div>
+            <div v-if="showNamespaceColumn" class="topics-col">{{ t("mqAdmin.namespace") }}</div>
+            <div class="topics-col">{{ t("mqTopics.type") }}</div>
+            <div v-if="!isRocketMqCluster" class="topics-col">{{ t("mqTopics.partitions") }}</div>
+            <div class="topics-col">{{ t("mqTopics.actions") }}</div>
+          </div>
+          <RecycleScroller class="topics-scroller" :items="virtualTopicRows" :item-size="TOPIC_ROW_HEIGHT" :buffer="200" key-field="id">
+            <template #default="{ item: row }">
+              <div class="topics-row" :class="{ selected: topicRowSelected(row.topic) }" :style="{ gridTemplateColumns: topicsGridTemplate, height: `${TOPIC_ROW_HEIGHT}px` }" @click="selectTopic(row.topic)">
+                <div class="topics-col topic-name">
+                  <div class="topic-name-cell">
+                    <span class="topic-name-text" :title="row.topic.shortName">{{ row.topic.shortName }}</span>
+                    <span v-if="!row.topic.persistent" class="badge badge-warning">{{ t("mqTopics.nonPersistent") }}</span>
+                  </div>
+                </div>
+                <div v-if="showNamespaceColumn" class="topics-col">{{ row.topic.namespace || "-" }}</div>
+                <div class="topics-col">
+                  <span class="badge" :class="topicTypeBadgeClass(row.topic)">
+                    {{ topicTypeLabel(row.topic) }}
+                  </span>
+                </div>
+                <div v-if="!isRocketMqCluster" class="topics-col">
+                  <span v-if="row.topic.partitioned">{{ row.topic.partitions ? t("mqTopics.partitionCount", { count: row.topic.partitions }) : t("mqTopics.partitionsUnknown") }}</span>
+                  <span v-else class="text-muted">-</span>
+                </div>
+                <div class="topics-col actions" @click.stop>
+                  <template v-if="isRocketMqCluster">
+                    <button type="button" class="btn-sm" @click="openRocketMqDialog('status', row.topic)">{{ t("mqTopics.actionStatus") }}</button>
+                    <button type="button" class="btn-sm" @click="openRocketMqDialog('route', row.topic)">{{ t("mqTopics.actionRoute") }}</button>
+                    <button type="button" class="btn-sm" @click="openRocketMqDialog('consumers', row.topic)">{{ t("mqTopics.actionConsumers") }}</button>
+                    <button v-if="isDlqTopic(row.topic)" type="button" class="btn-sm" @click="navigateToMessageQuery(row.topic, true)">{{ t("mqRocketmq.viewDlqMessages") }}</button>
+                    <template v-else>
+                      <button type="button" class="btn-sm" @click="navigateToMessageQuery(row.topic)">{{ t("mqRocketmq.actionMessageQuery") }}</button>
+                      <button type="button" class="btn-sm" :disabled="readOnly" @click="navigateToMessages(row.topic)">{{ t("mqRocketmq.actionSendMessage") }}</button>
+                    </template>
+                    <button type="button" class="btn-sm" @click="openRocketMqDialog('config', row.topic)">{{ t("mqTopics.actionConfig") }}</button>
+                    <button type="button" class="btn-sm" :disabled="readOnly || isTopicProtected(row.topic)" @click="openRocketMqDialog('reset', row.topic)">{{ t("mqTopics.actionReset") }}</button>
+                    <button type="button" class="btn-sm" :disabled="readOnly || isTopicProtected(row.topic)" @click="openRocketMqDialog('skip', row.topic)">{{ t("mqTopics.actionSkip") }}</button>
+                    <button type="button" class="btn-sm btn-danger" :disabled="readOnly || isTopicProtected(row.topic)" @click="handleDelete(row.topic)">{{ t("mqTopics.delete") }}</button>
+                  </template>
+                  <template v-else>
+                    <button v-if="row.topic.partitioned && supportsPartitionedTopics !== false && !isTopicProtected(row.topic)" type="button" @click="openPartitionsDialog(row.topic)" :disabled="readOnly || !row.topic.partitions" class="btn-sm">
+                      {{ t("mqTopics.adjustPartitions") }}
+                    </button>
+                    <button
+                      type="button"
+                      @click="handleDelete(row.topic)"
+                      :disabled="readOnly || isTopicProtected(row.topic) || (showNamespaceColumn && !row.topic.namespace)"
+                      :title="showNamespaceColumn && !row.topic.namespace ? t('mqAdmin.selectNamespaceToWrite') : undefined"
+                      class="btn-sm btn-danger"
+                    >
+                      {{ t("mqTopics.delete") }}
+                    </button>
+                  </template>
+                </div>
               </div>
-            </td>
-            <td>
-              <span class="badge" :class="topic.partitioned ? 'badge-info' : 'badge-default'">
-                {{ topic.partitioned ? t("mqTopics.partitionedTopic") : t("mqTopics.normalTopic") }}
-              </span>
-            </td>
-            <td>
-              <span v-if="topic.partitioned">{{ topic.partitions ? t("mqTopics.partitionCount", { count: topic.partitions }) : t("mqTopics.partitionsUnknown") }}</span>
-              <span v-else class="text-muted">-</span>
-            </td>
-            <td class="actions">
-              <button v-if="topic.partitioned && supportsPartitionedTopics !== false" @click.stop="openPartitionsDialog(topic)" :disabled="readOnly || !topic.partitions" class="btn-sm">
-                {{ t("mqTopics.adjustPartitions") }}
-              </button>
-              <button @click.stop="handleDelete(topic)" :disabled="readOnly" class="btn-sm btn-danger">{{ t("mqTopics.delete") }}</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <!-- Create Dialog -->
-    <div v-if="showCreateDialog" class="dialog-overlay" @click="showCreateDialog = false">
-      <div class="dialog" @click.stop>
-        <div class="dialog-header">
-          <h3>{{ t("mqTopics.createTopic") }}</h3>
-          <button @click="showCreateDialog = false" class="btn-close">×</button>
+            </template>
+          </RecycleScroller>
         </div>
-        <div class="dialog-body">
-          <div v-if="!isKafkaCluster" class="form-group">
-            <label>{{ t("mqTopics.tenantNamespace") }}</label>
-            <input type="text" :value="`${tenant} / ${namespace}`" disabled />
+      </div>
+
+      <!-- Create Dialog -->
+      <div v-if="showCreateDialog" class="dialog-overlay" @click="showCreateDialog = false">
+        <div class="dialog" @click.stop>
+          <div class="dialog-header">
+            <h3>{{ t("mqTopics.createTopic") }}</h3>
+            <button @click="showCreateDialog = false" class="btn-close">×</button>
           </div>
-          <div class="form-group">
-            <label>{{ t("mqTopics.topicName") }}*</label>
-            <input v-model="formData.topicName" type="text" :placeholder="t('mqTopics.topicNamePlaceholder')" :disabled="readOnly" />
-          </div>
-          <div class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" v-model="formData.persistent" :disabled="readOnly" />
-              {{ t("mqTopics.persistentRecommended") }}
-            </label>
-            <div class="form-hint">{{ t("mqTopics.persistentHint") }}</div>
-          </div>
-          <div v-if="supportsPartitionedTopics !== false" class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" v-model="formData.partitioned" :disabled="readOnly" />
-              {{ t("mqTopics.enablePartitions") }}
-            </label>
-            <div v-if="formData.partitioned" class="form-subgroup">
-              <label>{{ t("mqTopics.partitionQuantity") }}*</label>
-              <input v-model.number="formData.partitions" type="number" min="1" max="256" :disabled="readOnly" />
-              <div class="form-hint">{{ t("mqTopics.partitionHint") }}</div>
+          <div class="dialog-body">
+            <div v-if="!isRocketMqCluster && !isFlatMqCluster" class="form-group">
+              <label>{{ t("mqTopics.tenantNamespace") }}</label>
+              <input type="text" :value="`${tenant} / ${namespace}`" disabled />
             </div>
+            <div v-if="isRocketMqCluster" class="form-group">
+              <label>{{ t("mqTopics.clusterName") }}</label>
+              <input type="text" :value="rocketMqClusterName" disabled />
+            </div>
+            <div v-if="isRocketMqCluster" class="form-group">
+              <label>{{ t("mqTopics.brokerName") }}*</label>
+              <select v-model="formData.brokerName" :disabled="readOnly">
+                <option value="">{{ t("mqTopics.allBrokers") }}</option>
+                <option v-for="broker in rocketMqMasterBrokers.length ? rocketMqMasterBrokers : rocketMqBrokerOptions" :key="broker.brokerName || broker.id" :value="broker.brokerName || ''">
+                  {{ broker.brokerName || `${broker.host}:${broker.port}` }}
+                </option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>{{ t("mqTopics.topicName") }}*</label>
+              <input v-model="formData.topicName" type="text" :placeholder="t('mqTopics.topicNamePlaceholder')" :disabled="readOnly" />
+            </div>
+            <div v-if="isRocketMqCluster" class="form-group">
+              <label>{{ t("mqTopics.messageType") }}*</label>
+              <select v-model="formData.messageType" :disabled="readOnly">
+                <option v-for="type in rocketMqCreatableTopicTypes" :key="type" :value="type">
+                  {{ t(`mqTopics.rocketmqType.${type.toLowerCase()}`) }}
+                </option>
+              </select>
+              <div class="form-hint">{{ t("mqTopics.messageTypeHint") }}</div>
+            </div>
+            <div v-if="isRocketMqCluster" class="form-row-inline">
+              <div class="form-group">
+                <label>{{ t("mqTopics.readQueues") }}*</label>
+                <input v-model.number="formData.readQueueNums" type="number" min="1" max="256" :disabled="readOnly" />
+              </div>
+              <div class="form-group">
+                <label>{{ t("mqTopics.writeQueues") }}*</label>
+                <input v-model.number="formData.writeQueueNums" type="number" min="1" max="256" :disabled="readOnly" />
+              </div>
+              <div class="form-group">
+                <label>{{ t("mqTopics.perm") }}*</label>
+                <select v-model.number="formData.perm" :disabled="readOnly">
+                  <option v-for="opt in ROCKETMQ_PERM_OPTIONS" :key="opt.value" :value="opt.value">{{ t(opt.labelKey) }}</option>
+                </select>
+              </div>
+            </div>
+            <div v-if="!isRocketMqCluster" class="form-group">
+              <label class="checkbox-label">
+                <input type="checkbox" v-model="formData.persistent" :disabled="readOnly" />
+                {{ t("mqTopics.persistentRecommended") }}
+              </label>
+              <div class="form-hint">{{ t("mqTopics.persistentHint") }}</div>
+            </div>
+            <div v-if="!isRocketMqCluster && supportsPartitionedTopics !== false" class="form-group">
+              <label class="checkbox-label">
+                <input type="checkbox" v-model="formData.partitioned" :disabled="readOnly" />
+                {{ t("mqTopics.enablePartitions") }}
+              </label>
+              <div v-if="formData.partitioned" class="form-subgroup">
+                <label>{{ t("mqTopics.partitionQuantity") }}*</label>
+                <input v-model.number="formData.partitions" type="number" min="1" max="256" :disabled="readOnly" />
+                <div class="form-hint">{{ t("mqTopics.partitionHint") }}</div>
+              </div>
+            </div>
+            <div v-if="dialogError" class="form-error">{{ dialogError }}</div>
           </div>
-          <div v-if="dialogError" class="form-error">{{ dialogError }}</div>
-        </div>
-        <div class="dialog-footer">
-          <button @click="showCreateDialog = false" class="btn-secondary">{{ t("mqTopics.cancel") }}</button>
-          <button @click="handleCreate" :disabled="loading || readOnly" class="btn-primary">{{ t("mqTopics.create") }}</button>
+          <div class="dialog-footer">
+            <button @click="showCreateDialog = false" class="btn-secondary">{{ t("mqTopics.cancel") }}</button>
+            <button @click="handleCreate" :disabled="loading || readOnly" class="btn-primary">{{ t("mqTopics.create") }}</button>
+          </div>
         </div>
       </div>
-    </div>
 
-    <!-- Update Partitions Dialog -->
-    <div v-if="showPartitionsDialog" class="dialog-overlay" @click="showPartitionsDialog = false">
-      <div class="dialog" @click.stop>
-        <div class="dialog-header">
-          <h3>{{ t("mqTopics.updatePartitionsTitle", { name: editingTopic?.shortName }) }}</h3>
-          <button @click="showPartitionsDialog = false" class="btn-close">×</button>
-        </div>
-        <div class="dialog-body">
-          <div class="form-group">
-            <label>{{ t("mqTopics.currentPartitions") }}</label>
-            <input type="number" :value="editingTopic?.partitions" disabled />
+      <!-- Update Partitions Dialog -->
+      <div v-if="showPartitionsDialog" class="dialog-overlay" @click="showPartitionsDialog = false">
+        <div class="dialog" @click.stop>
+          <div class="dialog-header">
+            <h3>{{ t("mqTopics.updatePartitionsTitle", { name: editingTopic?.shortName }) }}</h3>
+            <button @click="showPartitionsDialog = false" class="btn-close">×</button>
           </div>
-          <div class="form-group">
-            <label>{{ t("mqTopics.newPartitions") }}*</label>
-            <input v-model.number="newPartitions" type="number" :min="editingCurrentPartitions + 1" max="256" :disabled="readOnly" @change="normalizePartitionInput" @blur="normalizePartitionInput" />
-            <div class="form-hint">{{ t("mqTopics.partitionMinHint", { min: editingCurrentPartitions + 1 }) }}</div>
+          <div class="dialog-body">
+            <div class="form-group">
+              <label>{{ t("mqTopics.currentPartitions") }}</label>
+              <input type="number" :value="editingTopic?.partitions" disabled />
+            </div>
+            <div class="form-group">
+              <label>{{ t("mqTopics.newPartitions") }}*</label>
+              <input v-model.number="newPartitions" type="number" :min="editingCurrentPartitions + 1" max="256" :disabled="readOnly" @change="normalizePartitionInput" @blur="normalizePartitionInput" />
+              <div class="form-hint">{{ t("mqTopics.partitionMinHint", { min: editingCurrentPartitions + 1 }) }}</div>
+            </div>
+            <div v-if="dialogError" class="form-error">{{ dialogError }}</div>
           </div>
-          <div v-if="dialogError" class="form-error">{{ dialogError }}</div>
-        </div>
-        <div class="dialog-footer">
-          <button @click="showPartitionsDialog = false" class="btn-secondary">{{ t("mqTopics.cancel") }}</button>
-          <button @click="handleUpdatePartitions" :disabled="loading || !canSubmitPartitionUpdate" class="btn-primary">{{ t("mqTopics.update") }}</button>
+          <div class="dialog-footer">
+            <button @click="showPartitionsDialog = false" class="btn-secondary">{{ t("mqTopics.cancel") }}</button>
+            <button @click="handleUpdatePartitions" :disabled="loading || !canSubmitPartitionUpdate" class="btn-primary">{{ t("mqTopics.update") }}</button>
+          </div>
         </div>
       </div>
-    </div>
+
+      <!-- Delete Confirm Dialog -->
+      <DangerConfirmDialog v-model:open="showDeleteDialog" :title="t('mqTopics.delete')" :message="t('mqTopics.confirmDelete', { name: deleteTarget?.shortName ?? '' })" :confirm-label="t('mqTopics.delete')" :loading="deleting" :close-on-confirm="false" @confirm="confirmDelete" />
+
+      <RocketMqTopicDialogs
+        v-if="isRocketMqCluster"
+        :connection-id="connectionId"
+        :tenant="tenant"
+        :namespace="namespace"
+        :topic="rocketMqDialogTopic"
+        :dialog="activeRocketMqDialog"
+        :read-only="readOnly"
+        :broker-options="rocketMqBrokerOptions"
+        @close="closeRocketMqDialog"
+        @navigate="handleRocketMqNavigate"
+        @refreshed="loadTopics"
+      />
+
+      <div v-if="showSendDialog && sendDialogTopic" class="dialog-overlay" @click="closeSendDialog">
+        <div class="dialog send-dialog" @click.stop>
+          <div class="dialog-header">
+            <h3>{{ t("mqMessages.title") }}</h3>
+            <button type="button" class="btn-close" @click="closeSendDialog">×</button>
+          </div>
+          <div class="dialog-body send-dialog-body">
+            <SendMessagePanel embedded :connection-id="connectionId" :tenant="tenant" :namespace="namespace" :topic="sendDialogTopic" :read-only="readOnly" mq-system-kind="rocketmq" :is-flat-mq-cluster="true" :supports-peek-messages="false" />
+          </div>
+        </div>
+      </div>
+    </template>
   </div>
 </template>
 
@@ -377,12 +729,66 @@ watch(newPartitions, () => {
   flex-direction: column;
 }
 
+.rabbitmq-subtabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px 0;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-background-secondary);
+}
+
+.rabbitmq-subtabs button {
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.rabbitmq-subtabs button:hover {
+  color: var(--color-text);
+  background: var(--color-hover);
+}
+
+.rabbitmq-subtabs button.active {
+  color: var(--color-primary);
+  border-bottom-color: var(--color-primary);
+  background: var(--color-background);
+}
+
 .panel-toolbar {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
+  gap: 12px;
   padding: 12px 16px;
   border-bottom: 1px solid var(--color-border);
+}
+
+.topic-type-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--topics-border-light);
+  background: color-mix(in srgb, var(--topics-header-bg) 72%, transparent);
+}
+
+.topic-type-filters-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary, #6b7280);
+  margin-right: 4px;
+}
+
+.checkbox-label.compact {
+  font-size: 12px;
+  gap: 6px;
 }
 
 .toolbar-left {
@@ -410,7 +816,7 @@ watch(newPartitions, () => {
   min-width: 180px;
   padding: 6px 10px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: var(--dbx-radius-fixed-6);
   background: var(--color-background);
   color: var(--color-text);
   font-size: 13px;
@@ -455,87 +861,94 @@ watch(newPartitions, () => {
 .topics-table {
   position: relative;
   flex: 1;
-  overflow: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--topics-surface);
 }
 
-.topics-table::before {
-  content: "";
-  position: sticky;
-  top: 0;
-  display: block;
+.topics-table-hscroll {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.topics-table-header,
+.topics-row {
+  display: grid;
+  align-items: center;
+  column-gap: 8px;
+  padding: 0 12px;
+  min-width: var(--topics-table-min-width, 100%);
+}
+
+.topics-table-header {
+  flex: 0 0 auto;
   height: 38px;
-  margin-bottom: -38px;
-  background: var(--topics-header-bg);
-  z-index: 9;
-  box-shadow:
-    0 1px 0 var(--topics-border),
-    0 2px 8px rgba(0, 0, 0, 0.05);
-  pointer-events: none;
-}
-
-table {
-  position: relative;
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-}
-
-thead {
-  position: sticky;
-  top: 0;
-  background: var(--topics-header-bg);
-  z-index: 10;
-}
-
-th {
-  position: sticky;
-  top: 0;
-  z-index: 11;
-  padding: 10px 12px;
-  text-align: left;
-  font-weight: 600;
-  font-size: 13px;
-  color: var(--color-text-secondary);
+  /* Match RecycleScroller classic-scrollbar gutter so header/body columns stay aligned. */
+  overflow: hidden;
+  scrollbar-gutter: stable;
   background: var(--topics-header-bg);
   border-bottom: 1px solid var(--topics-border);
-  background-clip: padding-box;
   box-shadow:
     0 1px 0 var(--topics-border),
     0 2px 6px rgba(0, 0, 0, 0.04);
+  z-index: 2;
 }
 
-tbody tr {
+.topics-table-header .topics-col {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.topics-scroller {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  min-width: var(--topics-table-min-width, 100%);
+  /* RecycleScroller owns overflow-y; reserve gutter for classic scrollbars (Windows). */
+  scrollbar-gutter: stable;
+}
+
+.topics-row {
+  width: 100%;
   cursor: pointer;
-  transition: background 0.2s;
-}
-
-tbody tr:hover {
-  background: var(--color-hover);
-}
-
-tbody tr:hover td {
-  background: var(--color-hover);
-}
-
-tbody tr.selected {
-  background: var(--color-primary-alpha);
-}
-
-tbody tr.selected td {
-  background: var(--color-primary-alpha);
-}
-
-td {
-  padding: 10px 12px;
   border-bottom: 1px solid var(--topics-border-light);
   background: var(--topics-surface);
+  box-sizing: border-box;
+}
+
+.topics-row:hover {
+  background: var(--color-hover);
+}
+
+.topics-row.selected {
+  background: var(--color-primary-alpha);
+}
+
+.topics-col {
+  min-width: 0;
+  font-size: 13px;
 }
 
 .topic-name-cell {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+
+.topic-name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
 }
 
 .topic-name {
@@ -545,7 +958,7 @@ td {
 .badge {
   display: inline-block;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 11px;
   font-weight: 500;
 }
@@ -572,7 +985,29 @@ td {
 
 .actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-start;
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.form-row-inline {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.form-group select {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--dbx-radius-fixed-4);
+  font-size: 14px;
+  box-sizing: border-box;
+  background: var(--color-background);
+  color: var(--color-text);
 }
 
 .btn-primary,
@@ -581,7 +1016,7 @@ td {
 .btn-danger {
   padding: 6px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   background: var(--color-background);
   color: var(--color-text);
   cursor: pointer;
@@ -635,7 +1070,7 @@ button:disabled {
 
 .dialog {
   background: var(--color-background);
-  border-radius: 8px;
+  border-radius: var(--dbx-radius-fixed-6);
   width: 90%;
   max-width: 500px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
@@ -686,7 +1121,7 @@ button:disabled {
   width: 100%;
   padding: 8px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 14px;
   box-sizing: border-box;
 }
@@ -712,7 +1147,7 @@ button:disabled {
   padding: 8px 12px;
   background: var(--color-error-bg);
   color: var(--color-error);
-  border-radius: 4px;
+  border-radius: var(--dbx-radius-fixed-4);
   font-size: 13px;
 }
 
@@ -722,5 +1157,16 @@ button:disabled {
   gap: 8px;
   padding: 16px 20px;
   border-top: 1px solid var(--color-border);
+}
+
+.send-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+}
+
+.send-dialog-body {
+  padding: 0;
+  max-height: calc(100vh - 140px);
+  overflow: auto;
 }
 </style>

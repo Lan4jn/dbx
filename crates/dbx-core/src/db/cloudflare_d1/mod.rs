@@ -349,12 +349,15 @@ fn query_result(
         columns: result.columns,
         column_types: Vec::new(),
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows: result.rows,
         affected_rows,
         execution_time_ms,
         truncated,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
     }
 }
 

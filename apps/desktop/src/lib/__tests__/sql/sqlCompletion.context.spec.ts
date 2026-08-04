@@ -15,6 +15,74 @@ describe("sqlCompletion keyword snippets", () => {
 });
 
 describe("sqlCompletion database functions", () => {
+  it("suggests ClickHouse functions with canonical casing and preferred placeholders", () => {
+    const sql = "SELECT tostart";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+      functionCase: "lower",
+    });
+
+    expect(items.find((item) => item.label === "toStartOfDay")).toMatchObject({
+      type: "function",
+      apply: "toStartOfDay(${value})",
+    });
+  });
+
+  it("uses exact ClickHouse window function placeholders", () => {
+    const denseRankSql = "SELECT dense_";
+    const denseRankItems = buildSqlCompletionItems(denseRankSql, denseRankSql.length, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+    expect(denseRankItems.find((item) => item.label === "dense_rank")?.apply).toBe("dense_rank()");
+
+    const ntileSql = "SELECT nti";
+    const ntileItems = buildSqlCompletionItems(ntileSql, ntileSql.length, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+    expect(ntileItems.find((item) => item.label === "ntile")?.apply).toBe("ntile(${buckets})");
+  });
+
+  it("does not leak ClickHouse-only functions to MySQL", () => {
+    const sql = "SELECT tostart";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "mysql",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === "toStartOfDay")).toBe(false);
+  });
+
+  it("suggests only ClickHouse table functions alongside tables after FROM", () => {
+    const sql = "SELECT * FROM num";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "clickhouse",
+      tables: [{ name: "number_events", type: "table" }],
+      columnsByTable: new Map(),
+    });
+
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "numbers", type: "function" }), expect.objectContaining({ label: "number_events", type: "table" })]));
+    expect(items.some((item) => item.label === "toStartOfDay")).toBe(false);
+  });
+
+  it("does not insert a duplicate opening parenthesis before an existing call", () => {
+    const sql = "SELECT toStart()";
+    const cursor = "SELECT toStart".length;
+    const items = buildSqlCompletionItems(sql, cursor, {
+      databaseType: "clickhouse",
+      tables: [],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.find((item) => item.label === "toStartOfDay")?.apply).toBe("toStartOfDay");
+  });
+
   it("suggests MySQL Unix timestamp functions with function snippets", () => {
     const fromUnixSql = "SELECT from_unix";
     const fromUnixItems = buildSqlCompletionItems(fromUnixSql, fromUnixSql.length, {
@@ -100,6 +168,20 @@ describe("sqlCompletion quoted schema qualifiers", () => {
 });
 
 describe("sqlCompletion table targets", () => {
+  it("suggests tables after a database qualifier in an EXISTS table list", () => {
+    const sql = "SELECT * FROM aa.tb t WHERE EXISTS (SELECT 1 FROM aa.tb1 t1, aa.";
+    const context = getSqlCompletionContext(sql, sql.length);
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "mysql",
+      tables: [{ name: "tb2", schema: "aa", type: "table" }],
+      columnsByTable: new Map(),
+    });
+
+    expect(context.qualifier).toBe("aa");
+    expect(context.suggestTables).toBe(true);
+    expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "tb2", type: "table" })]));
+  });
+
   it("does not suggest aliases while completing an empty FROM target before LIMIT", () => {
     const sql = "SELECT *\nFROM \nLIMIT 100;";
     const cursor = "SELECT *\nFROM ".length;
@@ -114,6 +196,30 @@ describe("sqlCompletion table targets", () => {
 });
 
 describe("sqlCompletion table aliases", () => {
+  it("uses initials from all words for generated aliases", () => {
+    const sql = "SELECT * FROM mat";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "materials_order_item", type: "table" }],
+      columnsByTable: new Map(),
+      autoAliasTables: true,
+    });
+
+    const table = items.find((item) => item.label === "materials_order_item" && item.type === "table");
+    expect(table?.apply).toBe("materials_order_item AS moi");
+  });
+
+  it("uses every word initial for longer multi-word names", () => {
+    const sql = "SELECT * FROM sup";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [{ name: "super_long_customer_order_history_archive_snapshot_daily_replica", type: "table" }],
+      columnsByTable: new Map(),
+      autoAliasTables: true,
+    });
+
+    const table = items.find((item) => item.label === "super_long_customer_order_history_archive_snapshot_daily_replica" && item.type === "table");
+    expect(table?.apply).toBe("super_long_customer_order_history_archive_snapshot_daily_replica AS slcohasdr");
+  });
+
   it("applies generated aliases to table completions when enabled", () => {
     const sql = "SELECT * FROM ord";
     const items = buildSqlCompletionItems(sql, sql.length, {
@@ -285,7 +391,7 @@ describe("sqlCompletion scoped context classification", () => {
     expect(context.prefix).toBe("userc");
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ name: "A1User" })]));
     expect(context.suggestColumns).toBe(true);
-    expect(context.suggestRoutines).toBe(false);
+    expect(context.suggestRoutines).toBe(true);
   });
 
   it("auto-opens column completion after WHERE whitespace before LIMIT", () => {
@@ -333,6 +439,13 @@ describe("sqlCompletion scoped context classification", () => {
     const context = getSqlCompletionContext(sql, sql.length);
 
     expect(context.referencedTables).toEqual(expect.arrayContaining([expect.objectContaining({ schema: "dbo", name: "Users", alias: "u" }), expect.objectContaining({ name: "Orders", alias: "o" })]));
+  });
+
+  it("preserves SQL Server database and omitted schema in legacy table references", () => {
+    const sql = "SELECT * FROM BarDB..orders AS o WHERE o.";
+    const context = getSqlCompletionContext(sql, sql.length, { databaseType: "sqlserver" });
+
+    expect(context.referencedTables).toEqual([expect.objectContaining({ database: "BarDB", schema: "dbo", name: "orders", alias: "o" })]);
   });
 
   it("treats schema-qualified table prefixes in FROM as table completion input", () => {
@@ -421,5 +534,55 @@ describe("sqlCompletion scoped metadata ranking", () => {
     });
 
     expect(items.findIndex((item) => item.label === "ORDERS_10K")).toBeLessThan(items.findIndex((item) => item.label === "TABLE"));
+  });
+
+  it("qualifies same-name PostgreSQL tables from different schemas", () => {
+    const sql = "SELECT * FROM shared";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "postgres",
+      dialect: "postgres",
+      tables: [
+        { name: "shared", schema: "public", type: "table" },
+        { name: "shared", schema: "reporting", type: "table" },
+      ],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(items).toHaveLength(2);
+    expect(items.map((item) => item.apply).sort()).toEqual(["public.shared", "reporting.shared"]);
+  });
+
+  it("qualifies same-name tables for generic metadata providers", () => {
+    const sql = "SELECT * FROM orders";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      tables: [
+        { name: "orders", schema: "archive", type: "table" },
+        { name: "orders", schema: "sales", type: "table" },
+      ],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(items.map((item) => item.apply).sort()).toEqual(["archive.orders", "sales.orders"]);
+  });
+
+  it("preserves Oracle current-schema and SQL Server unique-table insertion", () => {
+    const oracleItems = buildSqlCompletionItems("SELECT * FROM ORDERS", "SELECT * FROM ORDERS".length, {
+      databaseType: "oracle",
+      tables: [
+        { name: "ORDERS", schema: "APP", type: "table" },
+        { name: "ORDERS", schema: "REPORTING", type: "table" },
+      ],
+      columnsByTable: new Map(),
+      currentSchema: "APP",
+    }).filter((item) => item.type === "table");
+    const sqlServerItems = buildSqlCompletionItems("SELECT * FROM Orders", "SELECT * FROM Orders".length, {
+      databaseType: "sqlserver",
+      dialect: "sqlserver",
+      tables: [{ name: "Orders", schema: "dbo", type: "table" }],
+      columnsByTable: new Map(),
+    }).filter((item) => item.type === "table");
+
+    expect(oracleItems.map((item) => item.apply).sort()).toEqual(["ORDERS", "REPORTING.ORDERS"]);
+    expect(sqlServerItems).toEqual([expect.objectContaining({ label: "Orders", apply: "Orders" })]);
   });
 });

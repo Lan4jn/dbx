@@ -15,6 +15,7 @@ const TableImportDialog = defineAsyncComponent(() => import("@/components/import
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
 const DatabaseSearchDialog = defineAsyncComponent(() => import("@/components/search/DatabaseSearchDialog.vue"));
+const SshHostKeyPromptDialog = defineAsyncComponent(() => import("@/components/ssh/SshHostKeyPromptDialog.vue"));
 const DatabaseExportDialog = defineAsyncComponent(() => import("@/components/export/DatabaseExportDialog.vue"));
 const DataGenerateDialog = defineAsyncComponent(() => import("@/components/generate/DataGenerateDialog.vue"));
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -33,6 +34,7 @@ const props = defineProps<{
   showDangerDialog: boolean;
   dangerSql: string;
   suppressDangerConfirm: boolean;
+  activeDatabaseType?: DatabaseType;
   showSqlParameterDialog: boolean;
   sqlParameterSourceSql: string;
   sqlParameterNames: SqlParameterDescriptor[];
@@ -144,7 +146,7 @@ watch(
     v-if="showDangerDialog"
     :open="showDangerDialog"
     :sql="dangerSql"
-    :show-suppress-toggle="true"
+    :show-suppress-toggle="activeDatabaseType !== 'redis'"
     :suppress-future-prompts="suppressDangerConfirm"
     @update:open="emit('update:showDangerDialog', $event)"
     @update:suppress-future-prompts="emit('update:suppressDangerConfirm', $event)"
@@ -172,7 +174,17 @@ watch(
     @update:open="emit('update:showSqlParameterDialog', $event)"
     @execute="emit('sqlParametersConfirm', $event)"
   />
-  <DataTransferDialog v-model:open="dialogs.showTransferDialog.value" :prefill-connection-id="dialogs.transferPrefillConnectionId.value" :prefill-database="dialogs.transferPrefillDatabase.value" />
+  <DataTransferDialog
+    v-model:open="dialogs.showTransferDialog.value"
+    :prefill-connection-id="dialogs.transferPrefillConnectionId.value"
+    :prefill-database="dialogs.transferPrefillDatabase.value"
+    :prefill-catalog="dialogs.transferPrefillCatalog.value"
+    :prefill-schema="dialogs.transferPrefillSchema.value"
+    :prefill-tables="dialogs.transferPrefillTables.value"
+    :prefill-target-connection-id="dialogs.transferPrefillTargetConnectionId.value"
+    :prefill-target-database="dialogs.transferPrefillTargetDatabase.value"
+    :prefill-target-schema="dialogs.transferPrefillTargetSchema.value"
+  />
   <SchemaDiffDialog v-if="dialogs.showSchemaDiffDialog.value" v-model:open="dialogs.showSchemaDiffDialog.value" :prefill-connection-id="dialogs.schemaDiffPrefillConnectionId.value" :prefill-database="dialogs.schemaDiffPrefillDatabase.value" :prefill-schema="dialogs.schemaDiffPrefillSchema.value" />
   <DataCompareDialog
     v-if="dialogs.showDataCompareDialog.value"
@@ -261,4 +273,5 @@ watch(
       </DialogFooter>
     </DialogContent>
   </Dialog>
+  <SshHostKeyPromptDialog />
 </template>

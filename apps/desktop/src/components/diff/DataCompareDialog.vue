@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import SearchableSelect from "@/components/ui/searchable-select/SearchableSelect.vue";
+import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
@@ -117,7 +118,7 @@ const showModified = ref(true);
 
 let syncPlanRequestId = 0;
 
-const sqlConnections = computed(() => store.connections.filter((connection) => !["redis", "mongodb", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "mq", "nacos"].includes(connection.db_type)));
+const sqlConnections = computed(() => store.connections.filter((connection) => !["redis", "mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "mq", "nacos"].includes(connection.db_type)));
 const selectedSourceTableNames = computed(() => sourceTables.value.filter((table) => selectedSourceTables.value.has(table)));
 const isBatchCompare = computed(() => selectedSourceTableNames.value.length > 1);
 const filteredSourceTables = computed(() => {
@@ -915,6 +916,7 @@ watch(
               <template #option-label="{ option, label }">
                 <div class="flex min-w-0 items-center gap-2">
                   <DatabaseIcon :db-type="connectionIconType(option)" class="h-3.5 w-3.5 shrink-0" />
+                  <ConnectionGroupBadge :connection-id="option" />
                   <span class="min-w-0 flex-1 truncate">{{ label }}</span>
                 </div>
               </template>
@@ -1001,6 +1003,7 @@ watch(
               <template #option-label="{ option, label }">
                 <div class="flex min-w-0 items-center gap-2">
                   <DatabaseIcon :db-type="connectionIconType(option)" class="h-3.5 w-3.5 shrink-0" />
+                  <ConnectionGroupBadge :connection-id="option" />
                   <span class="min-w-0 flex-1 truncate">{{ label }}</span>
                 </div>
               </template>

@@ -137,7 +137,7 @@ pub fn analyze_editable_query_editability(sql: &str) -> QueryEditability {
     if !starts_with_keyword(&normalized, "SELECT") {
         return not_editable(QueryEditabilityReason::NotSelect);
     }
-    if has_top_level_keyword(&normalized, &["UNION", "INTERSECT", "EXCEPT"]) {
+    if has_top_level_keyword(&normalized, &["UNION", "INTERSECT", "EXCEPT", "MINUS"]) {
         return not_editable(QueryEditabilityReason::SetOperation);
     }
     if normalized.contains(';') {
@@ -169,9 +169,18 @@ pub fn analyze_editable_query_editability(sql: &str) -> QueryEditability {
     }
 
     let from_body_start = from_index + "FROM".len();
-    let from_end =
-        first_top_level_keyword_index(&normalized, &["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH"], from_body_start)
-            .unwrap_or(normalized.len());
+    let for_index = find_top_level_keyword(&normalized, "FOR", from_body_start);
+    // Row-locking FOR clauses change concurrency behavior, not the base-row
+    // mapping. Output/read-only FOR modes must stay non-editable.
+    if for_index.is_some_and(|index| !is_row_lock_clause(&normalized[index..])) {
+        return not_editable(QueryEditabilityReason::ComplexSource);
+    }
+    let from_end = first_top_level_keyword_index(
+        &normalized,
+        &["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"],
+        from_body_start,
+    )
+    .unwrap_or(normalized.len());
     let from_body = normalized[from_body_start..from_end].trim();
     if is_external_from_source(from_body) {
         return not_editable(QueryEditabilityReason::ExternalSource);
@@ -581,6 +590,26 @@ fn table_source_terminator_at(text: &str, pos: usize) -> bool {
         .any(|keyword| starts_with_keyword_at(text, pos, keyword))
 }
 
+fn is_row_lock_clause(text: &str) -> bool {
+    if !starts_with_keyword(text, "FOR") {
+        return false;
+    }
+    let mode_start = skip_whitespace(text, "FOR".len());
+    if starts_with_keyword_at(text, mode_start, "UPDATE") || starts_with_keyword_at(text, mode_start, "SHARE") {
+        return true;
+    }
+    if starts_with_keyword_at(text, mode_start, "NO") {
+        let key_start = skip_whitespace(text, mode_start + "NO".len());
+        let update_start = skip_whitespace(text, key_start + "KEY".len());
+        return starts_with_keyword_at(text, key_start, "KEY") && starts_with_keyword_at(text, update_start, "UPDATE");
+    }
+    if starts_with_keyword_at(text, mode_start, "KEY") {
+        let share_start = skip_whitespace(text, mode_start + "KEY".len());
+        return starts_with_keyword_at(text, share_start, "SHARE");
+    }
+    false
+}
+
 fn starts_with_keyword_at(text: &str, pos: usize, keyword: &str) -> bool {
     let start = skip_whitespace(text, pos);
     let Some(candidate) = text.get(start..start + keyword.len()) else {
@@ -691,12 +720,12 @@ fn read_identifier(text: &str, start: usize) -> Option<Identifier> {
         return None;
     }
 
-    if !(first.is_ascii_alphabetic() || first == '_') {
+    if !is_identifier_start(first) {
         return None;
     }
     let mut end = pos + first.len_utf8();
     for (offset, ch) in text[end..].char_indices() {
-        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$') {
+        if !is_identifier_char(ch) {
             return Some(Identifier { value: text[pos..end + offset].to_string(), quoted: false, end: end + offset });
         }
     }
@@ -817,8 +846,12 @@ fn previous_char(text: &str, index: usize) -> Option<char> {
     text[..index].chars().next_back()
 }
 
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || unicode_ident::is_xid_start(ch)
+}
+
 fn is_identifier_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+    ch == '$' || unicode_ident::is_xid_continue(ch)
 }
 
 #[cfg(test)]
@@ -886,6 +919,87 @@ mod tests {
         assert_eq!(analysis.table_name, "users");
         assert!(analysis.select_star);
         assert!(analysis.columns.is_empty());
+    }
+
+    #[test]
+    fn recognizes_top_level_sql_set_operations_as_read_only() {
+        for operator in ["UNION", "INTERSECT", "EXCEPT", "MINUS"] {
+            let sql = format!("SELECT id FROM users {operator} SELECT id FROM archived_users");
+            let result = analyze_editable_query_editability(&sql);
+
+            assert!(!result.editable, "{operator}");
+            assert_eq!(result.reason, Some(QueryEditabilityReason::SetOperation), "{operator}");
+        }
+    }
+
+    #[test]
+    fn ignores_minus_in_strings_comments_and_nested_queries() {
+        for sql in [
+            "SELECT id, 'MINUS' AS operation FROM users",
+            "SELECT id FROM users -- MINUS\nWHERE active = 1",
+            "SELECT id FROM users /* MINUS */ WHERE active = 1",
+            "SELECT * FROM users WHERE id IN (SELECT id FROM archived_users MINUS SELECT id FROM blocked_users)",
+        ] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(result.editable, "{sql}: {:?}", result.reason);
+            assert_eq!(result.analysis.unwrap().table_name, "users", "{sql}");
+        }
+    }
+
+    #[test]
+    fn recognizes_oracle_for_update_clauses_without_treating_for_as_an_alias() {
+        for sql in [
+            "SELECT * FROM employees FOR UPDATE",
+            "SELECT * FROM employees FOR UPDATE NOWAIT",
+            "SELECT * FROM employees FOR UPDATE SKIP LOCKED",
+            "SELECT * FROM employees FOR UPDATE OF salary, department_id WAIT 5",
+            "SELECT * FROM employees WHERE department_id = 10 ORDER BY employee_id FOR UPDATE OF salary NOWAIT",
+        ] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(result.editable, "{sql}");
+            let analysis = result.analysis.unwrap();
+            assert_eq!(analysis.table_name, "employees", "{sql}");
+            assert_eq!(analysis.table_alias, None, "{sql}");
+            assert!(analysis.select_star, "{sql}");
+        }
+
+        let result = analyze_editable_query_editability(
+            "SELECT e.employee_id, e.salary FROM employees e FOR UPDATE OF e.salary SKIP LOCKED",
+        );
+        assert!(result.editable);
+        assert_eq!(result.analysis.unwrap().table_alias.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn recognizes_postgres_row_lock_clauses_without_treating_for_as_an_alias() {
+        for sql in [
+            "SELECT * FROM jobs FOR SHARE",
+            "SELECT * FROM jobs FOR NO KEY UPDATE SKIP LOCKED",
+            "SELECT * FROM jobs FOR KEY SHARE NOWAIT",
+        ] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(result.editable, "{sql}");
+            let analysis = result.analysis.unwrap();
+            assert_eq!(analysis.table_name, "jobs", "{sql}");
+            assert_eq!(analysis.table_alias, None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn keeps_explicit_read_only_and_output_for_clauses_non_editable() {
+        for sql in [
+            "SELECT * FROM employees FOR READ ONLY",
+            "SELECT * FROM employees FOR FETCH ONLY",
+            "SELECT * FROM employees FOR JSON",
+        ] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(!result.editable, "{sql}");
+            assert_eq!(result.reason, Some(QueryEditabilityReason::ComplexSource), "{sql}");
+        }
     }
 
     #[test]
@@ -1029,6 +1143,35 @@ mod tests {
                 column(Some("country_name"), false, None, None, "country_name", "country_name"),
                 column(None, false, None, None, "score", "ihli / gdp_pc"),
             ]
+        );
+    }
+
+    #[test]
+    fn accepts_unquoted_unicode_aliases_in_mysql_and_sql_server_queries() {
+        for sql in [
+            "SELECT Guid, FDeleted AS 禁用, IsAuditing AS 审核 FROM xy.dbo.GL_CUSTOM WHERE TJBH=\n24049",
+            "SELECT Guid, FDeleted AS 禁用, IsAuditing AS 审核 FROM xy.GL_CUSTOM WHERE TJBH=24049",
+        ] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(result.editable, "{sql}");
+            assert_eq!(
+                result.analysis.unwrap().columns,
+                vec![
+                    column(Some("Guid"), false, None, None, "Guid", "Guid"),
+                    column(Some("FDeleted"), false, None, None, "禁用", "FDeleted"),
+                    column(Some("IsAuditing"), false, None, None, "审核", "IsAuditing"),
+                ]
+            );
+        }
+
+        let computed = analyze_editable_query_editability(
+            "SELECT Guid, FDeleted AS 禁用, CASE WHEN IsAuditing = 1 THEN 1 ELSE 0 END AS 审核状态 FROM xy.dbo.GL_CUSTOM",
+        );
+        assert!(computed.editable);
+        assert_eq!(
+            computed.analysis.unwrap().columns[2],
+            column(None, false, None, None, "审核状态", "CASE WHEN IsAuditing = 1 THEN 1 ELSE 0 END",)
         );
     }
 

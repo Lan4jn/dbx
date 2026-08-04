@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Loader2 } from "@lucide/vue";
+import { AlertTriangle, Loader2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { UpdateInfo } from "@/lib/backend/api";
@@ -15,12 +15,17 @@ const props = defineProps<{
   updateCheckMessage: string;
   isDownloadingUpdate: boolean;
   downloadProgress: number;
+  updateDownloaded: boolean;
+  isInstallingUpdate: boolean;
   updateReady: boolean;
+  activeTaskCount: number;
 }>();
 
 const emit = defineEmits<{
   "open-latest-release": [];
   "download-and-install": [];
+  "cancel-download": [];
+  "install-downloaded": [];
   restart: [];
 }>();
 
@@ -28,6 +33,24 @@ const { t } = useI18n();
 const isDesktop = isTauriRuntime();
 
 const renderedNotes = ref("");
+// Only active file replacement (installation) must trap the dialog.
+const isCloseBlocked = computed(() => props.isInstallingUpdate);
+
+function handleCancel() {
+  handleOpenChange(false);
+}
+
+function handleOpenChange(nextOpen: boolean) {
+  if (nextOpen) {
+    open.value = true;
+    return;
+  }
+  if (isCloseBlocked.value) return;
+  if (props.isDownloadingUpdate) {
+    emit("cancel-download");
+  }
+  open.value = false;
+}
 
 function handleReleaseNotesClick(event: MouseEvent) {
   const target = event.target as HTMLElement;
@@ -59,17 +82,18 @@ watch(
 </script>
 
 <template>
-  <Dialog v-model:open="open">
+  <Dialog :open="open" @update:open="handleOpenChange">
     <DialogContent
       class="sm:max-w-[520px]"
+      :show-close-button="!isCloseBlocked"
       @interact-outside="
         (e: Event) => {
-          if (isDownloadingUpdate || updateReady) e.preventDefault();
+          if (isCloseBlocked) e.preventDefault();
         }
       "
       @escape-key-down="
         (e: Event) => {
-          if (isDownloadingUpdate || updateReady) e.preventDefault();
+          if (isCloseBlocked) e.preventDefault();
         }
       "
     >
@@ -99,21 +123,33 @@ watch(
           <code class="bg-muted px-1 py-0.5 rounded text-[11px]">docker compose pull && docker compose up -d</code>
           {{ t("updates.toUpdate") }}
         </p>
-        <p v-if="isDesktop && updateInfo?.update_available && updateInfo.portable_mode" class="text-xs text-muted-foreground">
-          {{ t("updates.portableManualUpdate") }}
+        <p v-if="isDesktop && updateInfo?.update_available && updateInfo.portable_mode && !updateInfo.manual_update_only" class="text-xs text-muted-foreground">
+          {{ t("updates.portableAutomaticUpdate") }}
         </p>
+        <p v-if="isDesktop && updateInfo?.update_available && updateInfo.manual_update_only" class="text-xs text-muted-foreground">
+          {{ t("updates.windows7ManualUpdate") }}
+        </p>
+        <div v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop) && activeTaskCount > 0" role="alert" class="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{{ t("updates.activeTasksBlockUpdate", { count: activeTaskCount }) }}</span>
+        </div>
       </div>
       <DialogFooter>
-        <Button v-if="!isDownloadingUpdate && !updateReady" variant="outline" @click="open = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button v-if="!isCloseBlocked" variant="outline" @click="handleCancel">{{ t("dangerDialog.cancel") }}</Button>
         <template v-if="updateInfo?.update_available">
           <Button variant="outline" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
           <template v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
-            <Button v-if="updateReady" @click="emit('restart')">{{ t("updates.restart") }}</Button>
-            <Button v-else-if="isDownloadingUpdate" disabled>
+            <Button v-if="updateReady" :disabled="activeTaskCount > 0" @click="emit('restart')">{{ t("updates.restart") }}</Button>
+            <Button v-else-if="isInstallingUpdate" disabled>
+              <Loader2 class="h-4 w-4 animate-spin" />
+              {{ t("updates.installing") }}
+            </Button>
+            <Button v-else-if="isDownloadingUpdate" class="w-52" disabled>
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("updates.downloading", { progress: downloadProgress }) }}
             </Button>
-            <Button v-else @click="emit('download-and-install')">{{ t("updates.downloadAndInstall") }}</Button>
+            <Button v-else-if="updateDownloaded" :disabled="activeTaskCount > 0" @click="emit('install-downloaded')">{{ t("updates.exitAndUpdate") }}</Button>
+            <Button v-else :disabled="activeTaskCount > 0" @click="emit('download-and-install')">{{ t("updates.downloadAndInstall") }}</Button>
           </template>
         </template>
         <Button v-else-if="updateCheckMessage" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>

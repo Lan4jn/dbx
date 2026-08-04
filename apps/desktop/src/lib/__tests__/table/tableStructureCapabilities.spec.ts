@@ -28,6 +28,27 @@ describe("tableStructureCapabilities", () => {
     expect(getTableStructureCapabilities("postgres", "postgres").alterStrategy).toBe("direct");
   });
 
+  it("disables persisted comment editing for IRIS without disabling other structure changes", () => {
+    expect(getTableStructureCapabilities("iris", "iris")).toMatchObject({
+      comment: false,
+      addColumn: true,
+      dropColumn: true,
+      renameColumn: true,
+      alterType: true,
+      alterNullability: true,
+      alterDefault: true,
+    });
+    expect(getTableStructureCapabilities("oracle", "oracle").comment).toBe(true);
+    expect(getTableStructureCapabilities("oceanbase-oracle", "oceanbase-oracle").comment).toBe(true);
+    expect(getTableStructureCapabilities("dameng", "dameng").comment).toBe(true);
+  });
+
+  it("enables alter primary key for Dameng without enabling it for Oracle", () => {
+    expect(getTableStructureCapabilities("dameng", "dameng").alterPrimaryKey).toBe(true);
+    expect(getTableStructureCapabilities("oracle", "oracle").alterPrimaryKey).toBe(false);
+    expect(getTableStructureCapabilities("oceanbase-oracle", "oceanbase-oracle").alterPrimaryKey).toBe(false);
+  });
+
   it("uses local-only column reordering for editable databases without physical reorder support", () => {
     for (const databaseType of ["sqlserver", "postgres", "sqlite", "oracle", "dameng", "duckdb", "informix"] as const) {
       expect(supportsLocalTableColumnReorder(databaseType, databaseType)).toBe(true);

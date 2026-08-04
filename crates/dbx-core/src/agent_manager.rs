@@ -2,11 +2,14 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec, AgentMethod, AgentRuntimeClient};
+use crate::db::agent_driver::{
+    validate_dameng_java_system_properties, AgentDriverClient, AgentLaunchSpec, AgentMethod, AgentRuntimeClient,
+};
 use crate::models::connection::DatabaseType;
 
 pub const DEFAULT_JRE_KEY: &str = "21";
@@ -15,6 +18,10 @@ pub const DOWNLOAD_CACHE_MAX_AGE_DAYS: u64 = 7;
 
 fn default_jre_key() -> String {
     DEFAULT_JRE_KEY.to_string()
+}
+
+fn strip_utf8_bom(value: &str) -> &str {
+    value.strip_prefix('\u{feff}').unwrap_or(value)
 }
 
 fn is_valid_jar_file(path: &Path) -> bool {
@@ -139,6 +146,21 @@ mod tests {
     }
 
     #[test]
+    fn loads_agent_state_with_utf8_bom() {
+        let manager = test_manager("state-utf8-bom");
+        fs::create_dir_all(manager.base_dir()).unwrap();
+        fs::write(
+            manager.state_path(),
+            b"\xEF\xBB\xBF{\"installed_drivers\":{\"kafka\":{\"version\":\"0.1.4\",\"installed_at\":\"now\",\"jre\":\"21\"}}}",
+        )
+        .unwrap();
+
+        let state = manager.load_state();
+
+        assert_eq!(state.installed_drivers.get("kafka").map(|driver| driver.version.as_str()), Some("0.1.4"));
+    }
+
+    #[test]
     fn resolves_managed_java_runtime_by_default() {
         let manager = test_manager("managed");
         let java = manager.jre_java_path(DEFAULT_JRE_KEY);
@@ -254,6 +276,41 @@ mod tests {
     }
 
     #[test]
+    fn resolves_relative_native_agent_launch_with_absolute_paths() {
+        let base_dir =
+            PathBuf::from("target").join(format!("dbx-agent-manager-relative-native-{}", uuid::Uuid::new_v4()));
+        let manager = AgentManager::new_with_base_dir(base_dir.clone());
+        let native = manager.driver_native_path("oracle");
+        touch(&native);
+        let expected_program = native.canonicalize().unwrap();
+        let expected_working_dir = manager.driver_dir("oracle").canonicalize().unwrap();
+
+        let launch = manager
+            .resolve_agent_launch_spec(&AgentState::default(), "oracle", DEFAULT_JRE_KEY)
+            .expect("relative native launch should resolve");
+
+        assert!(launch.program.is_absolute());
+        assert_eq!(launch.program, expected_program);
+        assert_eq!(launch.args, Vec::<String>::new());
+        assert_eq!(launch.working_dir.as_deref(), Some(expected_working_dir.as_path()));
+
+        fs::remove_dir_all(base_dir).unwrap();
+    }
+
+    #[test]
+    fn relative_native_agent_launch_keeps_missing_driver_error() {
+        let base_dir =
+            PathBuf::from("target").join(format!("dbx-agent-manager-relative-missing-{}", uuid::Uuid::new_v4()));
+        let manager = AgentManager::new_with_base_dir(base_dir);
+
+        let error = manager
+            .resolve_agent_launch_spec(&AgentState::default(), "oracle", DEFAULT_JRE_KEY)
+            .expect_err("missing native agent should fail");
+
+        assert_eq!(error, "oracle driver is not installed. Please install it from the Driver Manager.");
+    }
+
+    #[test]
     fn resolves_manifest_agent_launch_with_driver_dir_templates() {
         let manager = test_manager("manifest-agent");
         let driver_dir = manager.driver_dir("dameng-go");
@@ -279,6 +336,25 @@ mod tests {
         );
         assert_eq!(launch.working_dir.as_deref(), Some(driver_dir.as_path()));
     }
+
+    #[test]
+    fn resolves_manifest_agent_launch_with_utf8_bom() {
+        let manager = test_manager("manifest-agent-utf8-bom");
+        let driver_dir = manager.driver_dir("kafka");
+        fs::create_dir_all(&driver_dir).unwrap();
+        fs::write(
+            manager.driver_launch_config_path("kafka"),
+            b"\xEF\xBB\xBF{\"command\":\"java\",\"args\":[\"-jar\",\"{driver_dir}/agent.jar\"]}",
+        )
+        .unwrap();
+
+        let launch = manager
+            .resolve_agent_launch_spec(&AgentState::default(), "kafka", DEFAULT_JRE_KEY)
+            .expect("manifest launch with UTF-8 BOM should resolve");
+
+        assert_eq!(launch.program, PathBuf::from("java"));
+        assert_eq!(launch.args, vec!["-jar".to_string(), format!("{}/agent.jar", driver_dir.to_string_lossy())]);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,7 +379,17 @@ pub struct DriverInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactInfo {
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<ArtifactFormat>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactFormat {
+    TarZstd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -397,6 +483,18 @@ pub struct AgentManager {
     pub(crate) connection_runtimes: Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<AgentRuntimeClient>>>>,
     >,
+    /// Serializes `load_state` → modify → `save_state` to prevent lost updates
+    /// when multiple driver installs run concurrently.
+    pub(crate) state_lock: StdMutex<()>,
+    /// Per-JRE-key install locks so that concurrent driver installs sharing the
+    /// same JRE download it only once (DCL pattern: lock → re-check installed → download).
+    pub(crate) jre_install_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-driver locks serialize install, import, and uninstall operations
+    /// targeting the same on-disk agent files.
+    pub(crate) driver_operation_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// Driver operations may run concurrently, but JRE replacement/removal
+    /// must exclude them until their dependent driver state is persisted.
+    pub(crate) installation_operation_lock: tokio::sync::RwLock<()>,
 }
 
 impl Default for AgentManager {
@@ -422,11 +520,28 @@ impl AgentManager {
             app_version: app_version.into(),
             daemons: Mutex::new(std::collections::HashMap::new()),
             connection_runtimes: Mutex::new(std::collections::HashMap::new()),
+            state_lock: StdMutex::new(()),
+            jre_install_locks: Mutex::new(std::collections::HashMap::new()),
+            driver_operation_locks: Mutex::new(std::collections::HashMap::new()),
+            installation_operation_lock: tokio::sync::RwLock::new(()),
         };
         mgr.migrate_legacy_jre();
         mgr.cleanup_pending_jre_dirs();
         mgr.cleanup_orphan_jre_dirs();
         mgr
+    }
+
+    /// Atomically load, modify, and persist the installation state.
+    ///
+    /// Keep the closure free of async work: this lock exists specifically to
+    /// prevent one installation operation from saving an older snapshot over
+    /// another operation's successful update.
+    pub fn mutate_state<T>(&self, mutate: impl FnOnce(&mut AgentState) -> T) -> Result<T, String> {
+        let _guard = self.state_lock.lock().map_err(|_| "Agent installation state lock was poisoned".to_string())?;
+        let mut state = self.load_state();
+        let result = mutate(&mut state);
+        self.save_state(&state)?;
+        Ok(result)
     }
 
     fn migrate_legacy_jre(&self) {
@@ -442,25 +557,26 @@ impl AgentManager {
     /// removals are pruned from the persisted state. Failures are kept for the
     /// next launch and never block startup. (Issue #1100, D6.)
     fn cleanup_pending_jre_dirs(&self) {
-        let mut state = self.load_state();
-        if state.pending_jre_cleanup.is_empty() {
+        if self.load_state().pending_jre_cleanup.is_empty() {
             return;
         }
-        let mut remaining = Vec::new();
-        for path in std::mem::take(&mut state.pending_jre_cleanup) {
-            if !path.exists() {
-                continue;
-            }
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => log::info!("Cleaned up pending JRE stash: {}", path.display()),
-                Err(err) => {
-                    log::warn!("Pending JRE cleanup failed for {}: {err}", path.display());
-                    remaining.push(path);
+
+        if let Err(err) = self.mutate_state(|state| {
+            let mut remaining = Vec::new();
+            for path in std::mem::take(&mut state.pending_jre_cleanup) {
+                if !path.exists() {
+                    continue;
+                }
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => log::info!("Cleaned up pending JRE stash: {}", path.display()),
+                    Err(err) => {
+                        log::warn!("Pending JRE cleanup failed for {}: {err}", path.display());
+                        remaining.push(path);
+                    }
                 }
             }
-        }
-        state.pending_jre_cleanup = remaining;
-        if let Err(err) = self.save_state(&state) {
+            state.pending_jre_cleanup = remaining;
+        }) {
             log::warn!("Failed to persist post-cleanup AgentState: {err}");
         }
     }
@@ -550,7 +666,10 @@ impl AgentManager {
     }
 
     pub fn load_state(&self) -> AgentState {
-        std::fs::read_to_string(self.state_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        std::fs::read_to_string(self.state_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(strip_utf8_bom(&s)).ok())
+            .unwrap_or_default()
     }
 
     pub fn save_state(&self, state: &AgentState) -> Result<(), String> {
@@ -596,6 +715,9 @@ impl AgentManager {
         jre_key: &str,
         extra_java_args: &[String],
     ) -> Result<AgentLaunchSpec, String> {
+        if driver_key == "dameng" {
+            validate_dameng_java_system_properties(extra_java_args)?;
+        }
         let driver_dir = self.driver_dir(driver_key);
         let config_path = self.driver_launch_config_path(driver_key);
         if config_path.exists() {
@@ -604,6 +726,17 @@ impl AgentManager {
 
         let native_path = self.driver_native_path(driver_key);
         if native_path.exists() {
+            let (native_path, driver_dir) = if native_path.is_relative() || driver_dir.is_relative() {
+                let native_path = native_path
+                    .canonicalize()
+                    .map_err(|e| format!("Failed to resolve {driver_key} native agent executable path: {e}"))?;
+                let driver_dir = driver_dir
+                    .canonicalize()
+                    .map_err(|e| format!("Failed to resolve {driver_key} native agent working directory: {e}"))?;
+                (native_path, driver_dir)
+            } else {
+                (native_path, driver_dir)
+            };
             return Ok(AgentLaunchSpec::new(native_path).with_working_dir(driver_dir));
         }
 
@@ -629,7 +762,7 @@ impl AgentManager {
     ) -> Result<AgentLaunchSpec, String> {
         let json = std::fs::read_to_string(config_path)
             .map_err(|e| format!("Failed to read {driver_key} agent launch config: {e}"))?;
-        let config: AgentLaunchConfig = serde_json::from_str(&json)
+        let config: AgentLaunchConfig = serde_json::from_str(strip_utf8_bom(&json))
             .map_err(|e| format!("Failed to parse {driver_key} agent launch config: {e}"))?;
         let command = config.command.trim();
         if command.is_empty() {
@@ -809,7 +942,7 @@ impl AgentManager {
         agent_session_id: String,
         connect_params: serde_json::Value,
         connect_timeout: std::time::Duration,
-    ) -> Result<AgentDriverClient, String> {
+    ) -> Result<AgentDriverClient, crate::agent_runtime::SharedConnectionOpenError> {
         crate::agent_runtime::spawn_shared_connection_client(
             self,
             db_type,

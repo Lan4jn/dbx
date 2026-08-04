@@ -2,6 +2,7 @@
 
 import { createReadStream, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_API_BASE = "https://api.cnb.cool";
 const DEFAULT_REPOSITORY = "dbxio.com/dbx";
@@ -15,9 +16,21 @@ async function main() {
   if (!tag) throw new Error("GitHub release JSON is missing tagName.");
 
   const client = new CnbClient(args);
-  const release = await client.ensureRelease(tag, githubRelease);
+  const release = await client.ensureRelease(tag, githubRelease, { makeLatest: args.makeLatest });
+
+  if (args.metadataOnly) {
+    console.log(`Updated CNB release metadata for ${tag}.`);
+    return;
+  }
+
+  const localAssetPaths = localAssets(args.assetsDir);
+  const localAssetNames = new Set(localAssetPaths.map((assetPath) => basename(assetPath)));
+  if (args.pruneAssets) {
+    await pruneReleaseAssets(client, release, localAssetNames);
+  }
+
   const existingAssets = new Set((release.assets || []).map((asset) => asset.name));
-  const assets = localAssets(args.assetsDir).filter((assetPath) => {
+  const assets = localAssetPaths.filter((assetPath) => {
     const name = basename(assetPath);
     if (existingAssets.has(name) && !args.overwriteExisting) {
       console.log(`Skipping existing CNB asset: ${name}`);
@@ -41,22 +54,40 @@ function parseArgs(argv) {
     overwriteExisting: false,
     githubReleasePath: "",
     assetsDir: "",
+    metadataOnly: false,
+    pruneAssets: false,
+    makeLatest: false,
   };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     if (arg === "--github-release") args.githubReleasePath = argv[++index];
     else if (arg === "--assets-dir") args.assetsDir = argv[++index];
+    else if (arg === "--metadata-only") args.metadataOnly = true;
     else if (arg === "--overwrite-existing") args.overwriteExisting = true;
+    else if (arg === "--prune-assets") args.pruneAssets = true;
+    else if (arg === "--make-latest") args.makeLatest = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!args.token) throw new Error("CNB_TOKEN is required.");
-  if (!args.githubReleasePath || !args.assetsDir) {
-    throw new Error("Usage: sync-cnb-release.mjs --github-release <release.json> --assets-dir <dir>");
+  if (!args.githubReleasePath || (!args.metadataOnly && !args.assetsDir)) {
+    throw new Error(
+      "Usage: sync-cnb-release.mjs --github-release <release.json> (--assets-dir <dir> | --metadata-only) [--prune-assets] [--make-latest]",
+    );
   }
   if (!Number.isInteger(args.concurrency) || args.concurrency < 1) {
     throw new Error("CNB_UPLOAD_CONCURRENCY must be a positive integer.");
   }
   return args;
+}
+
+export async function pruneReleaseAssets(client, release, localAssetNames) {
+  for (const asset of release.assets || []) {
+    if (localAssetNames.has(asset.name)) continue;
+    if (!asset.id) throw new Error(`CNB asset ${asset.name} is missing its id.`);
+    // Mutable release aliases must not retain files removed from the source release.
+    await client.deleteAsset(release.id, asset.id);
+    console.log(`Deleted stale CNB asset: ${asset.name}`);
+  }
 }
 
 async function uploadWithRetry(client, releaseId, filePath, overwriteExisting) {
@@ -76,20 +107,21 @@ async function uploadWithRetry(client, releaseId, filePath, overwriteExisting) {
   }
 }
 
-class CnbClient {
+export class CnbClient {
   constructor({ apiBase, repository, token }) {
     this.apiBase = apiBase.replace(/\/+$/, "");
     this.repository = repository;
     this.token = token;
   }
 
-  async ensureRelease(tag, githubRelease) {
+  async ensureRelease(tag, githubRelease, { makeLatest = false } = {}) {
     const payload = {
       tag_name: tag,
       name: githubRelease.name || tag,
       body: githubRelease.body || "",
       prerelease: Boolean(githubRelease.isPrerelease || githubRelease.prerelease),
       target_commitish: githubRelease.targetCommitish || githubRelease.target_commitish || "",
+      ...(makeLatest ? { make_latest: "true" } : {}),
     };
     const existing = await this.request("GET", `/${this.repository}/-/releases/tags/${encodeURIComponent(tag)}`, null, true);
     if (!existing) return this.request("POST", `/${this.repository}/-/releases`, payload);
@@ -98,6 +130,8 @@ class CnbClient {
     await this.request("PATCH", `/${this.repository}/-/releases/${existing.id}`, {
       name: payload.name,
       body: payload.body,
+      prerelease: payload.prerelease,
+      ...(makeLatest ? { make_latest: "true" } : {}),
     });
     return existing;
   }
@@ -127,6 +161,30 @@ class CnbClient {
     }
   }
 
+  async deleteAsset(releaseId, assetId) {
+    await this.request(
+      "DELETE",
+      `/${this.repository}/-/releases/${encodeURIComponent(releaseId)}/assets/${encodeURIComponent(assetId)}`,
+    );
+  }
+
+  async listReleases(pageSize = 100) {
+    const releases = [];
+    for (let page = 1; ; page++) {
+      const batch = await this.request(
+        "GET",
+        `/${this.repository}/-/releases?page=${page}&page_size=${pageSize}`,
+      );
+      if (!Array.isArray(batch)) throw new Error("CNB release list response must be an array.");
+      releases.push(...batch);
+      if (batch.length < pageSize) return releases;
+    }
+  }
+
+  async deleteRelease(releaseId) {
+    await this.request("DELETE", `/${this.repository}/-/releases/${encodeURIComponent(releaseId)}`);
+  }
+
   async request(method, path, body = null, allow404 = false) {
     const response = await fetch(`${this.apiBase}${path}`, {
       method,
@@ -135,7 +193,14 @@ class CnbClient {
     });
     if (allow404 && response.status === 404) return null;
     if (!response.ok) throw new Error(`CNB API ${method} ${path} failed with ${response.status}: ${await response.text()}`);
-    return response.status === 204 ? null : response.json();
+    const responseBody = await response.text();
+    // CNB may acknowledge release metadata updates with HTTP 200 and an empty body.
+    if (!responseBody.trim()) return null;
+    try {
+      return JSON.parse(responseBody);
+    } catch (error) {
+      throw new Error(`CNB API ${method} ${path} returned invalid JSON: ${error.message}`);
+    }
   }
 
   headers(json = false) {
@@ -165,7 +230,9 @@ async function mapWithConcurrency(items, concurrency, worker) {
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runWorker));
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

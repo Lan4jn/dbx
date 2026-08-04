@@ -2,6 +2,9 @@ use percent_encoding::percent_decode_str;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, LoadExtensionGuard, OpenFlags};
+use sqlparser::ast::Statement;
+use sqlparser::dialect::SQLiteDialect;
+use sqlparser::parser::Parser;
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
@@ -37,6 +40,43 @@ impl SqliteHandle {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         f(&mut conn)
     }
+}
+
+pub fn attach_database(pool: &SqliteHandle, name: &str, path: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("SQLite attached database name cannot be empty".to_string());
+    }
+    if name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp") {
+        return Err(format!("SQLite database name \"{name}\" is reserved"));
+    }
+    if !is_memory_database_path(path) {
+        validate_file_path(path, is_network_path)?;
+    }
+
+    let sql = format!("ATTACH DATABASE ?1 AS {}", sqlite_quote_ident(name));
+    pool.with_connection(|conn| {
+        conn.execute(&sql, [path]).map(|_| ()).map_err(|e| format!("Failed to attach SQLite database \"{name}\": {e}"))
+    })
+}
+
+pub fn validate_persistent_attachments(main_path: &str, cipher_key: &str, has_attachments: bool) -> Result<(), String> {
+    if !has_attachments {
+        return Ok(());
+    }
+    if is_memory_database_path(main_path) {
+        return Err(
+            "Persistent SQLite attachments are unavailable for an in-memory main database because reconnecting would discard its data."
+                .to_string(),
+        );
+    }
+    if !cipher_key.is_empty() {
+        return Err(
+            "Persistent SQLite attachments are unavailable for SQLCipher connections because each attached database requires an explicit key."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub async fn connect_path(path: &str) -> Result<SqliteHandle, String> {
@@ -498,6 +538,39 @@ pub fn is_memory_database_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sqlite_schema_name_repairs_file_paths_and_preserves_attached_aliases() {
+        for value in [
+            "",
+            ":memory:",
+            "/tmp/app.sqlite",
+            "./app.db",
+            "../app.db3",
+            "~/app.sqlite3",
+            "C:\\data\\app.db",
+            "file:/tmp/app.sqlite",
+            "sqlite:/tmp/app.sqlite",
+            "relative.sqlite?mode=ro",
+        ] {
+            assert_eq!(sqlite_schema_name(value), "main", "{value}");
+        }
+
+        assert_eq!(sqlite_schema_name("main"), "main");
+        assert_eq!(sqlite_schema_name("analytics"), "analytics");
+    }
+
+    #[test]
+    fn persistent_attachments_require_a_file_backed_plaintext_main_database() {
+        assert!(validate_persistent_attachments("/tmp/main.sqlite", "", false).is_ok());
+        assert!(validate_persistent_attachments("/tmp/main.sqlite", "", true).is_ok());
+
+        let memory_error = validate_persistent_attachments(":memory:", "", true).unwrap_err();
+        assert!(memory_error.contains("in-memory main database"), "{memory_error}");
+
+        let cipher_error = validate_persistent_attachments("/tmp/main.sqlite", "secret", true).unwrap_err();
+        assert!(cipher_error.contains("SQLCipher"), "{cipher_error}");
+    }
+
     #[tokio::test]
     async fn connect_path_supports_memory_database_across_statements() {
         let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
@@ -509,6 +582,45 @@ mod tests {
         let result = execute_query(&pool, "SELECT name FROM memory_probe WHERE id = 1;").await.expect("select row");
 
         assert_eq!(result.rows[0][0], serde_json::json!("Ada"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_dml_returning_preserves_result_rows() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(&pool, "CREATE TABLE dml_returning (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .expect("create table");
+
+        let inserted = execute_query(&pool, "INSERT INTO dml_returning VALUES (1, 'alice')").await.expect("insert row");
+        let unmatched =
+            execute_query(&pool, "UPDATE dml_returning SET name = name WHERE id = 999").await.expect("update no rows");
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(unmatched.affected_rows, 0);
+
+        let insert_returning = execute_query(&pool, "INSERT INTO dml_returning VALUES (2, 'bob') RETURNING id, name")
+            .await
+            .expect("insert returning");
+        let update_returning =
+            execute_query(&pool, "UPDATE dml_returning SET name = 'bob-updated' WHERE id = 2 RETURNING id, name")
+                .await
+                .expect("update returning");
+        let delete_returning = execute_query(&pool, "DELETE FROM dml_returning WHERE id = 2 RETURNING id, name")
+            .await
+            .expect("delete returning");
+        let empty_returning =
+            execute_query(&pool, "UPDATE dml_returning SET name = name WHERE id = 999 RETURNING id, name")
+                .await
+                .expect("empty returning");
+
+        for result in [&insert_returning, &update_returning, &delete_returning] {
+            assert_eq!(result.columns, vec!["id", "name"]);
+            assert_eq!(result.rows.len(), 1);
+        }
+        assert_eq!(insert_returning.rows[0], vec![serde_json::json!(2), serde_json::json!("bob")]);
+        assert_eq!(update_returning.rows[0], vec![serde_json::json!(2), serde_json::json!("bob-updated")]);
+        assert_eq!(delete_returning.rows[0], vec![serde_json::json!(2), serde_json::json!("bob-updated")]);
+        assert_eq!(empty_returning.columns, vec!["id", "name"]);
+        assert!(empty_returning.rows.is_empty());
     }
 
     #[tokio::test]
@@ -1078,22 +1190,124 @@ mod tests {
         assert_eq!(columns.candidates[0].name, "display_name");
         assert_eq!(columns.candidates[0].data_type.as_deref(), Some("TEXT"));
     }
+
+    #[tokio::test]
+    async fn attached_database_metadata_uses_attached_schema() {
+        let path = std::env::temp_dir().join(format!("dbx-sqlite-attach-{}.sqlite", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).expect("create attached database");
+            conn.execute_batch(
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY); \
+                 CREATE TABLE child(id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER REFERENCES parent(id), source TEXT NOT NULL); \
+                 INSERT INTO child(parent_id, source) VALUES(NULL, 'attached'); \
+                 CREATE INDEX child_parent_idx ON child(parent_id); \
+                 CREATE TRIGGER child_touch AFTER INSERT ON child BEGIN UPDATE child SET parent_id = parent_id WHERE id = new.id; END;",
+            )
+            .expect("create attached schema");
+        }
+
+        let pool = connect_path(":memory:").await.expect("connect primary database");
+        attach_database(&pool, "analytics.db", path.to_str().unwrap()).expect("attach database");
+        execute_query(&pool, "CREATE TABLE child(source TEXT NOT NULL); INSERT INTO child(source) VALUES('main');")
+            .await
+            .expect("create same-named main table");
+
+        let qualified_child = crate::sql_dialect::qualified_table_name(
+            Some(crate::models::connection::DatabaseType::Sqlite),
+            Some("analytics.db"),
+            "child",
+        );
+        pool.with_connection(|conn| {
+            let attached_source: String = conn
+                .query_row(&format!("SELECT source FROM {qualified_child}"), [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(attached_source, "attached");
+
+            conn.execute(&format!("UPDATE {qualified_child} SET source = 'updated'"), [])
+                .map_err(|error| error.to_string())?;
+            let main_source: String = conn
+                .query_row("SELECT source FROM main.child", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            let updated_attached_source: String = conn
+                .query_row("SELECT source FROM \"analytics.db\".child", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(main_source, "main");
+            assert_eq!(updated_attached_source, "updated");
+            Ok(())
+        })
+        .expect("query attached table by qualified name");
+
+        let databases = list_databases(&pool).await.expect("list databases");
+        assert_eq!(
+            databases.into_iter().map(|database| database.name).collect::<Vec<_>>(),
+            vec!["main", "analytics.db"]
+        );
+        assert!(list_tables(&pool, "analytics.db")
+            .await
+            .expect("list attached tables")
+            .iter()
+            .any(|table| table.name == "child"));
+
+        let columns = get_columns(&pool, "analytics.db", "child").await.expect("list attached columns");
+        assert_eq!(
+            columns.iter().find(|column| column.name == "id").and_then(|column| column.extra.as_deref()),
+            Some("autoincrement")
+        );
+        assert!(list_indexes(&pool, "analytics.db", "child")
+            .await
+            .expect("list attached indexes")
+            .iter()
+            .any(|index| index.name == "child_parent_idx"));
+        assert_eq!(
+            list_foreign_keys(&pool, "analytics.db", "child").await.expect("list attached foreign keys").len(),
+            1
+        );
+        assert!(list_triggers(&pool, "analytics.db", "child")
+            .await
+            .expect("list attached triggers")
+            .iter()
+            .any(|trigger| trigger.name == "child_touch"));
+        assert!(crate::schema::sqlite_ddl(&pool, "analytics.db", "child")
+            .await
+            .expect("read attached table DDL")
+            .contains("CREATE TABLE child"));
+
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
-pub async fn list_databases(_pool: &SqliteHandle) -> Result<Vec<DatabaseInfo>, String> {
-    Ok(vec![DatabaseInfo { name: "main".to_string() }])
-}
-
-pub async fn list_tables(pool: &SqliteHandle, _schema: &str) -> Result<Vec<TableInfo>, String> {
+pub async fn list_databases(pool: &SqliteHandle) -> Result<Vec<DatabaseInfo>, String> {
     let pool = pool.clone();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT name, type FROM sqlite_master \
-                     WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                )
-                .map_err(|e| e.to_string())?;
+            let mut stmt = conn.prepare("PRAGMA database_list").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>("name")).map_err(|e| e.to_string())?;
+            rows.filter_map(|row| match row {
+                Ok(name) if !name.eq_ignore_ascii_case("temp") => Some(Ok(DatabaseInfo { name })),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub async fn list_tables(pool: &SqliteHandle, schema: &str) -> Result<Vec<TableInfo>, String> {
+    let pool = pool.clone();
+    let requested_schema = schema.to_string();
+    tokio::task::spawn_blocking(move || {
+        pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let sql = format!(
+                "SELECT name, type FROM {}.sqlite_master \
+                 WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                sqlite_quote_ident(&schema)
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
                     let table_type: String = row.get(1)?;
@@ -1113,13 +1327,15 @@ pub async fn list_tables(pool: &SqliteHandle, _schema: &str) -> Result<Vec<Table
     .map_err(|e| e.to_string())?
 }
 
-pub async fn get_columns(pool: &SqliteHandle, _schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+pub async fn get_columns(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let pool = pool.clone();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        let sql = format!("PRAGMA table_info(\"{}\")", table.replace('"', "\"\""));
         pool.with_connection(|conn| {
-            let autoincrement_columns = sqlite_autoincrement_pk_columns(conn, &table).unwrap_or_default();
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let sql = format!("PRAGMA {}.table_info({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table));
+            let autoincrement_columns = sqlite_autoincrement_pk_columns(conn, &schema, &table).unwrap_or_default();
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1235,6 +1451,7 @@ fn sqlite_completion_schemas(
             parent_name: None,
             comment: None,
             data_type: None,
+            signature: None,
         })
         .collect())
 }
@@ -1259,7 +1476,7 @@ fn sqlite_completion_tables(
     if type_filters.is_empty() {
         type_filters.extend(["table", "view"]);
     }
-    let placeholders = std::iter::repeat("?").take(type_filters.len()).collect::<Vec<_>>().join(", ");
+    let placeholders = std::iter::repeat_n("?", type_filters.len()).collect::<Vec<_>>().join(", ");
     let sql = format!(
         "SELECT name, type FROM {}.sqlite_master WHERE type IN ({}) AND name NOT LIKE 'sqlite_%' AND {} ORDER BY name LIMIT ?",
         sqlite_quote_ident(&schema),
@@ -1288,6 +1505,7 @@ fn sqlite_completion_tables(
                 parent_name: None,
                 comment: None,
                 data_type: None,
+                signature: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1326,6 +1544,7 @@ fn sqlite_completion_columns(
             parent_name: Some(table.to_string()),
             comment: None,
             data_type: Some(data_type),
+            signature: None,
         });
         if candidates.len() >= limit {
             break;
@@ -1379,8 +1598,67 @@ fn sqlite_completion_like_pattern(request: &CompletionAssistantRequest) -> Strin
     }
 }
 
-fn sqlite_quote_ident(value: &str) -> String {
+pub(crate) fn sqlite_quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+pub(crate) fn sqlite_quote_schema_ident(value: &str) -> String {
+    sqlite_quote_ident(sqlite_schema_name(value))
+}
+
+pub(crate) fn sqlite_quote_schema_ident_for_connection(conn: &Connection, value: &str) -> Result<String, String> {
+    Ok(sqlite_quote_ident(&sqlite_schema_name_for_connection(conn, value)?))
+}
+
+fn sqlite_schema_name_for_connection(conn: &Connection, value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok("main".to_string());
+    }
+
+    let mut stmt = conn.prepare("PRAGMA database_list").map_err(|e| e.to_string())?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>("name"))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if names.iter().any(|name| name.eq_ignore_ascii_case(value)) {
+        Ok(value.to_string())
+    } else {
+        Ok(sqlite_schema_name(value).to_string())
+    }
+}
+
+fn sqlite_schema_name(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() || is_sqlite_file_namespace(value) {
+        "main"
+    } else {
+        value
+    }
+}
+
+fn is_sqlite_file_namespace(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    lower == ":memory:"
+        || lower.starts_with("file:")
+        || lower.starts_with("sqlite:")
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.starts_with("~/")
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains('/')
+        || value.contains('\\')
+        || path.ends_with(".db")
+        || path.ends_with(".db3")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || (value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'/' | b'\\'))
 }
 
 fn sqlite_quote_string(value: &str) -> String {
@@ -1391,11 +1669,10 @@ fn sqlite_quote_string(value: &str) -> String {
 /// are rowid-alias autoincrement primary keys (i.e. SQLite will assign a value when
 /// the column is omitted from an INSERT). Returns `None` only on connection / query
 /// errors; an unparseable build statement yields `Some(empty)`.
-fn sqlite_autoincrement_pk_columns(conn: &Connection, table: &str) -> Option<HashSet<String>> {
-    let create_sql: Option<String> = conn
-        .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |row| row.get(0))
-        .ok()
-        .flatten();
+fn sqlite_autoincrement_pk_columns(conn: &Connection, schema: &str, table: &str) -> Option<HashSet<String>> {
+    let sql =
+        format!("SELECT sql FROM {}.sqlite_master WHERE type = 'table' AND name = ?1", sqlite_quote_ident(schema));
+    let create_sql: Option<String> = conn.query_row(&sql, [table], |row| row.get(0)).ok().flatten();
     Some(parse_sqlite_autoincrement_pk_columns(create_sql.as_deref()?))
 }
 
@@ -1946,13 +2223,16 @@ fn is_sql_keyword(value: &str) -> bool {
     )
 }
 
-pub async fn list_indexes(pool: &SqliteHandle, _schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
+pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
     let pool = pool.clone();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        let safe_table = table.replace('"', "\"\"");
         pool.with_connection(|conn| {
-            let mut stmt = conn.prepare(&format!("PRAGMA index_list(\"{safe_table}\")")).map_err(|e| e.to_string())?;
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA {}.index_list({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table)))
+                .map_err(|e| e.to_string())?;
             let idx_rows = stmt
                 .query_map([], |row| {
                     Ok((
@@ -1967,14 +2247,21 @@ pub async fn list_indexes(pool: &SqliteHandle, _schema: &str, table: &str) -> Re
 
             let mut indexes = Vec::new();
             for (name, is_unique, origin) in idx_rows {
-                let safe_name = name.replace('"', "\"\"");
-                let mut col_stmt =
-                    conn.prepare(&format!("PRAGMA index_info(\"{safe_name}\")")).map_err(|e| e.to_string())?;
+                let mut col_stmt = conn
+                    .prepare(&format!(
+                        "PRAGMA {}.index_info({})",
+                        sqlite_quote_ident(&schema),
+                        sqlite_quote_string(&name)
+                    ))
+                    .map_err(|e| e.to_string())?;
                 let columns = col_stmt
-                    .query_map([], |row| row.get::<_, String>("name"))
+                    .query_map([], |row| row.get::<_, Option<String>>("name"))
                     .map_err(|e| e.to_string())?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
 
                 indexes.push(IndexInfo {
                     name,
@@ -1994,12 +2281,15 @@ pub async fn list_indexes(pool: &SqliteHandle, _schema: &str, table: &str) -> Re
     .map_err(|e| e.to_string())?
 }
 
-pub async fn list_foreign_keys(pool: &SqliteHandle, _schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+pub async fn list_foreign_keys(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
     let pool = pool.clone();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        let sql = format!("PRAGMA foreign_key_list(\"{}\")", table.replace('"', "\"\""));
         pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let sql =
+                format!("PRAGMA {}.foreign_key_list({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table));
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
@@ -2021,14 +2311,18 @@ pub async fn list_foreign_keys(pool: &SqliteHandle, _schema: &str, table: &str) 
     .map_err(|e| e.to_string())?
 }
 
-pub async fn list_triggers(pool: &SqliteHandle, _schema: &str, table: &str) -> Result<Vec<TriggerInfo>, String> {
+pub async fn list_triggers(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<TriggerInfo>, String> {
     let pool = pool.clone();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name")
-                .map_err(|e| e.to_string())?;
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let sql = format!(
+                "SELECT name, sql FROM {}.sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+                sqlite_quote_ident(&schema)
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([table], |row| {
                     let sql_text: Option<String> = row.get("sql")?;
@@ -2068,6 +2362,28 @@ pub async fn execute_query(pool: &SqliteHandle, sql: &str) -> Result<QueryResult
 
 fn query_result_row_limit(max_rows: Option<usize>) -> usize {
     max_rows.unwrap_or(crate::query::MAX_ROWS).max(1)
+}
+
+/// DML with `RETURNING` produces a result set in SQLite and must use the
+/// statement query API instead of `execute_batch`.
+fn sqlite_statement_returns_rows(sql: &str) -> bool {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "PRAGMA", "EXPLAIN", "WITH"]) {
+        return true;
+    }
+
+    let Ok(statements) = Parser::parse_sql(&SQLiteDialect {}, sql) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+
+    match statement {
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
 }
 
 const SQLITE_FUNCTION_ALIASES: &[(&str, &str)] = &[("if", "IIF"), ("substring", "substr")];
@@ -2174,7 +2490,7 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
     let row_limit = query_result_row_limit(max_rows);
 
     pool.with_connection(|conn| {
-        if starts_with_executable_sql_keyword(sql, &["SELECT", "PRAGMA", "EXPLAIN", "WITH"]) {
+        if sqlite_statement_returns_rows(sql) {
             let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
             let columns = stmt.column_names().iter().map(|name| name.to_string()).collect::<Vec<_>>();
             let column_decl_types =
@@ -2205,12 +2521,15 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
                 columns,
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
                 rows: result_rows,
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
                 truncated,
                 session_id: None,
                 has_more: false,
+                elasticsearch_raw_body: None,
             })
         } else {
             conn.execute_batch(sql).map_err(|e| e.to_string())?;
@@ -2218,12 +2537,15 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
                 rows: vec![],
                 affected_rows: conn.changes(),
                 execution_time_ms: start.elapsed().as_millis(),
                 truncated: false,
                 session_id: None,
                 has_more: false,
+                elasticsearch_raw_body: None,
             })
         }
     })

@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { toRefs, watch } from "vue";
-import { Loader2, Clipboard, Upload } from "@lucide/vue";
+import { computed, toRefs, watch } from "vue";
+import { AlertTriangle, Check, Loader2, Clipboard, Plus, Trash2, Upload } from "@lucide/vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 
 const props = defineProps<{ controller: Record<string, any> }>();
 const emit = defineEmits<{ closed: [] }>();
@@ -55,6 +57,19 @@ const {
   createDatabaseCollation,
   createDatabaseCollationOptionsForCharset,
   createDatabaseCollationsByCharset,
+  createDatabaseUsers,
+  createDatabaseSelectedUsers,
+  createDatabaseUsersLoading,
+  createDatabaseUserKey,
+  createDatabaseUserLabel,
+  createDatabaseUserSelected,
+  toggleCreateDatabaseUser,
+  showCreateDatabasePreviewDialog,
+  createDatabasePreviewSql,
+  createDatabaseAuthorizationResults,
+  createDatabaseAuthorizationApplying,
+  applyCreateDatabaseAuthorizationPlan,
+  createDatabaseAuthorizationStepLabel,
   confirmCreateDatabase,
   showEditDatabasePropertiesDialog,
   editDatabasePropertiesLoading,
@@ -75,6 +90,28 @@ const {
   editNacosNamespaceDesc,
   editNacosNamespaceLoading,
   confirmEditNacosNamespace,
+  showRenameMongoCollectionDialog,
+  renameMongoCollectionName,
+  renameMongoCollectionError,
+  renameMongoCollectionPreview,
+  renameMongoCollectionLoading,
+  confirmRenameMongoCollection,
+  showCreateMongoIndexDialog,
+  mongoCreateIndexForm,
+  mongoCreateIndexFieldOptions,
+  mongoCreateIndexError,
+  mongoCreateIndexLoading,
+  mongoIndexKeyTypes,
+  mongoCreateIndexCanSubmit,
+  mongoCreateIndexCanAddField,
+  addMongoCreateIndexField,
+  removeMongoCreateIndexField,
+  confirmCreateMongoIndex,
+  showRedisDatabaseAliasDialog,
+  redisDatabaseAliasInput,
+  redisDatabaseAliasSaving,
+  confirmRedisDatabaseAlias,
+  clearRedisDatabaseAlias,
   showCreateSchemaDialog,
   createSchemaName,
   confirmCreateSchema,
@@ -93,6 +130,36 @@ function pasteTargetsMissing(entries: Array<{ targetName: string }>): boolean {
   return entries.every((entry) => !entry.targetName.trim());
 }
 
+function returnToCreateDatabaseDialog() {
+  showCreateDatabaseDialog.value = true;
+  showCreateDatabasePreviewDialog.value = false;
+}
+
+function updateCreateDatabasePreviewDialog(open: boolean) {
+  if (open) {
+    showCreateDatabasePreviewDialog.value = true;
+    return;
+  }
+  if (createDatabaseAuthorizationApplying.value) return;
+  if (createDatabaseAuthorizationResults.value.length === 0) {
+    returnToCreateDatabaseDialog();
+    return;
+  }
+  showCreateDatabasePreviewDialog.value = false;
+}
+
+function closeCreateDatabaseResult() {
+  showCreateDatabasePreviewDialog.value = false;
+}
+
+const mongoIndexCollectionName = computed(() => node.value.tableName || node.value.label);
+
+function mongoIndexTypeLabel(type: string): string {
+  if (type === "1") return t.value("contextMenu.mongoIndexAscending");
+  if (type === "-1") return t.value("contextMenu.mongoIndexDescending");
+  return type;
+}
+
 watch(
   [
     showDeleteConfirm,
@@ -104,9 +171,13 @@ watch(
     showDuplicateDialog,
     showPasteDialog,
     showCreateDatabaseDialog,
+    showCreateDatabasePreviewDialog,
     showEditDatabasePropertiesDialog,
     showCreateNacosNamespaceDialog,
     showEditNacosNamespaceDialog,
+    showRenameMongoCollectionDialog,
+    showCreateMongoIndexDialog,
+    showRedisDatabaseAliasDialog,
     showCreateSchemaDialog,
     showEditSchemaCommentDialog,
   ],
@@ -122,7 +193,7 @@ watch(
       <DialogHeader>
         <DialogTitle>{{ t("contextMenu.confirmDeleteTitle") }}</DialogTitle>
       </DialogHeader>
-      <p class="text-sm text-muted-foreground">
+      <p class="min-w-0 break-words text-sm text-muted-foreground [overflow-wrap:anywhere]">
         {{ connectionDeleteConfirmMessage() }}
       </p>
       <DialogFooter>
@@ -181,6 +252,113 @@ watch(
         <Button variant="outline" @click="showRenameObjectDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="!renameObjectName.trim() || renameObjectName.trim() === node.label" @click="confirmRenameObject">
           {{ t("contextMenu.renameObject") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showRenameMongoCollectionDialog">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("contextMenu.renameObjectTitle") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-3">
+        <Input v-model="renameMongoCollectionName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" :disabled="renameMongoCollectionLoading" @keydown.enter.prevent="confirmRenameMongoCollection" />
+        <pre v-if="renameMongoCollectionPreview" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
+        <p v-if="renameMongoCollectionError" class="text-sm text-destructive">{{ renameMongoCollectionError }}</p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="renameMongoCollectionLoading" @click="showRenameMongoCollectionDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="renameMongoCollectionLoading || !renameMongoCollectionName || renameMongoCollectionName === node.label" @click="confirmRenameMongoCollection">
+          <Loader2 v-if="renameMongoCollectionLoading" class="mr-2 h-4 w-4 animate-spin" />
+          {{ t("contextMenu.renameObject") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showCreateMongoIndexDialog">
+    <DialogContent class="min-w-0 sm:max-w-[600px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("contextMenu.createMongoIndexTitle", { collection: mongoIndexCollectionName }) }}</DialogTitle>
+        <p class="font-mono text-xs text-muted-foreground">{{ node.database }} / {{ mongoIndexCollectionName }}</p>
+      </DialogHeader>
+      <div class="grid min-w-0 gap-5">
+        <section class="grid min-w-0 gap-2">
+          <div class="flex items-center justify-between gap-3">
+            <span class="text-sm font-medium">{{ t("contextMenu.createMongoIndexFields") }}</span>
+            <Button type="button" variant="outline" size="sm" :disabled="mongoCreateIndexLoading || !mongoCreateIndexCanAddField" @click="addMongoCreateIndexField">
+              <Plus class="mr-1 h-4 w-4" />
+              {{ t("mongo.addField") }}
+            </Button>
+          </div>
+          <div class="flex min-w-0 gap-2 px-0.5 text-xs text-muted-foreground">
+            <span class="min-w-0 flex-1">{{ t("mongo.field") }}</span>
+            <span class="w-36 shrink-0">{{ t("structureEditor.indexType") }}</span>
+            <span class="w-8 shrink-0"></span>
+          </div>
+          <div v-for="field in mongoCreateIndexForm.fields" :key="field.id" class="flex min-w-0 items-center gap-2">
+            <Input v-model="field.path" :list="`mongo-index-fields-${field.id}`" :disabled="mongoCreateIndexLoading" :placeholder="t('mongo.fieldPlaceholder')" :aria-label="t('mongo.field')" class="h-8 min-w-0 flex-1" autocomplete="off" />
+            <datalist :id="`mongo-index-fields-${field.id}`">
+              <option v-for="option in mongoCreateIndexFieldOptions" :key="option" :value="option"></option>
+            </datalist>
+            <Select v-model="field.type" :disabled="mongoCreateIndexLoading">
+              <SelectTrigger class="h-8 w-36 shrink-0" :aria-label="t('structureEditor.indexType')">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="type in mongoIndexKeyTypes" :key="type" :value="type">{{ mongoIndexTypeLabel(type) }}</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button type="button" variant="ghost" size="icon" class="h-8 w-8" :disabled="mongoCreateIndexLoading || mongoCreateIndexForm.fields.length === 1" :title="t('structureEditor.remove')" :aria-label="t('structureEditor.remove')" @click="removeMongoCreateIndexField(field.id)">
+              <Trash2 class="h-4 w-4" />
+            </Button>
+          </div>
+        </section>
+
+        <label class="grid gap-1.5 text-sm font-medium">
+          {{ t("structureEditor.indexName") }}
+          <Input v-model="mongoCreateIndexForm.name" :disabled="mongoCreateIndexLoading" :placeholder="t('contextMenu.createMongoIndexNamePlaceholder')" :aria-label="t('structureEditor.indexName')" />
+          <span class="text-xs font-normal text-muted-foreground">{{ t("contextMenu.createMongoIndexNameHint") }}</span>
+        </label>
+
+        <div class="grid gap-2 rounded-md border p-3 sm:grid-cols-2">
+          <label class="flex cursor-pointer items-center justify-between gap-3 text-sm font-medium">
+            {{ t("structureEditor.unique") }}
+            <Switch v-model="mongoCreateIndexForm.unique" :disabled="mongoCreateIndexLoading" :aria-label="t('structureEditor.unique')" />
+          </label>
+          <label class="flex cursor-pointer items-center justify-between gap-3 text-sm font-medium">
+            {{ t("contextMenu.createMongoIndexSparse") }}
+            <Switch v-model="mongoCreateIndexForm.sparse" :disabled="mongoCreateIndexLoading" :aria-label="t('contextMenu.createMongoIndexSparse')" />
+          </label>
+        </div>
+        <p v-if="mongoCreateIndexError" class="min-w-0 max-w-full whitespace-pre-wrap break-all text-sm text-destructive">{{ mongoCreateIndexError }}</p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="mongoCreateIndexLoading" @click="showCreateMongoIndexDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="mongoCreateIndexLoading || !mongoCreateIndexCanSubmit" @click="confirmCreateMongoIndex">
+          <Loader2 v-if="mongoCreateIndexLoading" class="mr-2 h-4 w-4 animate-spin" />
+          {{ t("contextMenu.createMongoIndex") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showRedisDatabaseAliasDialog">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("redis.databaseAliasTitle", { db: node.database }) }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-2">
+        <Input v-model="redisDatabaseAliasInput" :placeholder="t('redis.databaseAliasPlaceholder')" :disabled="redisDatabaseAliasSaving" @keydown.enter.prevent="confirmRedisDatabaseAlias" />
+        <p class="text-xs text-muted-foreground">{{ t("redis.databaseAliasHint") }}</p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="redisDatabaseAliasSaving" @click="clearRedisDatabaseAlias">{{ t("redis.clearDatabaseAlias") }}</Button>
+        <Button variant="outline" :disabled="redisDatabaseAliasSaving" @click="showRedisDatabaseAliasDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="redisDatabaseAliasSaving || !redisDatabaseAliasInput.trim()" @click="confirmRedisDatabaseAlias">
+          <Loader2 v-if="redisDatabaseAliasSaving" class="mr-2 h-4 w-4 animate-spin" />
+          {{ t("common.save") }}
         </Button>
       </DialogFooter>
     </DialogContent>
@@ -331,9 +509,63 @@ watch(
           </SearchableSelect>
         </div>
       </div>
+      <div v-if="createDatabaseUsersLoading || createDatabaseUsers.length > 0" class="grid gap-2">
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <div class="text-xs font-medium text-muted-foreground">{{ t("contextMenu.createDatabaseUsers") }}</div>
+            <div class="mt-1 text-[11px] text-muted-foreground">{{ t("contextMenu.createDatabaseUsersHint") }}</div>
+          </div>
+          <span class="text-[11px] text-muted-foreground">{{ t("contextMenu.createDatabaseUsersSelected", { count: createDatabaseSelectedUsers.length }) }}</span>
+        </div>
+        <div class="max-h-40 overflow-auto rounded-md border">
+          <div v-if="createDatabaseUsersLoading" class="flex items-center gap-2 p-3 text-xs text-muted-foreground">
+            <Loader2 class="h-3.5 w-3.5 animate-spin" />
+            {{ t("contextMenu.createDatabaseUsersLoading") }}
+          </div>
+          <template v-else>
+            <button v-for="user in createDatabaseUsers" :key="createDatabaseUserKey(user)" type="button" class="flex w-full items-center gap-2 border-b px-3 py-2 text-left text-xs last:border-b-0 hover:bg-muted/50" @click="toggleCreateDatabaseUser(user)">
+              <span class="flex h-3.5 w-3.5 items-center justify-center rounded border" :class="createDatabaseUserSelected(user) ? 'border-primary bg-primary text-primary-foreground' : 'border-border'">
+                <Check v-if="createDatabaseUserSelected(user)" class="h-2.5 w-2.5" />
+              </span>
+              <span class="truncate">{{ createDatabaseUserLabel(user) }}</span>
+            </button>
+          </template>
+        </div>
+      </div>
       <DialogFooter>
         <Button variant="outline" @click="showCreateDatabaseDialog = false">{{ t("dangerDialog.cancel") }}</Button>
-        <Button :disabled="!createDatabaseName.trim()" @click="confirmCreateDatabase">{{ t("dangerDialog.confirm") }}</Button>
+        <Button :disabled="!createDatabaseName.trim()" @click="confirmCreateDatabase">{{ t("contextMenu.previewCreateDatabaseSql") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog :open="showCreateDatabasePreviewDialog" @update:open="updateCreateDatabasePreviewDialog">
+    <DialogContent class="sm:max-w-[720px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("contextMenu.createDatabaseSqlPreview") }}</DialogTitle>
+      </DialogHeader>
+      <pre class="max-h-[48vh] min-h-44 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
+      <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid gap-2 rounded-md border p-3">
+        <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
+          <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
+          <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+          <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
+          <span class="min-w-0">
+            <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
+            <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
+            <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
+          </span>
+        </div>
+      </div>
+      <DialogFooter>
+        <template v-if="createDatabaseAuthorizationResults.length === 0">
+          <Button variant="outline" :disabled="createDatabaseAuthorizationApplying" @click="updateCreateDatabasePreviewDialog(false)">{{ t("dangerDialog.cancel") }}</Button>
+          <Button :disabled="createDatabaseAuthorizationApplying" @click="applyCreateDatabaseAuthorizationPlan">
+            <Loader2 v-if="createDatabaseAuthorizationApplying" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            {{ t("contextMenu.applyCreateDatabaseSql") }}
+          </Button>
+        </template>
+        <Button v-else @click="closeCreateDatabaseResult">{{ t("contextMenu.closeCreateDatabaseResult") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

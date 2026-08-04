@@ -24,7 +24,11 @@ pub struct DataDirResolution {
 
 impl DataDirResolution {
     pub fn uses_custom_data_dir(&self) -> bool {
-        matches!(self.mode, DataDirMode::EnvOverride | DataDirMode::ConfiguredOverride)
+        matches!(self.mode, DataDirMode::EnvOverride | DataDirMode::ConfiguredOverride | DataDirMode::Portable { .. })
+    }
+
+    pub fn custom_data_dir(&self) -> Option<&Path> {
+        self.uses_custom_data_dir().then_some(self.data_dir.as_path())
     }
 
     pub fn is_portable_mode(&self) -> bool {
@@ -35,51 +39,41 @@ impl DataDirResolution {
 pub fn resolve_data_dir_with_mode(default_app_data_dir: PathBuf, config_dir: Option<&Path>) -> DataDirResolution {
     let env_data_dir = std::env::var_os("DBX_DATA_DIR").filter(|value| !value.is_empty()).map(PathBuf::from);
     let configured_data_dir = config_dir.and_then(load_configured_data_dir);
-    let default_data_dir = default_data_dir(default_app_data_dir);
+    let default_app_data_dir = home_dir_from_env().map(default_home_data_dir).unwrap_or(default_app_data_dir);
 
     #[cfg(target_os = "windows")]
     let exe_dir = current_exe_dir();
     #[cfg(not(target_os = "windows"))]
-    let exe_dir = None;
+    let exe_dir: Option<PathBuf> = None;
 
     let portable_marker_exists = exe_dir.as_deref().is_some_and(portable_marker_exists);
     let installer_marker_exists = exe_dir.as_deref().is_some_and(installer_marker_exists);
+    let portable_data_dir = exe_dir.as_ref().filter(|_| portable_marker_exists).map(|dir| dir.join("data"));
+
+    if env_data_dir.is_none() {
+        if let Some(configured_dir) = configured_data_dir {
+            return DataDirResolution {
+                data_dir: configured_dir,
+                default_data_dir: default_app_data_dir,
+                mode: DataDirMode::ConfiguredOverride,
+                portable_data_dir,
+            };
+        }
+    }
 
     resolve_data_dir_from_inputs(
-        default_data_dir,
+        default_app_data_dir,
         exe_dir,
         portable_marker_exists,
         installer_marker_exists,
         env_data_dir,
-        configured_data_dir,
     )
-}
-
-fn default_data_dir(fallback: PathBuf) -> PathBuf {
-    home_dir_from_env().map(default_home_data_dir).unwrap_or(fallback)
-}
-
-fn home_dir_from_env() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("USERPROFILE")
-            .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
-            .map(PathBuf::from)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("HOME").filter(|value| !value.is_empty()).map(PathBuf::from)
-    }
-}
-
-pub fn default_home_data_dir(home_dir: PathBuf) -> PathBuf {
-    home_dir.join(".dbx")
 }
 
 pub fn alternative_data_dir(resolution: &DataDirResolution) -> Option<PathBuf> {
     match &resolution.mode {
-        DataDirMode::Default | DataDirMode::Portable { .. } => resolution.portable_data_dir.clone(),
+        DataDirMode::Portable { .. } => Some(resolution.default_data_dir.clone()),
+        DataDirMode::Default => resolution.portable_data_dir.clone(),
         DataDirMode::EnvOverride | DataDirMode::ConfiguredOverride => None,
     }
 }
@@ -88,7 +82,21 @@ pub fn is_portable_mode() -> bool {
     resolve_data_dir_with_mode(PathBuf::new(), None).is_portable_mode()
 }
 
-pub fn data_dir_override_file(config_dir: &Path) -> PathBuf {
+fn home_dir_from_env() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()));
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
+    home.map(PathBuf::from)
+}
+
+pub fn default_home_data_dir(home_dir: PathBuf) -> PathBuf {
+    home_dir.join(".dbx")
+}
+
+fn data_dir_override_file(config_dir: &Path) -> PathBuf {
     config_dir.join(DATA_DIR_OVERRIDE_FILE)
 }
 
@@ -105,8 +113,7 @@ pub fn save_configured_data_dir(config_dir: &Path, data_dir: &Path) -> Result<()
 }
 
 pub fn clear_configured_data_dir(config_dir: &Path) -> Result<(), String> {
-    let path = data_dir_override_file(config_dir);
-    match std::fs::remove_file(path) {
+    match std::fs::remove_file(data_dir_override_file(config_dir)) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("Failed to clear data dir config: {err}")),
@@ -144,7 +151,6 @@ fn resolve_data_dir_from_inputs(
     portable_marker_exists: bool,
     installer_marker_exists: bool,
     env_data_dir: Option<PathBuf>,
-    configured_data_dir: Option<PathBuf>,
 ) -> DataDirResolution {
     let portable_data_dir = exe_dir.as_ref().filter(|_| portable_marker_exists).map(|dir| dir.join("data"));
 
@@ -157,19 +163,10 @@ fn resolve_data_dir_from_inputs(
         };
     }
 
-    if let Some(configured_dir) = configured_data_dir {
-        return DataDirResolution {
-            data_dir: configured_dir,
-            default_data_dir: default_app_data_dir,
-            mode: DataDirMode::ConfiguredOverride,
-            portable_data_dir,
-        };
-    }
-
     if portable_marker_exists && !installer_marker_exists {
         if let Some(exe_dir) = exe_dir {
             return DataDirResolution {
-                data_dir: default_app_data_dir.clone(),
+                data_dir: exe_dir.join("data"),
                 default_data_dir: default_app_data_dir,
                 mode: DataDirMode::Portable { exe_dir },
                 portable_data_dir,
@@ -189,26 +186,19 @@ fn resolve_data_dir_from_inputs(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{alternative_data_dir, default_home_data_dir, resolve_data_dir_from_inputs, DataDirMode};
+    use super::{alternative_data_dir, resolve_data_dir_from_inputs, DataDirMode};
 
     #[test]
-    fn default_data_dir_is_home_dbx_on_all_platforms() {
-        assert_eq!(default_home_data_dir(PathBuf::from(r"C:\Users\alice")), PathBuf::from(r"C:\Users\alice\.dbx"));
-        assert_eq!(default_home_data_dir(PathBuf::from("/Users/alice")), PathBuf::from("/Users/alice/.dbx"));
-        assert_eq!(default_home_data_dir(PathBuf::from("/home/alice")), PathBuf::from("/home/alice/.dbx"));
-    }
-
-    #[test]
-    fn portable_marker_keeps_portable_mode_but_uses_default_data_dir() {
-        let default_dir = PathBuf::from(r"C:\Users\Administrator\.dbx");
+    fn uses_portable_data_dir_when_marker_exists_without_installer_marker() {
+        let default_dir = PathBuf::from(r"C:\Users\Administrator\AppData\Roaming\com.dbx.app");
         let exe_dir = PathBuf::from(r"D:\Apps\DBX");
 
-        let resolution =
-            resolve_data_dir_from_inputs(default_dir.clone(), Some(exe_dir.clone()), true, false, None, None);
+        let resolution = resolve_data_dir_from_inputs(default_dir, Some(exe_dir.clone()), true, false, None);
 
-        assert_eq!(resolution.data_dir, default_dir);
+        assert_eq!(resolution.data_dir, exe_dir.join("data"));
+        assert_eq!(resolution.custom_data_dir(), Some(resolution.data_dir.as_path()));
         assert_eq!(resolution.mode, DataDirMode::Portable { exe_dir });
-        assert!(!resolution.uses_custom_data_dir());
+        assert!(resolution.uses_custom_data_dir());
         assert!(resolution.is_portable_mode());
     }
 
@@ -217,9 +207,10 @@ mod tests {
         let default_dir = PathBuf::from(r"C:\Users\Administrator\AppData\Roaming\com.dbx.app");
         let exe_dir = PathBuf::from(r"C:\Program Files\DBX");
 
-        let resolution = resolve_data_dir_from_inputs(default_dir.clone(), Some(exe_dir), true, true, None, None);
+        let resolution = resolve_data_dir_from_inputs(default_dir.clone(), Some(exe_dir), true, true, None);
 
         assert_eq!(resolution.data_dir, default_dir);
+        assert_eq!(resolution.custom_data_dir(), None);
         assert_eq!(resolution.mode, DataDirMode::Default);
         assert!(!resolution.uses_custom_data_dir());
         assert!(!resolution.is_portable_mode());
@@ -231,46 +222,23 @@ mod tests {
         let exe_dir = PathBuf::from(r"C:\Program Files\DBX");
         let env_dir = PathBuf::from(r"E:\DBXData");
 
-        let configured_dir = PathBuf::from(r"D:\ConfiguredDBXData");
-        let resolution = resolve_data_dir_from_inputs(
-            default_dir,
-            Some(exe_dir),
-            true,
-            true,
-            Some(env_dir.clone()),
-            Some(configured_dir),
-        );
+        let resolution = resolve_data_dir_from_inputs(default_dir, Some(exe_dir), true, true, Some(env_dir.clone()));
 
         assert_eq!(resolution.data_dir, env_dir);
+        assert_eq!(resolution.custom_data_dir(), Some(resolution.data_dir.as_path()));
         assert_eq!(resolution.mode, DataDirMode::EnvOverride);
         assert!(resolution.uses_custom_data_dir());
         assert!(!resolution.is_portable_mode());
     }
 
     #[test]
-    fn configured_override_wins_over_portable_mode_when_env_is_not_set() {
-        let default_dir = PathBuf::from(r"C:\Users\Administrator\.dbx");
-        let exe_dir = PathBuf::from(r"D:\Apps\DBX");
-        let configured_dir = PathBuf::from(r"E:\DBXData");
-
-        let resolution =
-            resolve_data_dir_from_inputs(default_dir, Some(exe_dir), true, false, None, Some(configured_dir.clone()));
-
-        assert_eq!(resolution.data_dir, configured_dir);
-        assert_eq!(resolution.mode, DataDirMode::ConfiguredOverride);
-        assert!(resolution.uses_custom_data_dir());
-        assert!(!resolution.is_portable_mode());
-        assert_eq!(alternative_data_dir(&resolution), None);
-    }
-
-    #[test]
-    fn portable_mode_can_import_from_leftover_portable_data_dir() {
-        let default_dir = PathBuf::from(r"C:\Users\Administrator\.dbx");
+    fn portable_mode_can_import_from_default_data_dir() {
+        let default_dir = PathBuf::from(r"C:\Users\Administrator\AppData\Roaming\com.dbx.app");
         let exe_dir = PathBuf::from(r"D:\Apps\DBX");
 
-        let resolution = resolve_data_dir_from_inputs(default_dir.clone(), Some(exe_dir), true, false, None, None);
+        let resolution = resolve_data_dir_from_inputs(default_dir.clone(), Some(exe_dir), true, false, None);
 
-        assert_eq!(alternative_data_dir(&resolution), Some(PathBuf::from(r"D:\Apps\DBX").join("data")));
+        assert_eq!(alternative_data_dir(&resolution), Some(default_dir));
     }
 
     #[test]
@@ -278,7 +246,7 @@ mod tests {
         let default_dir = PathBuf::from(r"C:\Users\Administrator\AppData\Roaming\com.dbx.app");
         let exe_dir = PathBuf::from(r"C:\Program Files\DBX");
 
-        let resolution = resolve_data_dir_from_inputs(default_dir, Some(exe_dir.clone()), true, true, None, None);
+        let resolution = resolve_data_dir_from_inputs(default_dir, Some(exe_dir.clone()), true, true, None);
 
         assert_eq!(alternative_data_dir(&resolution), Some(exe_dir.join("data")));
     }
@@ -288,14 +256,8 @@ mod tests {
         let default_dir = PathBuf::from(r"C:\Users\Administrator\AppData\Roaming\com.dbx.app");
         let exe_dir = PathBuf::from(r"D:\Apps\DBX");
 
-        let resolution = resolve_data_dir_from_inputs(
-            default_dir,
-            Some(exe_dir),
-            true,
-            false,
-            Some(PathBuf::from(r"E:\DBXData")),
-            None,
-        );
+        let resolution =
+            resolve_data_dir_from_inputs(default_dir, Some(exe_dir), true, false, Some(PathBuf::from(r"E:\DBXData")));
 
         assert_eq!(alternative_data_dir(&resolution), None);
     }

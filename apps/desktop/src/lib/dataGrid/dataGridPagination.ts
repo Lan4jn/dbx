@@ -11,6 +11,48 @@ export interface CanGoNextDataGridPageOptions {
   allRowsLoaded?: boolean;
 }
 
+export interface CompleteLocalDataGridResultOptions {
+  isResultsContext: boolean;
+  rowCount: number;
+  pageLimit?: number;
+  pageOffset?: number;
+  totalRowCount?: number;
+  truncated?: boolean;
+  hasMore?: boolean;
+}
+
+export interface CanFetchNextDataGridSegmentOptions {
+  hasMore?: boolean;
+  loadedRowCount: number;
+  pageSize: number;
+  totalRowCount?: number;
+  allRowsLoaded?: boolean;
+}
+
+export type DataGridInexactTotalRowCountMode = "at-least" | "estimated";
+
+export function dataGridTotalRowCountLabelKey(totalRowCountIsExact: boolean, inexactMode: DataGridInexactTotalRowCountMode): "grid.totalRowCount" | "grid.totalRowCountAtLeast" | "grid.totalRowCountEstimated" {
+  if (totalRowCountIsExact) return "grid.totalRowCount";
+  return inexactMode === "estimated" ? "grid.totalRowCountEstimated" : "grid.totalRowCountAtLeast";
+}
+
+export function resolveDataGridPaginationTotal(options: { paginationTotalRowCount?: number; serverKnownTotalRowCount?: number; totalRowCountIsExact: boolean }): number | undefined {
+  if (options.paginationTotalRowCount !== undefined) return options.paginationTotalRowCount;
+  return options.totalRowCountIsExact ? options.serverKnownTotalRowCount : undefined;
+}
+
+export function hasCompleteLocalDataGridResult(options: CompleteLocalDataGridResultOptions): boolean {
+  if (!options.isResultsContext || options.truncated === true || options.hasMore === true) return false;
+  if (options.pageLimit === undefined) return true;
+  if ((options.pageOffset ?? 0) !== 0) return false;
+
+  const pageLimit = Math.max(1, options.pageLimit);
+  if (options.rowCount < pageLimit) return true;
+
+  const totalRowCount = options.totalRowCount;
+  return typeof totalRowCount === "number" && Number.isFinite(totalRowCount) && totalRowCount >= 0 && options.rowCount >= totalRowCount;
+}
+
 export function canGoNextDataGridPage(options: CanGoNextDataGridPageOptions): boolean {
   if (options.hasMore === true) return true;
 
@@ -27,4 +69,16 @@ export function canGoNextDataGridPage(options: CanGoNextDataGridPageOptions): bo
   }
 
   return options.rowCount >= pageSize;
+}
+
+export function canFetchNextDataGridSegment(options: CanFetchNextDataGridSegmentOptions): boolean {
+  if (options.hasMore === true) return true;
+
+  const totalRowCount = options.totalRowCount;
+  if (typeof totalRowCount === "number" && Number.isFinite(totalRowCount) && totalRowCount >= 0) {
+    return options.loadedRowCount < totalRowCount;
+  }
+
+  if (options.allRowsLoaded === true) return false;
+  return options.loadedRowCount >= Math.max(1, options.pageSize);
 }

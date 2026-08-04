@@ -1,12 +1,27 @@
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::connection::AppState;
+use dbx_core::backend_error::BackendError;
 use dbx_core::db;
 use dbx_core::models::connection::DatabaseType;
 use dbx_core::query_cancel::RunningTaskMetadata;
 use dbx_core::sql::split_sql_statements;
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecuteMultiProgress {
+    execution_id: String,
+    statement_index: usize,
+    completed: usize,
+    total: usize,
+    success: bool,
+    execution_time_ms: u128,
+    affected_rows: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<BackendError>,
+}
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -16,6 +31,7 @@ pub async fn execute_query(
     database: String,
     sql: String,
     schema: Option<String>,
+    catalog: Option<String>,
     execution_id: Option<String>,
     max_rows: Option<usize>,
     fetch_size: Option<usize>,
@@ -23,7 +39,8 @@ pub async fn execute_query(
     result_session_id: Option<String>,
     client_session_id: Option<String>,
     timeout_secs: Option<u64>,
-) -> Result<db::QueryResult, String> {
+    execution_mode: Option<dbx_core::query::QueryExecutionMode>,
+) -> Result<db::QueryResult, BackendError> {
     let execution_id = execution_id.filter(|id| !id.trim().is_empty());
     let registered_query = execution_id.as_ref().map(|id| {
         state.running_queries.register_task(
@@ -33,7 +50,7 @@ pub async fn execute_query(
     });
     let cancel_token = registered_query.as_ref().map(|query| query.token());
 
-    dbx_core::query::execute_sql_statement_with_options(
+    dbx_core::query::execute_sql_statement_with_options_typed(
         &state,
         &connection_id,
         &database,
@@ -44,24 +61,29 @@ pub async fn execute_query(
             max_rows,
             fetch_size,
             page_size,
+            catalog,
             result_session_id,
             client_session_id,
             timeout_secs,
             execution_id,
+            execution_mode: execution_mode.unwrap_or_default(),
             ..Default::default()
         },
     )
     .await
+    .map_err(dbx_core::query::QueryExecutionError::into_backend_error)
 }
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_multi(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     connection_id: String,
     database: String,
     sql: String,
     schema: Option<String>,
+    catalog: Option<String>,
     execution_id: Option<String>,
     max_rows: Option<usize>,
     fetch_size: Option<usize>,
@@ -71,7 +93,8 @@ pub async fn execute_multi(
     timeout_secs: Option<u64>,
     use_transaction: Option<bool>,
     continue_on_error: Option<bool>,
-) -> Result<Vec<dbx_core::query::ExecuteMultiResult>, String> {
+    execution_mode: Option<dbx_core::query::QueryExecutionMode>,
+) -> Result<Vec<dbx_core::query::ExecuteMultiResult>, BackendError> {
     let execution_id = execution_id.filter(|id| !id.trim().is_empty());
     let registered_query = execution_id.as_ref().map(|id| {
         state.running_queries.register_task(
@@ -80,18 +103,37 @@ pub async fn execute_multi(
         )
     });
     let cancel_token = registered_query.as_ref().map(|query| query.token());
+    let progress = execution_id.as_ref().map(|execution_id| {
+        let app = app.clone();
+        let execution_id = execution_id.clone();
+        Arc::new(move |progress: dbx_core::query::ExecuteMultiProgress| {
+            let _ = app.emit(
+                "query-batch-progress",
+                ExecuteMultiProgress {
+                    execution_id: execution_id.clone(),
+                    statement_index: progress.statement_index,
+                    completed: progress.completed,
+                    total: progress.total,
+                    success: progress.success,
+                    execution_time_ms: progress.execution_time_ms,
+                    affected_rows: progress.affected_rows,
+                    error: progress.error,
+                },
+            );
+        }) as dbx_core::query::ExecuteMultiProgressCallback
+    });
     let trace_id = execution_id.as_deref().unwrap_or("no-execution-id").to_string();
     let started_at = Instant::now();
+    dbx_core::sql_diagnostics::debug_sql("query:execute_multi:start", &sql);
     log::info!(
-        "[query][execute_multi:start] trace_id={} connection_id={} database={} schema={:?} sql={}",
+        "[query][execute_multi:start] trace_id={} connection_id={} database={} schema={:?}",
         trace_id,
         connection_id,
         database,
-        schema,
-        sql
+        schema
     );
 
-    let result = dbx_core::query::execute_multi_core_with_options_for_client(
+    let result = dbx_core::query::execute_multi_core_with_options_for_client_and_progress_typed(
         &state,
         &connection_id,
         &database,
@@ -102,13 +144,16 @@ pub async fn execute_multi(
             max_rows,
             fetch_size,
             page_size,
+            catalog,
             result_session_id,
             client_session_id,
             timeout_secs,
             execution_id,
             use_transaction,
             continue_on_error: continue_on_error.unwrap_or(false),
+            execution_mode: execution_mode.unwrap_or_default(),
         },
+        progress,
     )
     .await;
     match &result {
@@ -127,7 +172,7 @@ pub async fn execute_multi(
             error
         ),
     }
-    result
+    result.map_err(dbx_core::query::QueryExecutionError::into_backend_error)
 }
 
 #[tauri::command]
@@ -142,9 +187,17 @@ pub async fn close_query_session(
     database: String,
     session_id: String,
     client_session_id: Option<String>,
+    catalog: Option<String>,
 ) -> Result<bool, String> {
-    dbx_core::query::close_query_session(&state, &connection_id, &database, &session_id, client_session_id.as_deref())
-        .await
+    dbx_core::query::close_query_session(
+        &state,
+        &connection_id,
+        &database,
+        &session_id,
+        client_session_id.as_deref(),
+        catalog.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -153,9 +206,18 @@ pub async fn close_client_connection_session(
     connection_id: String,
     database: String,
     client_session_id: String,
+    catalog: Option<String>,
 ) -> Result<bool, String> {
-    let database = if database.trim().is_empty() { None } else { Some(database.as_str()) };
+    let database = query_session_database(&database, catalog.as_deref());
     state.close_client_session_pool(&connection_id, database, &client_session_id).await
+}
+
+fn query_session_database<'a>(database: &'a str, catalog: Option<&str>) -> Option<&'a str> {
+    if database.trim().is_empty() || catalog.is_some() {
+        None
+    } else {
+        Some(database)
+    }
 }
 
 #[tauri::command]
@@ -205,6 +267,7 @@ pub async fn execute_in_transaction(
     database: String,
     statements: Vec<String>,
     schema: Option<String>,
+    catalog: Option<String>,
 ) -> Result<db::QueryResult, String> {
     dbx_core::query::execute_statements_in_transaction(
         &state,
@@ -212,8 +275,36 @@ pub async fn execute_in_transaction(
         &database,
         &statements,
         schema.as_deref(),
+        catalog.as_deref(),
     )
     .await
+}
+
+/// Schema Diff deploy entrypoint (legacy command name kept for API compatibility).
+///
+/// Executes as one single-connection transaction via [`execute_schema_diff_deploy`].
+/// On failure, status is `rolled_back` when DDL/DML atomicity is guaranteed for the
+/// target, otherwise `mixed` with a best-effort `executed_count` (e.g. MySQL/Oracle DDL).
+pub async fn execute_script_with_2pc_core(
+    app: Arc<AppState>,
+    connection_id: String,
+    database: String,
+    statements: Vec<String>,
+    schema: Option<String>,
+) -> dbx_core::query::SchemaDiffDeployResult {
+    dbx_core::query::execute_schema_diff_deploy(&app, &connection_id, &database, &statements, schema.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn execute_script_with_2pc(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    statements: Vec<String>,
+    schema: Option<String>,
+) -> Result<dbx_core::query::SchemaDiffDeployResult, String> {
+    let app: Arc<AppState> = (*state).clone();
+    Ok(execute_script_with_2pc_core(app, connection_id, database, statements, schema).await)
 }
 
 #[tauri::command]
@@ -222,8 +313,10 @@ pub async fn begin_manual_transaction(
     connection_id: String,
     database: String,
     schema: Option<String>,
+    catalog: Option<String>,
 ) -> Result<String, String> {
-    dbx_core::query::begin_manual_transaction(&state, &connection_id, &database, schema.as_deref()).await
+    dbx_core::query::begin_manual_transaction(&state, &connection_id, &database, schema.as_deref(), catalog.as_deref())
+        .await
 }
 
 #[tauri::command]
@@ -338,12 +431,19 @@ pub fn build_create_database_sql(options: dbx_core::db_admin_sql::CreateDatabase
     dbx_core::db_admin_sql::build_create_database_sql(options)
 }
 
-#[cfg(feature = "duckdb-bundled")]
+#[cfg(feature = "duckdb-sidecar")]
 #[tauri::command]
 pub fn build_duckdb_attach_database_sql(
     options: dbx_core::db_admin_sql::DuckDbAttachDatabaseSqlOptions,
 ) -> Result<String, String> {
     Ok(dbx_core::db_admin_sql::build_duckdb_attach_database_sql(options))
+}
+
+#[tauri::command]
+pub fn build_sqlite_attach_database_sql(
+    options: dbx_core::db_admin_sql::SqliteAttachDatabaseSqlOptions,
+) -> Result<String, String> {
+    Ok(dbx_core::db_admin_sql::build_sqlite_attach_database_sql(options))
 }
 
 #[tauri::command]
@@ -503,6 +603,21 @@ pub fn prepare_data_grid_save(
 }
 
 #[tauri::command]
+pub async fn extract_data_grid_selection(
+    request: dbx_core::data_grid_extractors::DataGridExtractRequest,
+) -> Result<dbx_core::data_grid_extractors::DataGridExtractResult, dbx_core::data_grid_extractors::DataGridExtractError>
+{
+    tauri::async_runtime::spawn_blocking(move || dbx_core::data_grid_extractors::extract_data_grid_selection(request))
+        .await
+        .map_err(|error| {
+            dbx_core::data_grid_extractors::DataGridExtractError::new(
+                dbx_core::data_grid_extractors::DataGridExtractErrorCode::ExecutionFailed,
+                format!("Data grid extractor worker failed: {error}"),
+            )
+        })?
+}
+
+#[tauri::command]
 pub fn build_data_grid_copy_update_statements(
     options: dbx_core::data_grid_sql::DataGridCopyUpdateStatementOptions,
 ) -> Result<Vec<String>, String> {
@@ -628,4 +743,87 @@ pub async fn get_explain_info(
 #[tauri::command]
 pub fn build_create_user_sql(username: String, password: String, tablespace: String) -> Result<String, String> {
     Ok(dbx_core::db_admin_sql::build_create_user_sql(&username, &password, &tablespace))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbx_core::storage::Storage;
+    use std::sync::Arc;
+
+    async fn test_app_state() -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("dbx-query-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")))
+    }
+
+    #[tokio::test]
+    async fn execute_script_with_2pc_returns_structured_result() {
+        let state = test_app_state().await;
+        let result = execute_script_with_2pc_core(
+            state,
+            "conn-1".to_string(),
+            "testdb".to_string(),
+            vec!["SELECT 1".to_string()],
+            None,
+        )
+        .await;
+
+        assert!(!result.transaction_id.is_empty());
+        assert!(!result.participants.is_empty());
+        // No real connection: rolled_back with error, not silent auto-commit success.
+        assert_eq!(result.status, "rolled_back");
+        assert!(result.error.as_ref().is_some_and(|e| !e.is_empty()));
+        assert_eq!(result.statement_count, 1);
+        assert_eq!(result.executed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_script_with_2pc_empty_statements_succeeds() {
+        let state = test_app_state().await;
+        let result =
+            execute_script_with_2pc_core(state, "conn-empty".to_string(), "testdb".to_string(), vec![], None).await;
+
+        assert_eq!(result.status, "committed");
+        assert_eq!(result.statement_count, 0);
+        assert_eq!(result.executed_count, 0);
+        assert!(result.error.is_none());
+        assert_eq!(result.participants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_script_with_2pc_comment_only_is_empty_success() {
+        let state = test_app_state().await;
+        let result = execute_script_with_2pc_core(
+            state,
+            "conn-comment".to_string(),
+            "testdb".to_string(),
+            vec!["-- WARNING: incomplete\n-- manual only".to_string()],
+            None,
+        )
+        .await;
+
+        assert_eq!(result.status, "committed");
+        assert_eq!(result.statement_count, 0);
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_script_with_2pc_propagates_structured_failure_fields() {
+        let state = test_app_state().await;
+        let result = execute_script_with_2pc_core(
+            state,
+            "missing-conn".to_string(),
+            "testdb".to_string(),
+            vec!["CREATE TABLE t1 (id INT)".to_string(), "CREATE TABLE t2 (id INT)".to_string()],
+            None,
+        )
+        .await;
+
+        assert!(result.status == "rolled_back" || result.status == "mixed", "status={}", result.status);
+        assert_eq!(result.statement_count, 2);
+        assert!(result.error.as_ref().is_some_and(|e| !e.is_empty()));
+        assert_eq!(result.executed_count, 0);
+    }
 }

@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, areSqlSemanticDiagnosticsEqual, isSqlSemanticDiagnosticInputContext, shouldRunSqlSemanticDiagnostics, sqlSemanticDiagnosticRangesForViewport } from "../../apps/desktop/src/lib/sql/semantic/diagnostics.ts";
+import { sqlReferenceAnalysisDialectFor } from "../../apps/desktop/src/lib/sql/semantic/dialect.ts";
 import type { SqlReferenceAnalysis } from "../../apps/desktop/src/types/database.ts";
 
 const span = (startColumn: number, endColumn: number) => ({
@@ -48,6 +49,22 @@ test("flags confirmed missing tables", () => {
     ["Unknown table t_19991"],
   );
   assert.equal(diagnostics[0]?.severity, "error");
+});
+
+test("does not flag MySQL DUAL as a missing physical table", () => {
+  const analysis: SqlReferenceAnalysis = {
+    tables: [{ name: "DUAL", span: span(24, 27) }],
+    columns: [],
+  };
+
+  const diagnostics = buildSqlSemanticDiagnostics(analysis, {
+    tables: [],
+    columnsByTable: new Map(),
+    missingTables: new Set(["dual"]),
+    databaseType: "mysql",
+  });
+
+  assert.deepEqual(diagnostics, []);
 });
 
 test("trims whitespace from missing table diagnostic spans", () => {
@@ -290,6 +307,13 @@ test("builds a syntax diagnostic from parser errors with line and column", () =>
   assert.deepEqual(diagnostic?.span, span(10, 12));
 });
 
+test("uses MySQL reference parsing only for Kingbase connections that report backtick identifiers", () => {
+  assert.equal(sqlReferenceAnalysisDialectFor({ databaseType: "kingbase", identifierQuote: "`", fallbackDialect: "postgres" }), "mysql");
+  assert.equal(sqlReferenceAnalysisDialectFor({ databaseType: "kingbase", identifierQuote: '"', fallbackDialect: "postgres" }), "postgres");
+  assert.equal(sqlReferenceAnalysisDialectFor({ databaseType: "kingbase", fallbackDialect: "postgres" }), "postgres");
+  assert.equal(sqlReferenceAnalysisDialectFor({ databaseType: "postgres", identifierQuote: "`", fallbackDialect: "postgres" }), "postgres");
+});
+
 test("compares diagnostics by severity message and span", () => {
   const diagnostics = [
     {
@@ -323,8 +347,9 @@ test("skips diagnostics for MongoDB connections", () => {
   assert.equal(shouldRunSqlSemanticDiagnostics("db.my_collection.find({})", 0, { databaseType: "mongodb" }), false);
 });
 
-test("skips diagnostics for Elasticsearch connections", () => {
+test("skips diagnostics for Elasticsearch-compatible connections", () => {
   assert.equal(shouldRunSqlSemanticDiagnostics("db.my_collection.find({})", 0, { databaseType: "elasticsearch" }), false);
+  assert.equal(shouldRunSqlSemanticDiagnostics("GET /_cluster/health", 0, { databaseType: "easysearch" }), false);
 });
 
 test("still runs diagnostics for SQL connections", () => {

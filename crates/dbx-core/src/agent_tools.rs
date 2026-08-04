@@ -8,6 +8,7 @@ use crate::db::vector_driver;
 use crate::models::connection::DatabaseType;
 use crate::query::QueryExecutionOptions;
 use crate::query_execution_sql::{build_explain_sql, supports_explain_plan, supports_sql_query, ExplainSqlOptions};
+use crate::sql_dialect::{build_table_data_select_sql, TableDataSelectSqlOptions};
 use crate::sql_risk::SqlRisk;
 use crate::types::QueryResult;
 
@@ -26,10 +27,73 @@ const BROWSE_COLLECTION_LIMIT: usize = 20;
 /// Absolute maximum rows any query tool may request.
 const MAX_ALLOWED_ROWS: usize = 100;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentSqlPermissions {
     pub allow_writes: bool,
     pub allow_dangerous: bool,
+    /// When present, write/DDL execute_query calls must match this SQL
+    /// (after trimming only surrounding whitespace). Set by the frontend
+    /// when the user confirms a specific write-SQL proposal.
+    pub confirmed_write_sql: Option<String>,
+}
+
+/// Build the write permissions for one AI-agent run from an explicit user
+/// confirmation. Both Desktop and Web use this fail-closed boundary so an
+/// empty confirmation or a production target cannot enable writes.
+pub fn confirmed_write_sql_permissions(
+    production_database: bool,
+    allow_write_sql: bool,
+    confirmed_write_sql: Option<String>,
+) -> AgentSqlPermissions {
+    let confirmed_write_sql = confirmed_write_sql.filter(|sql| !sql.trim().is_empty());
+    let write_sql_confirmed = !production_database && allow_write_sql && confirmed_write_sql.is_some();
+
+    AgentSqlPermissions {
+        allow_writes: write_sql_confirmed,
+        allow_dangerous: write_sql_confirmed,
+        confirmed_write_sql: write_sql_confirmed.then_some(confirmed_write_sql).flatten(),
+    }
+}
+
+/// Verify that the confirmed connection/database snapshot matches the actual
+/// target. Returns `(allow_write_sql, confirmed_write_sql)` — when the target
+/// does not match, the grant is voided (allow=false, confirmed=None).
+///
+/// This is defense-in-depth: the frontend also verifies synchronously, but
+/// this backend check protects CLI-provider and API-driven paths.
+pub fn verify_confirmed_target(
+    allow_write_sql: Option<bool>,
+    confirmed_write_sql: Option<String>,
+    confirmed_connection_id: Option<String>,
+    confirmed_database: Option<String>,
+    confirmed_schema: Option<String>,
+    actual_connection_id: &str,
+    actual_database: &str,
+    actual_schema: Option<&str>,
+) -> (Option<bool>, Option<String>) {
+    let Some(ref confirmed_sql) = confirmed_write_sql else {
+        return (allow_write_sql, confirmed_write_sql);
+    };
+    // Only verify when a write SQL was actually confirmed.
+    let target_mismatch = confirmed_connection_id.as_deref() != Some(actual_connection_id)
+        || confirmed_database.as_deref() != Some(actual_database)
+        || confirmed_schema.as_deref() != actual_schema;
+    if target_mismatch {
+        log::warn!(
+            "Write-SQL grant voided: confirmed target (conn={:?}, db={:?}, schema={:?}) does not match actual (conn={}, db={}, schema={:?}).",
+            confirmed_connection_id,
+            confirmed_database,
+            confirmed_schema,
+            actual_connection_id,
+            actual_database,
+            actual_schema,
+        );
+        // SQL can contain literals or credentials. Keep diagnostic visibility
+        // behind the shared debug-only redaction boundary.
+        crate::sql_diagnostics::debug_sql("write_sql_grant_voided", confirmed_sql);
+        return (Some(false), None);
+    }
+    (allow_write_sql, confirmed_write_sql)
 }
 
 fn sql_risk_allowed(risk: SqlRisk, permissions: AgentSqlPermissions) -> bool {
@@ -145,6 +209,10 @@ fn execute_query_tool(sql_permissions: AgentSqlPermissions) -> ToolDefinition {
                 "limit": {
                     "type": "number",
                     "description": "Max rows to return (default 50, max 100)"
+                },
+                "client_session_id": {
+                    "type": "string",
+                    "description": "Opaque DBX session handle that pins this query to the same backend connection as earlier queries in the session (preserves USE/SET/session state). Managed by DBX; agents should not invent values."
                 }
             },
             "required": ["sql"]
@@ -250,21 +318,25 @@ pub async fn execute_tool(
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
+    default_schema: Option<&str>,
     db_type: &DatabaseType,
     sql_permissions: AgentSqlPermissions,
 ) -> ToolResult {
     let result = match tool_call.name.as_str() {
-        "list_tables" => execute_list_tables(tool_call, state, connection_id, database, db_type).await,
-        "get_columns" => execute_get_columns(tool_call, state, connection_id, database, db_type).await,
+        "list_tables" => execute_list_tables(tool_call, state, connection_id, database, default_schema, db_type).await,
+        "get_columns" => execute_get_columns(tool_call, state, connection_id, database, default_schema, db_type).await,
         "execute_query" => {
-            execute_execute_query(tool_call, state, connection_id, database, db_type, sql_permissions).await
+            execute_execute_query(tool_call, state, connection_id, database, default_schema, db_type, sql_permissions)
+                .await
         }
-        "get_sample_data" => execute_get_sample_data(tool_call, state, connection_id, database, db_type).await,
+        "get_sample_data" => {
+            execute_get_sample_data(tool_call, state, connection_id, database, default_schema, db_type).await
+        }
         "list_collections" => execute_list_collections(tool_call, state, connection_id, database, db_type).await,
         "browse_collection" => execute_browse_collection(tool_call, state, connection_id, database, db_type).await,
         "explain_query" => {
             let (text_result, explain_data) =
-                execute_explain_query(tool_call, state, connection_id, database, db_type).await;
+                execute_explain_query(tool_call, state, connection_id, database, default_schema, db_type).await;
             match text_result {
                 Ok(content) => {
                     return ToolResult {
@@ -312,9 +384,10 @@ async fn execute_list_tables(
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
+    default_schema: Option<&str>,
     _db_type: &DatabaseType,
 ) -> Result<String, String> {
-    let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let schema = effective_schema(tool_call, default_schema).unwrap_or_default();
 
     // Request one extra to detect whether more tables exist beyond the limit.
     let tables = crate::schema::list_tables_core(
@@ -324,6 +397,7 @@ async fn execute_list_tables(
         &schema,
         None,
         Some(LIST_TABLES_LIMIT + 1),
+        None,
         None,
         None,
     )
@@ -362,6 +436,7 @@ async fn execute_get_columns(
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
+    default_schema: Option<&str>,
     _db_type: &DatabaseType,
 ) -> Result<String, String> {
     let table = tool_call
@@ -383,7 +458,7 @@ async fn execute_get_columns(
         return Err(format!("Table name contains invalid characters: '{}'", table));
     }
 
-    let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let schema = effective_schema(tool_call, default_schema).unwrap_or_default();
 
     let columns = crate::schema::get_columns_core(state, connection_id, database, &schema, &table)
         .await
@@ -431,12 +506,41 @@ async fn execute_get_columns(
     Ok(lines.join("\n"))
 }
 
-/// Execute a read-only SQL query via the execute_query tool.
+/// Normalize a SQL string for confirmation comparison.
+///
+/// Confirmation is intentionally fail-closed: only surrounding whitespace is
+/// ignored. SQL case, internal whitespace, comments, literals, and quoted
+/// identifiers can all affect execution semantics across supported dialects.
+pub fn normalize_sql_for_confirmation(sql: &str) -> String {
+    sql.trim().to_string()
+}
+
+fn truncate_sql_for_error(sql: &str) -> String {
+    let s = sql.trim();
+    let char_count = s.chars().count();
+    if char_count <= 120 {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(117).collect::<String>())
+    }
+}
+
+/// Check whether `executed_sql` matches the user-confirmed write SQL. Returns
+/// `true` when no confirmation is required (confirmed is `None`) or when the
+/// trimmed forms match.
+fn sql_matches_confirmed_write(executed_sql: &str, confirmed: &Option<String>) -> bool {
+    match confirmed {
+        None => true,
+        Some(confirmed) => normalize_sql_for_confirmation(executed_sql) == normalize_sql_for_confirmation(confirmed),
+    }
+}
+
 async fn execute_execute_query(
     tool_call: &ToolCall,
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
+    default_schema: Option<&str>,
     db_type: &DatabaseType,
     sql_permissions: AgentSqlPermissions,
 ) -> Result<String, String> {
@@ -461,7 +565,7 @@ async fn execute_execute_query(
             return Err("Blocked: AI agents cannot execute writes or DDL on a production database. Return the SQL for the user to review and execute manually in DBX.".to_string());
         }
     }
-    if !sql_risk_allowed(risk, sql_permissions) {
+    if !sql_risk_allowed(risk, sql_permissions.clone()) {
         if risk == SqlRisk::Transaction {
             return Err("Blocked: transaction control statements are not available to the AI agent.".to_string());
         }
@@ -471,19 +575,51 @@ async fn execute_execute_query(
         ));
     }
 
+    // When the user confirmed a specific write SQL, the agent must
+    // execute only that SQL — not an arbitrary different statement.
+    if risk != SqlRisk::ReadOnly && !sql_matches_confirmed_write(sql, &sql_permissions.confirmed_write_sql) {
+        let confirmed = sql_permissions.confirmed_write_sql.as_deref().unwrap_or("");
+        return Err(format!(
+            "Blocked: the executed SQL does not match the user-confirmed SQL.\n\
+             Confirmed: {}\n\
+             Attempted: {}",
+            truncate_sql_for_error(confirmed),
+            truncate_sql_for_error(sql),
+        ));
+    }
+
+    // Stateful callers (e.g. MCP sessions) pin the query to their dedicated
+    // connection pool so USE/SET and other session state is preserved.
+    let client_session_id =
+        tool_call.arguments.get("client_session_id").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
+
     // Execute query using existing infrastructure
-    let options = QueryExecutionOptions { max_rows: Some(limit), timeout_secs: Some(30), ..Default::default() };
-    let result =
-        crate::query::execute_sql_statement_with_options(state, connection_id, database, sql, None, None, options)
-            .await?;
+    let options = QueryExecutionOptions {
+        max_rows: Some(limit),
+        timeout_secs: Some(30),
+        client_session_id: client_session_id.map(str::to_string),
+        ..Default::default()
+    };
+    let result = crate::query::execute_sql_statement_with_options(
+        state,
+        connection_id,
+        database,
+        sql,
+        default_schema,
+        None,
+        options,
+    )
+    .await?;
 
     format_query_result_as_text(&result, limit)
 }
 
 /// Format a QueryResult as a Markdown table for LLM consumption.
 fn format_query_result_as_text(result: &QueryResult, limit: usize) -> Result<String, String> {
-    if result.rows.is_empty() {
-        return Ok("Query returned 0 rows.".to_string());
+    // A result without columns is a command result, not an empty result set.
+    // This is how drivers represent DML that does not use RETURNING.
+    if result.columns.is_empty() {
+        return Ok(format!("Query executed. {} row(s) affected.", result.affected_rows));
     }
 
     let mut lines = Vec::new();
@@ -532,6 +668,7 @@ async fn execute_get_sample_data(
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
+    default_schema: Option<&str>,
     db_type: &DatabaseType,
 ) -> Result<String, String> {
     let table =
@@ -544,7 +681,7 @@ async fn execute_get_sample_data(
         return Err(format!("Table name contains invalid characters: '{}'", table));
     }
 
-    let schema = tool_call.arguments.get("schema").and_then(|v| v.as_str());
+    let schema = effective_schema(tool_call, default_schema);
     let limit = tool_call
         .arguments
         .get("limit")
@@ -552,18 +689,37 @@ async fn execute_get_sample_data(
         .map(|l| (l as usize).min(MAX_ALLOWED_ROWS))
         .unwrap_or(SAMPLE_DATA_LIMIT);
 
-    // Build SELECT * FROM table LIMIT N
-    let schema_prefix = schema.filter(|s| !s.is_empty()).map(|s| format!("\"{}\".", s)).unwrap_or_default();
-    let sql = format!("SELECT * FROM {}\"{}\" LIMIT {}", schema_prefix, table, limit);
+    // Reuse the table-data builder so identifier quoting and row limiting follow
+    // the active database instead of assuming PostgreSQL syntax.
+    let sql = build_sample_data_sql(db_type, schema.as_deref(), table, limit);
 
     // Delegate to execute_execute_query with a synthetic tool call
     let synthetic_call = ToolCall {
         id: tool_call.id.clone(),
         name: "execute_query".to_string(),
         arguments: serde_json::json!({ "sql": sql, "limit": limit }),
+        provider_payload: None,
     };
-    execute_execute_query(&synthetic_call, state, connection_id, database, db_type, AgentSqlPermissions::default())
-        .await
+    execute_execute_query(
+        &synthetic_call,
+        state,
+        connection_id,
+        database,
+        schema.as_deref(),
+        db_type,
+        AgentSqlPermissions::default(),
+    )
+    .await
+}
+
+fn build_sample_data_sql(db_type: &DatabaseType, schema: Option<&str>, table: &str, limit: usize) -> String {
+    build_table_data_select_sql(TableDataSelectSqlOptions {
+        database_type: Some(*db_type),
+        schema: schema.map(str::to_owned),
+        table_name: table.to_string(),
+        limit: Some(limit),
+        ..Default::default()
+    })
 }
 
 /// Execute an EXPLAIN query via the explain_query tool.
@@ -573,6 +729,7 @@ async fn execute_explain_query(
     state: &Arc<AppState>,
     connection_id: &str,
     database: &str,
+    default_schema: Option<&str>,
     db_type: &DatabaseType,
 ) -> (Result<String, String>, Option<serde_json::Value>) {
     let sql = match tool_call.arguments.get("sql").and_then(|v| v.as_str()) {
@@ -607,7 +764,7 @@ async fn execute_explain_query(
             state,
             connection_id,
             Some(database),
-            None,
+            default_schema,
             sql,
             Some("explain"),
         )
@@ -619,8 +776,12 @@ async fn execute_explain_query(
     }
 
     // Build the database-specific EXPLAIN SQL
-    let explain_result =
-        build_explain_sql(ExplainSqlOptions { database_type: Some(*db_type), format: None, sql: sql.to_string() });
+    let explain_result = build_explain_sql(ExplainSqlOptions {
+        database_type: Some(*db_type),
+        format: None,
+        analyze: None,
+        sql: sql.to_string(),
+    });
 
     let explain_sql = match (explain_result.ok, explain_result.sql) {
         (true, Some(sql)) => sql,
@@ -638,7 +799,7 @@ async fn execute_explain_query(
         connection_id,
         database,
         &explain_sql,
-        None,
+        default_schema,
         None,
         options,
     )
@@ -656,6 +817,20 @@ async fn execute_explain_query(
     };
 
     (Ok(text), explain_data)
+}
+
+/// A selected context schema is authoritative for an Agent run. If none was
+/// selected, keep the existing per-tool schema parameter behavior.
+fn effective_schema(tool_call: &ToolCall, default_schema: Option<&str>) -> Option<String> {
+    default_schema.map(str::trim).filter(|schema| !schema.is_empty()).map(ToOwned::to_owned).or_else(|| {
+        tool_call
+            .arguments
+            .get("schema")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|schema| !schema.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// Execute list_collections tool (vector databases).
@@ -807,6 +982,114 @@ async fn resolve_chroma_collection_uuid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::connection::PoolKind;
+    #[cfg(unix)]
+    use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec};
+    #[cfg(unix)]
+    use crate::models::connection::{default_redis_key_separator, ConnectionConfig};
+    #[cfg(unix)]
+    use crate::storage::Storage;
+
+    #[cfg(unix)]
+    async fn spawn_recording_agent(record_path: &std::path::Path) -> (AgentDriverClient, tempfile::NamedTempFile) {
+        use std::io::Write;
+
+        let mut script = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            script,
+            r#"import json
+import sys
+
+record_path = sys.argv[1]
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(record_path, "a", encoding="utf-8") as record:
+        record.write(json.dumps(request) + "\n")
+    result = {{
+        "columns": [],
+        "column_types": [],
+        "column_sortables": [],
+        "rows": [],
+        "affected_rows": 1,
+        "execution_time_ms": 0,
+        "truncated": False,
+        "session_id": None,
+        "has_more": False
+    }}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+"#
+        )
+        .unwrap();
+        script.flush().unwrap();
+
+        let client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new("python3")
+                .with_args([script.path().to_string_lossy().to_string(), record_path.to_string_lossy().to_string()]),
+        )
+        .await
+        .unwrap();
+        (client, script)
+    }
+
+    #[cfg(unix)]
+    fn dameng_test_connection() -> ConnectionConfig {
+        ConnectionConfig {
+            id: "dameng-1".to_string(),
+            name: "Dameng".to_string(),
+            note: String::new(),
+            db_type: DatabaseType::Dameng,
+            driver_profile: None,
+            driver_label: None,
+            url_params: None,
+            agent_java_options: Vec::new(),
+            host: "localhost".to_string(),
+            port: 5236,
+            username: "APP_USER".to_string(),
+            password: String::new(),
+            database: Some("APPDB".to_string()),
+            visible_databases: None,
+            visible_schemas: None,
+            show_system_schemas: false,
+            attached_databases: Vec::new(),
+            init_script: None,
+            color: None,
+            transport_layers: Vec::new(),
+            connect_timeout_secs: 10,
+            query_timeout_secs: 30,
+            idle_timeout_secs: 60,
+            keepalive_interval_secs: 30,
+            ssl: false,
+            ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+            sysdba: false,
+            oracle_connection_type: None,
+            connection_string: None,
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
+            redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
+            redis_database_aliases: Default::default(),
+            etcd_endpoints: String::new(),
+            gbase_server: String::new(),
+            informix_server: String::new(),
+            external_config: None,
+            jdbc_driver_class: None,
+            jdbc_driver_paths: Vec::new(),
+            one_time: false,
+            read_only: false,
+            is_production: false,
+            production_databases: vec![],
+            database_info: None,
+        }
+    }
 
     #[test]
     fn vector_read_only_tools_do_not_include_collection_browsing() {
@@ -826,7 +1109,10 @@ mod tests {
 
     #[test]
     fn confirmed_sql_permissions_update_execute_query_contract() {
-        let tools = all_tools(DatabaseType::Mysql, AgentSqlPermissions { allow_writes: true, allow_dangerous: true });
+        let tools = all_tools(
+            DatabaseType::Mysql,
+            AgentSqlPermissions { allow_writes: true, allow_dangerous: true, confirmed_write_sql: None },
+        );
         let execute_query = tools.iter().find(|tool| tool.name == "execute_query").unwrap();
 
         assert!(execute_query.description.contains("explicitly confirmed"));
@@ -837,10 +1123,13 @@ mod tests {
     fn sql_permissions_keep_writes_blocked_until_confirmation() {
         assert!(!sql_risk_allowed(SqlRisk::Write, AgentSqlPermissions::default()));
         assert!(!sql_risk_allowed(SqlRisk::Ddl, AgentSqlPermissions::default()));
-        assert!(sql_risk_allowed(SqlRisk::Ddl, AgentSqlPermissions { allow_writes: true, allow_dangerous: true }));
+        assert!(sql_risk_allowed(
+            SqlRisk::Ddl,
+            AgentSqlPermissions { allow_writes: true, allow_dangerous: true, confirmed_write_sql: None }
+        ));
         assert!(!sql_risk_allowed(
             SqlRisk::Transaction,
-            AgentSqlPermissions { allow_writes: true, allow_dangerous: true }
+            AgentSqlPermissions { allow_writes: true, allow_dangerous: true, confirmed_write_sql: None }
         ));
     }
 
@@ -850,6 +1139,147 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.name).collect();
 
         assert!(names.contains(&"explain_query"));
+    }
+
+    fn query_result(columns: Vec<&str>, rows: Vec<Vec<serde_json::Value>>, affected_rows: u64) -> QueryResult {
+        QueryResult {
+            columns: columns.into_iter().map(str::to_string).collect(),
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows,
+            affected_rows,
+            execution_time_ms: 1,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+        }
+    }
+
+    #[test]
+    fn query_result_formatter_reports_dml_affected_rows() {
+        let result = query_result(vec![], vec![], 2);
+
+        assert_eq!(format_query_result_as_text(&result, 50).unwrap(), "Query executed. 2 row(s) affected.");
+    }
+
+    #[test]
+    fn query_result_formatter_distinguishes_zero_row_dml_from_an_empty_result_set() {
+        let dml = query_result(vec![], vec![], 0);
+        let returning = query_result(vec!["id", "name"], vec![], 0);
+
+        assert_eq!(format_query_result_as_text(&dml, 50).unwrap(), "Query executed. 0 row(s) affected.");
+        assert_eq!(format_query_result_as_text(&returning, 50).unwrap(), "| id | name |\n|---|---|\n(0 rows, 1ms)");
+    }
+
+    #[test]
+    fn query_result_formatter_renders_returning_rows() {
+        let result =
+            query_result(vec!["id", "name"], vec![vec![serde_json::json!(5), serde_json::json!("returning")]], 0);
+
+        assert_eq!(
+            format_query_result_as_text(&result, 50).unwrap(),
+            "| id | name |\n|---|---|\n| 5 | returning |\n(1 rows, 1ms)"
+        );
+    }
+
+    #[test]
+    fn sample_data_sql_uses_database_identifier_and_limit_syntax() {
+        assert_eq!(
+            build_sample_data_sql(&DatabaseType::Mysql, Some("app"), "sys_tenant", 20),
+            "SELECT * FROM `app`.`sys_tenant` LIMIT 20;"
+        );
+        assert_eq!(
+            build_sample_data_sql(&DatabaseType::Postgres, Some("public"), "sys_tenant", 20),
+            "SELECT * FROM \"public\".\"sys_tenant\" LIMIT 20;"
+        );
+        assert_eq!(
+            build_sample_data_sql(&DatabaseType::SqlServer, Some("dbo"), "sys_tenant", 20),
+            "SELECT TOP (20) * FROM [dbo].[sys_tenant]"
+        );
+        assert_eq!(
+            build_sample_data_sql(&DatabaseType::Oracle, Some("APP"), "SYS_TENANT", 20),
+            "SELECT * FROM (SELECT * FROM \"APP\".\"SYS_TENANT\") WHERE ROWNUM <= 20"
+        );
+    }
+
+    #[test]
+    fn selected_schema_overrides_the_tool_schema_argument() {
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "list_tables".to_string(),
+            arguments: serde_json::json!({ "schema": "OTHER" }),
+            provider_payload: None,
+        };
+
+        assert_eq!(effective_schema(&call, Some("REPORTING")).as_deref(), Some("REPORTING"));
+        assert_eq!(effective_schema(&call, None).as_deref(), Some("OTHER"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dameng_agent_queries_and_confirmed_writes_use_selected_schema() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let record_path = temp_dir.path().join("agent-requests.jsonl");
+        let (client, _script) = spawn_recording_agent(&record_path).await;
+        let storage = Storage::open(&temp_dir.path().join("storage.db")).await.unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let connection = dameng_test_connection();
+        state.configs.write().await.insert(connection.id.clone(), connection);
+        state.connections.write().await.insert("dameng-1:APPDB".to_string(), PoolKind::agent(client));
+
+        let read = ToolCall {
+            id: "read".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "SELECT * FROM orders" }),
+            provider_payload: None,
+        };
+        let read_result = execute_tool(
+            &read,
+            &state,
+            "dameng-1",
+            "APPDB",
+            Some("REPORTING"),
+            &DatabaseType::Dameng,
+            AgentSqlPermissions::default(),
+        )
+        .await;
+        assert!(!read_result.is_error, "{}", read_result.content);
+
+        let confirmed_sql = "DELETE FROM orders WHERE id = 1";
+        let write = ToolCall {
+            id: "write".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": confirmed_sql }),
+            provider_payload: None,
+        };
+        let write_result = execute_tool(
+            &write,
+            &state,
+            "dameng-1",
+            "APPDB",
+            Some("REPORTING"),
+            &DatabaseType::Dameng,
+            confirmed_write_sql_permissions(false, true, Some(confirmed_sql.to_string())),
+        )
+        .await;
+        assert!(!write_result.is_error, "{}", write_result.content);
+
+        let requests = std::fs::read_to_string(&record_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|request| request["method"] == "execute_query")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["params"]["sql"], "SELECT * FROM orders");
+        assert_eq!(requests[1]["params"]["sql"], confirmed_sql);
+        for request in requests {
+            assert_eq!(request["params"]["database"], "APPDB");
+            assert_eq!(request["params"]["schema"], "REPORTING");
+        }
     }
 
     #[test]
@@ -913,5 +1343,129 @@ mod tests {
     fn build_browse_query_rejects_unsupported_type() {
         let result = build_browse_query(&DatabaseType::Postgres, "articles", "", 10);
         assert!(result.is_err());
+    }
+
+    // ── SQL confirmation binding tests ──────────────────────────────────────
+
+    #[test]
+    fn normalize_sql_only_trims_outer_whitespace() {
+        assert_eq!(normalize_sql_for_confirmation("  CREATE TABLE users (id INT);\n"), "CREATE TABLE users (id INT);");
+    }
+
+    #[test]
+    fn confirmed_sql_binding_rejects_quoted_identifier_case_change() {
+        let confirmed = Some("DROP TABLE \"Users\"".to_string());
+        assert!(!sql_matches_confirmed_write("DROP TABLE \"users\"", &confirmed));
+    }
+
+    #[test]
+    fn confirmed_sql_binding_rejects_keyword_case_or_reformatting() {
+        let confirmed = Some("DELETE FROM AuditLog WHERE id = 1".to_string());
+        assert!(!sql_matches_confirmed_write("delete from AuditLog where id = 1", &confirmed));
+        assert!(!sql_matches_confirmed_write("DELETE FROM AuditLog\nWHERE id = 1", &confirmed));
+    }
+
+    #[test]
+    fn confirmed_sql_binding_rejects_line_comment_newline_change() {
+        let confirmed = Some("DELETE FROM users -- only one record\nWHERE id = 1".to_string());
+        assert!(!sql_matches_confirmed_write("DELETE FROM users -- only one record WHERE id = 1", &confirmed));
+    }
+
+    #[test]
+    fn sql_matches_when_no_confirmation_required() {
+        assert!(sql_matches_confirmed_write("DELETE FROM users WHERE id = 1", &None));
+    }
+
+    #[test]
+    fn sql_matches_when_only_outer_whitespace_differs() {
+        // The confirmed statement itself must be unchanged; only surrounding
+        // whitespace is ignored before comparison.
+        let confirmed = Some("CREATE TABLE users (id INT)".to_string());
+        assert!(sql_matches_confirmed_write("  CREATE TABLE users (id INT)  ", &confirmed,));
+    }
+
+    #[test]
+    fn sql_mismatch_rejected_when_executed_differs_from_confirmed() {
+        let confirmed = Some("CREATE TABLE users (id INT)".to_string());
+        assert!(!sql_matches_confirmed_write("DROP TABLE users", &confirmed,));
+    }
+
+    #[test]
+    fn confirmed_sql_binding_rejects_same_table_different_statement() {
+        let confirmed = Some("INSERT INTO users (id, name) VALUES (1, 'test')".to_string());
+        assert!(!sql_matches_confirmed_write("DELETE FROM users WHERE id = 1", &confirmed,));
+    }
+
+    #[test]
+    fn confirmed_sql_binding_rejects_different_case_in_data_values() {
+        // Confirmed VALUES ('Alice') must NOT match executed VALUES ('alice').
+        // String-literal data values are preserved verbatim.
+        let confirmed = Some("INSERT INTO users (name) VALUES ('Alice')".to_string());
+        assert!(!sql_matches_confirmed_write("INSERT INTO users (name) VALUES ('alice')", &confirmed,));
+    }
+
+    #[test]
+    fn confirmed_sql_binding_rejects_different_whitespace_in_data_values() {
+        // Confirmed VALUES ('a b') must NOT match executed VALUES ('a  b').
+        let confirmed = Some("INSERT INTO t (c) VALUES ('a b')".to_string());
+        assert!(!sql_matches_confirmed_write("INSERT INTO t (c) VALUES ('a  b')", &confirmed,));
+    }
+
+    #[test]
+    fn confirmed_sql_default_is_none() {
+        let perms = AgentSqlPermissions::default();
+        assert_eq!(perms.confirmed_write_sql, None);
+    }
+
+    #[test]
+    fn confirmed_write_sql_diagnostics_redact_sensitive_literals() {
+        let confirmed_sql = "CREATE USER app_user WITH PASSWORD 'secret-123'";
+        let diagnostic = crate::sql_diagnostics::redact_sql_for_diagnostics(confirmed_sql);
+
+        assert!(!diagnostic.contains("secret-123"));
+        assert!(diagnostic.contains("'[REDACTED]'"));
+    }
+
+    #[test]
+    fn confirmed_write_permissions_bind_only_a_nonproduction_nonempty_confirmation() {
+        let confirmed_sql = Some("DELETE FROM sessions WHERE id = 7".to_string());
+        let permissions = confirmed_write_sql_permissions(false, true, confirmed_sql.clone());
+
+        assert!(permissions.allow_writes);
+        assert!(permissions.allow_dangerous);
+        assert_eq!(permissions.confirmed_write_sql, confirmed_sql);
+        assert!(!sql_matches_confirmed_write("DROP TABLE sessions", &permissions.confirmed_write_sql));
+    }
+
+    #[test]
+    fn confirmed_write_permissions_fail_closed_for_production_or_empty_confirmation() {
+        for (production_database, confirmed_write_sql) in
+            [(true, Some("DELETE FROM sessions".to_string())), (false, None), (false, Some("  \n".to_string()))]
+        {
+            let permissions = confirmed_write_sql_permissions(production_database, true, confirmed_write_sql);
+            assert!(!permissions.allow_writes);
+            assert!(!permissions.allow_dangerous);
+            assert_eq!(permissions.confirmed_write_sql, None);
+        }
+    }
+
+    #[test]
+    fn confirmed_sql_preserved_through_permission_construction() {
+        let perms = AgentSqlPermissions {
+            allow_writes: true,
+            allow_dangerous: true,
+            confirmed_write_sql: Some("CREATE TABLE t (c INT)".to_string()),
+        };
+        assert_eq!(perms.confirmed_write_sql.as_deref(), Some("CREATE TABLE t (c INT)"));
+    }
+
+    #[test]
+    fn write_allowed_when_confirmed_sql_is_none_and_writes_enabled() {
+        // confirmed_write_sql=None + allow_writes=true: write SQL is allowed
+        // (the check passes because sql_matches_confirmed_write returns true
+        // when no confirmation is required). This documents the current
+        // contract — the frontend is responsible for only sending
+        // allow_write_sql=true when a specific SQL was confirmed.
+        assert!(sql_matches_confirmed_write("INSERT INTO t VALUES (1)", &None));
     }
 }

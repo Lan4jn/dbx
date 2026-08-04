@@ -15,12 +15,15 @@ pub struct ChClient {
     base_url: String,
     username: Option<String>,
     password: Option<String>,
+    /// 用户在连接配置「URL 参数」中填写的自定义 HTTP query 参数（已归一化），
+    /// 例如 `dialect_type=ANSI`，会追加到每次请求的 URL query string 上。
+    extra_params: Option<String>,
 }
 
 impl ChClient {
     pub fn new(url: &str, username: Option<String>, password: Option<String>, timeout: Duration) -> Self {
         let http = http_client_builder(timeout).build().unwrap_or_else(|_| HttpClient::new());
-        Self { http, base_url: url.trim_end_matches('/').to_string(), username, password }
+        Self { http, base_url: url.trim_end_matches('/').to_string(), username, password, extra_params: None }
     }
 
     pub fn new_with_ca_cert(
@@ -28,6 +31,7 @@ impl ChClient {
         username: Option<String>,
         password: Option<String>,
         ca_cert_path: Option<&str>,
+        extra_params: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, String> {
         let mut builder = http_client_builder(timeout);
@@ -41,7 +45,24 @@ impl ChClient {
             builder = builder.add_root_certificate(cert);
         }
         let http = builder.build().map_err(|e| format!("Failed to configure ClickHouse HTTP client: {e}"))?;
-        Ok(Self { http, base_url: url.trim_end_matches('/').to_string(), username, password })
+        Ok(Self {
+            http,
+            base_url: url.trim_end_matches('/').to_string(),
+            username,
+            password,
+            extra_params: normalize_extra_params(extra_params),
+        })
+    }
+}
+
+/// 归一化用户填写的「URL 参数」：去除首尾空白与开头的 `?`/`&`，
+/// 返回可直接拼接到 query string 的片段；为空时返回 None。
+fn normalize_extra_params(params: Option<&str>) -> Option<String> {
+    let trimmed = params?.trim().trim_start_matches('?').trim_start_matches('&').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -77,6 +98,7 @@ impl Clone for ChClient {
             base_url: self.base_url.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            extra_params: self.extra_params.clone(),
         }
     }
 }
@@ -97,6 +119,7 @@ struct ChColumn {
     _type: String,
 }
 
+#[derive(Clone, Copy)]
 enum QueryResultLimit {
     Unlimited,
     Limited(usize),
@@ -124,8 +147,13 @@ pub enum ClickHouseQueryStreamItem {
     Row(Vec<serde_json::Value>),
 }
 
-fn build_query_url(base_url: &str, database: Option<&str>, limit: QueryResultLimit) -> String {
-    build_query_url_with_format(base_url, database, limit, QueryResultFormat::JsonCompact)
+fn build_query_url(
+    base_url: &str,
+    database: Option<&str>,
+    limit: QueryResultLimit,
+    extra_params: Option<&str>,
+) -> String {
+    build_query_url_with_format(base_url, database, limit, QueryResultFormat::JsonCompact, extra_params)
 }
 
 fn build_query_url_with_format(
@@ -133,6 +161,7 @@ fn build_query_url_with_format(
     database: Option<&str>,
     limit: QueryResultLimit,
     format: QueryResultFormat,
+    extra_params: Option<&str>,
 ) -> String {
     let mut url = format!("{}/?default_format={}", base_url, format.as_str());
     if let Some(db) = database {
@@ -140,6 +169,11 @@ fn build_query_url_with_format(
     }
     if let QueryResultLimit::Limited(max_rows) = limit {
         url.push_str(&format!("&max_result_rows={max_rows}&result_overflow_mode=break"));
+    }
+    // 用户自定义 URL 参数放在最后追加，允许其覆盖前面的默认设置（ClickHouse 取同名参数的最后一个值）
+    if let Some(params) = normalize_extra_params(extra_params) {
+        url.push('&');
+        url.push_str(&params);
     }
     url
 }
@@ -250,7 +284,11 @@ async fn ch_query_with_limit(
     database: Option<&str>,
     limit: QueryResultLimit,
 ) -> Result<ChJsonResult, String> {
-    let url = build_query_url(&client.base_url, database, limit);
+    let max_rows = match limit {
+        QueryResultLimit::Unlimited => None,
+        QueryResultLimit::Limited(max_rows) => Some(max_rows),
+    };
+    let url = build_query_url(&client.base_url, database, limit, client.extra_params.as_deref());
     log::info!("[clickhouse] query url={url} user={:?} has_pass={}", client.username, client.password.is_some());
     let req = build_request(client, client.http.post(&url).body(sql.to_string()));
     let resp = req.send().await.map_err(|e| format!("ClickHouse request failed: {e}"))?;
@@ -258,26 +296,71 @@ async fn ch_query_with_limit(
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         log::error!("[clickhouse] error body: {body}");
-        return Err(format!("ClickHouse error: {body}"));
+        let error = format!("ClickHouse error: {body}");
+        if let Some(max_rows) = max_rows.filter(|_| is_readonly_result_limit_error(&error)) {
+            log::warn!(
+                "[clickhouse] server-side result limit rejected by readonly profile; retrying with client-side limit"
+            );
+            return ch_query_with_client_limit(client, sql, database, max_rows).await;
+        }
+        return Err(error);
     }
     resp.json::<ChJsonResult>().await.map_err(|e| format!("ClickHouse parse error: {e}"))
 }
 
-pub async fn stream_query_with_max_rows(
+fn is_readonly_result_limit_error(error: &str) -> bool {
+    let readonly_error = error.contains("Code: 164") || error.contains("(READONLY)");
+    readonly_error
+        && ["max_result_rows", "result_overflow_mode"]
+            .iter()
+            .any(|setting| error.contains(&format!("Cannot modify '{setting}' setting in readonly mode")))
+}
+
+async fn ch_query_with_client_limit(
     client: &ChClient,
-    database: &str,
+    sql: &str,
+    database: Option<&str>,
+    max_rows: usize,
+) -> Result<ChJsonResult, String> {
+    let mut meta = Vec::new();
+    let mut data = Vec::new();
+    let mut collect_item = |item| {
+        match item {
+            ClickHouseQueryStreamItem::Columns { columns, column_types } => {
+                if columns.len() != column_types.len() {
+                    return Err("ClickHouse stream returned mismatched column names and types".to_string());
+                }
+                meta = columns.into_iter().zip(column_types).map(|(name, _type)| ChColumn { name, _type }).collect();
+            }
+            ClickHouseQueryStreamItem::Row(row) => data.push(row),
+        }
+        Ok(())
+    };
+
+    stream_query_once(client, database, sql, Some(max_rows), None, false, &mut collect_item).await?;
+    Ok(ChJsonResult { rows: data.len(), meta, data })
+}
+
+async fn stream_query_once(
+    client: &ChClient,
+    database: Option<&str>,
     sql: &str,
     max_rows: Option<usize>,
-    cancel_token: Option<CancellationToken>,
-    mut on_item: impl FnMut(ClickHouseQueryStreamItem) -> Result<(), String>,
+    cancel_token: Option<&CancellationToken>,
+    use_server_limit: bool,
+    on_item: &mut impl FnMut(ClickHouseQueryStreamItem) -> Result<(), String>,
 ) -> Result<(), String> {
-    let max_rows = max_rows.map(|max_rows| max_rows.max(1));
-    let limit = max_rows.map(QueryResultLimit::Limited).unwrap_or(QueryResultLimit::Unlimited);
+    let limit = if use_server_limit {
+        max_rows.map(QueryResultLimit::Limited).unwrap_or(QueryResultLimit::Unlimited)
+    } else {
+        QueryResultLimit::Unlimited
+    };
     let url = build_query_url_with_format(
         &client.base_url,
-        Some(database),
+        database,
         limit,
         QueryResultFormat::JsonCompactEachRowWithNamesAndTypes,
+        client.extra_params.as_deref(),
     );
     log::info!("[clickhouse] stream query url={url} user={:?} has_pass={}", client.username, client.password.is_some());
     let req = build_request(client, client.http.post(&url).body(sql.to_string()));
@@ -305,7 +388,7 @@ pub async fn stream_query_with_max_rows(
     };
 
     loop {
-        let chunk = match cancel_token.as_ref() {
+        let chunk = match cancel_token {
             Some(token) => {
                 tokio::select! {
                     biased;
@@ -328,6 +411,28 @@ pub async fn stream_query_with_max_rows(
 
     match process_stream_remainder(&mut buffer, &mut parser, &mut emit_item) {
         Err(error) if error == CLICKHOUSE_STREAM_ROW_LIMIT_REACHED => Ok(()),
+        result => result,
+    }
+}
+
+pub async fn stream_query_with_max_rows(
+    client: &ChClient,
+    database: &str,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    mut on_item: impl FnMut(ClickHouseQueryStreamItem) -> Result<(), String>,
+) -> Result<(), String> {
+    let max_rows = max_rows.map(|max_rows| max_rows.max(1));
+    let result =
+        stream_query_once(client, Some(database), sql, max_rows, cancel_token.as_ref(), true, &mut on_item).await;
+    match result {
+        Err(error) if max_rows.is_some() && is_readonly_result_limit_error(&error) => {
+            log::warn!(
+                "[clickhouse] server-side stream limit rejected by readonly profile; retrying with client-side limit"
+            );
+            stream_query_once(client, Some(database), sql, max_rows, cancel_token.as_ref(), false, &mut on_item).await
+        }
         result => result,
     }
 }
@@ -453,17 +558,24 @@ fn limited_query_result(result: ChJsonResult, execution_time_ms: u128, max_rows:
         columns,
         column_types,
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows,
         affected_rows: 0,
         execution_time_ms,
         truncated,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
     }
 }
 
 pub async fn test_connection(client: &ChClient, timeout: Duration) -> Result<(), String> {
-    let url = format!("{}/?query=SELECT%201", client.base_url);
+    let mut url = format!("{}/?query=SELECT%201", client.base_url);
+    if let Some(params) = normalize_extra_params(client.extra_params.as_deref()) {
+        url.push('&');
+        url.push_str(&params);
+    }
     let req = build_request(client, client.http.get(&url));
     let resp = with_connection_timeout("ClickHouse", timeout, async {
         req.send().await.map_err(|e| format!("ClickHouse connection failed: {e}"))
@@ -601,7 +713,12 @@ pub async fn execute_query_with_max_rows(
         let result = ch_query_with_limit(client, sql, Some(database), QueryResultLimit::Limited(row_limit + 1)).await?;
         Ok(limited_query_result(result, start.elapsed().as_millis(), Some(row_limit)))
     } else {
-        let url = build_query_url(&client.base_url, Some(database), QueryResultLimit::Unlimited);
+        let url = build_query_url(
+            &client.base_url,
+            Some(database),
+            QueryResultLimit::Unlimited,
+            client.extra_params.as_deref(),
+        );
         let req = build_request(client, client.http.post(&url).body(sql.to_string()));
         let resp = req.send().await.map_err(|e| format!("ClickHouse request failed: {e}"))?;
         if !resp.status().is_success() {
@@ -612,12 +729,15 @@ pub async fn execute_query_with_max_rows(
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
         })
     }
 }
@@ -626,12 +746,80 @@ pub async fn execute_query_with_max_rows(
 mod tests {
     use super::*;
 
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "request ended before headers were complete");
+            request.extend_from_slice(&chunk[..bytes_read]);
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "request ended before body was complete");
+            request.extend_from_slice(&chunk[..bytes_read]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn write_http_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn spawn_readonly_fallback_server(
+        success_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut targets = Vec::new();
+            for request_index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                targets.push(request.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string());
+                if request_index == 0 {
+                    write_http_response(
+                        &mut socket,
+                        "500 Internal Server Error",
+                        "Code: 164. DB::Exception: Cannot modify 'max_result_rows' setting in readonly mode. (READONLY)",
+                    )
+                    .await;
+                } else {
+                    write_http_response(&mut socket, "200 OK", success_body).await;
+                }
+            }
+            targets
+        });
+
+        (format!("http://{address}"), server)
+    }
+
     #[test]
     fn query_url_for_result_sets_adds_row_limit_break_settings() {
         let url = build_query_url(
             "http://localhost:8123",
             Some("analytics"),
             QueryResultLimit::Limited(crate::query::MAX_ROWS + 1),
+            None,
         );
 
         assert_eq!(
@@ -641,12 +829,106 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_readonly_result_limit_errors() {
+        assert!(is_readonly_result_limit_error(
+            "Code: 164. DB::Exception: Cannot modify 'max_result_rows' setting in readonly mode. (READONLY)"
+        ));
+        assert!(is_readonly_result_limit_error(
+            "Code: 164. DB::Exception: Cannot modify 'result_overflow_mode' setting in readonly mode. (READONLY)"
+        ));
+        assert!(!is_readonly_result_limit_error(
+            "Code: 164. DB::Exception: Cannot modify 'max_execution_time' setting in readonly mode. (READONLY)"
+        ));
+        assert!(!is_readonly_result_limit_error("Code: 62. DB::Exception: Syntax error near max_result_rows"));
+    }
+
+    #[tokio::test]
+    async fn readonly_result_query_retries_without_server_limit_and_truncates_client_side() {
+        let (base_url, server) = spawn_readonly_fallback_server("[\"number\"]\n[\"UInt64\"]\n[0]\n[1]\n[2]\n").await;
+        let client = ChClient::new(&base_url, None, None, Duration::from_secs(5));
+
+        let result =
+            execute_query_with_max_rows(&client, "default", "SELECT number FROM numbers(10)", Some(2)).await.unwrap();
+        let targets = server.await.unwrap();
+
+        assert_eq!(result.columns, vec!["number"]);
+        assert_eq!(result.column_types, vec!["UInt64"]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!(0)], vec![serde_json::json!(1)]]);
+        assert!(result.truncated);
+        assert!(targets[0].contains("max_result_rows=3"));
+        assert!(targets[0].contains("result_overflow_mode=break"));
+        assert!(!targets[1].contains("max_result_rows"));
+        assert!(!targets[1].contains("result_overflow_mode"));
+    }
+
+    #[tokio::test]
+    async fn readonly_stream_query_retries_without_server_limit_and_stops_client_side() {
+        let (base_url, server) = spawn_readonly_fallback_server("[\"number\"]\n[\"UInt64\"]\n[0]\n[1]\n[2]\n").await;
+        let client = ChClient::new(&base_url, None, None, Duration::from_secs(5));
+        let mut items = Vec::new();
+
+        stream_query_with_max_rows(&client, "default", "SELECT number FROM numbers(10)", Some(2), None, |item| {
+            items.push(item);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let targets = server.await.unwrap();
+
+        assert_eq!(
+            items,
+            vec![
+                ClickHouseQueryStreamItem::Columns {
+                    columns: vec!["number".to_string()],
+                    column_types: vec!["UInt64".to_string()],
+                },
+                ClickHouseQueryStreamItem::Row(vec![serde_json::json!(0)]),
+                ClickHouseQueryStreamItem::Row(vec![serde_json::json!(1)]),
+            ]
+        );
+        assert!(targets[0].contains("max_result_rows=2"));
+        assert!(targets[0].contains("result_overflow_mode=break"));
+        assert!(!targets[1].contains("max_result_rows"));
+        assert!(!targets[1].contains("result_overflow_mode"));
+    }
+
+    #[test]
+    fn query_url_appends_custom_url_params() {
+        // 用户在「URL 参数」填 dialect_type=ANSI，应追加到 query string 末尾
+        let url = build_query_url(
+            "http://localhost:8123",
+            Some("analytics"),
+            QueryResultLimit::Unlimited,
+            Some("dialect_type=ANSI"),
+        );
+
+        assert_eq!(url, "http://localhost:8123/?default_format=JSONCompact&database=analytics&dialect_type=ANSI");
+    }
+
+    #[test]
+    fn query_url_normalizes_leading_symbols_and_ignores_blank_params() {
+        // 允许用户带上开头的 ? 或 &，也允许多个参数
+        let url = build_query_url(
+            "http://localhost:8123",
+            None,
+            QueryResultLimit::Unlimited,
+            Some("?dialect_type=ANSI&max_threads=8"),
+        );
+        assert_eq!(url, "http://localhost:8123/?default_format=JSONCompact&dialect_type=ANSI&max_threads=8");
+
+        // 空白参数不产生多余的 &
+        let url = build_query_url("http://localhost:8123", None, QueryResultLimit::Unlimited, Some("   "));
+        assert_eq!(url, "http://localhost:8123/?default_format=JSONCompact");
+    }
+
+    #[test]
     fn stream_query_url_uses_line_delimited_names_and_types_format() {
         let url = build_query_url_with_format(
             "http://localhost:8123",
             Some("analytics"),
             QueryResultLimit::Limited(500),
             QueryResultFormat::JsonCompactEachRowWithNamesAndTypes,
+            None,
         );
 
         assert_eq!(

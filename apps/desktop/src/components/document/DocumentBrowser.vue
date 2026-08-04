@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, onMounted, onBeforeUnmount } from "vue";
+import { computed, ref, nextTick, watch, onMounted, onBeforeUnmount } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
-import { RefreshCw, Trash2, Plus, Save, ChevronLeft, ChevronRight, Table2, Braces, X, Columns3, Check, Search, Wrench, Filter } from "@lucide/vue";
+import { RefreshCw, Trash2, Plus, Save, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Table2, Braces, X, Search, Wrench, Filter } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -11,31 +11,67 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ErrorBanner from "@/components/ui/ErrorBanner.vue";
 import DataGrid from "@/components/grid/DataGrid.vue";
+import DataGridColumnLayoutPopover from "@/components/grid/DataGridColumnLayoutPopover.vue";
+import DataGridCopyFormatControl from "@/components/grid/DataGridCopyFormatControl.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
 import { documentViewerFontStyle } from "@/lib/document/documentViewerFontStyle";
+import { clampDocumentPage, documentPageRequestLimit, resetElasticsearchDocumentTotals, resolveElasticsearchDocumentTotals } from "@/lib/document/elasticsearchDocumentTotals";
+import { canGoNextDocumentPage, isSameDocumentQueryTotalCountRequest, resolveDocumentQueryTotals, type DocumentQueryTotalCountRequest } from "@/lib/document/documentQueryTotals";
 import {
+  arrayObjectAncestorPathForDocumentField,
   buildDocumentFilterCondition,
+  buildElasticsearchQueryFromRules,
   combineDocumentFilterConditions,
   currentDocumentFilterJson,
   currentDocumentSortJson,
   defaultDocumentFilterRule,
+  documentFieldPathOptionsFromDocuments,
+  documentFieldPathTreeFromDocuments,
+  flattenDocumentFieldPathTree,
+  searchDocumentFieldPathTree,
   documentFilterModeNeedsValue,
   documentFilterModeOptions,
   documentStoreProviderFor,
+  elasticsearchBoolClauseOptions,
+  elasticsearchFieldPathTreeFromFieldNames,
+  elasticsearchQueryTypeNeedsValue,
+  elasticsearchQueryTypeOptions,
+  elasticsearchStructuredFilter,
+  formatDocumentQueryInput,
+  searchElasticsearchFieldPathTree,
+  type DocumentFieldPathNode,
   type DocumentFilterMode,
   type DocumentFilterRule,
+  type DocumentStoreKind,
+  type ElasticsearchBoolClause,
+  type ElasticsearchQueryType,
 } from "@/lib/app/documentStoreProvider";
-import { documentStoreValueForGrid, parseDocumentStoreInputValue, serializeDocumentStoreId, stringifyDocumentStoreValue } from "@/lib/app/documentJsonValues";
+import {
+  isDocumentStoreIdentityField,
+  normalizeDocumentStoreRouting,
+  parseDocumentStoreInputValue,
+  parseDocumentStoreJsonDocument,
+  planDocumentStoreIdentityMigration,
+  resolveDocumentStoreWriteRouting,
+  serializeDocumentStoreId,
+  stringifyDocumentStoreValue,
+  documentStoreValueForGrid,
+} from "@/lib/app/documentJsonValues";
+import { applyDocumentStoreIdentityPlan, insertDocumentStoreDocument as insertDocumentStoreDocumentCore } from "@/lib/app/documentStoreSave";
+import RedisJsonEditor from "@/components/redis/RedisJsonEditor.vue";
 import { isLosslessJsonNumber, parseJsonPreservingLargeNumbers } from "@/lib/common/safeJsonFormat";
-import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, mongoDocumentIdForGrid, parseMongoDocumentInputValue, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
+import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, mongoDocumentDisplayValue, mongoDocumentIdForGrid, parseMongoDocumentInputValue, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
+import { findDocumentTextMatches, renderDocumentJsonHtml } from "@/lib/document/documentJsonSearch";
+import { documentDataGridColumnLayoutScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
+import { documentGridColumnVisibilityScopeKey, migrateDocumentGridColumnVisibilityToLayout } from "@/lib/document/documentGridColumnVisibilityStorage";
 import { useSettingsStore } from "@/stores/settingsStore";
 import JsonEditNode from "./JsonEditNode.vue";
 import type { EditNode } from "@/types/editor";
-import type { DatabaseType, QueryResult } from "@/types/database";
+import type { ColumnInfo, DatabaseType, QueryResult, QueryTab } from "@/types/database";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
@@ -49,14 +85,19 @@ const props = defineProps<{
   database: string;
   collection: string;
   databaseType?: DatabaseType;
+  tableMeta?: NonNullable<QueryTab["tableMeta"]>;
 }>();
 
 type JsonRecord = Record<string, unknown>;
 type ViewMode = "document" | "table";
 
 const documents = ref<JsonRecord[]>([]);
+const copyDocuments = ref<JsonRecord[]>([]);
+const mongoCopyDocumentsAvailable = ref(false);
 const lastGridColumns = ref<string[]>([]);
-const total = ref(0);
+const total = ref<number | undefined>(undefined);
+const totalIsExact = ref(true);
+const paginationTotal = ref<number | undefined>(undefined);
 const loading = ref(false);
 const documentLoadExecutionId = ref("");
 const documentLoadCancelling = ref(false);
@@ -67,6 +108,8 @@ const selectedIdx = ref<number | null>(null);
 const editJson = ref("");
 const isEditing = ref(false);
 const isNew = ref(false);
+const documentEditMode = ref<"fields" | "json">("json");
+const isSavingDocument = ref(false);
 const error = ref("");
 const editFields = ref<EditNode[]>([]);
 const showDeleteConfirm = ref(false);
@@ -76,15 +119,76 @@ const viewMode = computed<ViewMode>({
 });
 const filterInput = ref("");
 const sortInput = ref("");
+const filterInputRef = ref<HTMLTextAreaElement>();
+const sortInputRef = ref<HTMLTextAreaElement>();
 const dataGridRef = ref<InstanceType<typeof DataGrid>>();
-const columnVisibilitySearch = ref("");
-const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
+const viewOptionsOpen = ref(false);
+const mongoUpdateTarget = computed(() => (props.databaseType === "mongodb" && mongoCopyDocumentsAvailable.value ? { collection: props.collection, idColumn: "_id" as const } : undefined));
+const documentViewerRef = ref<HTMLElement>();
+const documentSearchInputRef = ref<HTMLInputElement>();
+const documentSearchOpen = ref(false);
+const documentSearchQuery = ref("");
+const documentSearchMatchIndex = ref(0);
+const documentSearchHasNavigated = ref(false);
+const documentViewerSearchActive = ref(false);
+
+function openDataGridExtractorConfiguration() {
+  viewOptionsOpen.value = false;
+  void nextTick(() => dataGridRef.value?.openExtractorConfiguration());
+}
 const tableSearchSplitContainerRef = ref<HTMLDivElement>();
 const tableFindPaneWidth = ref<number | null>(null);
 const isResizingTableSearchSplit = ref(false);
 let tableSearchSplitStartX = 0;
 let tableSearchSplitStartWidth = 0;
+let elasticsearchCountKey: string | null = null;
+let elasticsearchExactTotal: number | undefined;
+let elasticsearchPaginationLowerBound: number | undefined;
+let elasticsearchCountExecutionId = "";
+let elasticsearchCountGeneration = 0;
+type LoadedDocumentQueryTotalCountRequest = DocumentQueryTotalCountRequest & { storeKind: DocumentStoreKind };
+let loadedDocumentQueryTotalCountRequest: LoadedDocumentQueryTotalCountRequest | undefined;
+let documentRequestGeneration = 0;
 const documentStoreProvider = computed(() => documentStoreProviderFor(props.databaseType));
+const documentColumnLayoutScopeKey = computed(() =>
+  documentDataGridColumnLayoutScopeKey({
+    databaseType: props.databaseType ?? "mongodb",
+    connectionId: props.connectionId,
+    database: props.database,
+    collection: props.collection,
+  }),
+);
+const legacyDocumentColumnVisibilityScopeKey = computed(() =>
+  documentGridColumnVisibilityScopeKey({
+    databaseType: props.databaseType,
+    connectionId: props.connectionId,
+    database: props.database,
+    collection: props.collection,
+  }),
+);
+
+watch(
+  [legacyDocumentColumnVisibilityScopeKey, documentColumnLayoutScopeKey],
+  ([legacyScopeKey, layoutScopeKey]) => {
+    migrateDocumentGridColumnVisibilityToLayout(legacyScopeKey, layoutScopeKey);
+  },
+  { immediate: true },
+);
+
+const pageTotal = computed(() => paginationTotal.value);
+const documentPageCount = computed(() => (pageTotal.value === undefined ? undefined : Math.max(1, Math.ceil(pageTotal.value / pageSize.value))));
+const canGoNextPage = computed(() =>
+  canGoNextDocumentPage({
+    page: page.value,
+    pageSize: pageSize.value,
+    rowCount: documents.value.length,
+    paginationTotal: pageTotal.value,
+  }),
+);
+const documentRequestLimit = computed(() => {
+  if (documentStoreProvider.value.kind !== "elasticsearch" || paginationTotal.value === undefined) return pageSize.value;
+  return documentPageRequestLimit(page.value, pageSize.value, paginationTotal.value);
+});
 
 const tableFindPaneStyle = computed(() => {
   if (tableFindPaneWidth.value == null) return {};
@@ -92,7 +196,7 @@ const tableFindPaneStyle = computed(() => {
 });
 const documentFontStyle = computed(() => documentViewerFontStyle(settingsStore.editorSettings));
 const documentStoreLabels = computed(() => ({
-  documentsLabel: documentStoreProvider.value.documentsLabel({ total: total.value, t }),
+  documentsLabel: documentStoreProvider.value.documentsLabel({ total: total.value ?? 0, totalIsExact: totalIsExact.value, t }),
   queryPreview: documentQueryPreview.value,
 }));
 
@@ -103,6 +207,7 @@ type LocalFilterSummary = {
   values: string[];
   hiddenValueCount: number;
 };
+type DocumentFilterFieldTreeRow = DocumentFieldPathNode & { depth: number };
 type DocumentGridChanges = {
   dirtyRows: Map<number, Map<number, MongoInputValue>>;
   deletedRows: Set<number>;
@@ -111,14 +216,27 @@ type DocumentGridChanges = {
   rows: MongoInputValue[][];
 };
 const documentFilterBuilderOpen = ref(false);
+const documentFilterFieldPopoverOpen = ref<Record<string, boolean>>({});
+const documentFilterFieldSearch = ref<Record<string, string>>({});
 const documentFilterRules = ref<DocumentFilterRule[]>([]);
 const appliedDocumentFilter = ref<Record<string, unknown> | null>(null);
+const elasticsearchMappingFields = ref<ColumnInfo[]>([]);
 
 const pendingDelete = ref<PendingDelete | null>(null);
 
 const selectedDoc = computed(() => {
   if (selectedIdx.value === null) return null;
   return documents.value[selectedIdx.value] ?? null;
+});
+const documentSearchText = computed(() => editJson.value);
+const documentSearchMatches = computed(() => findDocumentTextMatches(documentSearchText.value, documentSearchQuery.value));
+const documentSearchActiveIndex = computed(() => {
+  if (documentSearchMatches.value.length === 0) return 0;
+  return Math.min(documentSearchMatchIndex.value, documentSearchMatches.value.length - 1);
+});
+const documentSearchStatus = computed(() => {
+  const count = documentSearchMatches.value.length;
+  return count > 0 ? `${documentSearchActiveIndex.value + 1}/${count}` : "0/0";
 });
 
 const editKeyWidth = computed(() => {
@@ -134,7 +252,10 @@ const deleteDetails = computed(() => {
   if (pending.kind === "document") {
     const id = documents.value[pending.index]?._id ?? "";
     const displayId = mongoDocumentIdForGrid(id);
-    if (props.databaseType === "elasticsearch") return `Elasticsearch index: ${props.collection}\nDocument _id: ${String(displayId)}`;
+    if (props.databaseType === "elasticsearch" || props.databaseType === "easysearch") {
+      const product = props.databaseType === "easysearch" ? "Easysearch" : "Elasticsearch";
+      return `${product} index: ${props.collection}\nDocument _id: ${String(displayId)}`;
+    }
     return t("dangerDialog.mongoDocumentDetails", { collection: props.collection, id: String(displayId) });
   }
   return t("dangerDialog.mongoFieldDetails", { field: pending.name || t("mongo.field") });
@@ -163,7 +284,7 @@ const gridResult = computed<QueryResult>(() => {
 
   const rows = docs.map((doc) =>
     columns.map((col) => {
-      const val = doc[col];
+      const val = mongoDocumentDisplayValue(doc[col]);
       if (val === undefined || val === null) return null;
       if (col === "_id") return documentStoreProvider.value.kind === "elasticsearch" ? documentStoreValueForGrid(val, "elasticsearch") : mongoDocumentIdForGrid(val);
       if (typeof val === "object") return documentStoreValueForGrid(val, documentStoreProvider.value.kind);
@@ -172,15 +293,63 @@ const gridResult = computed<QueryResult>(() => {
     }),
   );
 
-  return { columns, rows, mongo_documents: docs, affected_rows: 0, execution_time_ms: 0, truncated: false };
+  return { columns, rows, mongo_documents: docs, mongo_copy_documents: copyDocuments.value, affected_rows: 0, execution_time_ms: 0, truncated: false };
 });
-const documentFilterFieldOptions = computed(() => gridResult.value.columns);
-const documentStructuredFilterCount = computed(() => (appliedDocumentFilter.value ? 1 : 0));
+const expandedDocumentFilterFieldPaths = ref<Set<string>>(new Set());
+const elasticsearchFieldTypes = computed(() => new Map(elasticsearchMappingFields.value.map((field) => [field.name, field.data_type])));
+const elasticsearchFilterFieldNames = computed(() => {
+  const names = [...elasticsearchMappingFields.value.map((field) => field.name), ...gridResult.value.columns, "_id", "_routing"];
+  return [...new Set(names.filter(Boolean))];
+});
+const documentFilterFieldTree = computed<DocumentFieldPathNode[]>(() => {
+  if (documentStoreProvider.value.kind === "elasticsearch") {
+    return elasticsearchFieldPathTreeFromFieldNames(elasticsearchFilterFieldNames.value, elasticsearchFieldTypes.value);
+  }
+  const tree = documentFieldPathTreeFromDocuments(documents.value);
+  if (tree.length > 0) return tree;
+  return gridResult.value.columns.map((column) => ({
+    key: column,
+    path: column,
+    label: column,
+    displayPath: column,
+    kind: "scalar",
+    selectable: true,
+    children: [],
+  }));
+});
+const documentFilterFieldOptions = computed(() => {
+  if (documentStoreProvider.value.kind === "elasticsearch") {
+    return flattenDocumentFieldPathTree(documentFilterFieldTree.value)
+      .filter((field) => field.selectable)
+      .map((field) => field.path);
+  }
+  const nestedFields = documentFieldPathOptionsFromDocuments(documents.value);
+  return nestedFields.length > 0 ? nestedFields : gridResult.value.columns;
+});
+const documentFilterFieldRows = computed<DocumentFilterFieldTreeRow[]>(() => visibleDocumentFilterFieldRows(documentFilterFieldTree.value));
+const documentFilterFieldByPath = computed(() => new Map(flattenDocumentFieldPathTree(documentFilterFieldTree.value).map((node) => [node.path, node])));
+const documentStructuredFilterCount = computed(() => {
+  if (!appliedDocumentFilter.value) return 0;
+  if (documentStoreProvider.value.kind !== "elasticsearch") return 1;
+  const query = appliedDocumentFilter.value.$esQuery;
+  if (!query || typeof query !== "object" || Array.isArray(query)) return 0;
+  const bool = (query as Record<string, unknown>).bool;
+  if (!bool || typeof bool !== "object" || Array.isArray(bool)) return 0;
+  return elasticsearchBoolClauseOptions.reduce((count, clause) => {
+    const rules = (bool as Record<string, unknown>)[clause];
+    return count + (Array.isArray(rules) ? rules.length : 0);
+  }, 0);
+});
 const documentLoadingLabelKey = computed(() => (documentLoadCancelling.value ? "common.stopping" : "common.loading"));
 let documentLoadingTimer: ReturnType<typeof setInterval> | undefined;
 
 function createDocumentFilterRule(): DocumentFilterRule {
-  return defaultDocumentFilterRule(uuid(), documentFilterFieldOptions.value[0] ?? "");
+  const fieldName = documentFilterFieldOptions.value[0] ?? "";
+  const rule = defaultDocumentFilterRule(uuid(), fieldName);
+  if (documentStoreProvider.value.kind === "elasticsearch") {
+    rule.elasticsearchQueryType = elasticsearchQueryTypeOptions(elasticsearchFieldTypes.value.get(fieldName))[0];
+  }
+  return rule;
 }
 
 function ensureDocumentFilterRule() {
@@ -194,8 +363,75 @@ function addDocumentFilterRule() {
   documentFilterRules.value = [...documentFilterRules.value, createDocumentFilterRule()];
 }
 
+function visibleDocumentFilterFieldRows(nodes: readonly DocumentFieldPathNode[], depth = 0): DocumentFilterFieldTreeRow[] {
+  const rows: DocumentFilterFieldTreeRow[] = [];
+  for (const node of nodes) {
+    rows.push({ ...node, depth });
+    if (node.children.length > 0 && expandedDocumentFilterFieldPaths.value.has(node.path)) {
+      rows.push(...visibleDocumentFilterFieldRows(node.children, depth + 1));
+    }
+  }
+  return rows;
+}
+
+function toggleDocumentFilterFieldExpanded(path: string) {
+  const next = new Set(expandedDocumentFilterFieldPaths.value);
+  if (next.has(path)) next.delete(path);
+  else next.add(path);
+  expandedDocumentFilterFieldPaths.value = next;
+}
+
+function setDocumentFilterFieldPopoverOpen(ruleId: string, open: boolean) {
+  const next = { ...documentFilterFieldPopoverOpen.value };
+  if (open) next[ruleId] = true;
+  else delete next[ruleId];
+  documentFilterFieldPopoverOpen.value = next;
+  if (open) {
+    void nextTick(() => document.getElementById(documentFilterFieldSearchInputId(ruleId))?.focus());
+  }
+  if (!open) {
+    const search = { ...documentFilterFieldSearch.value };
+    delete search[ruleId];
+    documentFilterFieldSearch.value = search;
+  }
+}
+
+function documentFilterFieldSearchInputId(ruleId: string): string {
+  return `document-filter-field-search-${ruleId}`;
+}
+
+function documentFilterFieldSearchActive(ruleId: string): boolean {
+  return !!documentFilterFieldSearch.value[ruleId]?.trim();
+}
+
+function documentFilterFieldRowsForRule(ruleId: string): DocumentFilterFieldTreeRow[] {
+  const query = documentFilterFieldSearch.value[ruleId] ?? "";
+  if (!query.trim()) return documentFilterFieldRows.value;
+  const matchingFields = documentStoreProvider.value.kind === "elasticsearch" ? searchElasticsearchFieldPathTree(documentFilterFieldTree.value, query) : searchDocumentFieldPathTree(documentFilterFieldTree.value, query);
+  return matchingFields.map((node) => ({ ...node, depth: 0 }));
+}
+
+function selectDocumentFilterField(ruleId: string, fieldName: string) {
+  updateDocumentFilterRule(ruleId, { fieldName });
+  setDocumentFilterFieldPopoverOpen(ruleId, false);
+}
+
+function documentFilterFieldLabel(path: string): string {
+  if (documentStoreProvider.value.kind !== "elasticsearch") {
+    return documentFilterFieldByPath.value.get(path)?.displayPath ?? path;
+  }
+  const fieldType = elasticsearchFieldTypes.value.get(path);
+  return fieldType ? `${path} (${fieldType})` : path;
+}
+
+function documentFilterFieldKindLabel(kind: DocumentFieldPathNode["kind"]): string {
+  if (kind === "array-object") return "array object";
+  return kind;
+}
+
 function removeDocumentFilterRule(ruleId: string) {
   documentFilterRules.value = documentFilterRules.value.filter((rule) => rule.id !== ruleId);
+  setDocumentFilterFieldPopoverOpen(ruleId, false);
   if (documentFilterRules.value.length === 0) appliedDocumentFilter.value = null;
 }
 
@@ -203,19 +439,78 @@ function updateDocumentFilterRule(ruleId: string, patch: Partial<DocumentFilterR
   documentFilterRules.value = documentFilterRules.value.map((rule) => {
     if (rule.id !== ruleId) return rule;
     const next = { ...rule, ...patch };
-    if (!documentFilterModeNeedsValue(next.mode)) next.rawValue = "";
+    if (documentStoreProvider.value.kind === "elasticsearch") {
+      const queryTypes = elasticsearchQueryTypeOptions(elasticsearchFieldTypes.value.get(next.fieldName));
+      if (!next.elasticsearchQueryType || !queryTypes.includes(next.elasticsearchQueryType)) {
+        next.elasticsearchQueryType = queryTypes[0];
+      }
+      if (!elasticsearchQueryTypeNeedsValue(next.elasticsearchQueryType)) next.rawValue = "";
+    } else if (!documentFilterModeNeedsValue(next.mode)) {
+      next.rawValue = "";
+    }
     return next;
   });
 }
 
+function elasticsearchRuleQueryTypes(rule: DocumentFilterRule): ElasticsearchQueryType[] {
+  return elasticsearchQueryTypeOptions(elasticsearchFieldTypes.value.get(rule.fieldName));
+}
+
+function elasticsearchQueryTypeLabel(queryType: ElasticsearchQueryType): string {
+  const rangeOperator: Partial<Record<ElasticsearchQueryType, string>> = {
+    range_gt: "range >",
+    range_gte: "range >=",
+    range_lt: "range <",
+    range_lte: "range <=",
+  };
+  return rangeOperator[queryType] ?? queryType;
+}
+
 function resetDocumentFilterBuilder() {
   appliedDocumentFilter.value = null;
+  documentFilterFieldPopoverOpen.value = {};
+  documentFilterFieldSearch.value = {};
   documentFilterRules.value = documentFilterFieldOptions.value.length > 0 ? [createDocumentFilterRule()] : [];
 }
 
 function currentDocumentFilter(): string | undefined {
   return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value, documentStoreProvider.value.kind);
 }
+
+function resizeDocumentQueryInput(el: HTMLTextAreaElement | undefined) {
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(Math.max(el.scrollHeight, 20), 120)}px`;
+}
+
+function resizeDocumentQueryInputs() {
+  resizeDocumentQueryInput(filterInputRef.value);
+  resizeDocumentQueryInput(sortInputRef.value);
+}
+
+function formatFilterInput() {
+  try {
+    filterInput.value = formatDocumentQueryInput(filterInput.value, documentStoreProvider.value.kind);
+    error.value = "";
+    void nextTick(resizeDocumentQueryInputs);
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function formatSortInput() {
+  try {
+    sortInput.value = formatDocumentQueryInput(sortInput.value);
+    error.value = "";
+    void nextTick(resizeDocumentQueryInputs);
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+watch([filterInput, sortInput], () => {
+  void nextTick(resizeDocumentQueryInputs);
+});
 
 const documentQueryPreview = computed(() => {
   let filter = "{}";
@@ -229,24 +524,43 @@ const documentQueryPreview = computed(() => {
     filterJson: filter,
     sortJson: sortInput.value.trim(),
     skip: page.value * pageSize.value,
-    limit: pageSize.value,
+    limit: documentRequestLimit.value,
   });
 });
 
 async function applyDocumentStructuredFilters() {
+  if (documentStoreProvider.value.kind === "elasticsearch") {
+    appliedDocumentFilter.value = elasticsearchStructuredFilter(buildElasticsearchQueryFromRules(documentFilterRules.value));
+    documentFilterBuilderOpen.value = false;
+    applyFilter();
+    return;
+  }
   const items = documentFilterRules.value
     .map((rule) => ({
       rule,
-      condition: buildDocumentFilterCondition(rule, { kind: documentStoreProvider.value.kind }),
+      condition: buildDocumentFilterCondition(rule, {
+        kind: documentStoreProvider.value.kind,
+        sampleValue: documentFilterFieldByPath.value.get(rule.fieldName)?.sampleValue,
+      }),
     }))
     .filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
   const structured = combineDocumentFilterConditions(
     items.map((item) => item.condition),
     items.map((item) => item.rule),
+    items.map((item) => arrayObjectAncestorPathForDocumentField(documentFilterFieldTree.value, item.rule.fieldName)),
   );
   appliedDocumentFilter.value = structured;
   documentFilterBuilderOpen.value = false;
   applyFilter();
+}
+
+async function loadElasticsearchMappingFields() {
+  if (documentStoreProvider.value.kind !== "elasticsearch") return;
+  try {
+    elasticsearchMappingFields.value = await api.getColumns(props.connectionId, props.database, "", props.collection);
+  } catch {
+    elasticsearchMappingFields.value = [];
+  }
 }
 
 function clearDocumentFilters(clearLocalFilter?: (columnIndex?: number) => void) {
@@ -277,20 +591,26 @@ function documentIdFromGridValue(value: MongoInputValue | undefined): string | n
   return id.trim() ? id : null;
 }
 
-function documentRoutingValue(value: unknown): string | undefined {
-  if (value === null || value === undefined) return undefined;
-  const routing = typeof value === "string" ? value : String(value);
-  const trimmed = routing.trim();
-  return trimmed ? trimmed : undefined;
+function documentRoutingFromDocument(doc: JsonRecord | undefined): string | undefined {
+  return normalizeDocumentStoreRouting(doc?._routing);
 }
 
-function documentRoutingFromDocument(doc: JsonRecord | undefined): string | undefined {
-  return documentRoutingValue(doc?._routing);
+function documentTypeFromDocument(doc: JsonRecord | undefined): string | undefined {
+  const documentType = doc?._type;
+  return typeof documentType === "string" && documentType.trim() ? documentType.trim() : undefined;
 }
 
 function documentRoutingFromGridRow(row: MongoInputValue[] | undefined, columns: string[]): string | undefined {
   const routingColIdx = columns.indexOf("_routing");
-  return routingColIdx >= 0 ? documentRoutingValue(row?.[routingColIdx]) : undefined;
+  return routingColIdx >= 0 ? normalizeDocumentStoreRouting(row?.[routingColIdx]) : undefined;
+}
+
+function documentStoreWriteApis(documentType?: string) {
+  return {
+    insert: (docJson: string, routing?: string) => api.documentInsertDocument(props.connectionId, props.database, props.collection, docJson, routing),
+    update: (id: string, docJson: string, routing?: string) => api.documentUpdateDocument(props.connectionId, props.database, props.collection, id, docJson, routing),
+    delete: (id: string, routing?: string) => api.documentDeleteDocument(props.connectionId, props.database, props.collection, id, routing, documentType),
+  };
 }
 
 async function gridSave(changes: DocumentGridChanges) {
@@ -334,24 +654,27 @@ async function gridSave(changes: DocumentGridChanges) {
     if (id == null) continue;
     const document = documents.value[rowIdx];
     const routing = isEs ? documentRoutingFromDocument(document) : undefined;
+    const documentType = isEs ? documentTypeFromDocument(document) : undefined;
     const documentId = isEs ? id : (document?._id ?? id);
-    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, isEs ? String(documentId) : serializeMongoDocumentId(documentId), routing);
+    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, isEs ? String(documentId) : serializeMongoDocumentId(documentId), routing, documentType);
   }
 
   for (const newRow of changes.newRows) {
     const doc = isEs ? buildElasticsearchInsertDocument(newRow, cols) : buildMongoInsertDocument(newRow, cols);
     if (isEs) {
       const id = documentIdFromGridValue(newRow[idColIdx]);
+      const routing = documentRoutingFromGridRow(newRow, cols);
       if (id) {
-        await api.documentUpdateDocument(props.connectionId, props.database, props.collection, id, stringifyDocumentStoreValue(doc, "elasticsearch"), documentRoutingFromGridRow(newRow, cols));
+        await api.documentUpdateDocument(props.connectionId, props.database, props.collection, id, stringifyDocumentStoreValue(doc, "elasticsearch"), routing);
       } else {
-        await api.documentInsertDocument(props.connectionId, props.database, props.collection, stringifyDocumentStoreValue(doc, "elasticsearch"));
+        await api.documentInsertDocument(props.connectionId, props.database, props.collection, stringifyDocumentStoreValue(doc, "elasticsearch"), routing);
       }
       continue;
     }
     await api.documentInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
   }
 
+  if (isEs) resetElasticsearchTotals({ preservePaginationTotal: true });
   await load();
 }
 
@@ -364,12 +687,6 @@ function buildElasticsearchInsertDocument(row: MongoInputValue[], columns: strin
     if (value !== null) doc[column] = parseDocumentStoreInputValue(value, "elasticsearch");
   }
   return doc;
-}
-
-function mongoIdPreview(val: unknown): string {
-  if (val === null || val === undefined) return "null";
-  if (typeof val === "string" && /^[a-fA-F0-9]{24}$/.test(val)) return `ObjectId("${val}")`;
-  return formatMongoShellLiteral(val);
 }
 
 function elasticsearchPathIdPreview(id: string): string {
@@ -407,7 +724,7 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
       stmts.push(`POST /${coll}/_update/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}\n${stringifyDocumentStoreValue({ doc: updateDoc.$set ?? updateDoc }, "elasticsearch", 2)}`);
     } else {
       const updateDoc = buildMongoUpdateDocument(dirtyCols, columns, documents.value[rowIdx]);
-      stmts.push(`db.${coll}.updateOne({_id: ${mongoIdPreview(documents.value[rowIdx]?._id ?? id)}}, ${formatMongoShellLiteral(updateDoc)})`);
+      stmts.push(`db.${coll}.updateOne({_id: ${formatMongoShellLiteral(documents.value[rowIdx]?._id ?? id)}}, ${formatMongoShellLiteral(updateDoc)})`);
     }
   }
 
@@ -419,7 +736,7 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
       const routing = documentRoutingFromGridRow(row, columns);
       stmts.push(`DELETE /${coll}/_doc/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}`);
     } else {
-      stmts.push(`db.${coll}.deleteOne({_id: ${mongoIdPreview(documents.value[rowIdx]?._id ?? id)}})`);
+      stmts.push(`db.${coll}.deleteOne({_id: ${formatMongoShellLiteral(documents.value[rowIdx]?._id ?? id)}})`);
     }
   }
 
@@ -462,23 +779,136 @@ function startDocumentLoadingTimer() {
   }, 100);
 }
 
-async function load() {
+function elasticsearchCountFilterKey(filter: string | undefined): string {
+  return JSON.stringify([props.connectionId, props.database, props.collection, filter ?? ""]);
+}
+
+function isCurrentDocumentQueryTotalCountRequest(request: LoadedDocumentQueryTotalCountRequest): boolean {
+  if (request.generation !== documentRequestGeneration || request.connectionId !== props.connectionId || request.database !== props.database || request.collection !== props.collection || request.storeKind !== documentStoreProvider.value.kind) {
+    return false;
+  }
+  return loadedDocumentQueryTotalCountRequest !== undefined && isSameDocumentQueryTotalCountRequest(request, loadedDocumentQueryTotalCountRequest) && request.storeKind === loadedDocumentQueryTotalCountRequest.storeKind;
+}
+
+function cancelElasticsearchCount() {
+  elasticsearchCountGeneration++;
+  const executionId = elasticsearchCountExecutionId;
+  elasticsearchCountExecutionId = "";
+  if (executionId) void api.cancelQuery(executionId);
+}
+
+function resetElasticsearchTotals(options: { preservePaginationTotal?: boolean } = {}) {
+  const nextTotals = resetElasticsearchDocumentTotals(paginationTotal.value, options.preservePaginationTotal);
+  cancelElasticsearchCount();
+  elasticsearchCountKey = null;
+  elasticsearchExactTotal = undefined;
+  elasticsearchPaginationLowerBound = undefined;
+  paginationTotal.value = nextTotals.paginationTotal;
+  total.value = nextTotals.total;
+  totalIsExact.value = nextTotals.totalIsExact;
+}
+
+function clampPageToPaginationTotal(): number | undefined {
+  const cap = paginationTotal.value;
+  if (cap === undefined) return undefined;
+  const nextPage = clampDocumentPage(page.value, pageSize.value, cap);
+  if (page.value === nextPage) return undefined;
+  return nextPage;
+}
+
+function startElasticsearchExactCount(filter: string | undefined) {
+  if (elasticsearchCountExecutionId || elasticsearchExactTotal !== undefined || !elasticsearchCountKey) return;
+  const key = elasticsearchCountKey;
+  const executionId = uuid();
+  const generation = elasticsearchCountGeneration;
+  elasticsearchCountExecutionId = executionId;
+
+  void api
+    .elasticsearchCountDocuments(props.connectionId, props.collection, filter, executionId)
+    .then((exactCount) => {
+      if (generation !== elasticsearchCountGeneration || key !== elasticsearchCountKey || executionId !== elasticsearchCountExecutionId || !Number.isFinite(exactCount) || exactCount < 0) {
+        return;
+      }
+      elasticsearchExactTotal = exactCount;
+      const totals = resolveElasticsearchDocumentTotals(elasticsearchPaginationLowerBound ?? exactCount, false, exactCount);
+      total.value = totals.total;
+      totalIsExact.value = totals.totalIsExact;
+      paginationTotal.value = totals.paginationTotal;
+      const clampedPage = clampPageToPaginationTotal();
+      if (clampedPage !== undefined) void load({ page: clampedPage });
+    })
+    .catch(() => {
+      // The lower-bound result remains truthful when a background count fails.
+    })
+    .finally(() => {
+      if (generation === elasticsearchCountGeneration && executionId === elasticsearchCountExecutionId) {
+        elasticsearchCountExecutionId = "";
+      }
+    });
+}
+
+function applyElasticsearchSearchTotal(searchTotal: number, isExact: boolean, filter: string | undefined) {
+  const key = elasticsearchCountFilterKey(filter);
+  if (key !== elasticsearchCountKey) {
+    cancelElasticsearchCount();
+    elasticsearchCountKey = key;
+    elasticsearchExactTotal = undefined;
+    elasticsearchPaginationLowerBound = undefined;
+  }
+
+  elasticsearchPaginationLowerBound = searchTotal;
+  const totals = resolveElasticsearchDocumentTotals(searchTotal, isExact, elasticsearchExactTotal);
+  if (isExact) {
+    cancelElasticsearchCount();
+    elasticsearchExactTotal = searchTotal;
+    total.value = totals.total;
+    totalIsExact.value = totals.totalIsExact;
+    paginationTotal.value = totals.paginationTotal;
+    return;
+  }
+
+  if (elasticsearchExactTotal !== undefined) {
+    total.value = totals.total;
+    totalIsExact.value = totals.totalIsExact;
+    paginationTotal.value = totals.paginationTotal;
+    return;
+  }
+
+  total.value = totals.total;
+  totalIsExact.value = totals.totalIsExact;
+  paginationTotal.value = totals.paginationTotal;
+  startElasticsearchExactCount(filter);
+}
+
+async function load(options: { page?: number } = {}) {
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
+  const requestGeneration = ++documentRequestGeneration;
   const executionId = uuid();
   loading.value = true;
   documentLoadExecutionId.value = executionId;
   documentLoadCancelling.value = false;
   startDocumentLoadingTimer();
   error.value = "";
+  const requestPage = options.page ?? page.value;
   const previousSelectedIdx = selectedIdx.value;
   const previousSelectedId = previousSelectedIdx === null ? null : documentIdentity(documents.value[previousSelectedIdx]);
   try {
+    const connectionId = props.connectionId;
+    const database = props.database;
+    const collection = props.collection;
+    const storeKind = documentStoreProvider.value.kind;
     const filter = currentDocumentFilter();
+    const countRequest: LoadedDocumentQueryTotalCountRequest = { connectionId, database, collection, filter, generation: requestGeneration, storeKind };
+    if (storeKind === "elasticsearch" && elasticsearchCountKey !== null && elasticsearchCountKey !== elasticsearchCountFilterKey(filter)) {
+      resetElasticsearchTotals();
+    }
     const sort = currentDocumentSortJson(sortInput.value);
-    const result = await api.documentFindDocuments(props.connectionId, props.database, props.collection, page.value * pageSize.value, pageSize.value, filter, undefined, sort, executionId);
+    const skip = requestPage * pageSize.value;
+    const result = await api.documentFindDocuments(connectionId, database, collection, skip, documentRequestLimit.value, filter, undefined, sort, undefined, executionId);
     if (documentLoadExecutionId.value !== executionId) return;
+    if (connectionId !== props.connectionId || database !== props.database || collection !== props.collection || storeKind !== documentStoreProvider.value.kind) return;
     const nextDocuments =
-      documentStoreProvider.value.kind === "elasticsearch" && result.raw_documents?.length === result.documents.length
+      storeKind === "elasticsearch" && result.raw_documents?.length === result.documents.length
         ? result.raw_documents.map((raw, index) => {
             try {
               return asRecord(parseJsonPreservingLargeNumbers(raw));
@@ -487,7 +917,14 @@ async function load() {
             }
           })
         : result.documents.map(asRecord);
+    const hasTypePreservingCopyDocuments = result.extended_documents?.length === nextDocuments.length;
+    const nextCopyDocuments = hasTypePreservingCopyDocuments ? result.extended_documents!.map(asRecord) : nextDocuments;
+    // Commit page + rows together so stale rows never briefly show last-page indexes.
+    if (options.page !== undefined) page.value = options.page;
     documents.value = nextDocuments;
+    copyDocuments.value = nextCopyDocuments;
+    mongoCopyDocumentsAvailable.value = hasTypePreservingCopyDocuments;
+    loadedDocumentQueryTotalCountRequest = countRequest;
     if (nextDocuments.length > 0) {
       const keySet = new Set<string>();
       keySet.add("_id");
@@ -498,7 +935,19 @@ async function load() {
       }
       lastGridColumns.value = [...keySet];
     }
-    total.value = result.total;
+    if (storeKind === "elasticsearch") {
+      applyElasticsearchSearchTotal(result.total, result.total_is_exact !== false, filter);
+    } else {
+      cancelElasticsearchCount();
+      const totals = resolveDocumentQueryTotals(result.total, result.total_is_exact !== false, {
+        page: requestPage,
+        pageSize: pageSize.value,
+        rowCount: nextDocuments.length,
+      });
+      total.value = totals.total;
+      totalIsExact.value = totals.totalIsExact;
+      paginationTotal.value = totals.paginationTotal;
+    }
     syncSelectedDocumentAfterLoad(previousSelectedIdx, previousSelectedId);
   } catch (e: unknown) {
     if (documentLoadExecutionId.value === executionId) error.value = e instanceof Error ? e.message : String(e);
@@ -510,6 +959,39 @@ async function load() {
       stopDocumentLoadingTimer();
     }
   }
+}
+
+async function countExactDocumentTotal(): Promise<number | undefined> {
+  const request = loadedDocumentQueryTotalCountRequest;
+  if (!request || !isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
+  if (request.storeKind === "elasticsearch") {
+    const exactCount = await api.elasticsearchCountDocuments(request.connectionId, request.collection, request.filter);
+    if (!isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
+    if (!Number.isFinite(exactCount) || exactCount < 0) {
+      throw new Error("invalid count");
+    }
+    elasticsearchExactTotal = exactCount;
+    const totals = resolveElasticsearchDocumentTotals(elasticsearchPaginationLowerBound ?? exactCount, false, exactCount);
+    total.value = totals.total;
+    totalIsExact.value = totals.totalIsExact;
+    paginationTotal.value = totals.paginationTotal;
+    return exactCount;
+  }
+  const exactCount = await api.mongoCountDocuments(request.connectionId, request.database, request.collection, request.filter, "accurate");
+  if (!isCurrentDocumentQueryTotalCountRequest(request)) return undefined;
+  if (!Number.isFinite(exactCount) || exactCount < 0) {
+    throw new Error("invalid count");
+  }
+  const totals = resolveDocumentQueryTotals(exactCount, true);
+  total.value = totals.total;
+  totalIsExact.value = totals.totalIsExact;
+  paginationTotal.value = totals.paginationTotal;
+  return exactCount;
+}
+
+async function refreshDocuments() {
+  if (documentStoreProvider.value.kind === "elasticsearch") resetElasticsearchTotals({ preservePaginationTotal: true });
+  await load();
 }
 
 async function cancelDocumentLoad() {
@@ -530,20 +1012,22 @@ async function cancelDocumentLoad() {
 
 function applyFilter() {
   page.value = 0;
-  load();
+  if (documentStoreProvider.value.kind === "elasticsearch") resetElasticsearchTotals();
+  void load();
 }
 
 function paginate(offset: number, limit: number) {
   const normalizedLimit = normalizeResultPageSize(limit, pageSize.value);
   pageSize.value = normalizedLimit;
-  page.value = Math.floor(Math.max(0, offset) / normalizedLimit);
-  load();
+  const requestedPage = Math.floor(Math.max(0, offset) / normalizedLimit);
+  const nextPage = clampDocumentPage(requestedPage, normalizedLimit, paginationTotal.value);
+  void load({ page: nextPage });
 }
 
 function onSort(column: string, _columnIndex: number, direction: "asc" | "desc" | null) {
   sortInput.value = documentStoreProvider.value.sortInputForColumn(column, direction);
   page.value = 0;
-  load();
+  void load();
 }
 
 function asRecord(value: unknown): JsonRecord {
@@ -580,44 +1064,128 @@ function syncSelectedDocumentAfterLoad(previousSelectedIdx: number | null, previ
   }
 }
 
+function emptyDocumentJson(): string {
+  return stringifyDocumentStoreValue({}, documentStoreProvider.value.kind, 2);
+}
+
+function documentEditErrorMessage(result: { error: "empty" | "invalid" | "not-object" | "unsupported-number" } | { error: "duplicate-key"; field: string }): string {
+  if (result.error === "not-object") return t("mongo.documentMustBeObject");
+  if (result.error === "unsupported-number") return t("mongo.unsupportedJsonNumber");
+  if (result.error === "duplicate-key") return t("mongo.duplicateJsonKey", { field: result.field });
+  return t("mongo.invalidJson");
+}
+
+function buildEditFieldsFromDocument(doc: JsonRecord): EditNode[] {
+  return Object.entries(doc).map(([name, value]) => {
+    const isMetadata = isDocumentStoreIdentityField(documentStoreProvider.value.kind, name);
+    // Metadata field names stay fixed; values are editable so _id / routing rekey is possible.
+    return createEditNode(name, value, isMetadata, false);
+  });
+}
+
+function metadataFieldsFromDocument(doc: JsonRecord | undefined): JsonRecord {
+  const metadata: JsonRecord = {};
+  if (!doc) return metadata;
+  if (Object.prototype.hasOwnProperty.call(doc, "_id")) metadata._id = doc._id;
+  if (documentStoreProvider.value.kind === "elasticsearch" && Object.prototype.hasOwnProperty.call(doc, "_routing")) {
+    metadata._routing = doc._routing;
+  }
+  return metadata;
+}
+
+function currentDocumentMetadata(): JsonRecord {
+  if (selectedDoc.value) return metadataFieldsFromDocument(selectedDoc.value);
+  // New documents keep metadata that already exists in either editor mode.
+  if (documentEditMode.value === "json") {
+    const parsed = parseDocumentStoreJsonDocument(editJson.value, documentStoreProvider.value.kind);
+    return parsed.ok ? metadataFieldsFromDocument(parsed.document) : {};
+  }
+  const metadata: JsonRecord = {};
+  for (const field of editFields.value) {
+    const name = field.keyName.trim();
+    if (isDocumentStoreIdentityField(documentStoreProvider.value.kind, name)) {
+      metadata[name] = buildValueFromNode(field, name);
+    }
+  }
+  return metadata;
+}
+
+function syncEditJsonFromFields() {
+  const doc = buildDocumentFromFields();
+  // Field mode omits root metadata keys; restore them for JSON round-trips (new + existing).
+  Object.assign(doc, currentDocumentMetadata());
+  editJson.value = stringifyDocumentStoreValue(doc, documentStoreProvider.value.kind, 2);
+}
+
+function setDocumentEditMode(mode: "fields" | "json") {
+  if (!isEditing.value || documentEditMode.value === mode) return;
+  error.value = "";
+  if (mode === "json") {
+    try {
+      syncEditJsonFromFields();
+      documentEditMode.value = "json";
+    } catch (e: unknown) {
+      error.value = e instanceof Error ? e.message : String(e);
+    }
+    return;
+  }
+
+  const parsed = parseDocumentStoreJsonDocument(editJson.value, documentStoreProvider.value.kind);
+  if (!parsed.ok) {
+    error.value = documentEditErrorMessage(parsed);
+    return;
+  }
+  editFields.value = buildEditFieldsFromDocument(parsed.document);
+  documentEditMode.value = "fields";
+}
+
 function selectDoc(idx: number) {
   selectedIdx.value = idx;
   editJson.value = stringifyDocumentStoreValue(documents.value[idx], documentStoreProvider.value.kind, 2);
   isEditing.value = false;
   isNew.value = false;
+  documentEditMode.value = "fields";
   editFields.value = [];
+  error.value = "";
 }
 
 function startNew() {
   selectedIdx.value = null;
-  editJson.value = "";
+  editJson.value = emptyDocumentJson();
   editFields.value = [createEditNode("", "", false, false)];
+  documentEditMode.value = "json";
   isEditing.value = true;
   isNew.value = true;
+  error.value = "";
 }
 
 function startEdit() {
   const doc = selectedDoc.value;
   if (!doc) return;
-  editFields.value = Object.entries(doc).map(([name, value]) => {
-    const readonlyMetadata = name === "_id" || (documentStoreProvider.value.kind === "elasticsearch" && name === "_routing");
-    return createEditNode(name, value, readonlyMetadata, readonlyMetadata);
-  });
+  // Issue #2952: open whole-document JSON editing by default (DBeaver-style), not field tree.
+  editJson.value = stringifyDocumentStoreValue(doc, documentStoreProvider.value.kind, 2);
+  editFields.value = buildEditFieldsFromDocument(doc);
+  documentEditMode.value = "json";
   isEditing.value = true;
   isNew.value = false;
+  error.value = "";
 }
 
 function cancelEdit() {
   isEditing.value = false;
+  documentEditMode.value = "fields";
   if (isNew.value) {
     isNew.value = false;
     editFields.value = [];
+    editJson.value = "";
+    error.value = "";
     return;
   }
   if (selectedDoc.value) {
     editJson.value = stringifyDocumentStoreValue(selectedDoc.value, documentStoreProvider.value.kind, 2);
   }
   editFields.value = [];
+  documentEditMode.value = "fields";
   error.value = "";
 }
 
@@ -685,6 +1253,7 @@ function requestRemoveField(idx: number) {
 }
 
 function formatForEdit(value: unknown): string {
+  value = mongoDocumentDisplayValue(value);
   if (value === undefined) return "";
   if (value === null) return "null";
   if (typeof value === "string") return JSON.stringify(value);
@@ -702,7 +1271,7 @@ function buildObjectFromNodes(nodes: EditNode[], path: string): JsonRecord {
 
   for (const field of nodes) {
     const name = field.keyName.trim();
-    if (!name || (!path && (name === "_id" || (documentStoreProvider.value.kind === "elasticsearch" && name === "_routing")))) continue;
+    if (!name || (!path && isDocumentStoreIdentityField(documentStoreProvider.value.kind, name))) continue;
     if (seen.has(name)) throw new Error(t("mongo.duplicateField", { field: name }));
     seen.add(name);
     doc[name] = buildValueFromNode(field, path ? `${path}.${name}` : name);
@@ -723,30 +1292,113 @@ function buildDocumentFromFields(): JsonRecord {
   return buildObjectFromNodes(editFields.value, "");
 }
 
-async function saveDoc() {
-  error.value = "";
+function buildDocumentFromEditor(): JsonRecord | null {
+  if (documentEditMode.value === "json") {
+    const parsed = parseDocumentStoreJsonDocument(editJson.value, documentStoreProvider.value.kind);
+    if (!parsed.ok) {
+      error.value = documentEditErrorMessage(parsed);
+      return null;
+    }
+    return parsed.document;
+  }
+
+  // Field mode skips root metadata in buildDocumentFromFields(); reattach identity field values.
+  const doc = buildDocumentFromFields();
+  for (const field of editFields.value) {
+    const name = field.keyName.trim();
+    if (isDocumentStoreIdentityField(documentStoreProvider.value.kind, name)) {
+      doc[name] = buildValueFromNode(field, name);
+    }
+  }
+  return doc;
+}
+
+function resolveDocumentStorePathId(id: unknown): string | null {
+  if (documentStoreProvider.value.kind === "elasticsearch") {
+    return documentIdFromGridValue(documentStoreValueForGrid(id, "elasticsearch"));
+  }
+  if (id === undefined || id === null || id === "") return null;
   try {
-    const doc = buildDocumentFromFields();
+    const serialized = serializeDocumentStoreId(id, documentStoreProvider.value.kind);
+    return serialized.trim() ? serialized : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWriteIdentityFromEditor(doc: JsonRecord, currentId: unknown, currentRouting: string | undefined): { writeId: string; writeRouting?: string } | null {
+  const kind = documentStoreProvider.value.kind;
+  const hasPayloadId = Object.prototype.hasOwnProperty.call(doc, "_id");
+  const writeId = hasPayloadId ? resolveDocumentStorePathId(doc._id) : resolveDocumentStorePathId(currentId);
+  if (!writeId) return null;
+  const writeRouting = kind === "elasticsearch" ? resolveDocumentStoreWriteRouting(doc, currentRouting) : undefined;
+  return { writeId, writeRouting };
+}
+
+async function saveDoc() {
+  if (isSavingDocument.value) return;
+  error.value = "";
+  isSavingDocument.value = true;
+  try {
+    const doc = buildDocumentFromEditor();
+    if (!doc) return;
+
+    const kind = documentStoreProvider.value.kind;
+
     if (isNew.value) {
-      await api.documentInsertDocument(props.connectionId, props.database, props.collection, stringifyDocumentStoreValue(doc, documentStoreProvider.value.kind));
+      const apis = documentStoreWriteApis();
+      const explicitId = kind === "elasticsearch" ? documentIdFromGridValue(documentStoreValueForGrid(doc._id, "elasticsearch")) : null;
+      await insertDocumentStoreDocumentCore({
+        kind,
+        document: doc,
+        explicitId,
+        routing: normalizeDocumentStoreRouting(doc._routing),
+        apis,
+      });
     } else if (selectedIdx.value !== null) {
       const current = documents.value[selectedIdx.value];
-      const id = current?._id;
-      if (!id) {
+      const currentId = current?._id;
+      if (currentId === undefined || currentId === null) {
         error.value = "No _id field";
         return;
       }
-      await api.documentUpdateDocument(props.connectionId, props.database, props.collection, serializeDocumentStoreId(id, documentStoreProvider.value.kind), stringifyDocumentStoreValue(doc, documentStoreProvider.value.kind), documentRoutingFromDocument(current));
+
+      const deleteId = resolveDocumentStorePathId(currentId);
+      if (!deleteId) {
+        error.value = "No _id field";
+        return;
+      }
+      const currentRouting = documentRoutingFromDocument(current);
+      const apis = documentStoreWriteApis(kind === "elasticsearch" ? documentTypeFromDocument(current) : undefined);
+      const write = resolveWriteIdentityFromEditor(doc, currentId, currentRouting);
+      if (!write) {
+        error.value = t("mongo.jsonIdRequired");
+        return;
+      }
+
+      const plan = planDocumentStoreIdentityMigration({
+        write: { id: write.writeId, routing: write.writeRouting },
+        current: { id: deleteId, routing: kind === "elasticsearch" ? currentRouting : undefined },
+      });
+      // Rekey writes first then deletes; write failure leaves the old document intact.
+      await applyDocumentStoreIdentityPlan({ kind, plan, document: doc, apis });
+    } else {
+      return;
     }
+
     isEditing.value = false;
     isNew.value = false;
+    documentEditMode.value = "fields";
     editFields.value = [];
+    if (kind === "elasticsearch") resetElasticsearchTotals({ preservePaginationTotal: true });
     await load();
     if (selectedIdx.value !== null && documents.value[selectedIdx.value]) {
       editJson.value = stringifyDocumentStoreValue(documents.value[selectedIdx.value], documentStoreProvider.value.kind, 2);
     }
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    isSavingDocument.value = false;
   }
 }
 
@@ -756,11 +1408,12 @@ async function applyDeleteDoc(idx: number) {
   if (!id) return;
   error.value = "";
   try {
-    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, serializeDocumentStoreId(id, documentStoreProvider.value.kind), documentRoutingFromDocument(doc));
+    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, serializeDocumentStoreId(id, documentStoreProvider.value.kind), documentRoutingFromDocument(doc), documentStoreProvider.value.kind === "elasticsearch" ? documentTypeFromDocument(doc) : undefined);
     if (selectedIdx.value === idx) {
       selectedIdx.value = null;
       editJson.value = "";
     }
+    if (documentStoreProvider.value.kind === "elasticsearch") resetElasticsearchTotals({ preservePaginationTotal: true });
     await load();
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -786,13 +1439,13 @@ async function confirmDelete() {
 function prevPage() {
   if (page.value <= 0) return;
   page.value--;
-  load();
+  void load();
 }
 
 function nextPage() {
-  if ((page.value + 1) * pageSize.value >= total.value) return;
+  if (!canGoNextPage.value) return;
   page.value++;
-  load();
+  void load();
 }
 
 function docPreview(doc: JsonRecord): string {
@@ -805,27 +1458,88 @@ function docPreview(doc: JsonRecord): string {
 }
 
 function highlightedJson(json: string): string {
-  const escaped = json.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return renderDocumentJsonHtml(json, documentSearchOpen.value ? documentSearchQuery.value : "", documentSearchActiveIndex.value);
+}
 
-  return escaped.replace(/("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g, (match) => {
-    let cls = "json-number";
-    if (match.startsWith('"')) cls = match.endsWith(":") ? "json-key" : "json-string";
-    else if (match === "true" || match === "false") cls = "json-boolean";
-    else if (match === "null") cls = "json-null";
-    return `<span class="${cls}">${match}</span>`;
+function handleDocumentBrowserPointerDown(event: PointerEvent) {
+  const target = event.target;
+  documentViewerSearchActive.value = target instanceof Element && !!target.closest("[data-document-json-viewer], [data-document-search]");
+}
+
+function focusSearch(): boolean {
+  if (viewMode.value !== "document" || !documentViewerSearchActive.value) return false;
+  if (isEditing.value) return false;
+  if (!isNew.value && selectedIdx.value === null) return false;
+  documentSearchOpen.value = true;
+  documentSearchHasNavigated.value = false;
+  void nextTick(() => {
+    documentSearchInputRef.value?.focus();
+    documentSearchInputRef.value?.select();
+  });
+  return true;
+}
+
+function closeDocumentSearch() {
+  documentSearchOpen.value = false;
+  void nextTick(() => {
+    documentViewerRef.value?.focus();
   });
 }
 
+function moveDocumentSearchMatch(delta: -1 | 1) {
+  const count = documentSearchMatches.value.length;
+  if (count === 0) return;
+  documentSearchMatchIndex.value = (documentSearchActiveIndex.value + delta + count) % count;
+  documentSearchHasNavigated.value = true;
+  void scrollDocumentSearchMatchIntoView();
+}
+
+function activateDocumentSearchMatch(delta: -1 | 1) {
+  if (documentSearchMatches.value.length === 0) return;
+  if (!documentSearchHasNavigated.value) {
+    documentSearchHasNavigated.value = true;
+    void scrollDocumentSearchMatchIntoView();
+    return;
+  }
+  moveDocumentSearchMatch(delta);
+}
+
+async function scrollDocumentSearchMatchIntoView() {
+  await nextTick();
+  documentViewerRef.value?.querySelector<HTMLElement>('[data-document-search-active="true"]')?.scrollIntoView({ block: "center", inline: "nearest" });
+}
+
+watch([documentSearchQuery, documentSearchText], () => {
+  documentSearchMatchIndex.value = 0;
+  documentSearchHasNavigated.value = false;
+  void scrollDocumentSearchMatchIntoView();
+});
+
+watch([viewMode, isEditing, selectedIdx], ([mode, editing, index]) => {
+  if (mode === "document" && !editing && index !== null) return;
+  documentViewerSearchActive.value = false;
+  documentSearchOpen.value = false;
+});
+
 onMounted(async () => {
+  window.addEventListener("pointerdown", handleDocumentBrowserPointerDown, true);
   try {
     await connectionStore.ensureConnected(props.connectionId);
   } catch (e) {
     console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
   }
-  load();
+  // Mapping metadata enriches the filter builder, but it must not delay the
+  // first page of documents when the mapping endpoint is slow.
+  void loadElasticsearchMappingFields();
+  void load();
+  void nextTick(resizeDocumentQueryInputs);
 });
 onBeforeUnmount(() => {
+  window.removeEventListener("pointerdown", handleDocumentBrowserPointerDown, true);
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
+  documentRequestGeneration++;
+  loadedDocumentQueryTotalCountRequest = undefined;
+  cancelElasticsearchCount();
   stopDocumentLoadingTimer();
   endTableSearchSplitResize();
 });
@@ -871,6 +1585,8 @@ function resetTableSearchSplitWidth() {
   const containerWidth = tableSearchSplitContainerWidth();
   tableFindPaneWidth.value = containerWidth > 0 ? clampSearchSplitWidth({ containerWidth }) : null;
 }
+
+defineExpose({ focusSearch });
 </script>
 
 <template>
@@ -889,74 +1605,30 @@ function resetTableSearchSplitWidth() {
       <span class="shrink-0 ml-1">{{ documentStoreLabels.documentsLabel }}</span>
 
       <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="startNew"><Plus class="h-3 w-3" /></Button>
-      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="load"><RefreshCw class="h-3 w-3" :class="{ 'animate-spin': loading }" /></Button>
+      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="refreshDocuments"><RefreshCw class="h-3 w-3" :class="{ 'animate-spin': loading }" /></Button>
 
       <div v-if="viewMode === 'document'" class="flex items-center gap-1 ml-1">
         <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="page <= 0" @click="prevPage">
           <ChevronLeft class="h-3 w-3" />
         </Button>
-        <span>{{ page + 1 }} / {{ Math.max(1, Math.ceil(total / pageSize)) }}</span>
-        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="(page + 1) * pageSize >= total" @click="nextPage">
+        <span v-if="documentPageCount !== undefined">{{ page + 1 }} / {{ documentPageCount }}</span>
+        <span v-else>{{ page + 1 }}</span>
+        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canGoNextPage" @click="nextPage">
           <ChevronRight class="h-3 w-3" />
         </Button>
       </div>
 
       <div class="flex-1" />
 
-      <Popover v-if="viewMode === 'table' && gridResult.columns.length">
-        <PopoverTrigger as-child>
-          <Button variant="ghost" size="sm" class="h-5 shrink-0 gap-1 px-1.5 text-xs text-foreground hover:bg-accent" :class="{ 'bg-accent text-foreground': (dataGridRef?.hiddenColumnCount ?? 0) > 0 }" :title="t('grid.columnVisibility')" :aria-label="t('grid.columnVisibility')">
-            <Columns3 class="h-3.5 w-3.5" />
-            {{ t("grid.columnVisibility") }}
-            <span v-if="(dataGridRef?.hiddenColumnCount ?? 0) > 0" class="tabular-nums"> {{ dataGridRef?.visibleColumnCount }}/{{ dataGridRef?.displayableColumnCount }} </span>
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent align="end" class="w-64 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
-          <div class="border-b bg-muted/40 px-2 py-1.5">
-            <div class="flex items-center justify-between gap-2">
-              <div class="text-xs font-semibold">{{ t("grid.columnVisibility") }}</div>
-              <div class="text-[10px] text-muted-foreground tabular-nums">{{ dataGridRef?.visibleColumnCount ?? 0 }}/{{ dataGridRef?.displayableColumnCount ?? 0 }}</div>
-            </div>
-          </div>
-          <div class="flex items-center gap-1.5 border-b px-2 py-1.5">
-            <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <input v-model="columnVisibilitySearch" autocapitalize="off" autocorrect="off" spellcheck="false" class="h-6 min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('grid.searchColumns')" />
-          </div>
-          <div class="max-h-72 overflow-auto py-0.5">
-            <button v-for="option in columnVisibilityOptions" :key="`${option.index}:${option.column}`" type="button" class="grid w-full grid-cols-[1.5rem_minmax(0,1fr)] items-center px-2 py-1 text-left text-xs hover:bg-accent" @click="dataGridRef?.toggleColumnVisibility(option.index)">
-              <span class="flex h-4 w-4 items-center justify-center rounded border" :class="dataGridRef?.isColumnVisible(option.index) ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-transparent'">
-                <Check class="h-3 w-3 stroke-[3]" />
-              </span>
-              <span class="truncate font-mono text-xs" :title="option.column">{{ option.column }}</span>
-            </button>
-            <div v-if="columnVisibilityOptions.length === 0" class="px-2 py-6 text-center text-xs text-muted-foreground">
-              {{ t("grid.noSearchResults") }}
-            </div>
-          </div>
-          <div class="flex flex-col gap-1 border-t bg-muted/30 px-2 py-1.5">
-            <span class="text-[11px] leading-4 text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
-            <div class="flex items-center justify-end gap-1">
-              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.displayableColumnCount ?? 0) <= 1" @click="dataGridRef?.invertColumnVisibility()">
-                {{ t("grid.invertColumnVisibility") }}
-              </Button>
-              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="!dataGridRef?.hasCustomColumnOrder" @click="dataGridRef?.resetColumnOrder()">
-                {{ t("grid.resetColumnOrder") }}
-              </Button>
-              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.hiddenColumnCount ?? 0) === 0" @click="dataGridRef?.showAllColumns()">
-                {{ t("grid.showAllColumns") }}
-              </Button>
-            </div>
-          </div>
-        </PopoverContent>
-      </Popover>
+      <DataGridColumnLayoutPopover v-if="viewMode === 'table' && gridResult.columns.length" :grid="dataGridRef" />
 
-      <Popover v-if="viewMode === 'table' && gridResult.columns.length">
+      <Popover v-if="viewMode === 'table' && gridResult.columns.length" v-model:open="viewOptionsOpen">
         <PopoverTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-foreground hover:bg-accent" :class="{ 'bg-accent text-foreground': dataGridRef?.nullColumnsHidden }" :title="t('grid.viewOptions')" :aria-label="t('grid.viewOptions')">
             <Wrench class="h-4 w-4" />
           </Button>
         </PopoverTrigger>
-        <PopoverContent align="end" class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
+        <PopoverContent align="end" class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-md border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
           <div class="border-b bg-muted/40 px-3 py-2">
             <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
           </div>
@@ -967,6 +1639,13 @@ function resetTableSearchSplitWidth() {
               <span v-if="(dataGridRef?.allNullColumnCount ?? 0) > 0" class="text-muted-foreground tabular-nums"> ({{ dataGridRef?.allNullColumnCount }}) </span>
             </span>
           </label>
+          <DataGridCopyFormatControl
+            :current-label="dataGridRef?.defaultCopyExtractorLabel ?? '-'"
+            :current-value="dataGridRef?.defaultCopyExtractor ?? ''"
+            :items="dataGridRef?.copyExtractorMenuItems ?? []"
+            @select="dataGridRef?.setDefaultCopyExtractor($event)"
+            @configure="openDataGridExtractorConfiguration"
+          />
         </PopoverContent>
       </Popover>
     </div>
@@ -987,8 +1666,13 @@ function resetTableSearchSplitWidth() {
       ref="dataGridRef"
       class="flex-1 min-h-0"
       :result="gridResult"
+      :connection-id="props.connectionId"
+      :database="props.database"
+      :table-meta="props.tableMeta"
+      :column-layout-scope-key="documentColumnLayoutScopeKey"
       context="results"
       :database-type="props.databaseType"
+      :mongo-update-target="mongoUpdateTarget"
       editable
       :custom-save-handler="customSaveHandler"
       :loading="loading"
@@ -996,13 +1680,17 @@ function resetTableSearchSplitWidth() {
       :page-offset="page * pageSize"
       :page-limit="pageSize"
       :total-row-count="total"
+      :total-row-count-is-exact="totalIsExact"
+      :inexact-total-row-count-mode="documentStoreProvider.kind === 'mongodb' ? 'estimated' : 'at-least'"
+      :pagination-total-row-count="pageTotal"
+      :count-total-rows="countExactDocumentTotal"
       @sort="onSort"
-      @reload="load"
+      @reload="refreshDocuments"
       @paginate="(offset: number, limit: number) => paginate(offset, limit)"
     >
       <template #search-bar="{ localFilterCount, hasLocalColumnFilters, localFilterSummaries, clearLocalFilter }: { localFilterCount: number; hasLocalColumnFilters: boolean; localFilterSummaries: LocalFilterSummary[]; clearLocalFilter: (columnIndex?: number) => void }">
         <div ref="tableSearchSplitContainerRef" class="flex flex-1 min-w-0">
-          <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0" :style="tableFindPaneStyle">
+          <div class="flex flex-1 items-start gap-1 px-2 py-0.5 min-w-0" :style="tableFindPaneStyle">
             <Popover v-model:open="documentFilterBuilderOpen">
               <PopoverTrigger as-child>
                 <button
@@ -1017,7 +1705,7 @@ function resetTableSearchSplitWidth() {
                   </span>
                 </button>
               </PopoverTrigger>
-              <PopoverContent align="start" class="w-[360px] max-w-[calc(100vw-24px)] gap-3 p-3">
+              <PopoverContent align="start" class="max-w-[calc(100vw-32px)] gap-3 p-3" :class="documentStoreProvider.kind === 'elasticsearch' ? 'w-[680px]' : 'w-[360px]'">
                 <div class="flex items-center justify-between gap-3">
                   <div class="text-xs font-medium text-foreground">{{ t("grid.filter") }}</div>
                   <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="addDocumentFilterRule">
@@ -1059,7 +1747,7 @@ function resetTableSearchSplitWidth() {
 
                 <div v-if="documentFilterRules.length" class="space-y-2">
                   <template v-for="(rule, index) in documentFilterRules" :key="rule.id">
-                    <div v-if="index > 0" class="flex justify-center">
+                    <div v-if="index > 0 && documentStoreProvider.kind !== 'elasticsearch'" class="flex justify-center">
                       <Button
                         variant="ghost"
                         size="sm"
@@ -1073,19 +1761,78 @@ function resetTableSearchSplitWidth() {
                         {{ rule.conjunction }}
                       </Button>
                     </div>
-                    <div class="grid grid-cols-[minmax(0,1fr)_minmax(0,0.95fr)_minmax(0,1fr)_auto] items-center gap-1.5">
-                      <Select :model-value="rule.fieldName" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { fieldName: String(value) })">
+                    <div class="grid items-center gap-1.5" :class="documentStoreProvider.kind === 'elasticsearch' ? 'grid-cols-[minmax(0,0.75fr)_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_auto]' : 'grid-cols-[minmax(0,1fr)_minmax(0,0.95fr)_minmax(0,1fr)_auto]'">
+                      <Select v-if="documentStoreProvider.kind === 'elasticsearch'" :model-value="rule.elasticsearchClause || 'filter'" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { elasticsearchClause: value as ElasticsearchBoolClause })">
                         <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
-                          <SelectValue :placeholder="t('grid.filterBuilderColumn')" />
+                          <SelectValue />
                         </SelectTrigger>
                         <SelectContent position="popper">
-                          <SelectItem v-for="fieldName in documentFilterFieldOptions" :key="fieldName" :value="fieldName">
-                            {{ fieldName }}
+                          <SelectItem v-for="clause in elasticsearchBoolClauseOptions" :key="clause" :value="clause">
+                            {{ clause }}
                           </SelectItem>
                         </SelectContent>
                       </Select>
 
-                      <Select :model-value="rule.mode" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { mode: value as DocumentFilterMode })">
+                      <Popover :open="!!documentFilterFieldPopoverOpen[rule.id]" @update:open="(open) => setDocumentFilterFieldPopoverOpen(rule.id, open)">
+                        <PopoverTrigger as-child>
+                          <button type="button" class="flex h-8 w-full min-w-0 items-center justify-between gap-1 rounded-md border bg-background px-2 text-left text-xs hover:bg-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                            <span class="min-w-0 truncate font-mono" :title="documentFilterFieldLabel(rule.fieldName)">{{ documentFilterFieldLabel(rule.fieldName) || t("grid.filterBuilderColumn") }}</span>
+                            <ChevronDown class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          </button>
+                        </PopoverTrigger>
+                        <PopoverContent align="start" class="w-72 max-w-[calc(100vw-32px)] gap-0 overflow-hidden rounded-md border bg-popover p-0 text-popover-foreground shadow-lg" @click.stop @keydown.stop>
+                          <div class="border-b bg-muted/40 px-2 py-1.5 text-xs font-medium text-foreground">{{ t("grid.filterBuilderColumn") }}</div>
+                          <div class="relative border-b p-2">
+                            <Search class="pointer-events-none absolute left-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                            <Input :id="documentFilterFieldSearchInputId(rule.id)" v-model="documentFilterFieldSearch[rule.id]" autofocus class="h-7 pl-7 text-xs" :placeholder="t('grid.filterBuilderSearchColumns')" />
+                          </div>
+                          <div class="max-h-72 overflow-auto py-1">
+                            <div v-for="field in documentFilterFieldRowsForRule(rule.id)" :key="field.path" class="flex items-center gap-1 px-1.5">
+                              <button
+                                type="button"
+                                class="flex h-7 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                                :class="{ invisible: field.children.length === 0 || documentFilterFieldSearchActive(rule.id) }"
+                                :style="{ marginLeft: `${field.depth * 14}px` }"
+                                @click.stop="toggleDocumentFilterFieldExpanded(field.path)"
+                              >
+                                <ChevronRight v-if="!expandedDocumentFilterFieldPaths.has(field.path)" class="h-3.5 w-3.5" />
+                                <ChevronDown v-else class="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                class="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded px-1.5 text-left text-xs hover:bg-accent disabled:cursor-default disabled:text-muted-foreground disabled:hover:bg-transparent"
+                                :class="rule.fieldName === field.path ? 'bg-accent text-foreground' : ''"
+                                :disabled="!field.selectable"
+                                @click="selectDocumentFilterField(rule.id, field.path)"
+                              >
+                                <span class="min-w-0 flex-1 truncate font-mono" :title="documentStoreProvider.kind === 'elasticsearch' ? field.path : field.displayPath">
+                                  {{ documentFilterFieldSearchActive(rule.id) ? (documentStoreProvider.kind === "elasticsearch" ? field.path : field.displayPath) : field.label }}
+                                </span>
+                                <span v-if="documentStoreProvider.kind === 'elasticsearch' && field.selectable && elasticsearchFieldTypes.get(field.path)" class="shrink-0 text-[10px] text-muted-foreground"> ({{ elasticsearchFieldTypes.get(field.path) }}) </span>
+                                <span v-else-if="documentStoreProvider.kind !== 'elasticsearch' && field.kind !== 'scalar'" class="shrink-0 rounded border px-1 py-0 text-[10px] leading-4 text-muted-foreground">
+                                  {{ documentFilterFieldKindLabel(field.kind) }}
+                                </span>
+                              </button>
+                            </div>
+                            <div v-if="documentFilterFieldRowsForRule(rule.id).length === 0" class="px-3 py-6 text-center text-xs text-muted-foreground">
+                              {{ t("grid.noSearchResults") }}
+                            </div>
+                          </div>
+                        </PopoverContent>
+                      </Popover>
+
+                      <Select v-if="documentStoreProvider.kind === 'elasticsearch'" :model-value="rule.elasticsearchQueryType || elasticsearchRuleQueryTypes(rule)[0]" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { elasticsearchQueryType: value as ElasticsearchQueryType })">
+                        <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent position="popper">
+                          <SelectItem v-for="queryType in elasticsearchRuleQueryTypes(rule)" :key="queryType" :value="queryType">
+                            {{ elasticsearchQueryTypeLabel(queryType) }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+
+                      <Select v-else :model-value="rule.mode" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { mode: value as DocumentFilterMode })">
                         <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
                           <SelectValue />
                         </SelectTrigger>
@@ -1097,7 +1844,7 @@ function resetTableSearchSplitWidth() {
                       </Select>
 
                       <Input
-                        v-if="documentFilterModeNeedsValue(rule.mode)"
+                        v-if="documentStoreProvider.kind === 'elasticsearch' ? elasticsearchQueryTypeNeedsValue(rule.elasticsearchQueryType) : documentFilterModeNeedsValue(rule.mode)"
                         :model-value="rule.rawValue"
                         class="h-8 min-w-0 text-xs"
                         :placeholder="t('grid.filterBuilderValue')"
@@ -1133,11 +1880,27 @@ function resetTableSearchSplitWidth() {
                 </div>
               </PopoverContent>
             </Popover>
-            <span class="text-blue-600 dark:text-blue-400 text-xs font-medium select-none shrink-0">{{ documentStoreProvider.filterInputLabel }}</span>
-            <input v-model="filterInput" autocapitalize="off" autocorrect="off" spellcheck="false" class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono" placeholder="{}" @keydown.enter="applyFilter" />
+            <span class="text-blue-600 dark:text-blue-400 text-xs font-medium select-none shrink-0 pt-0.5">{{ documentStoreProvider.filterInputLabel }}</span>
+            <textarea
+              ref="filterInputRef"
+              v-model="filterInput"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              rows="1"
+              class="document-query-input flex-1 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
+              placeholder="{}"
+              @keydown.enter.exact.prevent="applyFilter"
+              @keydown.ctrl.enter.prevent="applyFilter"
+              @keydown.meta.enter.prevent="applyFilter"
+            />
+            <button v-if="filterInput.trim()" type="button" class="text-muted-foreground hover:text-foreground shrink-0 mt-0.5" title="Format JSON" aria-label="Format JSON" @click="formatFilterInput">
+              <Braces class="w-3 h-3" />
+            </button>
             <button
               v-if="filterInput.trim()"
-              class="text-muted-foreground hover:text-foreground shrink-0"
+              type="button"
+              class="text-muted-foreground hover:text-foreground shrink-0 mt-0.5"
               @click="
                 filterInput = '';
                 applyFilter();
@@ -1155,12 +1918,28 @@ function resetTableSearchSplitWidth() {
           >
             <span class="h-5 w-px bg-border group-hover:bg-primary/60" />
           </button>
-          <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0">
-            <span class="text-orange-600 dark:text-orange-400 text-xs font-medium select-none shrink-0">{{ documentStoreProvider.sortInputLabel }}</span>
-            <input v-model="sortInput" autocapitalize="off" autocorrect="off" spellcheck="false" class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono" placeholder="{}" @keydown.enter="applyFilter" />
+          <div class="flex flex-1 items-start gap-1 px-2 py-0.5 min-w-0">
+            <span class="text-orange-600 dark:text-orange-400 text-xs font-medium select-none shrink-0 pt-0.5">{{ documentStoreProvider.sortInputLabel }}</span>
+            <textarea
+              ref="sortInputRef"
+              v-model="sortInput"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              rows="1"
+              class="document-query-input flex-1 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
+              placeholder="{}"
+              @keydown.enter.exact.prevent="applyFilter"
+              @keydown.ctrl.enter.prevent="applyFilter"
+              @keydown.meta.enter.prevent="applyFilter"
+            />
+            <button v-if="sortInput.trim()" type="button" class="text-muted-foreground hover:text-foreground shrink-0 mt-0.5" title="Format JSON" aria-label="Format JSON" @click="formatSortInput">
+              <Braces class="w-3 h-3" />
+            </button>
             <button
               v-if="sortInput.trim()"
-              class="text-muted-foreground hover:text-foreground shrink-0"
+              type="button"
+              class="text-muted-foreground hover:text-foreground shrink-0 mt-0.5"
               @click="
                 sortInput = '';
                 applyFilter();
@@ -1201,25 +1980,55 @@ function resetTableSearchSplitWidth() {
               <span class="flex-1" />
               <Button v-if="!isEditing" variant="ghost" size="sm" class="h-6 text-xs" @click="startEdit">{{ t("mongo.edit") }}</Button>
               <template v-if="isEditing">
-                <Button variant="ghost" size="sm" class="h-6 text-xs" @click="addField"> <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }} </Button>
-                <Button variant="ghost" size="sm" class="h-6 text-xs" @click="cancelEdit">{{ t("grid.discard") }}</Button>
-                <Button size="sm" class="h-6 text-xs" @click="saveDoc"><Save class="w-3 h-3 mr-1" />{{ t("grid.save") }}</Button>
+                <div class="flex items-center border rounded-md overflow-hidden mr-1">
+                  <Button variant="ghost" size="sm" class="h-6 rounded-none px-2 text-xs" :class="{ 'bg-accent': documentEditMode === 'json' }" :disabled="isSavingDocument" @click="setDocumentEditMode('json')">{{ t("mongo.editModeJson") }}</Button>
+                  <Button variant="ghost" size="sm" class="h-6 rounded-none px-2 text-xs" :class="{ 'bg-accent': documentEditMode === 'fields' }" :disabled="isSavingDocument" @click="setDocumentEditMode('fields')">{{ t("mongo.editModeFields") }}</Button>
+                </div>
+                <Button v-if="documentEditMode === 'fields'" variant="ghost" size="sm" class="h-6 text-xs" :disabled="isSavingDocument" @click="addField"> <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }} </Button>
+                <Button variant="ghost" size="sm" class="h-6 text-xs" :disabled="isSavingDocument" @click="cancelEdit">{{ t("grid.discard") }}</Button>
+                <Button size="sm" class="h-6 text-xs" :disabled="isSavingDocument" @click="saveDoc"><Save class="w-3 h-3 mr-1" />{{ t("grid.save") }}</Button>
               </template>
             </div>
 
-            <div v-if="isEditing" class="flex-1 overflow-auto bg-muted/10">
-              <div class="json-edit min-w-fit p-5" :style="{ ...documentFontStyle, '--mongo-key-width': editKeyWidth }">
-                <div class="json-edit-brace">{</div>
+            <div v-if="documentSearchOpen && (!isEditing || documentEditMode === 'json')" data-document-search class="flex h-9 shrink-0 items-center justify-end gap-1 border-b bg-background px-2">
+              <div class="relative w-56 max-w-[45%] min-w-32">
+                <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input ref="documentSearchInputRef" v-model="documentSearchQuery" class="h-7 pl-7 pr-2 text-xs" :placeholder="t('editor.search.find')" @keydown.enter.prevent="activateDocumentSearchMatch($event.shiftKey ? -1 : 1)" @keydown.escape.prevent="closeDocumentSearch" />
+              </div>
+              <span class="w-12 text-center text-[11px] tabular-nums text-muted-foreground">{{ documentSearchStatus }}</span>
+              <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('editor.search.prevMatch')" :disabled="documentSearchMatches.length === 0" @click="moveDocumentSearchMatch(-1)">
+                <ChevronUp class="h-3.5 w-3.5" />
+              </Button>
+              <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('editor.search.nextMatch')" :disabled="documentSearchMatches.length === 0" @click="moveDocumentSearchMatch(1)">
+                <ChevronDown class="h-3.5 w-3.5" />
+              </Button>
+              <Button variant="ghost" size="icon" class="h-7 w-7" @click="closeDocumentSearch">
+                <X class="h-3.5 w-3.5" />
+              </Button>
+            </div>
 
-                <JsonEditNode v-for="(field, idx) in editFields" :key="field.key" :node="field" parent-kind="root" :removable="!field.readonlyValue" @remove="requestRemoveField(idx)" />
+            <div v-if="isEditing && documentEditMode === 'json' && !isNew" class="px-4 py-1.5 text-[11px] text-muted-foreground border-b bg-muted/20 shrink-0">
+              {{ t("mongo.jsonReplaceHint") }}
+            </div>
 
-                <Button variant="ghost" size="sm" class="json-edit-add" @click="addField"> <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }} </Button>
+            <div v-if="isEditing" class="flex-1 min-h-0 overflow-hidden bg-muted/10">
+              <div v-if="documentEditMode === 'json'" class="h-full min-h-0 p-2">
+                <RedisJsonEditor v-model="editJson" class="h-full rounded border bg-background" :save-disabled="isSavingDocument" :read-only="isSavingDocument" @save="saveDoc" />
+              </div>
+              <div v-else class="h-full overflow-auto">
+                <div class="json-edit min-w-fit p-5" :class="{ 'pointer-events-none opacity-60': isSavingDocument }" :style="{ ...documentFontStyle, '--mongo-key-width': editKeyWidth }" :aria-disabled="isSavingDocument ? 'true' : undefined">
+                  <div class="json-edit-brace">{</div>
 
-                <div class="json-edit-brace">}</div>
+                  <JsonEditNode v-for="(field, idx) in editFields" :key="field.key" :node="field" parent-kind="root" :removable="!isSavingDocument && !field.readonlyValue" @remove="requestRemoveField(idx)" />
+
+                  <Button variant="ghost" size="sm" class="json-edit-add" :disabled="isSavingDocument" @click="addField"> <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }} </Button>
+
+                  <div class="json-edit-brace">}</div>
+                </div>
               </div>
             </div>
 
-            <div v-else class="flex-1 overflow-auto bg-muted/10">
+            <div v-else ref="documentViewerRef" data-document-json-viewer tabindex="-1" class="flex-1 overflow-auto bg-muted/10 outline-none">
               <pre class="json-viewer min-w-fit p-5" :style="documentFontStyle" v-html="highlightedJson(editJson)" />
             </div>
           </template>
@@ -1236,6 +2045,15 @@ function resetTableSearchSplitWidth() {
 </template>
 
 <style scoped>
+.document-query-input {
+  min-height: 20px;
+  max-height: 120px;
+  line-height: 1.25rem;
+  resize: none;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
 .json-viewer {
   font-family: var(--dbx-editor-font-family);
   font-size: var(--dbx-editor-font-size);
@@ -1262,6 +2080,27 @@ function resetTableSearchSplitWidth() {
 .json-edit-add {
   margin: 6px 0 6px 2ch;
   font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+.native-document-editor {
+  width: 100%;
+  min-height: 0;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: var(--dbx-radius-fixed-4);
+  background: var(--background);
+  color: var(--foreground);
+  padding: 14px 16px;
+  line-height: 1.6;
+  tab-size: 2;
+  outline: none;
+  white-space: pre;
+  overflow: auto;
+}
+
+.native-document-editor:focus {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--ring) 28%, transparent);
 }
 
 :deep(.json-key) {
@@ -1305,5 +2144,27 @@ function resetTableSearchSplitWidth() {
 
 :global(.dark) :deep(.json-null) {
   color: #94a3b8;
+}
+
+:deep(.document-search-match) {
+  border-radius: 2px;
+  background: #fde68a;
+  color: inherit;
+  padding: 0;
+}
+
+:deep(.document-search-match-active) {
+  background: #f59e0b;
+  color: #111827;
+  outline: 1px solid #d97706;
+}
+
+:global(.dark) :deep(.document-search-match) {
+  background: #854d0e;
+}
+
+:global(.dark) :deep(.document-search-match-active) {
+  background: #fbbf24;
+  color: #111827;
 }
 </style>

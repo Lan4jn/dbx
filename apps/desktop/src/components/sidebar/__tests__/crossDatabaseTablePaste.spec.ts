@@ -1,0 +1,28 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+const runtimeSource = readFileSync(new URL("../SidebarTreeRuntimeHost.vue", import.meta.url), "utf8");
+
+describe("cross-database table paste", () => {
+  it("routes a table clipboard from another context to data transfer", () => {
+    expect(runtimeSource).toContain("function canTransferTreeClipboardToCurrentNode()");
+    expect(runtimeSource).toContain("function openTransferFromTreeClipboard()");
+    expect(runtimeSource).toContain("targetConnectionId: target.connectionId");
+    expect(runtimeSource).toContain("targetDatabase: target.database");
+    expect(runtimeSource).toContain("tables: clipboard.tables.map((entry) => entry.tableName)");
+    expect(runtimeSource).toMatch(/function treeTableClipboardMenuItems[\s\S]*?tableClipboardMenuState\([\s\S]*?canTransferTreeClipboardToCurrentNode\(\),\s*\)/);
+  });
+
+  it("retains the local duplicate-table paste path", () => {
+    expect(runtimeSource).toContain("if (canTransferTreeClipboardToCurrentNode()) return openTransferFromTreeClipboard();");
+    expect(runtimeSource).toContain("pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());");
+    expect(runtimeSource).toContain('normalizeNewTargetName: mode === "structure-and-data"');
+  });
+
+  it("carries table comments through the local sidebar paste path", () => {
+    expect(runtimeSource).toMatch(/tableName: node\.label,\s*tableComment: node\.comment/);
+    expect(runtimeSource).toMatch(/targetName: `\$\{entry\.tableName\}_copy`,[\s\S]*?tableComment: entry\.tableComment/);
+    expect(runtimeSource).toMatch(/targetName,\s*tableComment: entry\.tableComment/);
+    expect(runtimeSource).toContain("executeAsScript: duplicateTableStructureRequiresScript(structureSql)");
+  });
+});

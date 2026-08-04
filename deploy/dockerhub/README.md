@@ -1,6 +1,6 @@
 # DBX
 
-DBX is a lightweight, self-hosted database client for the browser. It supports more than 60 databases, including MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, and Elasticsearch.
+DBX is a lightweight, self-hosted database client for the browser. It supports 70+ databases, including MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, and Elasticsearch.
 
 - Official website: https://dbxio.com
 - Documentation: https://dbxio.com/en/docs/getting-started
@@ -62,6 +62,8 @@ docker compose up -d --pull always
 | `DBX_PUBLIC_BASE_PATH` | `/` | URL prefix for reverse-proxy deployments, for example `/dbx`. |
 
 Persist `/app/data` with a named volume or bind mount. Removing this data removes saved connections and other DBX application data.
+
+DuckDB is delivered as a standalone native driver instead of being embedded in `dbx-web`. Install the DuckDB driver from Driver Manager after the first launch. It is stored under `/app/data/agents` and remains available across container upgrades when `/app/data` is persisted.
 
 ## Reverse Proxy
 

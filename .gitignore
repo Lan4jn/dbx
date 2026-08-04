@@ -2,8 +2,9 @@
 node_modules/
 .claude/
 .codex/
-.superpowers/
 .codegraph/
+.workbuddy/
+.superpowers/
 .trellis/
 .worktrees/
 openspec/
@@ -18,11 +19,14 @@ coverage/
 plugins/jdbc/target/
 plugins/jdbc/dependency-reduced-pom.xml
 plugins/jdbc/lib/*.jar
+plugins/jdbc/.gradle/
+plugins/jdbc/build/
 plugins/jdbc/dist/
 docs/.next/
 docs/out/
 docs/.source/
 docs/superpowers/
+/docs/aegis/
 src-tauri/*.dylib
 
 # OS files
@@ -50,6 +54,10 @@ Thumbs.db
 # Temp
 tmp/
 
+# Code review tool artifacts
+review_diff.json
+review_classified.json
+
 # Logs
 *.log
 
@@ -64,9 +72,6 @@ DBX_*_x64-portable.zip
 .agents/skills
 .pnpm-store/*
 .dbx-web
-src-tauri/target*/
-src-tauri-legacy/target*/
-third-party/webview2-fixed-runtime/
-_dev
-src-tauri/target-win-x64/
-src-tauri-legacy/target-win7-x64/
+# Local devtest connections (contains credentials; do not commit)
+dbx-devtest-connections.json
+.npmrc

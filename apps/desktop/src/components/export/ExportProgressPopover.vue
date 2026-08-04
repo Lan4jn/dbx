@@ -3,13 +3,15 @@ import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { Loader2, CheckCircle2, XCircle, AlertCircle, X, FileDown, DatabaseBackup, FileCode2, ArrowRightLeft } from "@lucide/vue";
-import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
+import { Loader2, CheckCircle2, XCircle, AlertCircle, X, FileDown, DatabaseBackup, FileCode2, ArrowRightLeft, ChevronRight } from "@lucide/vue";
+import { formatDataTransferDuration, useExportTracker, type ExportTask } from "@/composables/useExportTracker";
+import { translateBackendError } from "@/i18n/backend-errors";
 
 const { t } = useI18n();
 const { tasks, activeCount, hasActive, clearFinished, cancelTask, removeTask } = useExportTracker();
 const open = ref(false);
 const showAll = ref(false);
+const expandedFailureTaskIds = ref<string[]>([]);
 const MAX_VISIBLE = 5;
 
 const reversedTasks = computed(() => {
@@ -36,6 +38,7 @@ const progressPercent = (totalRows: number | null, rowsExported: number) => {
 
 const progressValue = (task: ExportTask) => {
   if (task.kind === "database-export") {
+    if (task.overallPercent !== undefined) return task.overallPercent;
     if (!task.totalObjects || task.totalObjects <= 0) return 0;
     return Math.min(100, Math.round(((task.objectIndex ?? 0) / task.totalObjects) * 100));
   }
@@ -62,6 +65,7 @@ const taskTitle = (task: ExportTask) => {
 
 const rowsText = (task: ExportTask) => {
   if (task.kind === "database-export") {
+    if (task.overallPercent !== undefined) return `${task.overallPercent}%`;
     if (task.totalObjects) {
       return t("exportProgress.objectsCount", {
         current: (task.objectIndex ?? 0).toLocaleString(),
@@ -84,7 +88,9 @@ const rowsText = (task: ExportTask) => {
         })
       : task.currentTable || "";
     const rowText = task.totalRows ? `${task.rowsExported.toLocaleString()} / ${task.totalRows.toLocaleString()} ${t("exportProgress.rowsShort")}` : `${task.rowsExported.toLocaleString()} ${t("exportProgress.rowsShort")}`;
-    return task.currentTable ? `${tableText} · ${task.currentTable} · ${rowText}` : tableText;
+    const finishedAt = task.finishedAt ?? Date.now();
+    const durationText = t("exportProgress.elapsed", { duration: formatDataTransferDuration(finishedAt - (task.startedAt ?? finishedAt)) });
+    return task.currentTable ? `${tableText} · ${task.currentTable} · ${rowText} · ${durationText}` : `${tableText} · ${durationText}`;
   }
   if (task.totalRows) return `${task.rowsExported.toLocaleString()} / ${task.totalRows.toLocaleString()}`;
   return `${task.rowsExported.toLocaleString()} ${t("exportProgress.rowsShort")}`;
@@ -130,6 +136,18 @@ const statusColor = (status: string) => {
 function toggleShowAll() {
   showAll.value = !showAll.value;
 }
+
+function failureDetailsExpanded(exportId: string) {
+  return expandedFailureTaskIds.value.includes(exportId);
+}
+
+function toggleFailureDetails(exportId: string) {
+  expandedFailureTaskIds.value = failureDetailsExpanded(exportId) ? expandedFailureTaskIds.value.filter((id) => id !== exportId) : [...expandedFailureTaskIds.value, exportId];
+}
+
+function failureDetailCount(task: ExportTask) {
+  return (task.transferFailures?.length ?? 0) + (task.transferFailuresOmitted ?? 0);
+}
 </script>
 
 <template>
@@ -159,7 +177,11 @@ function toggleShowAll() {
 
             <!-- Progress bar -->
             <div v-if="isActive(task.status)" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
-              <div v-if="task.totalRows || (task.kind === 'database-export' && task.totalObjects) || (task.kind === 'data-transfer' && task.totalTables)" class="h-full bg-primary rounded-full transition-[width] duration-300" :style="{ width: `${progressValue(task)}%` }" />
+              <div
+                v-if="task.totalRows || (task.kind === 'database-export' && (task.totalObjects || task.overallPercent !== undefined)) || (task.kind === 'data-transfer' && task.totalTables)"
+                class="h-full bg-primary rounded-full transition-[width] duration-300"
+                :style="{ width: `${progressValue(task)}%` }"
+              />
               <div v-else class="h-full w-full overflow-hidden rounded-full">
                 <div class="export-progress-indeterminate h-full rounded-full bg-primary" />
               </div>
@@ -170,9 +192,23 @@ function toggleShowAll() {
 
             <div class="min-w-0 text-muted-foreground">
               <span class="break-words tabular-nums">{{ rowsText(task) }}</span>
-              <span v-if="task.status === 'Error' && task.errorMessage" class="mt-1 block whitespace-normal break-words text-destructive" :title="task.errorMessage">
-                {{ task.errorMessage }}
+              <span v-if="task.status === 'Error' && task.errorMessage" class="mt-1 block whitespace-normal break-words text-destructive" :title="translateBackendError(t, task.errorMessage)">
+                {{ translateBackendError(t, task.errorMessage) }}
               </span>
+              <template v-if="task.kind === 'data-transfer' && failureDetailCount(task) > 0">
+                <button class="mt-1.5 flex items-center gap-1 text-xs font-medium text-foreground hover:text-primary" :aria-expanded="failureDetailsExpanded(task.exportId)" @click="toggleFailureDetails(task.exportId)">
+                  <ChevronRight class="h-3.5 w-3.5 shrink-0 transition-transform" :class="{ 'rotate-90': failureDetailsExpanded(task.exportId) }" />
+                  {{ failureDetailsExpanded(task.exportId) ? t("exportProgress.hideFailureDetails") : t("exportProgress.showFailureDetails", { count: failureDetailCount(task) }) }}
+                </button>
+                <div v-if="failureDetailsExpanded(task.exportId)" class="mt-1.5 max-h-44 overflow-y-auto rounded border border-destructive/20 bg-destructive/5">
+                  <div v-for="failure in task.transferFailures" :key="failure.table" class="border-b border-destructive/15 px-2.5 py-2 last:border-b-0">
+                    <div class="break-all font-mono font-medium text-foreground">{{ failure.table }}</div>
+                    <div class="mt-0.5 select-text whitespace-pre-wrap break-words text-destructive">{{ failure.error }}</div>
+                    <div v-if="failure.truncated" class="mt-0.5 text-muted-foreground">{{ t("exportProgress.failureDetailTruncated") }}</div>
+                  </div>
+                  <div v-if="task.transferFailuresOmitted" class="px-2.5 py-2 text-muted-foreground">{{ t("exportProgress.failureDetailsOmitted", { count: task.transferFailuresOmitted }) }}</div>
+                </div>
+              </template>
             </div>
           </div>
 

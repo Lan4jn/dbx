@@ -24,6 +24,7 @@ type TemplateElement = {
     name?: string;
     arg?: { content?: string };
     exp?: { content?: string };
+    value?: { content?: string };
   }>;
 };
 
@@ -34,6 +35,10 @@ type TemplateNode = {
 
 function directiveExpression(element: TemplateElement, name: string, arg?: string): string | undefined {
   return element.props.find((prop) => prop.type === 7 && prop.name === name && (arg == null || prop.arg?.content === arg))?.exp?.content;
+}
+
+function staticAttribute(element: TemplateElement, name: string): string | undefined {
+  return element.props.find((prop) => prop.type === 6 && prop.name === name)?.value?.content;
 }
 
 function templateElements(node: TemplateNode): TemplateElement[] {
@@ -102,6 +107,20 @@ function calledName(call: ts.CallExpression): string | undefined {
 }
 
 describe("native RedisJSON editor", () => {
+  it("opens full member values in a centered dialog instead of an app-height side sheet", () => {
+    const memberDialog = findTemplateElement((element) => element.tag === "Dialog" && directiveExpression(element, "bind", "open") === "showMemberDetail");
+    const memberDetailTags = templateElements(memberDialog).map((element) => element.tag);
+    const memberDetailFooter = templateElements(memberDialog).find((element) => element.tag === "DialogFooter");
+
+    expect(memberDetailTags).toContain("DialogContent");
+    expect(memberDetailTags).toContain("DialogHeader");
+    expect(memberDetailTags).toContain("DialogFooter");
+    expect(memberDetailTags).not.toContain("SheetContent");
+    expect(staticAttribute(memberDetailFooter!, "class")).toContain("mx-0 mb-0");
+    expect(viewerSource).not.toContain("memberDetailSheetWidth");
+    expect(viewerSource).not.toContain("startResizeMemberSheet");
+  });
+
   it("uses the same foldable source editor as JSON strings and hash fields", () => {
     const stringEditor = findTemplateElement((element) => element.tag === "RedisJsonEditor" && directiveExpression(element, "if") === "stringValueView === 'json' && stringValueDetail.json");
     const nativeJsonBranch = findTemplateElement((element) => directiveExpression(element, "else-if") === "redisKind === 'json'");
@@ -215,7 +234,7 @@ describe("native RedisJSON editor", () => {
   });
 
   it("keeps retained drafts out of background refresh and exposes word wrap for every JSON editor", () => {
-    const autoRefresh = findFunction("startAutoRefresh");
+    const refreshAutoValue = findFunction("refreshAutoValue");
     const hashSearch = findFunction("onHashSearch");
     const viewMember = findFunction("viewMember");
     const setMemberValueFormat = findFunction("setMemberValueFormat");
@@ -224,10 +243,9 @@ describe("native RedisJSON editor", () => {
     const labels = templateElements(parsedViewer.descriptor.template!.ast as unknown as TemplateElement);
     const stringTextarea = findTemplateElement((element) => element.tag === "textarea" && directiveExpression(element, "model") === "editValue");
     const memberTextarea = findTemplateElement((element) => element.tag === "textarea" && directiveExpression(element, "model") === "memberEditValue");
-    const refreshButton = findTemplateElement((element) => element.tag === "Button" && directiveExpression(element, "on", "click") === "load");
+    const refreshButton = findTemplateElement((element) => element.tag === "Button" && element.props.some((prop) => prop.type === 6 && prop.name === "data-redis-value-refresh"));
 
-    expect(autoRefresh.getText()).toContain("if (hasUnsavedRedisDraft.value) return;");
-    expect(autoRefresh.getText()).toContain("load({ preserveDraft: true })");
+    expect(refreshAutoValue.getText().match(/hasUnsavedRedisDraft\.value/g)).toHaveLength(2);
     expect(hashSearch.getText()).toContain("if (!hasRetainedMemberDraft.value) clearSelectedMember();");
     expect(viewMember.getText()).toContain("hasRetainedMemberDraft.value");
     // Clean JSON → other format must clear memberDraftFormat so rawText is not compared to the pretty baseline.
@@ -240,6 +258,6 @@ describe("native RedisJSON editor", () => {
     expect(labels.some((element) => element.tag === "label" && directiveExpression(element, "if") === "isTextRedisFormat(memberValueView)")).toBe(true);
     expect(directiveExpression(stringTextarea, "bind", "readonly")).toBe("!canEditCurrentStringFormat || savingString");
     expect(directiveExpression(memberTextarea, "bind", "readonly")).toBe("savingMember");
-    expect(directiveExpression(refreshButton, "bind", "disabled")).toBe("hasUnsavedRedisDraft");
+    expect(directiveExpression(refreshButton, "bind", "disabled")).toBe("loading || refreshingValue || hasUnsavedRedisDraft");
   });
 });

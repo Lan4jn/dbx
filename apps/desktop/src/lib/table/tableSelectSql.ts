@@ -2,6 +2,7 @@ import type { DatabaseType } from "@/types/database.ts";
 import { isSchemaAware, usesDatabaseObjectTreeMode } from "@/lib/database/databaseCapabilities.ts";
 import * as api from "@/lib/backend/api.ts";
 import { parseSqlServerLinkedSchema, sqlServerLinkedTableName } from "@/lib/database/sqlServerLinkedServers.ts";
+import { isExplicitlyQuotedSqlIdentifier, quoteGaussDbJdbcIdentifier } from "@/lib/sql/sqlIdentifier.ts";
 
 export interface BuildTableSelectSqlOptions {
   databaseType?: DatabaseType;
@@ -22,10 +23,12 @@ export interface BuildTableSelectSqlOptions {
 }
 
 export function quoteTableIdentifier(databaseType: DatabaseType | undefined, name: string): string {
+  if ((databaseType === "gaussdb" || databaseType === "opengauss") && isExplicitlyQuotedSqlIdentifier(name)) return name;
   if (databaseType === "iotdb") return name;
   // JDBC connections use the driver-reported identifier quote string
   // (DatabaseMetaData.getIdentifierQuoteString()) — pass through unquoted.
   if (databaseType === "jdbc") return name;
+  if (databaseType === "bigquery") return `\`${name.replace(/`/g, "\\`")}\``;
   if (databaseType === "mysql" || databaseType === "clickhouse" || databaseType === "hive" || databaseType === "spark" || databaseType === "databend" || databaseType === "tdengine" || databaseType === "access" || databaseType === "doris" || databaseType === "starrocks")
     return `\`${name.replace(/`/g, "``")}\``;
   if (databaseType === "informix" && /^[A-Za-z_][A-Za-z0-9_$]*$/.test(name)) return name;
@@ -35,6 +38,7 @@ export function quoteTableIdentifier(databaseType: DatabaseType | undefined, nam
 }
 
 export function quoteTableDataIdentifier(databaseType: DatabaseType | undefined, name: string, identifierQuote?: string): string {
+  if ((databaseType === "gaussdb" || databaseType === "opengauss" || databaseType === "postgres") && identifierQuote != null) return quoteGaussDbJdbcIdentifier(name, identifierQuote);
   if (databaseType === "kingbase" && identifierQuote != null) {
     if (!identifierQuote) return name;
     return `${identifierQuote}${name.replaceAll(identifierQuote, identifierQuote + identifierQuote)}${identifierQuote}`;
@@ -46,8 +50,8 @@ function quoteCypherIdentifier(name: string): string {
   return `\`${name.replace(/`/g, "``")}\``;
 }
 
-export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "databaseType" | "schema" | "tableName" | "catalog" | "database">): string {
-  const { databaseType, schema, tableName, catalog, database } = options;
+export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "databaseType" | "identifierQuote" | "schema" | "tableName" | "catalog" | "database">): string {
+  const { databaseType, identifierQuote, schema, tableName, catalog, database } = options;
   // Doris / StarRocks multi-catalog: address external-catalog tables with the
   // 3-part `catalog.database.table` form, which the engines accept directly.
   if (catalog && catalog !== "internal" && (databaseType === "doris" || databaseType === "starrocks")) {
@@ -69,7 +73,15 @@ export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "da
     }
     return quoteTableIdentifier(databaseType, tableName);
   }
-  if (isSchemaAware(databaseType) && !usesDatabaseObjectTreeMode(databaseType) && schema) {
+  if ((databaseType === "gaussdb" || databaseType === "opengauss" || databaseType === "postgres" || databaseType === "kingbase") && identifierQuote != null) {
+    const quotedTable = quoteTableDataIdentifier(databaseType, tableName, identifierQuote);
+    const trimmedSchema = schema?.trim();
+    if (trimmedSchema) {
+      return `${quoteTableDataIdentifier(databaseType, trimmedSchema, identifierQuote)}.${quotedTable}`;
+    }
+    return quotedTable;
+  }
+  if ((isSchemaAware(databaseType) || databaseType === "sqlite") && !usesDatabaseObjectTreeMode(databaseType) && schema) {
     if (databaseType === "sqlserver") {
       const linked = parseSqlServerLinkedSchema(schema);
       if (linked) return sqlServerLinkedTableName(linked, tableName);

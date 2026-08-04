@@ -222,7 +222,7 @@ fn build_query_url(client: &InfluxdbClient, database: Option<&str>, sql: &str) -
     }
     let encoded_sql = utf8_percent_encode(sql, NON_ALPHANUMERIC);
     params.push(format!("q={encoded_sql}"));
-    format!("{}/query?{}", &client.base_url, params.join("&").as_str())
+    format!("{}/query?{}", client.base_url, params.join("&").as_str())
 }
 
 fn encode_url_param(value: &str) -> String {
@@ -231,12 +231,12 @@ fn encode_url_param(value: &str) -> String {
 
 fn build_v2_buckets_url(client: &InfluxdbClient, offset: usize) -> Result<String, String> {
     let org = client.org.as_deref().ok_or_else(|| "InfluxDB 2.x organization is required".to_string())?;
-    Ok(format!("{}/api/v2/buckets?org={}&limit=100&offset={offset}", &client.base_url, encode_url_param(org)))
+    Ok(format!("{}/api/v2/buckets?org={}&limit=100&offset={offset}", client.base_url, encode_url_param(org)))
 }
 
 fn build_v2_query_url(client: &InfluxdbClient) -> Result<String, String> {
     let org = client.org.as_deref().ok_or_else(|| "InfluxDB 2.x organization is required".to_string())?;
-    Ok(format!("{}/api/v2/query?org={}", &client.base_url, encode_url_param(org)))
+    Ok(format!("{}/api/v2/query?org={}", client.base_url, encode_url_param(org)))
 }
 
 fn build_request(client: &InfluxdbClient, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -476,23 +476,29 @@ pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -
             columns: s.columns.clone(),
             column_types: vec![],
             column_sortables: s.columns.iter().map(|_| false).collect(),
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: s.values.clone(),
             affected_rows: s.values.len() as u64,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
         }),
         None => Ok(QueryResult {
             columns: vec![],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
         }),
     }
 }
@@ -628,6 +634,8 @@ fn parse_flux_csv(text: &str, start: Instant) -> Result<QueryResult, String> {
     let columns = headers.unwrap_or_default();
     Ok(QueryResult {
         column_sortables: columns.iter().map(|_| false).collect(),
+        spatial_columns: vec![],
+        spatial_values: vec![],
         columns,
         column_types: vec![],
         affected_rows: rows.len() as u64,
@@ -636,6 +644,7 @@ fn parse_flux_csv(text: &str, start: Instant) -> Result<QueryResult, String> {
         truncated: false,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
     })
 }
 

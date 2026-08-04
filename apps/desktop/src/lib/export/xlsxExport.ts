@@ -1,10 +1,21 @@
+import { isNumericColumnType } from "@/lib/dataGrid/dataGridColumnType";
+
 export type XlsxCellValue = string | number | boolean | null | undefined;
 
 export interface XlsxWorksheetData {
   sheetName?: string;
   columns: readonly string[];
   columnTypes?: readonly string[];
+  columnComments?: readonly (string | null)[] | undefined;
   rows: readonly (readonly XlsxCellValue[])[];
+  numericColumnRightAlign?: boolean;
+}
+
+interface XlsxWorksheetSegment {
+  worksheet: XlsxWorksheetData;
+  sheetName?: string;
+  rowStart: number;
+  rowEnd: number;
 }
 
 type ZipEntry = {
@@ -16,6 +27,7 @@ type ZipEntry = {
 
 const encoder = new TextEncoder();
 const CRC_TABLE = buildCrcTable();
+const XLSX_MAX_DATA_ROWS = 1_048_575;
 
 function buildCrcTable(): number[] {
   const table: number[] = [];
@@ -80,15 +92,20 @@ function normalizeSheetName(value?: string): string {
   return name.slice(0, 31);
 }
 
-function normalizeUniqueSheetNames(sheets: readonly XlsxWorksheetData[]): string[] {
+function appendSheetSuffix(base: string, suffix: number): string {
+  const suffixText = ` (${suffix})`;
+  const maxBaseLength = Math.max(0, 31 - [...suffixText].length);
+  return `${[...base].slice(0, maxBaseLength).join("")}${suffixText}`;
+}
+
+function normalizeUniqueSheetNames(sheets: readonly { sheetName?: string }[]): string[] {
   const names: string[] = [];
   sheets.forEach((sheet, index) => {
     const base = normalizeSheetName(sheet.sheetName || `Sheet${index + 1}`);
     let candidate = base;
     let suffix = 2;
     while (names.includes(candidate)) {
-      const suffixText = ` (${suffix})`;
-      candidate = `${base.slice(0, 31 - suffixText.length)}${suffixText}`;
+      candidate = appendSheetSuffix(base, suffix);
       suffix += 1;
     }
     names.push(candidate);
@@ -96,49 +113,13 @@ function normalizeUniqueSheetNames(sheets: readonly XlsxWorksheetData[]): string
   return names;
 }
 
-function estimateColumnWidths(columns: readonly string[], rows: readonly (readonly XlsxCellValue[])[]): number[] {
+function estimateColumnWidths(columns: readonly string[], rows: readonly (readonly XlsxCellValue[])[], rowStart: number, rowEnd: number, columnComments?: readonly (string | null)[]): number[] {
   return columns.map((column, colIndex) => {
-    const values = rows.slice(0, 100).map((row) => row[colIndex]);
-    const maxLen = [column, ...values.map((value) => (value == null ? "" : String(value)))].map((value) => Math.min(value.length, 60)).reduce((max, length) => Math.max(max, length), 8);
+    const headerText = columnComments?.[colIndex] || column;
+    const values = Array.from({ length: Math.min(100, rowEnd - rowStart) }, (_, index) => rows[rowStart + index]?.[colIndex]);
+    const maxLen = [headerText, ...values.map((value) => (value == null ? "" : String(value)))].map((value) => Math.min(value.length, 60)).reduce((max, length) => Math.max(max, length), 8);
     return Math.max(10, Math.min(60, maxLen + 2));
   });
-}
-
-function isNumericColumnType(columnType?: string): boolean {
-  const base = (columnType || "")
-    .trim()
-    .toLowerCase()
-    .split(/[\s([]/, 1)[0];
-  return new Set([
-    "bit",
-    "tinyint",
-    "smallint",
-    "mediumint",
-    "int",
-    "integer",
-    "bigint",
-    "int2",
-    "int4",
-    "int8",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "uint128",
-    "uint256",
-    "float",
-    "float4",
-    "float8",
-    "float32",
-    "float64",
-    "real",
-    "double",
-    "decimal",
-    "numeric",
-    "number",
-    "money",
-    "smallmoney",
-  ]).has(base);
 }
 
 function safeExcelNumber(value: string): string | undefined {
@@ -146,6 +127,14 @@ function safeExcelNumber(value: string): string | undefined {
   if (!trimmed || !Number.isFinite(Number(trimmed))) return undefined;
   const significantDigits = (trimmed.split(/[eE]/, 1)[0].match(/\d/g) || []).join("").replace(/^0+/, "").length;
   return significantDigits <= 15 ? trimmed : undefined;
+}
+
+const NUMERIC_RIGHT_ALIGN_STYLE_INDEX = 2;
+const NUMERIC_LEFT_ALIGN_STYLE_INDEX = 3;
+
+function numericColumnStyle(columnType?: string, enabled = true): number | undefined {
+  if (!isNumericColumnType(columnType)) return undefined;
+  return enabled ? NUMERIC_RIGHT_ALIGN_STYLE_INDEX : NUMERIC_LEFT_ALIGN_STYLE_INDEX;
 }
 
 function cellXml(value: XlsxCellValue, rowIndex: number, colIndex: number, style?: number, columnType?: string): string {
@@ -167,21 +156,22 @@ function cellXml(value: XlsxCellValue, rowIndex: number, colIndex: number, style
   return `<c r="${ref}" t="inlineStr"${styleAttr}><is><t>${escapeXml(String(value))}</t></is></c>`;
 }
 
-function worksheetXml(data: XlsxWorksheetData): string {
+function worksheetXml(segment: XlsxWorksheetSegment): string {
+  const data = segment.worksheet;
   const columns = data.columns;
   const rows = data.rows;
-  const totalRows = rows.length + 1;
+  const totalRows = segment.rowEnd - segment.rowStart + 1;
   const range = sheetRange(columns.length, totalRows);
-  const widths = estimateColumnWidths(columns, rows);
+  const widths = estimateColumnWidths(columns, rows, segment.rowStart, segment.rowEnd, data.columnComments);
+  const rightAlignEnabled = data.numericColumnRightAlign !== false;
   const colsXml = widths.map((width, index) => `<col min="${index + 1}" max="${index + 1}" width="${width}" customWidth="1"/>`).join("");
-  const headerXml = `<row r="1">${columns.map((column, index) => cellXml(column, 0, index, 1)).join("")}</row>`;
-  const bodyXml = rows
-    .map((row, rowIndex) => {
-      const excelRowIndex = rowIndex + 2;
-      const cells = columns.map((_, colIndex) => cellXml(row[colIndex], excelRowIndex - 1, colIndex, undefined, data.columnTypes?.[colIndex])).join("");
-      return `<row r="${excelRowIndex}">${cells}</row>`;
-    })
-    .join("");
+  const headerXml = `<row r="1">${columns.map((column, index) => cellXml(data.columnComments?.[index] || column, 0, index, 1)).join("")}</row>`;
+  const bodyXml = Array.from({ length: segment.rowEnd - segment.rowStart }, (_, rowIndex) => {
+    const row = rows[segment.rowStart + rowIndex]!;
+    const excelRowIndex = rowIndex + 2;
+    const cells = columns.map((_, colIndex) => cellXml(row[colIndex], excelRowIndex - 1, colIndex, numericColumnStyle(data.columnTypes?.[colIndex], rightAlignEnabled), data.columnTypes?.[colIndex])).join("");
+    return `<row r="${excelRowIndex}">${cells}</row>`;
+  }).join("");
 
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -192,6 +182,30 @@ function worksheetXml(data: XlsxWorksheetData): string {
   <sheetData>${headerXml}${bodyXml}</sheetData>
   <autoFilter ref="${range}"/>
 </worksheet>`;
+}
+
+function splitWorksheetsForMaxRows(sheets: readonly XlsxWorksheetData[], maxDataRowsPerSheet: number): XlsxWorksheetSegment[] {
+  const maxRows = Number.isFinite(maxDataRowsPerSheet) ? Math.max(1, Math.floor(maxDataRowsPerSheet)) : XLSX_MAX_DATA_ROWS;
+  const segments: XlsxWorksheetSegment[] = [];
+
+  for (const worksheet of sheets) {
+    if (worksheet.rows.length <= maxRows) {
+      segments.push({ worksheet, sheetName: worksheet.sheetName, rowStart: 0, rowEnd: worksheet.rows.length });
+      continue;
+    }
+
+    const baseName = normalizeSheetName(worksheet.sheetName);
+    for (let rowStart = 0, chunkIndex = 0; rowStart < worksheet.rows.length; rowStart += maxRows, chunkIndex += 1) {
+      segments.push({
+        worksheet,
+        sheetName: chunkIndex === 0 ? baseName : appendSheetSuffix(baseName, chunkIndex + 1),
+        rowStart,
+        rowEnd: Math.min(rowStart + maxRows, worksheet.rows.length),
+      });
+    }
+  }
+
+  return segments;
 }
 
 function contentTypesXml(sheetCount = 1): string {
@@ -237,7 +251,7 @@ function stylesXml(): string {
   <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
   <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>
+  <cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="right"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="left"/></xf></cellXfs>
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>`;
 }
@@ -301,14 +315,19 @@ export function buildXlsxWorkbook(data: XlsxWorksheetData): Uint8Array {
 }
 
 export function buildXlsxWorkbookMulti(sheets: readonly XlsxWorksheetData[]): Uint8Array {
+  return buildXlsxWorkbookMultiWithMaxRows(sheets, XLSX_MAX_DATA_ROWS);
+}
+
+export function buildXlsxWorkbookMultiWithMaxRows(sheets: readonly XlsxWorksheetData[], maxDataRowsPerSheet: number): Uint8Array {
   if (sheets.length === 0) throw new Error("At least one worksheet is required");
-  const sheetNames = normalizeUniqueSheetNames(sheets);
+  const segments = splitWorksheetsForMaxRows(sheets, maxDataRowsPerSheet);
+  const sheetNames = normalizeUniqueSheetNames(segments);
   return createZip([
-    { path: "[Content_Types].xml", content: contentTypesXml(sheets.length) },
+    { path: "[Content_Types].xml", content: contentTypesXml(segments.length) },
     { path: "_rels/.rels", content: rootRelsXml() },
     { path: "xl/workbook.xml", content: workbookXml(sheetNames) },
-    { path: "xl/_rels/workbook.xml.rels", content: workbookRelsXml(sheets.length) },
+    { path: "xl/_rels/workbook.xml.rels", content: workbookRelsXml(segments.length) },
     { path: "xl/styles.xml", content: stylesXml() },
-    ...sheets.map((sheet, index) => ({ path: `xl/worksheets/sheet${index + 1}.xml`, content: worksheetXml(sheet) })),
+    ...segments.map((segment, index) => ({ path: `xl/worksheets/sheet${index + 1}.xml`, content: worksheetXml(segment) })),
   ]);
 }

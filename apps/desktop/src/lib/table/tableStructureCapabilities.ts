@@ -190,6 +190,19 @@ const oracleCapabilities = capabilities({
   indexType: true,
 });
 
+// Dameng (DM8): ALTER TABLE ... DROP PRIMARY KEY / ADD PRIMARY KEY is official DDL.
+// Keep separate from oracleCapabilities so UI cannot enable PK edit without BE drop SQL.
+const damengCapabilities = capabilities({
+  ...oracleCapabilities,
+  alterPrimaryKey: true,
+});
+
+const irisCapabilities = capabilities({
+  ...oracleCapabilities,
+  // IRIS exposes %DESCRIPTION at definition time but cannot alter persisted descriptions.
+  comment: false,
+});
+
 const h2Capabilities = capabilities({
   dialect: "h2",
   createTable: true,
@@ -307,6 +320,7 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   redshift: redshiftCapabilities,
   vertica: redshiftCapabilities,
   highgo: postgresCapabilities,
+  uxdb: postgresCapabilities,
   vastbase: postgresCapabilities,
   kingbase: postgresCapabilities,
   firebird: firebirdCapabilities,
@@ -316,9 +330,9 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   duckdb: duckdbCapabilities,
   sqlserver: sqlserverCapabilities,
   oracle: oracleCapabilities,
-  dameng: oracleCapabilities,
+  dameng: damengCapabilities,
   "oceanbase-oracle": oracleCapabilities,
-  iris: oracleCapabilities,
+  iris: irisCapabilities,
   yashandb: oracleCapabilities,
   xugu: oracleCapabilities,
   h2: h2Capabilities,

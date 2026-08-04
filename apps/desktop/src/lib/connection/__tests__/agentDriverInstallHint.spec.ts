@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { driverStoreFocusForInstallError } from "@/lib/connection/agentDriverInstallHint";
+import { agentDriverInstallKey, driverStoreFocusForInstallError, hasInstalledAgentVersion, showAgentDriverInstallHint } from "@/lib/connection/agentDriverInstallHint";
+
+describe("DuckDB driver installation", () => {
+  it("requires the downloadable DuckDB driver before connecting", () => {
+    expect(agentDriverInstallKey("duckdb")).toBe("duckdb");
+    expect(showAgentDriverInstallHint("duckdb", [])).toBe(true);
+    expect(showAgentDriverInstallHint("duckdb", [{ db_type: "duckdb", installed: true }])).toBe(false);
+  });
+});
 
 describe("driverStoreFocusForInstallError", () => {
   it("focuses the missing agent driver for driver-not-installed errors", () => {
@@ -13,6 +21,10 @@ describe("driverStoreFocusForInstallError", () => {
     expect(driverStoreFocusForInstallError("kafka driver is not installed. Please install it from the Driver Manager.", "mq", "kafka")).toEqual({
       target: "driver",
       driver: "kafka",
+    });
+    expect(driverStoreFocusForInstallError("rocketmq driver is not installed. Please install it from the Driver Manager.", "mq", "rocketmq")).toEqual({
+      target: "driver",
+      driver: "rocketmq",
     });
   });
 
@@ -32,5 +44,13 @@ describe("driverStoreFocusForInstallError", () => {
   it("returns null for unrelated connection errors", () => {
     expect(driverStoreFocusForInstallError("Connection timed out", "zookeeper", undefined)).toBeNull();
     expect(driverStoreFocusForInstallError("No reachable ZooKeeper server within 2000ms: zk:2181", "zookeeper", undefined)).toBeNull();
+  });
+});
+
+describe("hasInstalledAgentVersion", () => {
+  it("requires an installed Agent at or above the requested release", () => {
+    expect(hasInstalledAgentVersion([{ db_type: "xugu", installed: true, installed_version: "0.1.23" }], "xugu", "0.1.23")).toBe(true);
+    expect(hasInstalledAgentVersion([{ db_type: "xugu", installed: true, installed_version: "0.1.22" }], "xugu", "0.1.23")).toBe(false);
+    expect(hasInstalledAgentVersion([{ db_type: "xugu", installed: true, installed_version: null }], "xugu", "0.1.23")).toBe(false);
   });
 });

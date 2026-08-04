@@ -8,18 +8,24 @@ import com.dbx.agent.DdlBuilder;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcAgentProfile;
+import com.dbx.agent.JdbcExecutor;
 import com.dbx.agent.JdbcIdentifiers;
 import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.ObjectInfo;
+import com.dbx.agent.ObjectSource;
 import com.dbx.agent.TableInfo;
 import com.dbx.agent.TriggerInfo;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Types;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -29,6 +35,7 @@ import java.util.stream.Collectors;
 
 public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
     private static final long MICROS_PER_SECOND = 1_000_000L;
+    private static final long UNLIMITED_QUERY_TIMEOUT_MICROS = 3_216_672_000_000_000L;
     private static final String COMPATIBLE_OJDBC_VERSION = "compatibleOjdbcVersion";
     private static final String DEFAULT_COMPATIBLE_OJDBC_VERSION = "compatibleOjdbcVersion=8";
     private static final Set<String> SYSTEM_SCHEMAS = Set.of(
@@ -40,6 +47,7 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
         "REMOTE_SCHEDULER_AGENT", "PDBADMIN", "DGPDB_INT", "OPS$ORACLE",
         "GGSYS", "FLOWS_FILES", "APEX_PUBLIC_USER", "GSMROOTUSER", "SYSRAC"
     );
+    private boolean queryTimeoutChanged;
 
     public static final JdbcAgentProfile OCEANBASE_ORACLE_PROFILE = new JdbcAgentProfile(
         "com.oceanbase.jdbc.Driver",
@@ -73,7 +81,39 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
         // Connector/J's Statement timeout does not update OceanBase's stricter
         // session variable, so synchronize both limits before every execution.
         try (var stmt = connection.createStatement()) {
-            stmt.execute(queryTimeoutSql(timeoutSecs));
+            try {
+                stmt.execute(queryTimeoutSql(timeoutSecs));
+            } catch (SQLException error) {
+                if (isReadOnlyTransactionError(error)) {
+                    return;
+                }
+                throw error;
+            }
+            queryTimeoutChanged = true;
+        }
+    }
+
+    @Override
+    protected void beforePooledConnectionReturn(Connection connection) throws SQLException {
+        if (!queryTimeoutChanged) {
+            return;
+        }
+        try (var stmt = connection.createStatement()) {
+            stmt.execute(queryTimeoutSql(0));
+            queryTimeoutChanged = false;
+        }
+    }
+
+    @Override
+    protected Object resultValue(ResultSet rs, int index, int sqlType) {
+        switch (sqlType) {
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY:
+            case Types.BLOB:
+                return unchecked(() -> JdbcExecutor.stringResultValue(rs, index, sqlType));
+            default:
+                return super.resultValue(rs, index, sqlType);
         }
     }
 
@@ -81,7 +121,45 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
         if (timeoutSecs < 0) {
             throw new IllegalArgumentException("Query timeout cannot be negative: " + timeoutSecs);
         }
-        return "ALTER SESSION SET ob_query_timeout = " + timeoutSecs * MICROS_PER_SECOND;
+        long timeoutMicros = timeoutSecs == 0
+            ? UNLIMITED_QUERY_TIMEOUT_MICROS
+            : timeoutSecs * MICROS_PER_SECOND;
+        return "ALTER SESSION SET ob_query_timeout = " + timeoutMicros;
+    }
+
+    private static boolean isReadOnlyTransactionError(SQLException error) {
+        Deque<Throwable> pending = new ArrayDeque<>();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        pending.add(error);
+        while (!pending.isEmpty()) {
+            Throwable current = pending.removeFirst();
+            if (!seen.add(current)) {
+                continue;
+            }
+            if (current instanceof SQLException) {
+                SQLException sqlError = (SQLException) current;
+                String message = sqlError.getMessage();
+                if ("25006".equals(sqlError.getSQLState())
+                    || sqlError.getErrorCode() == 1456
+                    || message != null && containsReadOnlyTransactionCode(message)) {
+                    return true;
+                }
+                SQLException next = sqlError.getNextException();
+                if (next != null) {
+                    pending.addLast(next);
+                }
+            }
+            Throwable cause = current.getCause();
+            if (cause != null) {
+                pending.addLast(cause);
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsReadOnlyTransactionCode(String message) {
+        String normalized = message.toUpperCase(Locale.ROOT);
+        return normalized.contains("OBE-01456") || normalized.contains("ORA-01456");
     }
 
     @Override
@@ -264,6 +342,114 @@ public final class OceanBaseOracleAgent extends ConfiguredJdbcAgent {
             }
         }
         return result;
+    }
+
+    @Override
+    public ObjectSource getObjectSource(String schema, String name, String objectType) {
+        return unchecked(() -> {
+            String owner = normalizeSchema(schema);
+            String normalizedType = normalizeObjectSourceType(objectType);
+            String source;
+            SQLException metadataError = null;
+            try {
+                source = queryDbmsMetadataSource(owner, name, normalizedType);
+            } catch (SQLException e) {
+                metadataError = e;
+                source = null;
+            }
+
+            if ((source == null || source.trim().isEmpty()) && supportsDictionarySource(normalizedType)) {
+                try {
+                    // OceanBase versions and tenant privileges differ in DBMS_METADATA coverage.
+                    // Oracle-compatible dictionary views keep schema compare and source editing usable.
+                    source = queryDictionarySource(owner, name, normalizedType);
+                } catch (SQLException fallbackError) {
+                    if (metadataError != null) {
+                        metadataError.addSuppressed(fallbackError);
+                        throw metadataError;
+                    }
+                    throw fallbackError;
+                }
+            }
+            if (metadataError != null && (source == null || source.trim().isEmpty())) {
+                throw metadataError;
+            }
+            return new ObjectSource(name, normalizedType, owner, source == null ? "" : source);
+        });
+    }
+
+    private String queryDbmsMetadataSource(String owner, String name, String objectType) throws SQLException {
+        String sql = "SELECT DBMS_METADATA.GET_DDL(?, ?, ?) FROM DUAL";
+        try (var stmt = requireConnection().prepareStatement(sql)) {
+            stmt.setString(1, objectType);
+            stmt.setString(2, name);
+            stmt.setString(3, owner);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    private String queryDictionarySource(String owner, String name, String objectType) throws SQLException {
+        if ("VIEW".equals(objectType)) {
+            String sql = "SELECT TEXT FROM ALL_VIEWS WHERE OWNER = ? AND VIEW_NAME = ?";
+            try (var stmt = requireConnection().prepareStatement(sql)) {
+                stmt.setString(1, owner);
+                stmt.setString(2, name);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            }
+        }
+
+        String sourceType = switch (objectType) {
+            case "PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE" -> objectType;
+            case "PACKAGE_BODY" -> "PACKAGE BODY";
+            case "TYPE_BODY" -> "TYPE BODY";
+            default -> throw new IllegalArgumentException("Unsupported object type: " + objectType);
+        };
+        String sql = "SELECT TEXT FROM ALL_SOURCE WHERE OWNER = ? AND NAME = ? AND TYPE = ? ORDER BY LINE";
+        StringBuilder source = new StringBuilder();
+        try (var stmt = requireConnection().prepareStatement(sql)) {
+            stmt.setString(1, owner);
+            stmt.setString(2, name);
+            stmt.setString(3, sourceType);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String line = rs.getString(1);
+                    if (line != null) {
+                        source.append(line);
+                    }
+                }
+            }
+        }
+        return editableOracleSource(source.toString());
+    }
+
+    private static String normalizeObjectSourceType(String objectType) {
+        String normalized = objectType == null
+            ? ""
+            : objectType.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+        return switch (normalized) {
+            case "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE",
+                "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY" -> normalized;
+            default -> throw new IllegalArgumentException("Unsupported object type: " + objectType);
+        };
+    }
+
+    private static boolean supportsDictionarySource(String objectType) {
+        return switch (objectType) {
+            case "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY" -> true;
+            default -> false;
+        };
+    }
+
+    private static String editableOracleSource(String source) {
+        String trimmed = source.trim();
+        if (trimmed.isEmpty() || trimmed.regionMatches(true, 0, "CREATE ", 0, "CREATE ".length())) {
+            return trimmed;
+        }
+        return "CREATE OR REPLACE " + trimmed;
     }
 
     private static String placeholders(int count) {

@@ -136,9 +136,10 @@ class ValidateAgentsTest(unittest.TestCase):
                 "include(*(infrastructureModules + driverModules))\n",
                 encoding="utf-8",
             )
-            (root / "drivers/oracle-go").mkdir(parents=True)
+            for driver in ("cassandra-go", "oracle-go", "kingbase-go", "vastbase-go", "xugu", "duckdb", "rabbitmq"):
+                (root / "drivers" / driver).mkdir(parents=True)
             (root / "versions.json").write_text(
-                json.dumps({"h2": "0.1.0", "oracle": "0.1.0"}),
+                json.dumps({"h2": "0.1.0", "cassandra": "0.1.0", "oracle": "0.1.0", "kingbase": "0.1.0", "vastbase": "0.1.0", "xugu": "0.1.0", "rabbitmq": "0.1.0"}),
                 encoding="utf-8",
             )
 
@@ -171,6 +172,32 @@ class ValidateAgentsTest(unittest.TestCase):
                     "docs/examples/jdbc-agent-template/src/main/java/com/dbx/agent/template/TemplateAgent.java: template contains copied JDBC connection creation",
                 ],
                 validate_agents.validate_authoring_template(root),
+            )
+
+    def test_jdbc_pool_coverage_requires_every_jdbc_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "build.gradle").write_text(
+                "def pooledJdbcProjects = ['h2'] as Set\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                ["JDBC module missing pooled runtime dependency: access"],
+                validate_agents.validate_jdbc_pool_coverage(root, {"access", "h2", "mongodb"}),
+            )
+
+    def test_jdbc_pool_coverage_rejects_non_jdbc_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "build.gradle").write_text(
+                "def pooledJdbcProjects = ['h2', 'mongodb'] as Set\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                ["non-JDBC module listed as pooled JDBC runtime: mongodb"],
+                validate_agents.validate_jdbc_pool_coverage(root, {"h2", "mongodb"}),
             )
 
     def test_manifest_validation_requires_registry_fields(self):
@@ -318,7 +345,10 @@ class ValidateAgentsTest(unittest.TestCase):
                         include:
                           - jre-key: "21"
                             java-version: "21"
-                            modules: "java.base,jdk.security.auth,jdk.security.jgss"
+                            modules: "java.base,jdk.security.auth,jdk.security.jgss,jdk.crypto.ec"
+                    declare -A PLATFORMS=(
+                      ["windows-aarch64"]="windows/aarch64"
+                    )
                     detect_jre_key() {
                       case "$name" in
                         *) echo "21" ;;
@@ -375,6 +405,8 @@ class ValidateAgentsTest(unittest.TestCase):
                     "registry must publish Java 21 under JRE key 21",
                     "release workflow JRE must include jdk.security.auth for Kafka Kerberos LoginModule support",
                     "release workflow JRE must include jdk.security.jgss for Kafka GSSAPI SASL support",
+                    "release workflow JRE must include jdk.crypto.ec for Kafka EC TLS support",
+                    "release workflow must build the managed JRE for windows-aarch64",
                     "native-only registry entries must publish a legacy jar placeholder for older DBX clients",
                     "release workflow must not build Java 21 under JRE key 17",
                     "agents must not use JRE key 17",

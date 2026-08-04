@@ -23,11 +23,14 @@ class PostgresLikeAgentTest {
         TestPostgresLikeAgent agent = new TestPostgresLikeAgent();
         agent.connect(new ConnectParams());
 
+        agent.listDatabases();
         agent.listSchemas();
         agent.listTables("app");
         agent.listObjects("app");
+        agent.getObjectSource("app", "refresh_orders", "FUNCTION");
         agent.getColumns("app", "orders");
         agent.listCheckConstraintsForTest("app", "orders");
+        agent.listIndexes("app", "orders");
         agent.listForeignKeys("app", "orders");
         agent.listTriggers("app", "orders");
 
@@ -35,15 +38,58 @@ class PostgresLikeAgentTest {
 
         assertFalse(sql.contains("FROM information_schema"), sql);
         assertFalse(sql.contains("JOIN information_schema"), sql);
+        assertTrue(sql.contains("pg_catalog.pg_database"), sql);
         assertTrue(sql.contains("pg_catalog.pg_namespace"), sql);
         assertTrue(sql.contains("pg_catalog.pg_class"), sql);
         assertTrue(sql.contains("pg_catalog.pg_proc"), sql);
+        assertTrue(sql.contains("pg_catalog.pg_index"), sql);
         assertTrue(sql.contains("pg_catalog.pg_attribute"), sql);
         assertTrue(sql.contains("pg_catalog.pg_constraint"), sql);
         assertTrue(sql.contains("pg_catalog.pg_get_constraintdef"), sql);
         assertTrue(sql.contains("pg_catalog.pg_trigger"), sql);
+        assertFalse(sql.contains("FROM pg_database"), sql);
+        assertFalse(sql.contains("FROM pg_proc"), sql);
+        assertFalse(sql.contains("FROM pg_index"), sql);
         assertFalse(sql.contains(" AS key "), sql);
         assertFalse(sql.contains(" key."), sql);
+        assertTrue(sql.contains("JOIN LATERAL"), sql);
+        assertFalse(agent.getProfile().mapsCatalogAttributeArraysInJava());
+    }
+
+    @Test
+    void metadataQueriesSupportRenamedPostgresCatalogs() {
+        TestPostgresLikeAgent agent = new TestPostgresLikeAgent(new PostgresLikeAgentProfile(
+            PostgresLikeAgentTest.class.getName(),
+            "jdbc:uxdb://{host}:{port}/{database}",
+            52025,
+            "ux_catalog",
+            "ux_"
+        ));
+        agent.connect(new ConnectParams());
+
+        agent.listDatabases();
+        agent.listSchemas();
+        agent.listTables("app");
+        agent.listObjects("app");
+        agent.getObjectSource("app", "refresh_orders", "FUNCTION");
+        agent.getColumns("app", "orders");
+        agent.listCheckConstraintsForTest("app", "orders");
+        agent.listIndexes("app", "orders");
+        agent.listForeignKeys("app", "orders");
+        agent.listTriggers("app", "orders");
+
+        String sql = String.join("\n", MetadataSqlFake.statements);
+
+        assertTrue(sql.contains("ux_catalog.ux_database"), sql);
+        assertTrue(sql.contains("ux_catalog.ux_namespace"), sql);
+        assertTrue(sql.contains("ux_catalog.ux_class"), sql);
+        assertTrue(sql.contains("ux_catalog.ux_proc"), sql);
+        assertTrue(sql.contains("ux_catalog.ux_get_constraintdef"), sql);
+        assertTrue(sql.contains("ux_catalog.ux_get_functiondef"), sql);
+        assertTrue(sql.contains("ux_catalog.ux_get_expr"), sql);
+        assertFalse(sql.contains("pg_catalog"), sql);
+        assertTrue(sql.contains("JOIN LATERAL"), sql);
+        assertFalse(agent.getProfile().mapsCatalogAttributeArraysInJava());
     }
 
     @Test
@@ -142,20 +188,76 @@ class PostgresLikeAgentTest {
         assertEquals(1, result.getRows().size());
         assertEquals(1, result.getRows().get(0).get(0));
         assertEquals("POINT(116.397 39.908)", result.getRows().get(0).get(1));
+        assertEquals(1, result.getSpatial_columns().size());
+        assertEquals(1, result.getSpatial_columns().get(0).getColumn_index());
+        assertEquals(4326, result.getSpatial_columns().get(0).getSrid());
+    }
+
+    @Test
+    void normalizeCollapsesFirstNonNullSridPerColumn() {
+        List<Object> firstRow = java.util.Arrays.asList(new SpatialValue("POINT(1 2)", null), "keep");
+        List<Object> secondRow = java.util.Arrays.asList(new SpatialValue("POINT(3 4)", 4326), "keep");
+        List<Object> thirdRow = java.util.Arrays.asList(new SpatialValue("POINT(5 6)", 3857), "keep");
+        List<List<Object>> rows = java.util.Arrays.asList(firstRow, secondRow, thirdRow);
+
+        QueryResult result = new QueryResult(
+            java.util.Arrays.asList("geom", "note"),
+            java.util.Arrays.asList("geometry", "text"),
+            rows, 0L, 0L, false);
+
+        assertEquals(
+            java.util.Collections.singletonList(new SpatialColumn(0, 4326)),
+            result.getSpatial_columns());
+        assertEquals("POINT(1 2)", result.getRows().get(0).get(0));
+        // Per-cell SRIDs are preserved for every row instead of collapsing:
+        // unknown, then 4326, then 3857 in the same column.
+        assertEquals(
+            java.util.Arrays.asList(
+                java.util.Arrays.asList(null, null),
+                java.util.Arrays.asList(4326, null),
+                java.util.Arrays.asList(3857, null)),
+            result.getSpatial_values());
+    }
+
+    @Test
+    void normalizeOmitsSpatialValuesForNonSpatialRows() {
+        List<List<Object>> rows = java.util.Collections.singletonList(java.util.Arrays.asList(1, "plain text"));
+
+        QueryResult result = new QueryResult(
+            java.util.Arrays.asList("id", "note"),
+            java.util.Arrays.asList("int4", "text"),
+            rows, 0L, 0L, false);
+        QueryPageResult page = new QueryPageResult(
+            java.util.Arrays.asList("id", "note"),
+            java.util.Arrays.asList("int4", "text"),
+            rows, 0L, 0L, false, "session", false);
+
+        assertTrue(result.getSpatial_columns().isEmpty());
+        assertTrue(result.getSpatial_values().isEmpty());
+        assertTrue(page.getSpatial_columns().isEmpty());
+        assertTrue(page.getSpatial_values().isEmpty());
     }
 
     private static final class TestPostgresLikeAgent extends PostgresLikeAgent {
         private final Connection connection;
 
         private TestPostgresLikeAgent() {
-            this(null);
+            this((Connection) null);
         }
 
         private TestPostgresLikeAgent(Connection connection) {
-            super(new PostgresLikeAgentProfile(
+            this(new PostgresLikeAgentProfile(
                 PostgresLikeAgentTest.class.getName(),
                 "jdbc:test://{host}:{port}/{database}"
-            ));
+            ), connection);
+        }
+
+        private TestPostgresLikeAgent(PostgresLikeAgentProfile profile) {
+            this(profile, null);
+        }
+
+        private TestPostgresLikeAgent(PostgresLikeAgentProfile profile, Connection connection) {
+            super(profile);
             this.connection = connection;
         }
 
@@ -174,7 +276,7 @@ class PostgresLikeAgentTest {
                     if (rs.wasNull() || raw == null) {
                         return null;
                     }
-                    return EwkbWktDecoder.decode(raw);
+                    return EwkbWktDecoder.decodeSpatial(raw);
                 }
                 if (sqlType == Types.INTEGER) {
                     return rs.getInt(index);

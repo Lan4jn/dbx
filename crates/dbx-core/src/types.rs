@@ -5,6 +5,12 @@ pub struct DatabaseInfo {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseStorageInfo {
+    pub name: String,
+    pub size_bytes: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaInfo {
     pub name: String,
@@ -62,6 +68,8 @@ pub struct ObjectInfo {
     pub object_type: String,
     pub schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub comment: Option<String>,
     pub created_at: Option<String>,
@@ -93,9 +101,13 @@ pub enum ObjectSourceKind {
     MaterializedView,
     Procedure,
     Function,
+    Trigger,
     Sequence,
+    Synonym,
     Package,
     PackageBody,
+    Type,
+    TypeBody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +127,8 @@ pub struct ColumnInfo {
     pub is_nullable: bool,
     pub column_default: Option<String>,
     pub is_primary_key: bool,
+    #[serde(default)]
+    pub is_unique: bool,
     pub extra: Option<String>,
     pub comment: Option<String>,
     pub numeric_precision: Option<i32>,
@@ -126,6 +140,14 @@ pub struct ColumnInfo {
     pub character_set: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableColumnsResult {
+    pub table_name: String,
+    pub columns: Vec<ColumnInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +226,7 @@ pub struct CompletionAssistantCandidate {
     pub parent_name: Option<String>,
     pub comment: Option<String>,
     pub data_type: Option<String>,
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +234,55 @@ pub struct CompletionAssistantResponse {
     pub candidates: Vec<CompletionAssistantCandidate>,
     pub incomplete: bool,
     pub fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpatialColumn {
+    /// Zero-based index into `QueryResult.columns`.
+    pub column_index: usize,
+    /// SRID shared by the column's geometry cells. `None` when unknown/absent
+    /// (or SRID 0). A column reports the first non-null SRID it observes.
+    pub srid: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SpatialColumnBuilder {
+    // column_index -> first non-null srid seen (sticky once set)
+    columns: std::collections::BTreeMap<usize, Option<u32>>,
+}
+
+impl SpatialColumnBuilder {
+    pub(crate) fn new(column_indices: impl IntoIterator<Item = usize>) -> Self {
+        let mut builder = Self::default();
+        for column_index in column_indices {
+            builder.columns.entry(column_index).or_insert(None);
+        }
+        builder
+    }
+
+    /// Record a geometry cell's SRID. The first non-null (and non-zero) value
+    /// wins; later observations for the same column are ignored.
+    pub(crate) fn observe(&mut self, column_index: usize, srid: Option<u32>) {
+        let entry = self.columns.entry(column_index).or_insert(None);
+        if entry.is_none() {
+            if let Some(value) = srid.filter(|value| *value != 0) {
+                *entry = Some(value);
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> Vec<SpatialColumn> {
+        self.columns.into_iter().map(|(column_index, srid)| SpatialColumn { column_index, srid }).collect()
+    }
+
+    pub(crate) fn finish_with_values(
+        self,
+        spatial_values: Vec<Vec<Option<u32>>>,
+    ) -> (Vec<SpatialColumn>, Vec<Vec<Option<u32>>>) {
+        let spatial_columns = self.finish();
+        let spatial_values = if spatial_columns.is_empty() { Vec::new() } else { spatial_values };
+        (spatial_columns, spatial_values)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +297,16 @@ pub struct QueryResult {
     /// be shorter/empty when a driver cannot supply sortable information.
     #[serde(default)]
     pub column_sortables: Vec<bool>,
+    /// Spatial reference metadata for geometry/geography cells. Kept outside
+    /// `rows` so displayed, copied, exported, and edited values remain WKT.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spatial_columns: Vec<SpatialColumn>,
+    /// Per-cell SRID metadata, parallel to `rows`: `spatial_values[row][column]`
+    /// is the SRID of that cell's geometry value (`None` for non-spatial cells
+    /// or unknown SRID). Unlike `spatial_columns` (a column-level hint), every
+    /// geometry value keeps its own SRID so mixed-SRID results stay correct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spatial_values: Vec<Vec<Option<u32>>>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub affected_rows: u64,
     pub execution_time_ms: u128,
@@ -234,6 +316,11 @@ pub struct QueryResult {
     pub session_id: Option<String>,
     #[serde(default)]
     pub has_more: bool,
+    /// For Elasticsearch REST search results parsed into a table from _source,
+    /// this carries the raw HTTP response body so the UI can offer a toggle
+    /// between the tabular view and the original JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elasticsearch_raw_body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +356,59 @@ pub struct TriggerInfo {
     pub timing: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintInfo {
+    pub name: String,
+    pub constraint_type: String,
+    pub definition: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_table: Option<String>,
+    #[serde(default)]
+    pub ref_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_delete: Option<String>,
+    #[serde(default)]
+    pub deferrable: bool,
+    #[serde(default)]
+    pub initially_deferred: bool,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionInfo {
+    pub name: String,
+    pub position: i32,
+    pub value: String,
+    pub partition_type: String,
+    pub partition_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_partition_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_partition_span: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubpartitionInfo {
+    pub name: String,
+    pub position: i32,
+    pub value: String,
+    pub partition_type: String,
+    pub partition_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,4 +449,66 @@ pub struct OwnerInfo {
     pub object_name: String,
     pub object_type: String,
     pub owner: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectInfo, ObjectSourceKind, SpatialColumn, SpatialColumnBuilder};
+
+    #[test]
+    fn list_objects_payload_preserves_optional_validity() {
+        let objects: Vec<ObjectInfo> =
+            serde_json::from_str(r#"[{"name":"TRG_AUDIT","object_type":"TRIGGER","schema":"APP","valid":false}]"#)
+                .unwrap();
+
+        assert_eq!(objects[0].valid, Some(false));
+        assert_eq!(objects[0].object_type, "TRIGGER");
+    }
+
+    #[test]
+    fn spatial_builder_reports_first_non_null_srid_per_column() {
+        let mut builder = SpatialColumnBuilder::new([3]);
+        builder.observe(3, None);
+        builder.observe(1, Some(4326));
+        builder.observe(3, Some(3857));
+        builder.observe(3, Some(4490)); // ignored: column 3 already set
+        builder.observe(1, None); // ignored: column 1 already set
+
+        assert_eq!(
+            builder.finish(),
+            vec![
+                SpatialColumn { column_index: 1, srid: Some(4326) },
+                SpatialColumn { column_index: 3, srid: Some(3857) },
+            ]
+        );
+    }
+
+    #[test]
+    fn spatial_builder_normalizes_zero_and_all_null() {
+        let mut builder = SpatialColumnBuilder::new([0]);
+        builder.observe(0, Some(0)); // SRID 0 -> unknown
+        assert_eq!(builder.finish(), vec![SpatialColumn { column_index: 0, srid: None }]);
+        assert!(SpatialColumnBuilder::default().finish().is_empty());
+    }
+
+    #[test]
+    fn spatial_builder_omits_values_without_spatial_columns() {
+        let values = vec![vec![None, None]];
+        let (columns, values) = SpatialColumnBuilder::default().finish_with_values(values);
+        assert!(columns.is_empty());
+        assert!(values.is_empty());
+
+        let expected_values = vec![vec![None, None]];
+        let (columns, values) = SpatialColumnBuilder::new([0]).finish_with_values(expected_values.clone());
+        assert_eq!(columns, vec![SpatialColumn { column_index: 0, srid: None }]);
+        assert_eq!(values, expected_values);
+    }
+
+    #[test]
+    fn object_source_kind_accepts_synonym_wire_value() {
+        let kind: ObjectSourceKind = serde_json::from_str("\"SYNONYM\"").unwrap();
+
+        assert_eq!(kind, ObjectSourceKind::Synonym);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"SYNONYM\"");
+    }
 }

@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { filterSidebarSearchRootsByConnectionState, filterSidebarTree } from "../../apps/desktop/src/lib/sidebar/sidebarSearchTree.ts";
+import { filterSidebarSearchRootsByConnectionState, filterSidebarTree, reuseLiveSidebarTreeNodes } from "../../apps/desktop/src/lib/sidebar/sidebarSearchTree.ts";
 import type { TreeNode } from "../../apps/desktop/src/types/database.ts";
 
 test("preserves loaded table children when the table itself matches search", () => {
@@ -272,6 +272,176 @@ test("search scope excludes non-selected node self matches", () => {
   const filtered = filterSidebarTree(nodes, "orders", new Set(), new Set(["table"]));
 
   assert.equal(filtered.length, 0);
+});
+
+function scopedSearchNodes(): TreeNode[] {
+  return [
+    {
+      id: "conn:1",
+      label: "warehouse",
+      type: "connection",
+      connectionId: "conn:1",
+      isExpanded: true,
+      children: [
+        {
+          id: "conn:1:db",
+          label: "inventory",
+          type: "database",
+          connectionId: "conn:1",
+          database: "inventory",
+          isExpanded: true,
+          children: [
+            {
+              id: "conn:1:db:sales-order",
+              label: "sales_order",
+              type: "schema",
+              connectionId: "conn:1",
+              database: "inventory",
+              schema: "sales_order",
+              isExpanded: true,
+              children: [
+                {
+                  id: "conn:1:db:sales-order:orders",
+                  label: "orders",
+                  type: "table",
+                  connectionId: "conn:1",
+                  database: "inventory",
+                  schema: "sales_order",
+                },
+              ],
+            },
+            {
+              id: "conn:1:db:audit",
+              label: "audit",
+              type: "schema",
+              connectionId: "conn:1",
+              database: "inventory",
+              schema: "audit",
+              isExpanded: true,
+              children: [
+                {
+                  id: "conn:1:db:audit:order-log",
+                  label: "order_log",
+                  type: "table",
+                  connectionId: "conn:1",
+                  database: "inventory",
+                  schema: "audit",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ];
+}
+
+test("filters the sidebar by node type without a text query", () => {
+  const filtered = filterSidebarTree(scopedSearchNodes(), "", new Set(), new Set(["schema"]));
+
+  const schemas = filtered[0]?.children?.[0]?.children;
+  assert.deepEqual(
+    schemas?.map((node) => node.label),
+    ["sales_order", "audit"],
+  );
+  assert.deepEqual(
+    schemas?.map((node) => node.children),
+    [[], []],
+  );
+});
+
+test("preserves an expanded type-filtered table after the text query is cleared", () => {
+  const table: TreeNode = {
+    id: "conn:db:orders",
+    label: "orders",
+    type: "table",
+    connectionId: "conn",
+    database: "inventory",
+    isExpanded: true,
+    children: [
+      {
+        id: "conn:db:orders:__columns",
+        label: "tree.columns",
+        type: "group-columns",
+        connectionId: "conn",
+        database: "inventory",
+        tableName: "orders",
+        isExpanded: false,
+        children: [],
+      },
+    ],
+  };
+
+  const [filteredTable] = filterSidebarTree([table], "", new Set(), new Set(["table"]));
+
+  assert.equal(filteredTable, table);
+  assert.equal(filteredTable?.isExpanded, true);
+  assert.equal(filteredTable?.children?.[0]?.type, "group-columns");
+});
+
+test("indexed table search reuses loaded live node state before type filtering", () => {
+  const liveTable: TreeNode = {
+    id: "conn:db:orders",
+    label: "orders",
+    type: "table",
+    connectionId: "conn",
+    database: "inventory",
+    isExpanded: true,
+    isLoading: true,
+    children: [
+      {
+        id: "conn:db:orders:__columns",
+        label: "tree.columns",
+        type: "group-columns",
+        connectionId: "conn",
+        database: "inventory",
+        tableName: "orders",
+        children: [],
+      },
+    ],
+  };
+  const indexedTable: TreeNode = { ...liveTable, isExpanded: false, isLoading: false, children: [] };
+  const indexedOnly: TreeNode = {
+    id: "conn:db:archive",
+    label: "archive",
+    type: "table",
+    connectionId: "conn",
+    database: "inventory",
+    children: [],
+  };
+
+  const merged = reuseLiveSidebarTreeNodes([indexedTable, indexedOnly], [liveTable]);
+  const filtered = filterSidebarTree(merged, "", new Set(), new Set(["table"]));
+
+  assert.equal(filtered[0], liveTable);
+  assert.equal(filtered[0]?.children?.[0]?.type, "group-columns");
+  assert.equal(filtered[0]?.isExpanded, true);
+  assert.equal(filtered[0]?.isLoading, true);
+  assert.equal(filtered[1], indexedOnly);
+});
+
+test("combines text search with the selected node types", () => {
+  const filtered = filterSidebarTree(scopedSearchNodes(), "order", new Set(), new Set(["schema"]));
+
+  assert.deepEqual(
+    filtered[0]?.children?.[0]?.children?.map((node) => node.label),
+    ["sales_order"],
+  );
+});
+
+test("clearing the type filter restores default text search", () => {
+  const filtered = filterSidebarTree(scopedSearchNodes(), "order", new Set());
+
+  assert.deepEqual(
+    filtered[0]?.children?.[0]?.children?.map((node) => node.label),
+    ["sales_order", "audit"],
+  );
+});
+
+test("clearing all search criteria preserves the original tree", () => {
+  const nodes = scopedSearchNodes();
+
+  assert.equal(filterSidebarTree(nodes, "", new Set()), nodes);
 });
 
 test("connection search results stay visible before connecting", () => {

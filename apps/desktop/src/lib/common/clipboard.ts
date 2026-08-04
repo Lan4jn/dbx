@@ -58,6 +58,16 @@ interface NativeClipboardSelectionEnvironment {
 
 const EDITABLE_CLIPBOARD_TARGET_SELECTOR = "input, textarea, [contenteditable='true'], [role='textbox']";
 const NATIVE_CLIPBOARD_REGION_SELECTOR = "[data-native-clipboard]";
+const DATA_GRID_ROOT_SELECTOR = "[data-grid-root]";
+let clipboardWriteRevision = 0;
+
+export function getClipboardWriteRevision(): number {
+  return clipboardWriteRevision;
+}
+
+function recordClipboardWrite(): void {
+  clipboardWriteRevision += 1;
+}
 
 function closestElement(target: unknown, selector: string): unknown {
   return (target as { closest?: (selector: string) => unknown } | null)?.closest?.(selector) ?? null;
@@ -75,6 +85,10 @@ function selectionNodeElement(node: Node | null): Element | null {
 
 export function isPlainClipboardShortcut(event: ClipboardShortcutEvent, key: string): boolean {
   return !!(event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === key;
+}
+
+export function shouldBlockAppNativeSelectAll(event: ClipboardShortcutEvent): boolean {
+  return isPlainClipboardShortcut(event, "a") && !eventTargetUsesNativeClipboard(event) && !closestElement(event.target, DATA_GRID_ROOT_SELECTOR);
 }
 
 export function hasNativeClipboardSelection(env: NativeClipboardSelectionEnvironment = globalThis as unknown as NativeClipboardSelectionEnvironment): boolean {
@@ -117,15 +131,17 @@ export async function copyToClipboard(text: string, env: ClipboardEnvironment = 
     try {
       const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
       await writeText(text);
+      recordClipboardWrite();
       return;
     } catch {
-      // Fall through to Web Clipboard / legacy copy when the native plugin is unavailable.
+      // Preserve Web Clipboard and legacy copy compatibility when native writes fail.
     }
   }
 
   try {
     if (env.navigator?.clipboard?.writeText) {
       await env.navigator.clipboard.writeText(text);
+      recordClipboardWrite();
       return;
     }
   } catch {
@@ -153,6 +169,7 @@ export async function copyToClipboard(text: string, env: ClipboardEnvironment = 
     if (!document.execCommand("copy")) {
       throw new Error("Clipboard copy failed");
     }
+    recordClipboardWrite();
   } finally {
     document.body.removeChild(textarea);
   }

@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { buildInsertValueHints, expandToSqlStatementWindow, parseInsertValueHints, parseInsertValueHintsInRanges, parseInsertValuesClauses } from "../../apps/desktop/src/lib/sql/insertValueHints.ts";
+import { insertValueHintColumnNames } from "../../apps/desktop/src/lib/sql/insertValueHintColumns.ts";
 
 test("maps explicit column list to single-row VALUES", () => {
   const sql = "INSERT INTO auth_user (id, password, last_login) VALUES (5, 'hash', NULL)";
@@ -64,6 +65,56 @@ test("resolves columns from table metadata when column list is omitted", () => {
   });
   assert.deepEqual(
     hints.map((hint) => hint.column),
+    ["id", "name"],
+  );
+});
+
+test("skips SQL Server identity columns when mapping multi-row VALUES without a column list", () => {
+  const sql = "INSERT INTO dbo.users VALUES (N'A', 1), (N'B', 2)";
+  const columns = insertValueHintColumnNames("sqlserver", [
+    { name: "id", is_identity: true },
+    { name: "name" },
+    { name: "status" },
+  ]);
+  const hints = parseInsertValueHints(sql, {
+    resolveTableColumns: () => columns,
+  });
+  assert.deepEqual(
+    hints.map((hint) => hint.column),
+    ["name", "status", "name", "status"],
+  );
+});
+
+test("skips SQL Server computed and temporal generated columns in positional hints", () => {
+  const columns = insertValueHintColumnNames("sqlserver", [
+    { name: "id", is_identity: true },
+    { name: "quantity" },
+    { name: "doubled", is_computed: true },
+    { name: "note" },
+    { name: "valid_from", is_hidden: true, generated_always_type: 1 },
+    { name: "valid_to", is_hidden: true, generated_always_type: 2 },
+  ]);
+
+  assert.deepEqual(columns, ["quantity", "note"]);
+});
+
+test("skips visible SQL Server generated columns in positional hints", () => {
+  assert.deepEqual(
+    insertValueHintColumnNames("sqlserver", [
+      { name: "name" },
+      { name: "valid_from", generated_always_type: 1 },
+      { name: "valid_to", generated_always_type: 2 },
+    ]),
+    ["name"],
+  );
+});
+
+test("keeps identity columns in positional hints for databases other than SQL Server", () => {
+  assert.deepEqual(
+    insertValueHintColumnNames("postgres", [
+      { name: "id", is_identity: true },
+      { name: "name" },
+    ]),
     ["id", "name"],
   );
 });
@@ -166,6 +217,16 @@ test("expandToSqlStatementWindow stops at neighboring statements", () => {
 test("ignores statements that are not INSERT VALUES", () => {
   const sql = "SELECT 1; UPDATE users SET name = 'a' WHERE id = 1;";
   assert.deepEqual(parseInsertValueHints(sql), []);
+});
+
+test("scans large procedural sources without repeatedly filtering all tokens", () => {
+  const sql = Array.from({ length: 6000 }, (_, index) => `v_value := v_value + ${index % 10};`).join("\n");
+  const startedAt = performance.now();
+  const hints = parseInsertValueHints(sql);
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.deepEqual(hints, []);
+  assert.ok(elapsedMs < 1000, `insert hint scan took ${elapsedMs.toFixed(1)}ms`);
 });
 
 test("buildInsertValueHints skips unresolved tables without metadata", () => {

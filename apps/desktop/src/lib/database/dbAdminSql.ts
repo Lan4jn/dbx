@@ -1,4 +1,4 @@
-import type { DatabaseObjectType, DatabaseType } from "@/types/database";
+import type { ColumnInfo, DatabaseObjectType, DatabaseType } from "@/types/database";
 import * as api from "@/lib/backend/api";
 
 export interface DropObjectSqlOptions {
@@ -55,6 +55,15 @@ export interface DuplicateTableStructureSqlOptions {
   schema?: string | null;
   sourceName: string;
   targetName: string;
+  tableComment?: string | null;
+  columnComments?: Array<{ name: string; comment: string }>;
+}
+
+export function collectDuplicateTableColumnComments(columns: readonly Pick<ColumnInfo, "name" | "comment">[]): Array<{ name: string; comment: string }> {
+  return columns.flatMap((column) => {
+    const comment = column.comment;
+    return comment?.trim() ? [{ name: column.name, comment }] : [];
+  });
 }
 
 export interface CopyTableDataSqlOptions {
@@ -65,6 +74,7 @@ export interface CopyTableDataSqlOptions {
   columns?: string[];
   postgresOverridingSystemValue?: boolean;
   sqlserverIdentityInsert?: boolean;
+  normalizeNewTargetName?: boolean;
 }
 
 export function buildDropObjectSql(options: DropObjectSqlOptions): Promise<string> {
@@ -87,8 +97,8 @@ export function buildTruncateTableSql(options: TableAdminSqlOptions): Promise<st
   return api.buildTruncateTableSql(options);
 }
 
-const DROP_TABLE_CASCADE_DATABASE_TYPES: readonly DatabaseType[] = ["postgres", "redshift", "gaussdb", "kwdb", "kingbase", "highgo", "vastbase", "opengauss"];
-const TRUNCATE_TABLE_CASCADE_DATABASE_TYPES: readonly DatabaseType[] = ["postgres", "gaussdb", "kwdb", "kingbase", "highgo", "vastbase", "opengauss"];
+const DROP_TABLE_CASCADE_DATABASE_TYPES: readonly DatabaseType[] = ["postgres", "redshift", "gaussdb", "kwdb", "kingbase", "highgo", "uxdb", "vastbase", "opengauss"];
+const TRUNCATE_TABLE_CASCADE_DATABASE_TYPES: readonly DatabaseType[] = ["postgres", "gaussdb", "kwdb", "kingbase", "highgo", "uxdb", "vastbase", "opengauss"];
 
 export function supportsDropTableCascade(databaseType?: DatabaseType): boolean {
   return !!databaseType && DROP_TABLE_CASCADE_DATABASE_TYPES.includes(databaseType);
@@ -110,8 +120,15 @@ export function buildDropSchemaSql(options: SchemaNameSqlOptions): Promise<strin
   return api.buildDropSchemaSql(options);
 }
 
+export function damengDropSchemaExecutionSchema(username: string | null | undefined, targetSchema: string): string | null {
+  const executionSchema = username?.trim();
+  const normalizedTargetSchema = targetSchema.trim().toUpperCase();
+  if (!executionSchema || !normalizedTargetSchema || executionSchema.toUpperCase() === normalizedTargetSchema) return null;
+  return executionSchema;
+}
+
 export function supportsSchemaComment(databaseType?: DatabaseType): boolean {
-  return ["postgres", "gaussdb", "kwdb", "kingbase", "highgo", "vastbase", "opengauss", "yashandb"].includes(databaseType || "");
+  return ["postgres", "gaussdb", "kwdb", "kingbase", "highgo", "uxdb", "vastbase", "opengauss", "yashandb"].includes(databaseType || "");
 }
 
 export function buildUpdateDatabasePropertiesSql(options: DatabasePropertyEditSqlOptions): Promise<string> {
@@ -143,6 +160,10 @@ export function buildSetSchemaCommentSql(options: SchemaCommentSqlOptions): stri
 
 export function buildDuplicateTableStructureSql(options: DuplicateTableStructureSqlOptions): Promise<string> {
   return api.buildDuplicateTableStructureSql(options);
+}
+
+export function duplicateTableStructureRequiresScript(sql: string): boolean {
+  return /;\s*\n\s*COMMENT ON (?:TABLE|COLUMN)\b/i.test(sql);
 }
 
 export function buildCopyTableDataSql(options: CopyTableDataSqlOptions): Promise<string> {

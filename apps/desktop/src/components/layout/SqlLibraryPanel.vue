@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowDownWideNarrow, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Search, Trash2, Upload, X } from "@lucide/vue";
+import { ArrowDownWideNarrow, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Play, Search, Trash2, Upload, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import CustomContextMenu, { type ContextMenuItem as CtxMenuItem } from "@/components/ui/CustomContextMenu.vue";
@@ -10,6 +10,7 @@ import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import * as api from "@/lib/backend/api";
+import { externalSqlFileOpenErrorMessage } from "@/lib/sql/sqlFileOpen";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
@@ -17,6 +18,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { focusSidebarRenameInput } from "@/lib/sidebar/sidebarRenameFocus";
 import { savedSqlFolderBranchFileCount } from "@/lib/savedSql/savedSqlFolderCounts";
 import { ensureSqlExtension, stripSqlExtension } from "@/lib/savedSql/savedSqlFileName";
+import { savedSqlExecutionTargetFromTab, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import type { SavedSqlFile, SavedSqlFolder } from "@/types/database";
 
 const { t } = useI18n();
@@ -75,7 +77,7 @@ function importConnectionIdForFolder(folder?: SavedSqlFolder) {
 }
 
 function sanitizeFileSystemSegment(name: string) {
-  return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").trim() || "untitled";
+  return name.replace(/[<>:"/\\|?*\p{Cc}]/gu, "_").trim() || "untitled";
 }
 
 function relativeImportName(baseDir: string, filePath: string) {
@@ -204,21 +206,9 @@ async function exportFolderContents(folder?: SavedSqlFolder) {
 }
 
 async function collectSqlFilesRecursively(dir: string): Promise<string[]> {
-  const { readDir } = await import("@tauri-apps/plugin-fs");
-  const { join } = await import("@tauri-apps/api/path");
+  const collectPaths = (entries: Awaited<ReturnType<typeof api.listSqlFilesInFolder>>): string[] => entries.flatMap((entry) => (entry.is_dir ? collectPaths(entry.children) : [entry.path]));
 
-  const results: string[] = [];
-  for (const entry of await readDir(dir)) {
-    const fullPath = await join(dir, entry.name);
-    if (entry.isDirectory) {
-      results.push(...(await collectSqlFilesRecursively(fullPath)));
-      continue;
-    }
-    if (!entry.isFile) continue;
-    if (!fullPath.toLowerCase().endsWith(".sql")) continue;
-    results.push(fullPath);
-  }
-  return results;
+  return collectPaths(await api.listSqlFilesInFolder(dir));
 }
 
 async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
@@ -235,7 +225,6 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
 
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const { readTextFile } = await import("@tauri-apps/plugin-fs");
     const selected = await open({
       directory: true,
       multiple: false,
@@ -253,7 +242,7 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
     const takenNames = new Set((targetFolder ? savedSqlStore.filesInFolder(targetFolder.id) : savedSqlStore.filesWithoutFolder()).filter((file) => !orphanedIds.value.has(file.id)).map((file) => file.name));
 
     for (const path of sqlPaths) {
-      const content = await readTextFile(path);
+      const content = await api.readExternalSqlFile(path);
       const displayName = uniqueImportedName(relativeImportName(selected, path), takenNames);
       await savedSqlStore.saveFile({
         connectionId,
@@ -266,7 +255,7 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
 
     toast(t("sqlLibrary.imported", { count: sqlPaths.length }), 2500);
   } catch (e: any) {
-    toast(t("sqlLibrary.importFailed", { message: e?.message || String(e) }), 5000);
+    toast(t("sqlLibrary.importFailed", { message: externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)) }), 5000);
   }
 }
 
@@ -421,13 +410,19 @@ function isFolderExpanded(folderId: string) {
 
 async function openNewFolderInput(parentFolderId?: string) {
   const parent = parentFolderId ? savedSqlStore.allFolders.find((folder) => folder.id === parentFolderId) : undefined;
+  if (parentFolderId && !parent) return;
   const connectionId = parent?.connectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
   if (parent?.id) {
     collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== parent.id));
   }
-  const folder = await savedSqlStore.createFolder(connectionId, t("savedSql.newFolderDefault"), parent?.id);
-  startRenameFolder(folder);
+  try {
+    const folder = await savedSqlStore.createFolder(connectionId, t("savedSql.newFolderDefault"), parent?.id);
+    searchText.value = "";
+    startRenameFolder(folder);
+  } catch (e: any) {
+    toast(t("savedSql.createFolderFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 async function openNewQueryInFolder(folder?: SavedSqlFolder) {
@@ -450,7 +445,8 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
     database: "",
     sql: "",
   });
-  queryStore.openSavedSql(file);
+  const tabId = queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
 }
 
 // Batch selection state
@@ -462,6 +458,11 @@ const lastClickedItemIndex = ref<number | null>(null); // Unified index for both
 const activeItemId = ref<string | null>(null);
 const activeItemType = ref<"file" | "folder" | null>(null);
 const activeSavedSqlId = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId)?.savedSqlId ?? null);
+const hasCurrentSavedSqlExecutionTarget = computed(() => {
+  const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+  const target = savedSqlExecutionTargetFromTab(activeTab);
+  return !!target && activeConnectionIds.value.has(target.connectionId);
+});
 
 watch(
   activeSavedSqlId,
@@ -670,12 +671,12 @@ async function moveFilesToFolder(fileIds: string[], folderId?: string) {
   toast(t("sqlLibrary.moveSuccess", { count: movableIds.length }), 2000);
 }
 
-async function openFile(file: SavedSqlFile) {
+async function openFile(file: SavedSqlFile, targetMode?: SavedSqlOpenTargetMode) {
   if (suppressNextRowClick.value) return;
   const loadedFile = await savedSqlStore.ensureFileContent(file.id);
   if (!loadedFile) return;
-  queryStore.openSavedSql(loadedFile);
-  connectionStore.activeConnectionId = loadedFile.connectionId;
+  const tabId = queryStore.openSavedSql(loadedFile, { targetMode });
+  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? loadedFile.connectionId;
   void savedSqlStore.recordFileUsage(loadedFile.id);
 }
 
@@ -878,6 +879,12 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
   if ("sql" in target) {
     return [
       { label: t("savedSql.open"), action: () => openFile(target), icon: FileText },
+      {
+        label: t("sqlLibrary.openInCurrentDatabase"),
+        action: () => openFile(target, "current"),
+        icon: Play,
+        disabled: !hasCurrentSavedSqlExecutionTarget.value,
+      },
       { label: t("sqlLibrary.exportFile"), action: () => exportSingleFile(target), icon: Upload },
       { label: t("sqlLibrary.moveToFolder"), icon: FolderClosed, children: folderMoveMenuItems([target.id]) },
       { label: "", separator: true },
@@ -892,7 +899,7 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
     ];
   }
   return [
-    { label: t("savedSql.newFolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
+    { label: t("savedSql.newSubfolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
     { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(target), icon: FilePlus },
     { label: t("sqlLibrary.importIntoFolder"), action: () => importDirectoryIntoLibrary(target), icon: Download },
     { label: t("sqlLibrary.exportFolder"), action: () => exportFolderContents(target), icon: Upload },
@@ -973,7 +980,7 @@ function createDragGhost(sourceEl: HTMLElement, x: number, y: number) {
     z-index: 9999;
     opacity: 0.9;
     box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-    border-radius: 4px;
+    border-radius: var(--dbx-radius-fixed-4);
     background: var(--background, #fff);
     border: 1px solid var(--border, #e5e7eb);
     max-width: 220px;
@@ -1150,7 +1157,7 @@ function showDropInside(targetId: string) {
         </Button>
       </LightTooltip>
       <LightTooltip :text="t('savedSql.newFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
-        <Button variant="ghost" size="icon" class="h-5 w-5" @click="openNewFolderInput">
+        <Button variant="ghost" size="icon" class="h-5 w-5" @click="openNewFolderInput()">
           <FolderPlus class="h-3 w-3" />
         </Button>
       </LightTooltip>
@@ -1225,6 +1232,18 @@ function showDropInside(targetId: string) {
                     {{ item.item.name }}
                     <span class="ml-1 text-muted-foreground">({{ folderFileCount(item.item.id) }})</span>
                   </span>
+                  <LightTooltip v-if="!isRenamingFolder(item.item.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
+                    <button
+                      type="button"
+                      data-no-drag="true"
+                      class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :aria-label="t('savedSql.newSubfolder')"
+                      @mousedown.stop
+                      @click.stop="openNewFolderInput(item.item.id)"
+                    >
+                      <FolderPlus class="h-3.5 w-3.5" />
+                    </button>
+                  </LightTooltip>
                 </div>
 
                 <div
@@ -1298,6 +1317,18 @@ function showDropInside(targetId: string) {
                     {{ row.folder.name }}
                     <span class="ml-1 text-muted-foreground">({{ folderFileCount(row.folder.id) }})</span>
                   </span>
+                  <LightTooltip v-if="!isRenamingFolder(row.folder.id)" :text="t('savedSql.newSubfolder')" side="left" :delay="0" :close-delay="0" nowrap>
+                    <button
+                      type="button"
+                      data-no-drag="true"
+                      class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :aria-label="t('savedSql.newSubfolder')"
+                      @mousedown.stop
+                      @click.stop="openNewFolderInput(row.folder.id)"
+                    >
+                      <FolderPlus class="h-3.5 w-3.5" />
+                    </button>
+                  </LightTooltip>
                 </div>
 
                 <div

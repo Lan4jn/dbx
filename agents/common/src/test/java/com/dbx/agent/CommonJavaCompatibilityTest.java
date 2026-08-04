@@ -6,8 +6,11 @@ import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
 
 import java.sql.Connection;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.PrintStream;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -63,7 +66,26 @@ class CommonJavaCompatibilityTest {
         JsonObject contract = protocolContract("/agent-protocol-v2.json");
 
         assertEquals(AgentProtocol.MULTI_SESSION_PROTOCOL_VERSION, contract.get("protocolVersion").getAsInt());
+        assertEquals(AgentProtocol.METHOD_HANDSHAKE, contract.get("handshakeMethod").getAsString());
+        assertEquals(
+            Arrays.asList("protocolVersion", "agentProtocolVersion", "capabilities"),
+            strings(contract.getAsJsonArray("handshakeResponseFields"))
+        );
+        assertEquals(
+            AgentProtocol.MULTI_SESSION_JDBC_ALL_CAPABILITIES,
+            strings(contract.getAsJsonArray("allCapabilities"))
+        );
+        assertEquals(
+            AgentProtocol.MULTI_SESSION_CAPABILITIES,
+            strings(contract.getAsJsonArray("capabilities"))
+        );
+        assertEquals(
+            AgentProtocol.MULTI_SESSION_JDBC_CAPABILITIES,
+            strings(contract.getAsJsonArray("defaultSqlCapabilities"))
+        );
         assertEquals(AgentProtocol.MULTI_SESSION_METHODS, strings(contract.getAsJsonArray("commonMethods")));
+        assertEquals(AgentProtocol.MONGO_LEGACY_METHODS, strings(contract.getAsJsonArray("mongoLegacyMethods")));
+        assertEquals(AgentProtocol.KV_METHODS, strings(contract.getAsJsonArray("kvMethods")));
     }
 
     @Test
@@ -129,7 +151,7 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
-    void multiSessionServerCreatesAndClosesIndependentAgents() {
+    void multiSessionServerCreatesAndClosesIndependentAgents() throws Exception {
         java.util.List<TrackingAgent> created = new java.util.ArrayList<>();
         MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(() -> {
             TrackingAgent agent = new TrackingAgent();
@@ -142,6 +164,7 @@ class CommonJavaCompatibilityTest {
         )).getAsJsonObject().getAsJsonObject("result");
         assertEquals(2, handshake.get("protocolVersion").getAsInt());
         assertTrue(containsCapability(handshake.getAsJsonArray("capabilities"), "multi_session"));
+        assertTrue(containsCapability(handshake.getAsJsonArray("capabilities"), "structured_error_v1"));
 
         server.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"a\"}}");
         server.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"b\"}}");
@@ -150,8 +173,101 @@ class CommonJavaCompatibilityTest {
         assertEquals(1, created.get(1).connectCount);
 
         server.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"close_session\",\"params\":{\"agentSessionId\":\"a\"}}");
+        awaitCondition(() -> created.get(0).disconnectCount == 1);
         assertEquals(1, created.get(0).disconnectCount);
         assertEquals(0, created.get(1).disconnectCount);
+    }
+
+    @Test
+    void customSessionHandlersDoNotImplicitlyAdvertiseStructuredErrors() {
+        MultiSessionJsonRpcServer server = MultiSessionJsonRpcServer.forSessionHandlers(() -> new SessionRpcHandler() {
+            @Override
+            public Object connect(JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public Object handle(String method, JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public void close() {
+            }
+        });
+
+        JsonObject handshake = JsonParser.parseString(server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+
+        assertTrue(containsCapability(handshake.getAsJsonArray("capabilities"), "multi_session"));
+        assertFalse(containsCapability(handshake.getAsJsonArray("capabilities"), "structured_error_v1"));
+    }
+
+    @Test
+    void multiSessionLimitReturnsStructuredBackpressureBeforeConnectStarts() {
+        try (MultiSessionJsonRpcServer server = MultiSessionJsonRpcServer.forSessionHandlers(() -> new SessionRpcHandler() {
+            @Override
+            public Object connect(JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public Object handle(String method, JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public void close() {
+            }
+        })) {
+            for (int index = 0; index < MultiSessionJsonRpcServer.MAX_SESSIONS; index++) {
+                JsonObject response = JsonParser.parseString(server.handleRequest(openSessionRequest(index, "session-" + index)))
+                    .getAsJsonObject();
+                assertTrue(response.has("result"), response::toString);
+            }
+
+            JsonObject response = JsonParser.parseString(server.handleRequest(
+                openSessionRequest(MultiSessionJsonRpcServer.MAX_SESSIONS, "overflow")
+            )).getAsJsonObject();
+            JsonObject data = response.getAsJsonObject("error").getAsJsonObject("data");
+
+            assertEquals("resource", data.get("category").getAsString());
+            assertTrue(data.get("retryable").getAsBoolean());
+            assertEquals("keep", data.get("sessionDisposition").getAsString());
+            assertEquals("connect", data.get("stage").getAsString());
+            assertEquals("not_started", data.get("operationOutcome").getAsString());
+        }
+    }
+
+    @Test
+    void multiSessionServerKeepsProtocolOutputWhenGlobalStdoutChanges() {
+        synchronized (System.class) {
+            InputStream originalInput = System.in;
+            PrintStream originalOutput = System.out;
+            ByteArrayOutputStream protocolBytes = new ByteArrayOutputStream();
+            ByteArrayOutputStream redirectedBytes = new ByteArrayOutputStream();
+            try (PrintStream protocolOutput = new PrintStream(protocolBytes, true, StandardCharsets.UTF_8);
+                 PrintStream redirectedOutput = new PrintStream(redirectedBytes, true, StandardCharsets.UTF_8)) {
+                System.setOut(protocolOutput);
+                MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(MinimalAgent::new);
+                System.setIn(new ByteArrayInputStream(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n"
+                        .getBytes(StandardCharsets.UTF_8)
+                ));
+                System.setOut(redirectedOutput);
+
+                server.run();
+
+                String protocol = protocolBytes.toString(StandardCharsets.UTF_8);
+                assertTrue(protocol.contains("{\"ready\":true}"), protocol);
+                assertTrue(protocol.contains("\"id\":1"), protocol);
+                assertEquals("", redirectedBytes.toString(StandardCharsets.UTF_8));
+            } finally {
+                System.setIn(originalInput);
+                System.setOut(originalOutput);
+            }
+        }
     }
 
     @Test
@@ -543,6 +659,40 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
+    void buildsCompositeKeysFromOrderedIndexAndForeignKeyMetadata() {
+        String ddl = DdlBuilder.buildTableDdl(
+            "avatar_asset",
+            "app_config_info",
+            Arrays.asList(
+                new ColumnInfo("id", "bigint", false, null, true),
+                new ColumnInfo("tenant_id", "bigint", false, null, true),
+                new ColumnInfo("payload", "text", true, null, false)
+            ),
+            Collections.singletonList(new IndexInfo(
+                "app_config_info_pkey",
+                Arrays.asList("tenant_id", "id"),
+                true,
+                true
+            )),
+            Arrays.asList(
+                new ForeignKeyInfo("fk_account_region", "tenant_id", "accounts", "account_id"),
+                new ForeignKeyInfo("fk_account_region", "id", "accounts", "region_id")
+            )
+        );
+
+        assertEquals(
+            "CREATE TABLE \"avatar_asset\".\"app_config_info\" (\n" +
+                "  \"id\" bigint NOT NULL,\n" +
+                "  \"tenant_id\" bigint NOT NULL,\n" +
+                "  \"payload\" text,\n" +
+                "  PRIMARY KEY (\"tenant_id\", \"id\"),\n" +
+                "  CONSTRAINT \"fk_account_region\" FOREIGN KEY (\"tenant_id\", \"id\") REFERENCES \"accounts\"(\"account_id\", \"region_id\")\n" +
+                ");\n",
+            ddl
+        );
+    }
+
+    @Test
     void buildsTableDdlWithColumnComments() {
         String ddl = DdlBuilder.buildTableDdl(
             "public",
@@ -639,7 +789,7 @@ class CommonJavaCompatibilityTest {
 
     private static final class TrackingAgent extends MinimalAgent {
         private int connectCount;
-        private int disconnectCount;
+        private volatile int disconnectCount;
 
         @Override
         public void connect(ConnectParams params) {
@@ -1024,6 +1174,25 @@ class CommonJavaCompatibilityTest {
             }
         }
         return false;
+    }
+
+    private static String openSessionRequest(int requestId, String sessionId) {
+        JsonObject params = new JsonObject();
+        params.addProperty("agentSessionId", sessionId);
+        JsonObject request = new JsonObject();
+        request.addProperty("jsonrpc", "2.0");
+        request.addProperty("id", requestId);
+        request.addProperty("method", AgentProtocol.METHOD_OPEN_SESSION);
+        request.add("params", params);
+        return request.toString();
+    }
+
+    private static void awaitCondition(java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            Thread.sleep(10L);
+        }
+        assertTrue(condition.getAsBoolean());
     }
 
     private static JsonObject protocolContract(String resourcePath) {

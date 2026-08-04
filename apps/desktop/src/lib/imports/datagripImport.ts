@@ -1,14 +1,21 @@
-import type { ConnectionConfig, DatabaseType } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, SidebarLayout } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
+import { buildSidebarLayoutFromFolderPaths } from "@/lib/sidebar/sidebarLayout";
 
 declare var process: { env: Record<string, string | undefined> } | undefined;
 
 type PartialConnection = Omit<ConnectionConfig, "id">;
 
+export type DataGripImportResult = {
+  connections: ConnectionConfig[];
+  layout?: SidebarLayout;
+};
+
 export type DataGripImportPayload = {
   format: "datagrip-import";
   dataSources: string;
   dataSourcesLocal?: string;
+  dbForestConfig?: string;
 };
 
 type DataSourceFragment = {
@@ -52,8 +59,11 @@ const driverRefMap: Record<string, DriverProfile> = {
   cockroachdb: { dbType: "postgres", profile: "cockroachdb", label: "CockroachDB", port: 26257, user: "root" },
   redshift: { dbType: "redshift", profile: "redshift", label: "Redshift", port: 5439, user: "awsuser" },
   elasticsearch: { dbType: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", port: 9200, user: "" },
+  easysearch: { dbType: "easysearch", profile: "easysearch", label: "Easysearch", port: 9200, user: "" },
   h2: { dbType: "h2", profile: "h2", label: "H2", port: 9092, user: "sa" },
   snowflake: { dbType: "snowflake", profile: "snowflake", label: "Snowflake", port: 443, user: "" },
+  kingbase: { dbType: "kingbase", profile: "kingbase", label: "KingbaseES", port: 54321, user: "SYSTEM" },
+  kingbase8: { dbType: "kingbase", profile: "kingbase", label: "KingbaseES", port: 54321, user: "SYSTEM" },
 };
 
 // product name from <database-info product="..."> → dbx profile
@@ -73,7 +83,9 @@ const productMap: Record<string, DriverProfile> = {
   bigquery: { dbType: "bigquery", profile: "bigquery", label: "BigQuery", port: 443, user: "" },
   redshift: { dbType: "redshift", profile: "redshift", label: "Redshift", port: 5439, user: "awsuser" },
   elasticsearch: { dbType: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", port: 9200, user: "" },
+  easysearch: { dbType: "easysearch", profile: "easysearch", label: "Easysearch", port: 9200, user: "" },
   snowflake: { dbType: "snowflake", profile: "snowflake", label: "Snowflake", port: 443, user: "" },
+  kingbase: { dbType: "kingbase", profile: "kingbase", label: "KingbaseES", port: 54321, user: "SYSTEM" },
 };
 
 // JDBC subprotocol → dbx profile (fallback when driver-ref and product are unknown)
@@ -92,6 +104,8 @@ const subprotocolMap: Record<string, DriverProfile> = {
   duckdb: { dbType: "duckdb", profile: "duckdb", label: "DuckDB", port: 0, user: "" },
   bigquery: { dbType: "bigquery", profile: "bigquery", label: "BigQuery", port: 443, user: "" },
   redshift: { dbType: "redshift", profile: "redshift", label: "Redshift", port: 5439, user: "awsuser" },
+  kingbase: { dbType: "kingbase", profile: "kingbase", label: "KingbaseES", port: 54321, user: "SYSTEM" },
+  kingbase8: { dbType: "kingbase", profile: "kingbase", label: "KingbaseES", port: 54321, user: "SYSTEM" },
 };
 
 function getNumber(value: string | undefined): number {
@@ -165,7 +179,9 @@ function parseJdbcUrl(jdbcUrl: string): {
   const fileMatch = url.match(/^(sqlite|duckdb):(.+)$/i);
   if (fileMatch) {
     result.host = expandPathMacros(fileMatch[2].split("?")[0]);
-    result.database = result.host;
+    if (fileMatch[1].toLowerCase() !== "sqlite") {
+      result.database = result.host;
+    }
     return result;
   }
 
@@ -248,6 +264,7 @@ function inferProfile(driverRef: string, subprotocol: string, driverClass: strin
   if (classLower.includes("mongo")) return driverRefMap.mongodb;
   if (classLower.includes("redis")) return driverRefMap.redis;
   if (classLower.includes("clickhouse")) return driverRefMap.clickhouse;
+  if (classLower.includes("kingbase")) return driverRefMap.kingbase;
 
   // 5. Fallback to JDBC
   return { dbType: "jdbc", profile: "jdbc", label: driverClass || "JDBC", port: 0, user: "" };
@@ -283,7 +300,9 @@ function parseDataSourcesXml(xml: string): Map<string, Partial<DataSourceFragmen
     const userName = getText(element, "user-name");
     if (userName) fragment.username = userName;
 
-    const groupName = element.getAttribute("group-name") || undefined;
+    // DataGrip stores the folder grouping as a `group` attribute on each
+    // <data-source>. `group-name` is kept as a legacy fallback for older exports.
+    const groupName = element.getAttribute("group") || element.getAttribute("group-name") || undefined;
     if (groupName) fragment.groupName = groupName;
 
     result.set(uuidVal, fragment);
@@ -322,6 +341,59 @@ function parseDataSourcesLocalXml(xml: string): Map<string, Partial<DataSourceFr
   return result;
 }
 
+function parseDbForestGroupPaths(xml: string): Map<string, string> {
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  if (doc.querySelector("parsererror")) return new Map();
+
+  const data = doc.getElementsByTagName("data")[0]?.textContent;
+  if (!data) return new Map();
+
+  const groupRecords = new Map<string, { parentId: string; name: string }>();
+  const connectionRecords: Array<{ uuid: string; parentId: string }> = [];
+  let readingConnections = false;
+
+  for (const rawLine of data.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line === ".") continue;
+    if (/^-{8,}$/.test(line)) {
+      readingConnections = true;
+      continue;
+    }
+
+    const match = line.match(/^(\d+):(\d+):([^:]+)(?::(.*))?$/);
+    if (!match) continue;
+    const [, recordId, parentId, uuidVal, rawName] = match;
+    if (!readingConnections && rawName) {
+      const name = rawName.replace(/^[\u200B\uFEFF]+/, "").trim();
+      if (name) groupRecords.set(recordId, { parentId, name });
+    } else if (readingConnections) {
+      connectionRecords.push({ uuid: uuidVal, parentId });
+    }
+  }
+
+  const groupPathByRecordId = new Map<string, string>();
+  const resolveGroupPath = (recordId: string, visiting = new Set<string>()): string => {
+    const cached = groupPathByRecordId.get(recordId);
+    if (cached) return cached;
+    const group = groupRecords.get(recordId);
+    if (!group || visiting.has(recordId)) return "";
+
+    visiting.add(recordId);
+    const parentPath = group.parentId === "0" ? "" : resolveGroupPath(group.parentId, visiting);
+    visiting.delete(recordId);
+    const path = parentPath ? `${parentPath}/${group.name}` : group.name;
+    groupPathByRecordId.set(recordId, path);
+    return path;
+  };
+
+  const paths = new Map<string, string>();
+  for (const connection of connectionRecords) {
+    const path = resolveGroupPath(connection.parentId);
+    if (path) paths.set(connection.uuid, path);
+  }
+  return paths;
+}
+
 function mergeFragments(shared: Map<string, Partial<DataSourceFragment>>, local: Map<string, Partial<DataSourceFragment>>): DataSourceFragment[] {
   const merged = new Map<string, Partial<DataSourceFragment>>();
 
@@ -349,11 +421,11 @@ function mergeFragments(shared: Map<string, Partial<DataSourceFragment>>, local:
   // Resolve and filter
   const resolved: DataSourceFragment[] = [];
   for (const frag of merged.values()) {
-    if (!frag.uuid || !frag.driverRef || !frag.jdbcUrl) continue;
+    if (!frag.uuid || !frag.jdbcUrl) continue;
     resolved.push({
       uuid: frag.uuid,
       name: frag.name || frag.uuid,
-      driverRef: frag.driverRef,
+      driverRef: frag.driverRef || "",
       jdbcUrl: frag.jdbcUrl,
       driverClass: frag.driverClass || "",
       username: frag.username || "",
@@ -412,23 +484,73 @@ export function isDataGripImportPayload(content: string): boolean {
   }
 }
 
-export function parseDataGripConnections(payload: DataGripImportPayload): ConnectionConfig[] {
+export function parseDataGripImport(payload: DataGripImportPayload): DataGripImportResult {
   const shared = parseDataSourcesXml(payload.dataSources);
   const local = payload.dataSourcesLocal ? parseDataSourcesLocalXml(payload.dataSourcesLocal) : new Map();
   const fragments = mergeFragments(shared, local);
+  const forestGroupPaths = payload.dbForestConfig ? parseDbForestGroupPaths(payload.dbForestConfig) : new Map<string, string>();
 
   const configs: ConnectionConfig[] = [];
+  const connectionGroupPaths = new Map<string, string>();
   const seen = new Set<string>();
 
   for (const fragment of fragments) {
     const config = buildConnection(fragment);
+    // Custom-driver sources without a <driver-ref> are kept only when a concrete
+    // database type is recognised. DataGrip ships no built-in Kingbase driver, so
+    // every Kingbase connection is custom (configured by URL, no driver-ref).
+    // An unrecognised custom driver falls back to "jdbc" and is dropped here to
+    // avoid importing unusable half-baked JDBC connections. `fragment.driverRef
+    // === ""` is the sentinel mergeFragments sets when <driver-ref> was absent.
+    if (fragment.driverRef === "" && config.db_type === "jdbc") continue;
     const key = [config.name, config.db_type, config.host, config.port, config.database || ""].join("\u0000");
     if (seen.has(key)) continue;
     seen.add(key);
     configs.push(config);
+    const groupPath = forestGroupPaths.get(fragment.uuid) || fragment.groupName;
+    if (groupPath) connectionGroupPaths.set(config.id, groupPath);
   }
 
-  return configs;
+  // DataGrip stores the selected group on each data source rather than in a
+  // separate folder registry, so rebuild the layout from those references.
+  const layout = buildSidebarLayoutFromFolderPaths(
+    configs.map((config) => config.id),
+    new Set(connectionGroupPaths.values()),
+    connectionGroupPaths,
+  );
+  return { connections: configs, layout };
+}
+
+export function parseDataGripConnections(payload: DataGripImportPayload): ConnectionConfig[] {
+  return parseDataGripImport(payload).connections;
+}
+
+/**
+ * Pick DataGrip config file paths by name from a dialog multi-select list.
+ * `dataSources.xml` is required; `dataSources.local.xml` (usernames) and
+ * `db-forest-config.xml` (legacy group tree) are optional and stay undefined
+ * when not selected. Names are matched case-insensitively on both path styles.
+ */
+export function matchDataGripImportFiles(paths: string[]): {
+  dataSources: string;
+  local?: string;
+  forest?: string;
+} {
+  const fileName = (path: string) => (path.split(/[\\/]/).pop() ?? "").toLowerCase();
+  const find = (name: string) => paths.find((path) => fileName(path) === name.toLowerCase());
+  const dataSources = find("dataSources.xml");
+  if (!dataSources) {
+    // Library layer keeps a readable fallback message; UI layers translate the
+    // coded error (see readDataGripImportFile) instead of showing this raw text.
+    const error = new Error("Select dataSources.xml (required); optionally dataSources.local.xml and db-forest-config.xml");
+    (error as Error & { code?: string }).code = "DATAGRIP_IMPORT_MISSING_DATASOURCES";
+    throw error;
+  }
+  return {
+    dataSources,
+    local: find("dataSources.local.xml"),
+    forest: find("db-forest-config.xml"),
+  };
 }
 
 /** Returns a map of dedup key (name\0host\0port\0db) → DataGrip UUID for Keychain lookup. */
@@ -442,6 +564,9 @@ export function getDataGripUuidMap(payload: DataGripImportPayload): Map<string, 
 
   for (const fragment of fragments) {
     const profile = inferProfile(fragment.driverRef, extractSubprotocol(fragment.jdbcUrl), fragment.driverClass, fragment.product);
+    // Stay in sync with parseDataGripImport: skip custom-driver sources (no
+    // <driver-ref>) that don't resolve to a concrete database type.
+    if (fragment.driverRef === "" && profile.dbType === "jdbc") continue;
     const parsed = parseJdbcUrl(fragment.jdbcUrl);
     const host = parsed.host || (profile.dbType === "sqlite" ? "" : "127.0.0.1");
     const port = parsed.port || profile.port;

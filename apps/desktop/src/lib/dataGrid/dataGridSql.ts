@@ -19,10 +19,12 @@ export interface DataGridColumnInfo {
   is_primary_key?: boolean;
   column_default?: string | null;
   extra?: string | null;
+  comment?: string | null;
 }
 
 export interface DataGridSaveStatementOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   tableMeta: DataGridTableMeta;
   columns: string[];
   sourceColumns?: Array<string | undefined>;
@@ -50,6 +52,7 @@ export interface DataGridCopyInsertStatementOptions {
   sourceColumns?: Array<string | undefined>;
   rows: GridCellValue[][];
   excludePrimaryKeys?: boolean;
+  includeComputedColumns?: boolean;
   insertMode?: DataGridCopyInsertMode;
 }
 
@@ -57,6 +60,7 @@ export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "i
 
 export interface DataGridContextFilterConditionOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   columnName: string;
   mode: DataGridContextFilterMode;
   value: GridCellValue;
@@ -67,6 +71,7 @@ export interface DataGridContextFilterConditionOptions {
 
 export interface DataGridColumnValueFilterConditionOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   columnName: string;
   columnInfo?: DataGridColumnInfo;
   rawValue: string;
@@ -74,6 +79,7 @@ export interface DataGridColumnValueFilterConditionOptions {
 
 export interface DataGridColumnValuesFilterConditionOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   columnName: string;
   columnInfo?: DataGridColumnInfo;
   values: GridCellValue[];
@@ -81,6 +87,7 @@ export interface DataGridColumnValuesFilterConditionOptions {
 
 export interface DataGridColumnDistinctValuesSqlOptions {
   databaseType?: DatabaseType;
+  identifierQuote?: string;
   catalog?: string;
   database?: string;
   schema?: string;

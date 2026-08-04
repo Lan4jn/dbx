@@ -39,10 +39,20 @@ const MONGODB_PROFILES: &[AgentDriverProfile] = &[AgentDriverProfile {
 const H2_PROFILES: &[AgentDriverProfile] =
     &[AgentDriverProfile { profile: "h2-legacy", key: "h2-legacy", label: "H2 2.1 Legacy", store_visible: true }];
 
-const EXTRA_AGENT_LABELS: &[(&str, &str)] =
-    &[("kafka", "Apache Kafka"), ("sqlserver-legacy", "SQL Server legacy compatibility component")];
-const EXTRA_DRIVER_STORE_ENTRIES: &[(&str, &str)] =
-    &[("kafka", "Apache Kafka"), ("sqlserver-legacy", "SQL Server legacy compatibility component")];
+const EXTRA_AGENT_LABELS: &[(&str, &str)] = &[
+    ("duckdb", "DuckDB"),
+    ("kafka", "Apache Kafka"),
+    ("rocketmq", "Apache RocketMQ"),
+    ("rabbitmq", "RabbitMQ"),
+    ("sqlserver-legacy", "SQL Server legacy compatibility component"),
+];
+const EXTRA_DRIVER_STORE_ENTRIES: &[(&str, &str)] = &[
+    ("duckdb", "DuckDB"),
+    ("kafka", "Apache Kafka"),
+    ("rocketmq", "Apache RocketMQ"),
+    ("rabbitmq", "RabbitMQ"),
+    ("sqlserver-legacy", "SQL Server legacy compatibility component"),
+];
 
 const AGENT_CATALOG: &[AgentCatalogEntry] = &[
     AgentCatalogEntry {
@@ -63,6 +73,13 @@ const AGENT_CATALOG: &[AgentCatalogEntry] = &[
         db_type: DatabaseType::Highgo,
         key: "highgo",
         label: "瀚高 HighGo",
+        store_visible: true,
+        profiles: &[],
+    },
+    AgentCatalogEntry {
+        db_type: DatabaseType::Uxdb,
+        key: "uxdb",
+        label: "优炫 UXDB",
         store_visible: true,
         profiles: &[],
     },
@@ -301,7 +318,12 @@ pub fn entries() -> &'static [AgentCatalogEntry] {
 
 pub fn agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<&'static str> {
     if *db_type == DatabaseType::MessageQueue {
-        return (driver_profile == Some("kafka")).then_some("kafka");
+        return match driver_profile {
+            Some("kafka") => Some("kafka"),
+            Some("rocketmq") => Some("rocketmq"),
+            Some("rabbitmq") => Some("rabbitmq"),
+            _ => None,
+        };
     }
     if *db_type == DatabaseType::SqlServer {
         return driver_profile
@@ -367,5 +389,12 @@ mod tests {
         assert_eq!(agent_key(&DatabaseType::H2, Some("h2")), Some("h2"));
         assert_eq!(agent_key(&DatabaseType::H2, Some("h2-legacy")), Some("h2-legacy"));
         assert!(driver_store_entries().any(|(key, label)| key == "h2-legacy" && label == "H2 2.1 Legacy"));
+    }
+
+    #[test]
+    fn duckdb_is_available_in_driver_store_without_using_agent_runtime() {
+        assert!(driver_store_entries().any(|(key, label)| key == "duckdb" && label == "DuckDB"));
+        assert_eq!(label_for_key("duckdb"), Some("DuckDB"));
+        assert!(!is_agent_type(&DatabaseType::DuckDb));
     }
 }

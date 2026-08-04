@@ -17,6 +17,12 @@ const defaultCapabilities: TableMetadataCapabilities = {
 };
 
 const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabilities>>> = {
+  mongodb: {
+    columns: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
   clickhouse: {
     foreignKeys: false,
     triggers: false,
@@ -26,6 +32,18 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
     triggers: false,
   },
   elasticsearch: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
+  easysearch: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
+  hbase: {
     indexes: false,
     foreignKeys: false,
     triggers: false,

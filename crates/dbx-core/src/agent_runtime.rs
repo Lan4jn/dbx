@@ -2,9 +2,21 @@ use serde::de::DeserializeOwned;
 use std::time::Duration;
 
 use crate::agent_manager::{AgentManager, DEFAULT_JRE_KEY};
+use crate::agent_recovery::{RecoveryPolicy, RecoveryScope};
 use crate::database_capabilities;
-use crate::db::agent_driver::{AgentDriverClient, AgentMethod, AgentRuntimeClient};
+use crate::db::agent_driver::{AgentCallError, AgentDriverClient, AgentMethod, AgentRuntimeClient};
 use crate::models::connection::DatabaseType;
+
+pub struct SharedConnectionOpenError {
+    pub(crate) message: String,
+    pub(crate) runtime: Option<std::sync::Arc<AgentRuntimeClient>>,
+}
+
+impl From<String> for SharedConnectionOpenError {
+    fn from(message: String) -> Self {
+        Self { message, runtime: None }
+    }
+}
 
 pub fn db_type_to_agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<&'static str> {
     database_capabilities::agent_key(db_type, driver_profile)
@@ -18,18 +30,23 @@ pub async fn stop_daemons(manager: &AgentManager) {
     manager.daemons.lock().await.clear();
     let runtimes = std::mem::take(&mut *manager.connection_runtimes.lock().await);
     for runtime in runtimes.into_values().filter_map(|cell| cell.get().cloned()) {
-        runtime.kill();
+        runtime.kill_and_wait().await;
     }
 }
 
 pub async fn stop_daemon_by_key(manager: &AgentManager, agent_key: &str) {
     manager.daemons.lock().await.remove(agent_key);
-    let mut runtimes = manager.connection_runtimes.lock().await;
-    let matching = runtimes.keys().filter(|key| key.starts_with(&format!("{agent_key}|"))).cloned().collect::<Vec<_>>();
-    for key in matching {
-        if let Some(runtime) = runtimes.remove(&key).and_then(|cell| cell.get().cloned()) {
-            runtime.kill();
-        }
+    let runtimes = {
+        let mut runtimes = manager.connection_runtimes.lock().await;
+        let matching =
+            runtimes.keys().filter(|key| key.starts_with(&format!("{agent_key}|"))).cloned().collect::<Vec<_>>();
+        matching
+            .into_iter()
+            .filter_map(|key| runtimes.remove(&key).and_then(|cell| cell.get().cloned()))
+            .collect::<Vec<_>>()
+    };
+    for runtime in runtimes {
+        runtime.kill_and_wait().await;
     }
 }
 
@@ -59,7 +76,7 @@ pub async fn spawn_shared_connection_client(
     agent_session_id: String,
     connect_params: serde_json::Value,
     connect_timeout: Duration,
-) -> Result<AgentDriverClient, String> {
+) -> Result<AgentDriverClient, SharedConnectionOpenError> {
     let keys = runtime_agent_key_candidates(db_type, driver_profile)
         .ok_or_else(|| format!("{:?} is not an agent-driven database type", db_type))?;
     let key = first_installed_agent_key(manager, &keys).unwrap_or(keys[0]);
@@ -95,13 +112,22 @@ pub async fn spawn_shared_connection_client(
         }
     };
     if let Err(err) = runtime
-        .call::<serde_json::Value>(AgentMethod::OpenSession.as_str(), session_params, Some(connect_timeout), None)
+        .call_typed::<serde_json::Value>(AgentMethod::OpenSession.as_str(), session_params, Some(connect_timeout), None)
         .await
     {
+        let open_error = shared_connection_open_error(err, runtime.clone());
         forget_unused_runtime_after_failed_open(manager, &runtime_key, &runtime_cell, &runtime).await;
-        return Err(err);
+        return Err(open_error);
     }
     Ok(AgentDriverClient::shared_session(runtime, agent_session_id))
+}
+
+fn shared_connection_open_error(
+    error: AgentCallError,
+    runtime: std::sync::Arc<AgentRuntimeClient>,
+) -> SharedConnectionOpenError {
+    let runtime = RecoveryPolicy::decide(&error, RecoveryScope::ConnectionOpen).replaces_runtime().then_some(runtime);
+    SharedConnectionOpenError { message: error.into_legacy_string(), runtime }
 }
 
 async fn forget_unused_runtime_after_failed_open(
@@ -311,8 +337,9 @@ for line in sys.stdin:
 "#,
         )
         .unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
         let runtime = AgentRuntimeClient::spawn(
-            crate::db::agent_driver::AgentLaunchSpec::new("python3")
+            crate::db::agent_driver::AgentLaunchSpec::new(python)
                 .with_args([script_path.to_string_lossy().to_string()]),
             "test",
         )
@@ -381,6 +408,29 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn replace_runtime_open_error_reports_runtime_without_killing_it_directly() {
+        let (manager, _cell, runtime, script_path) = test_shared_runtime("replace-runtime-open-error").await;
+        let error = AgentCallError::Legacy {
+            rpc_code: Some(-1),
+            message: "capacity exhausted".to_string(),
+            hints: crate::db::agent_driver::LegacyAgentHints {
+                category: Some(crate::db::agent_driver::AgentErrorCategory::Resource),
+                session_disposition: Some(crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime),
+                ..Default::default()
+            },
+        };
+
+        let open_error = shared_connection_open_error(error, runtime.clone());
+
+        assert!(open_error.runtime.as_ref().is_some_and(|failed| std::sync::Arc::ptr_eq(failed, &runtime)));
+        assert!(!runtime.is_failed());
+
+        runtime.kill();
+        drop(manager);
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
     async fn failed_open_cleanup_cannot_remove_runtime_after_reservation() {
         let (manager, cell, runtime, script_path) = test_shared_runtime("failed-open-race").await;
         let runtime_key = "oracle|test";
@@ -398,6 +448,22 @@ for line in sys.stdin:
         assert_eq!(runtime.active_session_count(), 1);
         AgentRuntimeClient::decrement_session_count(&runtime);
         runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn stopping_driver_runtime_removes_and_terminates_shared_process() {
+        let (manager, cell, runtime, script_path) = test_shared_runtime("stop-driver-runtime").await;
+        let runtime_key = "dameng|test";
+        manager.connection_runtimes.lock().await.insert(runtime_key.to_string(), cell);
+
+        stop_daemon_by_key(&manager, "dameng").await;
+
+        assert!(!manager.connection_runtimes.lock().await.contains_key(runtime_key));
+        assert!(runtime.is_failed());
+        let call_result =
+            runtime.call::<serde_json::Value>("ping", serde_json::json!({}), Some(Duration::from_secs(1)), None).await;
+        assert_eq!(call_result.unwrap_err(), "Agent runtime is unavailable");
         let _ = std::fs::remove_file(script_path);
     }
 }

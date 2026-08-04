@@ -1,7 +1,7 @@
 use crate::connection::{AppState, PoolKind};
 use crate::db::agent_driver::mongo_document_id_params;
-use crate::db::mongo_driver::MongoDocumentResult;
-use crate::db::{elasticsearch_driver, mongo_driver, vector_driver};
+use crate::db::document_result::DocumentQueryResult;
+use crate::db::{easysearch_driver, elasticsearch_driver, mongo_driver, vector_driver};
 
 pub use crate::db::vector_driver::CollectionInfo;
 
@@ -27,12 +27,14 @@ pub struct MongoGridFsBucketInfo {
     pub total_bytes: i64,
 }
 
+fn cmp_names(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_lower = left.to_lowercase();
+    let right_lower = right.to_lowercase();
+    left_lower.cmp(&right_lower).then_with(|| left.cmp(right))
+}
+
 fn sort_names(mut names: Vec<String>) -> Vec<String> {
-    names.sort_by(|left, right| {
-        let left_lower = left.to_lowercase();
-        let right_lower = right.to_lowercase();
-        left_lower.cmp(&right_lower).then_with(|| left.cmp(right))
-    });
+    names.sort_by(|left, right| cmp_names(left, right));
     names
 }
 
@@ -53,7 +55,8 @@ pub async fn list_databases_core(state: &AppState, connection_id: &str) -> Resul
             Err(error) => Err(error),
         },
         PoolKind::Elasticsearch(_) => Ok(vec!["default".to_string()]),
-        PoolKind::VectorDb(client) => vector_driver::list_databases(&client).await,
+        PoolKind::Easysearch(_) => Ok(vec!["default".to_string()]),
+        PoolKind::VectorDb(client) => vector_driver::list_databases(client).await,
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             match client.mongo_list_databases::<Vec<serde_json::Value>>().await {
@@ -84,14 +87,46 @@ fn mongo_list_databases_unauthorized(error: &str) -> bool {
     lower.contains("not authorized") && lower.contains("listdatabases")
 }
 
-fn mongo_collection_info(name: String) -> CollectionInfo {
-    CollectionInfo {
-        name: name.clone(),
-        id: name,
-        dimension: None,
-        kind: Some("collection".to_string()),
-        bucket_name: None,
-    }
+fn mongo_collection_info(name: String, kind: mongo_driver::MongoCollectionKind) -> CollectionInfo {
+    CollectionInfo { name: name.clone(), id: name, kind: Some(kind.as_str().to_string()), ..Default::default() }
+}
+
+fn sort_mongo_collection_specs(
+    mut specs: Vec<mongo_driver::MongoCollectionSpec>,
+) -> Vec<mongo_driver::MongoCollectionSpec> {
+    specs.sort_by(|left, right| cmp_names(&left.name, &right.name));
+    specs
+}
+
+/// Decode both generations of the Legacy Agent response. Existing installed
+/// Agents return names, while current Agents opt into `name` + `kind` specs.
+fn mongo_collection_specs_from_agent_response(
+    value: serde_json::Value,
+) -> Result<Vec<mongo_driver::MongoCollectionSpec>, String> {
+    let values =
+        value.as_array().ok_or_else(|| "Invalid MongoDB legacy collection list: expected an array".to_string())?;
+
+    values
+        .iter()
+        .map(|value| match value {
+            serde_json::Value::String(name) => Ok(mongo_driver::MongoCollectionSpec {
+                name: name.clone(),
+                kind: mongo_driver::MongoCollectionKind::Collection,
+            }),
+            serde_json::Value::Object(spec) => {
+                let name = spec
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "Invalid MongoDB legacy collection spec: name is required".to_string())?;
+                let kind = spec.get("kind").or_else(|| spec.get("type")).and_then(serde_json::Value::as_str);
+                Ok(mongo_driver::MongoCollectionSpec {
+                    name: name.to_string(),
+                    kind: mongo_driver::MongoCollectionKind::from_metadata_kind(kind),
+                })
+            }
+            _ => Err("Invalid MongoDB legacy collection list entry".to_string()),
+        })
+        .collect()
 }
 
 pub(crate) fn mongo_gridfs_bucket_names(names: &[String]) -> Vec<String> {
@@ -116,9 +151,9 @@ fn mongo_bucket_infos(names: &[String]) -> Vec<CollectionInfo> {
         .map(|bucket_name| CollectionInfo {
             name: bucket_name.clone(),
             id: format!("bucket:{bucket_name}"),
-            dimension: None,
             kind: Some("bucket".to_string()),
             bucket_name: Some(bucket_name),
+            ..Default::default()
         })
         .collect()
 }
@@ -204,24 +239,29 @@ pub async fn list_collections_core(
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => {
-            let names = sort_names(mongo_driver::list_collections(client, database).await?);
+            let specs = sort_mongo_collection_specs(mongo_driver::list_collection_specs(client, database).await?);
+            let names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
             let mut infos = mongo_bucket_infos(&names);
-            infos.extend(names.into_iter().map(mongo_collection_info));
+            infos.extend(specs.into_iter().map(|spec| mongo_collection_info(spec.name, spec.kind)));
             Ok(infos)
         }
         PoolKind::Elasticsearch(client) => {
             let names = sort_names(elasticsearch_driver::list_indices(client).await?);
-            Ok(names
-                .into_iter()
-                .map(|n| CollectionInfo { name: n.clone(), id: n, dimension: None, kind: None, bucket_name: None })
-                .collect())
+            Ok(names.into_iter().map(|n| CollectionInfo { name: n.clone(), id: n, ..Default::default() }).collect())
         }
-        PoolKind::VectorDb(client) => vector_driver::list_collections_with_db(&client, database).await,
+        PoolKind::Easysearch(client) => {
+            let names = sort_names(easysearch_driver::list_indices(client).await?);
+            Ok(names.into_iter().map(|n| CollectionInfo { name: n.clone(), id: n, ..Default::default() }).collect())
+        }
+        PoolKind::VectorDb(client) => vector_driver::list_collections_with_db(client, database).await,
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
-            let names = sort_names(client.mongo_list_collections(database).await?);
+            let specs = sort_mongo_collection_specs(mongo_collection_specs_from_agent_response(
+                client.mongo_list_collection_specs(database).await?,
+            )?);
+            let names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
             let mut infos = mongo_bucket_infos(&names);
-            infos.extend(names.into_iter().map(mongo_collection_info));
+            infos.extend(specs.into_iter().map(|spec| mongo_collection_info(spec.name, spec.kind)));
             Ok(infos)
         }
         _ => Err("Not a MongoDB/Elasticsearch/vector connection".to_string()),
@@ -362,17 +402,28 @@ pub async fn find_documents_core(
     filter: Option<&str>,
     projection: Option<&str>,
     sort: Option<&str>,
-) -> Result<MongoDocumentResult, String> {
+    collation: Option<&str>,
+) -> Result<DocumentQueryResult, String> {
     ensure_document_pool(state, connection_id).await?;
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => {
-            mongo_driver::find_documents(client, database, collection, skip, limit, filter, projection, sort).await
+            // Document browser responses must retain BSON type metadata so nested filters
+            // can round-trip ObjectId, Date, and int64 values through Extended JSON.
+            mongo_driver::find_documents_extended_json(
+                client, database, collection, skip, limit, filter, projection, sort, collation,
+            )
+            .await
         }
         PoolKind::Elasticsearch(client) => {
             let client = client.clone();
             drop(connections);
             elasticsearch_driver::find_documents(&client, collection, skip, limit, filter, sort).await
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            drop(connections);
+            easysearch_driver::find_documents(&client, collection, skip, limit, filter, sort).await
         }
         PoolKind::VectorDb(client) => {
             let client = client.clone();
@@ -393,10 +444,47 @@ pub async fn find_documents_core(
             if let Some(projection) = projection {
                 params["projection"] = serde_json::json!(projection);
             }
-            client.mongo_find_documents(params).await
+            if let Some(collation) = collation {
+                params["collation"] = serde_json::json!(collation);
+            }
+            match client.mongo_find_documents_extended_json(params.clone()).await {
+                Ok(result) => Ok(result),
+                Err(error) if is_unknown_agent_method_error(&error, "find_documents_extended_json") => {
+                    client.mongo_find_documents(params).await
+                }
+                Err(error) => Err(error),
+            }
         }
         _ => Err("Not a MongoDB/Elasticsearch/vector connection".to_string()),
     }
+}
+
+pub async fn count_elasticsearch_documents_core(
+    state: &AppState,
+    connection_id: &str,
+    index: &str,
+    filter: Option<&str>,
+) -> Result<u64, String> {
+    ensure_document_pool(state, connection_id).await?;
+    let connections = state.connections.read().await;
+    match connections.get(connection_id).ok_or("Not found")? {
+        PoolKind::Elasticsearch(client) => {
+            let client = client.clone();
+            drop(connections);
+            elasticsearch_driver::count_documents(&client, index, filter).await
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            drop(connections);
+            easysearch_driver::count_documents(&client, index, filter).await
+        }
+        _ => Err("Not an Elasticsearch connection".to_string()),
+    }
+}
+
+fn is_unknown_agent_method_error(error: &str, method: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains(method) && (lower.contains("unknown method") || lower.contains("method not found"))
 }
 
 pub async fn insert_document_core(
@@ -405,6 +493,7 @@ pub async fn insert_document_core(
     database: &str,
     collection: &str,
     doc_json: &str,
+    routing: Option<&str>,
 ) -> Result<String, String> {
     ensure_document_pool(state, connection_id).await?;
     let connections = state.connections.read().await;
@@ -413,7 +502,12 @@ pub async fn insert_document_core(
         PoolKind::Elasticsearch(client) => {
             let client = client.clone();
             drop(connections);
-            elasticsearch_driver::insert_document(&client, collection, doc_json).await
+            elasticsearch_driver::insert_document(&client, collection, doc_json, routing).await
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            drop(connections);
+            easysearch_driver::insert_document(&client, collection, doc_json, routing).await
         }
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
@@ -450,6 +544,11 @@ pub async fn update_document_core(
             // as was used to index the document.
             elasticsearch_driver::update_document(&client, collection, id, doc_json, routing).await
         }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            drop(connections);
+            easysearch_driver::update_document(&client, collection, id, doc_json, routing).await
+        }
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             let result: serde_json::Value = client
@@ -474,6 +573,18 @@ pub async fn delete_document_core(
     id: &str,
     routing: Option<&str>,
 ) -> Result<u64, String> {
+    delete_document_core_with_type(state, connection_id, database, collection, id, routing, None).await
+}
+
+pub async fn delete_document_core_with_type(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+    id: &str,
+    routing: Option<&str>,
+    document_type: Option<&str>,
+) -> Result<u64, String> {
     ensure_document_pool(state, connection_id).await?;
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
@@ -483,7 +594,12 @@ pub async fn delete_document_core(
             drop(connections);
             // Elasticsearch requires the same custom routing value for writes
             // as was used to index the document.
-            elasticsearch_driver::delete_document(&client, collection, id, routing).await
+            elasticsearch_driver::delete_document(&client, collection, id, document_type, routing).await
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            drop(connections);
+            easysearch_driver::delete_document(&client, collection, id, document_type, routing).await
         }
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
@@ -498,9 +614,11 @@ pub async fn delete_document_core(
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_mongo_database, filter_and_sort_gridfs_bucket_infos, mongo_gridfs_bucket_names,
-        mongo_list_databases_unauthorized, parse_gridfs_bucket_sort, sort_names, MongoGridFsBucketInfo,
+        fallback_mongo_database, filter_and_sort_gridfs_bucket_infos, mongo_collection_specs_from_agent_response,
+        mongo_gridfs_bucket_names, mongo_list_databases_unauthorized, parse_gridfs_bucket_sort, sort_names,
+        MongoGridFsBucketInfo,
     };
+    use crate::db::mongo_driver::MongoCollectionKind;
 
     #[test]
     fn sorts_names_case_insensitively() {
@@ -543,6 +661,27 @@ mod tests {
         ]);
 
         assert_eq!(buckets, vec!["orders".to_string(), "reports".to_string()]);
+    }
+
+    #[test]
+    fn decodes_legacy_collection_names_and_type_aware_specs() {
+        let specs = mongo_collection_specs_from_agent_response(serde_json::json!([
+            "orders",
+            { "name": "report_view", "kind": "view" },
+            { "name": "metrics", "kind": "timeseries" },
+            { "name": "future_kind", "kind": "unknown" }
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            specs.into_iter().map(|spec| (spec.name, spec.kind)).collect::<Vec<_>>(),
+            vec![
+                ("orders".to_string(), MongoCollectionKind::Collection),
+                ("report_view".to_string(), MongoCollectionKind::View),
+                ("metrics".to_string(), MongoCollectionKind::Timeseries),
+                ("future_kind".to_string(), MongoCollectionKind::Collection),
+            ]
+        );
     }
 
     #[test]

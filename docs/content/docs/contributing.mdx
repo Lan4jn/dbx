@@ -33,6 +33,8 @@ If nobody is working on the issue, post this as a standalone comment:
 
 The claim workflow assigns the issue to you when it is available. If your proposed solution changes existing behavior, explain the approach briefly in the issue before making a large patch.
 
+If you later cannot continue, post `/unclaim` as a standalone comment (`/unclaimed` is also accepted). The workflow removes only your own assignment so another contributor can claim the issue.
+
 ## 2. Install the Toolchain
 
 DBX Desktop uses Tauri, Vue, and Rust. The repository currently requires:
@@ -41,7 +43,7 @@ DBX Desktop uses Tauri, Vue, and Rust. The repository currently requires:
 | --- | --- |
 | Node.js | 22.13.0 or newer |
 | pnpm | 10.27.0 |
-| Rust | 1.77 or newer |
+| Rust | 1.88 or newer |
 | Git | Current stable version |
 | Make | Recommended on macOS and Linux |
 
@@ -151,11 +153,15 @@ make
 
 `make` installs dependencies from the lockfile and starts the Tauri desktop development environment. The first Rust build can take a while; later starts are much faster.
 
-If your change does not involve DuckDB, skip the DuckDB source build:
+For a lightweight desktop build, keep DuckDB sidecar support while skipping the other default Rust features:
 
 ```bash
 make dev-fast
 ```
+
+Development builds can run alongside an installed DBX instance. Both use the same local DBX data, so connections and history are available in each window. Avoid changing the same connection, saved SQL, or global setting in both windows at once.
+
+When testing the MCP bridge, the instance started last owns the shared `mcp-bridge-port` discovery file and receives MCP requests. Redis PubSub prefers port `4224` (or `DBX_PORT` when set) and automatically falls back to an available local port; the frontend uses the actual bound port.
 
 ### Windows
 
@@ -166,10 +172,10 @@ pnpm install --frozen-lockfile
 pnpm dev:tauri
 ```
 
-To skip DuckDB:
+For the same lightweight build:
 
 ```powershell
-pnpm tauri dev -- --no-default-features
+pnpm tauri dev -- --no-default-features --features duckdb-sidecar
 ```
 
 ### Confirm the Environment Works
@@ -181,6 +187,19 @@ A successful run opens the DBX desktop window without a compiler error in the te
 3. Close and start the app again to confirm the setup is repeatable
 
 If port `1420` is already in use, stop the previous DBX/Vite development process and restart.
+
+## Local database test environments
+
+Changes to a database driver, connection flow, metadata query, or database-specific UI should be checked against a real instance when possible. The repository provides pinned local Docker Compose recipes for this purpose:
+
+```bash
+make db-list
+make db DB=mysql@8.4
+make db-verify DB=mysql@8.4
+make db-down DB=mysql@8.4
+```
+
+The service ports listen on `127.0.0.1` by default. Set `DB_BIND_ADDRESS=0.0.0.0`, choose a strong `DB_PASSWORD`, and use firewall controls before exposing a host to a shared network. See the [Database Test Lab](/en/docs/database-lab) for all supported recipes, overrides, and reset safety requirements.
 
 ## 5. Understand the Repository Layout
 
@@ -233,6 +252,15 @@ Open the local address printed in the terminal. When adding a page, also registe
 docs/content/docs/meta.json
 docs/content/docs/meta.cn.json
 ```
+
+Run the fast content check and then the full documentation build before submitting:
+
+```bash
+pnpm --dir docs content:check
+make docs-build
+```
+
+`content:check` verifies bilingual page pairs, navigation coverage and ordering, frontmatter, duplicate titles, and internal links. `make docs-build` runs the check again and validates the Next.js production build.
 
 ### Path B: Change the Desktop Frontend
 
@@ -312,7 +340,7 @@ Restart DBX or disconnect and reconnect the database so the old agent process ex
 #### When to Change `agents/versions.json`
 
 <Callout type="warn">
-  Do not edit `agents/versions.json` when changing an existing driver. The agent release workflow compares against the previous `agents-v*` tag and automatically increments the patch version of changed modules.
+  Do not edit `agents/versions.json` when changing an existing driver. The agent release workflow compares runtime files against the previous `agents-v*` tag, uses that release's post-release version-sync commit as the effective version baseline, and automatically increments the patch version of changed modules. Unchanged modules reuse verified artifacts from the previous immutable release.
 </Callout>
 
 - A change under `agents/drivers/<module>/` automatically bumps that module during release
@@ -326,7 +354,7 @@ Normal bug-fix pull requests do not manually bump a version to make the change t
 
 #### Native Agents
 
-Native agents such as `oracle` and `xugu` use an `agent` executable instead of `agent.jar`. Run the Go tests and build from the module, then follow its README to replace the local runtime executable:
+Native agents such as `oracle`, `kingbase`, and `xugu` use an `agent` executable instead of `agent.jar`. Run the Go tests and build from the module, then follow its README to replace the local runtime executable:
 
 ```bash
 cd agents/drivers/<native-module>
@@ -404,6 +432,8 @@ The pull request description should include:
 
 If CI fails, open the failed job and inspect its logs. Push the fix to the same branch; you do not need to create another pull request.
 
+When your linked PR has been merged into the default branch but the issue remains open, post `/close` as a standalone issue comment. The workflow only closes the issue when you are its current assignee and the author of a merged PR that cross-references the issue.
+
 ## 10. Update the Pull Request After Review
 
 Continue working on the same branch after receiving review feedback:
@@ -430,7 +460,7 @@ git push --force-with-lease
 
 ### The First Rust Build Is Slow
 
-This is expected. Use `make dev-fast`, `make cargo-check-fast`, and `make cargo-test-fast` when DuckDB is not part of the change.
+This is expected. Use `make dev-fast` for a lightweight desktop build that still supports DuckDB. `make cargo-check-fast` and `make cargo-test-fast` skip all optional default features, so they do not validate DuckDB-specific paths.
 
 ### pnpm Reports the Wrong Version
 

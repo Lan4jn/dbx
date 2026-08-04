@@ -103,7 +103,7 @@ pub(super) fn validate_tdengine_inserted_rows(options: &DataGridSaveStatementOpt
     if options
         .new_rows
         .iter()
-        .any(|row| tdengine_tbname_value(&save_columns, row).map_or(true, |tbname| tbname.trim().is_empty()))
+        .any(|row| tdengine_tbname_value(&save_columns, row).is_none_or(|tbname| tbname.trim().is_empty()))
     {
         return Some(tdengine_insert_identity_error());
     }
@@ -134,7 +134,9 @@ pub(super) fn validate_tdengine_existing_rows(options: &DataGridSaveStatementOpt
             column.as_deref().is_some_and(|column| column.eq_ignore_ascii_case(DBX_TDENGINE_TBNAME_COLUMN))
         }))
         || primary_keys.is_empty()
-        || primary_keys.iter().any(|primary_key| find_column_index(&save_columns, primary_key).is_none())
+        || primary_keys
+            .iter()
+            .any(|primary_key| find_column_index(options.database_type, &save_columns, primary_key).is_none())
     {
         return Some(tdengine_row_identity_error());
     }
@@ -155,12 +157,11 @@ pub(super) fn validate_tdengine_existing_rows(options: &DataGridSaveStatementOpt
         let Some(row) = options.rows.get(row_index) else {
             return Some(tdengine_row_identity_error());
         };
-        if (requires_tbname
-            && tdengine_tbname_value(&save_columns, row).map_or(true, |tbname| tbname.trim().is_empty()))
+        if (requires_tbname && tdengine_tbname_value(&save_columns, row).is_none_or(|tbname| tbname.trim().is_empty()))
             || primary_keys.iter().any(|primary_key| {
-                find_column_index(&save_columns, primary_key)
+                find_column_index(options.database_type, &save_columns, primary_key)
                     .and_then(|index| row.get(index))
-                    .map_or(true, Value::is_null)
+                    .is_none_or(Value::is_null)
             })
         {
             return Some(tdengine_row_identity_error());
@@ -187,6 +188,7 @@ fn build_tdengine_delete_statement(
         save_columns,
         row,
         options.table_meta.columns.as_deref().unwrap_or(&[]),
+        None,
     );
     if where_clause.is_empty() {
         return None;
@@ -281,7 +283,7 @@ fn tdengine_tbname_value(save_columns: &[Option<String>], row: &[Value]) -> Opti
 
 fn tdengine_can_insert_column(column: &str, table_name: &str, tbname: Option<&str>, tag_columns: &[String]) -> bool {
     let normalized = column.to_ascii_lowercase();
-    let target_is_child_table = tbname.map_or(true, |tbname| tbname == table_name);
+    let target_is_child_table = tbname.is_none_or(|tbname| tbname == table_name);
     if !target_is_child_table {
         return true;
     }

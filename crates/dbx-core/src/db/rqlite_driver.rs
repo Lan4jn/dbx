@@ -297,12 +297,15 @@ pub async fn execute_query_with_max_rows(
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
         })
     }
 }
@@ -346,12 +349,15 @@ fn query_result_from_rqlite_result(
         columns: result.columns,
         column_types: Vec::new(),
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows: result.values,
         affected_rows: 0,
         execution_time_ms,
         truncated,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
     }
 }
 

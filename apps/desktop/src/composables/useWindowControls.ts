@@ -31,21 +31,22 @@ export function shouldReserveMacTrafficLightInset(isMac: boolean, isFullscreen: 
   return isDesktop && isMac && !isFullscreen;
 }
 
-export function shouldShowWindowControls(isMac: boolean, isDesktop = true, nativeDecorations = false): boolean {
-  return isDesktop && !isMac && !nativeDecorations;
+export function shouldShowWindowControls(isMac: boolean, isDesktop = true): boolean {
+  return isDesktop && !isMac;
 }
 
-export function shouldDrawDesktopWindowFrame(isMac: boolean, isDesktop = true): boolean {
-  return isDesktop && !isMac;
+export function shouldDrawDesktopWindowFrame(isMac: boolean, isDesktop = true, isWindows = false): boolean {
+  // Windows frameless+shadow windows already get a DWM 1px border on all sides.
+  // An extra CSS top hairline stacks on that edge and no longer matches left/right/bottom.
+  return isDesktop && !isMac && !isWindows;
 }
 
 export function useWindowControls() {
   const isMaximized = ref(false);
   const isFullscreen = ref(false);
-  const nativeDecorations = ref(false);
   const isMac = isMacOS();
   const isDesktop = isTauriRuntime();
-  const showControls = ref(shouldShowWindowControls(isMac, isDesktop, nativeDecorations.value));
+  const showControls = shouldShowWindowControls(isMac, isDesktop);
 
   let unlisten: (() => void) | null = null;
 
@@ -76,12 +77,6 @@ export function useWindowControls() {
 
   onMounted(async () => {
     if (!isDesktop) return;
-    try {
-      nativeDecorations.value = await api.useNativeWindowDecorations();
-      showControls.value = shouldShowWindowControls(isMac, isDesktop, nativeDecorations.value);
-    } catch {
-      showControls.value = shouldShowWindowControls(isMac, isDesktop, false);
-    }
     await updateWindowState();
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const unlistenFn = await getCurrentWindow().onResized(() => {

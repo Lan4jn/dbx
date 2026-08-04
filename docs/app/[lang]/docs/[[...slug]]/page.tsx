@@ -1,7 +1,7 @@
 import { source } from "@/lib/source";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
-import { DocsPage, DocsBody, DocsTitle, DocsDescription } from "fumadocs-ui/page";
+import { DocsPage, DocsBody, DocsTitle } from "fumadocs-ui/page";
 import defaultMdxComponents from "fumadocs-ui/mdx";
 import { Tab, Tabs } from "fumadocs-ui/components/tabs";
 import { Step, Steps } from "fumadocs-ui/components/steps";
@@ -88,15 +88,16 @@ export default async function Page({ params }: { params: Promise<{ lang: string;
   };
 
   return (
-    <DocsPage toc={toc}>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }} />
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(articleJsonLd) }} />
-      <DocsTitle>{title}</DocsTitle>
-      <DocsDescription>{description}</DocsDescription>
-      <DocsBody>
-        <MDX components={mdxComponents} />
-      </DocsBody>
-    </DocsPage>
+    <main className="contents">
+      <DocsPage toc={toc}>
+        <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }} />
+        <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(articleJsonLd) }} />
+        <DocsTitle>{title}</DocsTitle>
+        <DocsBody>
+          <MDX components={mdxComponents} />
+        </DocsBody>
+      </DocsPage>
+    </main>
   );
 }
 

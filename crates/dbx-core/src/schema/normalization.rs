@@ -133,7 +133,7 @@ fn merge_optional_string(target: &mut Option<String>, candidate: Option<String>)
         }
         return;
     }
-    if target.as_ref().map_or(true, |value| value.trim().is_empty()) {
+    if target.as_ref().is_none_or(|value| value.trim().is_empty()) {
         *target = Some(candidate);
     }
 }
@@ -159,6 +159,7 @@ mod tests {
             database: Some("demo".to_string()),
             visible_databases: None,
             visible_schemas: None,
+            show_system_schemas: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -235,6 +236,7 @@ mod tests {
                 name: "orders".to_string(),
                 object_type: "BASE TABLE".to_string(),
                 schema: None,
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -246,6 +248,7 @@ mod tests {
                 name: "active_orders".to_string(),
                 object_type: "MATERIALIZED_VIEW".to_string(),
                 schema: None,
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -257,6 +260,7 @@ mod tests {
                 name: "payroll".to_string(),
                 object_type: "PACKAGE BODY".to_string(),
                 schema: None,
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -308,6 +312,7 @@ mod tests {
                 name: "ORDERS".to_string(),
                 object_type: "TABLE".to_string(),
                 schema: Some("HR".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
@@ -319,6 +324,7 @@ mod tests {
                 name: "bin$deleted".to_string(),
                 object_type: "TABLE".to_string(),
                 schema: Some("HR".to_string()),
+                valid: None,
                 signature: None,
                 comment: None,
                 created_at: None,
