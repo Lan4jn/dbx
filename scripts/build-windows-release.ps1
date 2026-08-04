@@ -66,7 +66,7 @@ function Ensure-Signature {
   }
   $password = $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
   if ($null -eq $password) { $password = "" }
-  pnpm tauri signer sign --private-key-path $SigningKeyPath --password $password $InstallerPath
+  pnpm tauri signer sign --password $password $InstallerPath | Out-Host
   Assert-LastExitCode "Signing $InstallerPath"
   return $signaturePath
 }
