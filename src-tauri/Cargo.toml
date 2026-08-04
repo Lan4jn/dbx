@@ -18,6 +18,7 @@ duckdb-sidecar = ["dbx-core/duckdb-sidecar"]
 mq-admin = ["dbx-core/mq-admin"]
 sqlite-sqlcipher = ["dbx-core/sqlite-sqlcipher"]
 system-fonts = ["dbx-core/system-fonts"]
+legacy-native-window-decorations = []
 
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
