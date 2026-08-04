@@ -186,7 +186,29 @@ fn resolve_data_dir_from_inputs(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{alternative_data_dir, resolve_data_dir_from_inputs, DataDirMode};
+    use super::{
+        alternative_data_dir, clear_configured_data_dir, default_home_data_dir, load_configured_data_dir,
+        resolve_data_dir_from_inputs, save_configured_data_dir, DataDirMode,
+    };
+
+    #[test]
+    fn default_data_dir_is_home_dbx() {
+        assert_eq!(default_home_data_dir(PathBuf::from("/Users/alice")), PathBuf::from("/Users/alice/.dbx"));
+    }
+
+    #[test]
+    fn configured_data_dir_helpers_round_trip() {
+        let config_dir = std::env::temp_dir().join(format!("dbx-data-dir-test-{}", std::process::id()));
+        let data_dir = config_dir.join("custom-data");
+        let _ = std::fs::remove_dir_all(&config_dir);
+
+        save_configured_data_dir(&config_dir, &data_dir).unwrap();
+        assert_eq!(load_configured_data_dir(&config_dir), Some(data_dir));
+
+        clear_configured_data_dir(&config_dir).unwrap();
+        assert_eq!(load_configured_data_dir(&config_dir), None);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
 
     #[test]
     fn uses_portable_data_dir_when_marker_exists_without_installer_marker() {
