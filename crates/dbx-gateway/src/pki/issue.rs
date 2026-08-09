@@ -9,6 +9,7 @@ use rcgen::{
 };
 use time::OffsetDateTime;
 use x509_parser::pem::parse_x509_pem;
+use x509_parser::prelude::parse_x509_certificate;
 use zeroize::Zeroizing;
 
 use super::store::{load_issuer, pki_error, read_certificate, record_issued_certificate};
@@ -87,6 +88,7 @@ impl PkiStore {
                 .try_into()
                 .map_err(|_| pki_error("invalid edge identity"))?,
         )];
+        validate_issuer_validity(&self.data_dir, CertificateRole::Edge, params.not_after)?;
         let issuer = load_issuer(&self.data_dir, CertificateRole::Edge.as_str(), ca_password)?;
         let certificate =
             params.signed_by(&csr.public_key, &issuer).map_err(|_| pki_error("could not issue edge certificate"))?;
@@ -145,11 +147,28 @@ impl PkiStore {
         ca_password: &Zeroizing<String>,
     ) -> Result<IssuedKeyPair, GatewayError> {
         let serial = params.serial_number.clone();
+        validate_issuer_validity(&self.data_dir, role, params.not_after)?;
         let issuer = load_issuer(&self.data_dir, role.as_str(), ca_password)?;
         let certificate = params.signed_by(key, &issuer).map_err(|_| pki_error("could not issue certificate"))?;
         let issued = issued_certificate(&self.data_dir, role, identity, certificate.pem(), serial)?;
         Ok(IssuedKeyPair { issued, private_key_pem: Zeroizing::new(key.serialize_pem()) })
     }
+}
+
+fn validate_issuer_validity(
+    data_dir: &std::path::Path,
+    role: CertificateRole,
+    leaf_not_after: OffsetDateTime,
+) -> Result<(), GatewayError> {
+    let certificate_pem = read_certificate(data_dir, role.as_str())?;
+    let (_, pem) =
+        parse_x509_pem(certificate_pem.as_bytes()).map_err(|_| pki_error("could not parse CA certificate validity"))?;
+    let (_, certificate) =
+        parse_x509_certificate(&pem.contents).map_err(|_| pki_error("could not parse CA certificate validity"))?;
+    if leaf_not_after > certificate.validity().not_after.to_datetime() {
+        return Err(pki_error("certificate validity exceeds the issuing CA"));
+    }
+    Ok(())
 }
 
 fn leaf_params(name: &str, validity: time::Duration) -> Result<CertificateParams, GatewayError> {

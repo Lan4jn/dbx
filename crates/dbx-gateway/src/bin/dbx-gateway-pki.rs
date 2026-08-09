@@ -1,4 +1,6 @@
 use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -167,6 +169,7 @@ fn dispatch(cli: Cli) -> Result<String, GatewayError> {
 
 fn issue_server(args: ServerIssueArgs) -> Result<String, GatewayError> {
     let password = read_password_file(&args.password_file)?;
+    prepare_output_dir(&args.output_dir)?;
     let store = PkiStore::open(&args.data_dir)?;
     let dns_sans = args.dns_sans.iter().map(String::as_str).collect::<Vec<_>>();
     let issued = store.issue_server(
@@ -178,7 +181,6 @@ fn issue_server(args: ServerIssueArgs) -> Result<String, GatewayError> {
         },
         &password,
     )?;
-    prepare_output_dir(&args.output_dir)?;
     write_output_file(&args.output_dir.join("certificate.pem"), issued.issued.certificate_pem.as_bytes(), 0o644)?;
     write_output_file(&args.output_dir.join("chain.pem"), issued.issued.chain_pem.as_bytes(), 0o644)?;
     write_output_file(&args.output_dir.join("private-key.pem"), issued.private_key_pem.as_bytes(), 0o600)?;
@@ -188,6 +190,7 @@ fn issue_server(args: ServerIssueArgs) -> Result<String, GatewayError> {
 fn issue_client(args: ClientIssueArgs) -> Result<String, GatewayError> {
     let password = read_password_file(&args.password_file)?;
     let bundle_password = read_password_file(&args.bundle_password_file)?;
+    prepare_output_dir(&args.output_dir)?;
     let store = PkiStore::open(&args.data_dir)?;
     let issued = store.issue_client(
         ClientIssueRequest {
@@ -197,7 +200,6 @@ fn issue_client(args: ClientIssueArgs) -> Result<String, GatewayError> {
         },
         &password,
     )?;
-    prepare_output_dir(&args.output_dir)?;
     write_output_file(
         &args.output_dir.join("certificate.pem"),
         issued.key_pair.issued.certificate_pem.as_bytes(),
@@ -212,12 +214,12 @@ fn issue_client(args: ClientIssueArgs) -> Result<String, GatewayError> {
 fn issue_edge(args: EdgeIssueArgs) -> Result<String, GatewayError> {
     let password = read_password_file(&args.password_file)?;
     let csr = fs::read(&args.csr).map_err(|_| pki_error("could not read edge CSR"))?;
+    prepare_output_dir(&args.output_dir)?;
     let store = PkiStore::open(&args.data_dir)?;
     let issued = store.issue_edge(
         EdgeIssueRequest { edge_id: &args.identity, csr_der: &csr, validity: time::Duration::days(365) },
         &password,
     )?;
-    prepare_output_dir(&args.output_dir)?;
     write_output_file(&args.output_dir.join("certificate.pem"), issued.certificate_pem.as_bytes(), 0o644)?;
     write_output_file(&args.output_dir.join("chain.pem"), issued.chain_pem.as_bytes(), 0o644)?;
     Ok(format!("issued edge certificate {}", issued.serial_hex))
@@ -232,18 +234,28 @@ fn revoke(role: CertificateRole, args: RevokeArgs) -> Result<String, GatewayErro
 }
 
 fn read_password_file(path: &Path) -> Result<Zeroizing<String>, GatewayError> {
-    let metadata = fs::metadata(path).map_err(|_| pki_error("could not read password file"))?;
-    if !metadata.file_type().is_file() {
-        return Err(pki_error("password file must be a regular file"));
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| pki_error("could not read password file"))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.file_type().is_file() {
+        return Err(pki_error("password file must be a real regular file"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o7777 != 0o600 {
+        if path_metadata.permissions().mode() & 0o7777 != 0o600 {
             return Err(pki_error("password file permissions must be 0600"));
         }
     }
-    let mut password = fs::read_to_string(path).map_err(|_| pki_error("could not read password file"))?;
+    let mut file = File::open(path).map_err(|_| pki_error("could not read password file"))?;
+    let opened_metadata = file.metadata().map_err(|_| pki_error("could not inspect password file"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != opened_metadata.dev() || path_metadata.ino() != opened_metadata.ino() {
+            return Err(pki_error("password file changed while opening"));
+        }
+    }
+    let mut password = String::new();
+    file.read_to_string(&mut password).map_err(|_| pki_error("could not read password file"))?;
     if let Some(stripped) = password.strip_suffix("\r\n") {
         password.truncate(stripped.len());
     } else if password.ends_with('\n') {
@@ -256,7 +268,20 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>, GatewayError> {
 }
 
 fn prepare_output_dir(path: &Path) -> Result<(), GatewayError> {
-    fs::create_dir_all(path).map_err(|_| pki_error("could not create output directory"))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(pki_error("output path must be a real directory"));
+            }
+            if fs::read_dir(path).map_err(|_| pki_error("could not inspect output directory"))?.next().is_some() {
+                return Err(pki_error("output directory must be empty"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|_| pki_error("could not create output directory"))?;
+        }
+        Err(_) => return Err(pki_error("could not inspect output directory")),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -272,7 +297,7 @@ fn pki_error(message: &str) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{read_password_file, Cli};
     use clap::CommandFactory;
 
     #[test]
@@ -289,6 +314,28 @@ mod tests {
         }
         assert!(Cli::command().get_version().is_some());
         assert_no_plaintext_password_argument(&Cli::command());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_files_must_not_be_symbolic_links() {
+        use std::fs;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = std::env::temp_dir().join(format!(
+            "dbx-gateway-password-test-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("password.txt");
+        fs::write(&target, "secret").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.join("password-link.txt");
+        symlink(&target, &link).unwrap();
+
+        assert!(read_password_file(&link).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn assert_no_plaintext_password_argument(command: &clap::Command) {

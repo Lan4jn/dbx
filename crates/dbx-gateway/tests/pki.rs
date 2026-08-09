@@ -1,10 +1,12 @@
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use std::net::{IpAddr, Ipv4Addr};
 
 use dbx_gateway::pki::{
-    CertificateRole, ClientIssueRequest, EdgeIssueRequest, PkiStore, RevocationReason, ServerIssueRequest,
+    write_output_file, CertificateRole, ClientIssueRequest, EdgeIssueRequest, PkiStore, RevocationReason,
+    ServerIssueRequest,
 };
 use p12_keystore::KeyStore;
 use pkcs8::der::Decode;
@@ -54,6 +56,27 @@ fn initialization_fails_closed_for_existing_pki_and_empty_password() {
     assert!(PkiStore::init(&data_dir, &password).is_err());
     assert_eq!(fs::read(store.root_certificate_path()).unwrap(), root_before);
     assert!(PkiStore::init(&temp_dir(), &Zeroizing::new(String::new())).is_err());
+
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn concurrent_initialization_publishes_one_complete_pki() {
+    let data_dir = temp_dir();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [(), ()].map(|()| {
+        let data_dir = data_dir.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            PkiStore::init(&data_dir, &Zeroizing::new("ca-password".to_string()))
+        })
+    });
+    let [first, second] = handles;
+    let results = [first.join().unwrap(), second.join().unwrap()];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(PkiStore::open(&data_dir).is_ok());
 
     fs::remove_dir_all(data_dir).unwrap();
 }
@@ -116,6 +139,11 @@ fn issues_role_limited_certificates_and_modern_client_bundle() {
     csr_params.distinguished_name.push(DnType::CommonName, "attacker-controlled");
     csr_params.subject_alt_names.push(SanType::URI("urn:dbx-gateway:edge:attacker".try_into().unwrap()));
     let csr = csr_params.serialize_request(&csr_key).unwrap();
+    let mut tampered_csr = csr.der().to_vec();
+    *tampered_csr.last_mut().unwrap() ^= 1;
+    assert!(store
+        .issue_edge(EdgeIssueRequest { edge_id: "edge-prod-01", csr_der: &tampered_csr, validity }, &ca_password,)
+        .is_err());
     let edge = store
         .issue_edge(EdgeIssueRequest { edge_id: "edge-prod-01", csr_der: csr.der(), validity }, &ca_password)
         .unwrap();
@@ -188,6 +216,53 @@ fn issues_role_limited_certificates_and_modern_client_bundle() {
 }
 
 #[test]
+fn rejects_leaf_validity_beyond_the_issuing_ca() {
+    let data_dir = temp_dir();
+    let ca_password = Zeroizing::new("ca-password".to_string());
+    let store = PkiStore::init(&data_dir, &ca_password).unwrap();
+
+    let result = store.issue_server(
+        ServerIssueRequest {
+            name: "main",
+            dns_sans: &["gateway.example.com"],
+            ip_sans: &[],
+            validity: time::Duration::days(4000),
+        },
+        &ca_password,
+    );
+
+    assert!(result.err().unwrap().message.contains("validity"));
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_pki_rejects_symlinked_private_keys() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = temp_dir();
+    let ca_password = Zeroizing::new("ca-password".to_string());
+    PkiStore::init(&data_dir, &ca_password).unwrap();
+    let edge_key = data_dir.join("edge/ca.key.encrypted.pem");
+    fs::remove_file(&edge_key).unwrap();
+    symlink(data_dir.join("server/ca.key.encrypted.pem"), &edge_key).unwrap();
+
+    assert!(PkiStore::open(&data_dir).is_err());
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn output_files_are_not_overwritten() {
+    let data_dir = temp_dir();
+    let output = data_dir.join("private-key.pem");
+    fs::write(&output, b"existing secret").unwrap();
+
+    assert!(write_output_file(&output, b"replacement", 0o600).is_err());
+    assert_eq!(fs::read(&output).unwrap(), b"existing secret");
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
 fn revocation_persists_and_generates_a_signed_monotonic_crl() {
     let data_dir = temp_dir();
     let ca_password = Zeroizing::new("ca-password".to_string());
@@ -254,6 +329,90 @@ fn revocation_persists_and_generates_a_signed_monotonic_crl() {
     assert!(store
         .revoke(CertificateRole::Server, &"aa".repeat(21), RevocationReason::Unspecified, &ca_password,)
         .is_err());
+
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn revocation_recovers_when_record_was_committed_before_crl() {
+    let data_dir = temp_dir();
+    let ca_password = Zeroizing::new("ca-password".to_string());
+    let store = PkiStore::init(&data_dir, &ca_password).unwrap();
+    let issued = store
+        .issue_server(
+            ServerIssueRequest {
+                name: "main",
+                dns_sans: &["gateway.example.com"],
+                ip_sans: &[],
+                validity: time::Duration::days(30),
+            },
+            &ca_password,
+        )
+        .unwrap();
+    let record_path = data_dir.join("server/issued").join(format!("{}.toml", issued.issued.serial_hex));
+    let mut record = fs::read_to_string(&record_path).unwrap().replace("revoked = false", "revoked = true");
+    record.push_str(&format!(
+        "revoked_at = {}\nreason = \"key_compromise\"\n",
+        time::OffsetDateTime::now_utc().unix_timestamp()
+    ));
+    fs::write(record_path, record).unwrap();
+
+    let crl = store
+        .revoke(CertificateRole::Server, &issued.issued.serial_hex, RevocationReason::KeyCompromise, &ca_password)
+        .unwrap();
+    let (_, pem) = parse_x509_pem(crl.pem.as_bytes()).unwrap();
+    let (_, parsed) = parse_x509_crl(&pem.contents).unwrap();
+    assert!(parsed
+        .iter_revoked_certificates()
+        .any(|entry| hex::encode(entry.user_certificate.to_bytes_be()) == issued.issued.serial_hex));
+
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn concurrent_revocations_preserve_all_entries_and_unique_numbers() {
+    let data_dir = temp_dir();
+    let ca_password = Zeroizing::new("ca-password".to_string());
+    let store = PkiStore::init(&data_dir, &ca_password).unwrap();
+    let validity = time::Duration::days(30);
+    let first = store
+        .issue_server(
+            ServerIssueRequest { name: "main-a", dns_sans: &["a.gateway.example.com"], ip_sans: &[], validity },
+            &ca_password,
+        )
+        .unwrap();
+    let second = store
+        .issue_server(
+            ServerIssueRequest { name: "main-b", dns_sans: &["b.gateway.example.com"], ip_sans: &[], validity },
+            &ca_password,
+        )
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let handles = [first.issued.serial_hex.clone(), second.issued.serial_hex.clone()].map(|serial| {
+        let data_dir = data_dir.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let store = PkiStore::open(&data_dir).unwrap();
+            let password = Zeroizing::new("ca-password".to_string());
+            barrier.wait();
+            store.revoke(CertificateRole::Server, &serial, RevocationReason::Unspecified, &password)
+        })
+    });
+    let [first_handle, second_handle] = handles;
+    let first_crl = first_handle.join().unwrap().unwrap();
+    let second_crl = second_handle.join().unwrap().unwrap();
+
+    assert_ne!(first_crl.number, second_crl.number);
+    let current_crl = fs::read(data_dir.join("server/crl.pem")).unwrap();
+    let (_, pem) = parse_x509_pem(&current_crl).unwrap();
+    let (_, parsed) = parse_x509_crl(&pem.contents).unwrap();
+    let revoked = parsed
+        .iter_revoked_certificates()
+        .map(|entry| hex::encode(entry.user_certificate.to_bytes_be()))
+        .collect::<Vec<_>>();
+    assert!(revoked.contains(&first.issued.serial_hex));
+    assert!(revoked.contains(&second.issued.serial_hex));
 
     fs::remove_dir_all(data_dir).unwrap();
 }
