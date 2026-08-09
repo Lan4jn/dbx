@@ -13,10 +13,15 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("dbx-gateway-config-{}-{id}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
+        loop {
+            let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("dbx-gateway-config-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create test directory: {error}"),
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -160,6 +165,26 @@ address = "10.0.0.8:5432"
 
     assert_eq!(error.code, GatewayErrorCode::ConfigInvalid);
     assert!(error.message.contains("allow_remote"));
+}
+
+#[test]
+fn rejects_tcp_target_port_zero() {
+    let dir = TempDir::new();
+    write_credentials(dir.path());
+    let config_path = dir.path().join("gateway.toml");
+    write_file(
+        &config_path,
+        &edge_config(
+            r#"[targets.postgres]
+address = "127.0.0.1:0"
+"#,
+        ),
+    );
+
+    let error = load_config_file(&config_path).unwrap_err();
+
+    assert_eq!(error.code, GatewayErrorCode::ConfigInvalid);
+    assert!(error.message.contains("port"));
 }
 
 #[test]

@@ -167,13 +167,16 @@ fn validate_target(target: &EdgeTarget) -> Result<(), GatewayError> {
 
 fn tcp_host(address: &str) -> Result<String, GatewayError> {
     if let Ok(socket) = address.parse::<SocketAddr>() {
+        if socket.port() == 0 {
+            return Err(config_error("target TCP port must be between 1 and 65535"));
+        }
         return Ok(socket.ip().to_string());
     }
 
     let (host, port) =
         address.rsplit_once(':').ok_or_else(|| config_error("target TCP address must contain a host and port"))?;
     let host = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')).unwrap_or(host);
-    if host.is_empty() || port.parse::<u16>().is_err() {
+    if host.is_empty() || !port.parse::<u16>().is_ok_and(|port| port > 0) {
         return Err(config_error("target TCP address must contain a valid host and port"));
     }
     Ok(host.to_string())
