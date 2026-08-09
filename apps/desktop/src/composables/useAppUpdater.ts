@@ -14,6 +14,8 @@ interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
 }
 
+const SELF_HOSTED_DOWNLOAD_URL = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
+
 export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
   return options.silent !== true;
 }
@@ -26,6 +28,14 @@ export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDow
   // Old persisted AtomGit preferences should retain their mainland mirror behavior.
   if (value === "atomgit") return "cnb";
   return value === "cnb" ? "cnb" : "official";
+}
+
+export function tagVersion(version: string): string {
+  return version.startsWith("v") ? version : `v${version}`;
+}
+
+export function resolveUpdateReleaseUrl(_info: api.UpdateInfo | null, _source: SettingsUpdateDownloadSource, _fallbackUrl: string): string {
+  return SELF_HOSTED_DOWNLOAD_URL;
 }
 
 export async function resolveUpdaterProxy(): Promise<string | undefined> {
@@ -54,7 +64,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const updateReady = ref(false);
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
   const hasUpdateAvailable = computed(() => updateInfo.value?.update_available === true);
-  const latestReleaseUrl = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
+  const latestReleaseUrl = SELF_HOSTED_DOWNLOAD_URL;
   let activeDownloadAttempt = 0;
   let pendingCancellation: Promise<void> | undefined;
 
