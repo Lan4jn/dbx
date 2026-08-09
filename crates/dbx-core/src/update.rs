@@ -5,7 +5,7 @@ const LATEST_JSON_R2_PATH: &str = "releases/latest/latest.json";
 const LATEST_JSON_CNB_PATH: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/latest/download/latest.json";
 const LATEST_EN_NOTES_R2_PATH: &str = "changelog/latest-en.json";
 const GITHUB_RELEASE_API_PREFIX: &str = "https://api.github.com/repos/t8y2/dbx/releases/tags/v";
-const RELEASE_URL_PREFIX: &str = "https://github.com/t8y2/dbx/releases/tag/v";
+const RELEASE_DOWNLOAD_PAGE: &str = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
 
 #[derive(Debug, Deserialize)]
 pub struct TauriRelease {
@@ -285,18 +285,13 @@ pub fn build_update_info(release: TauriRelease, current_version: &str) -> Update
         .and_then(|metadata| non_empty(metadata.name.as_deref()))
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("DBX v{latest_version}"));
-    let release_url = github
-        .and_then(|metadata| non_empty(metadata.html_url.as_deref()))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("{RELEASE_URL_PREFIX}{latest_version}"));
-
     UpdateInfo {
         update_available: is_newer_version(&latest_version, current_version),
         portable_mode: false,
         manual_update_only: false,
         current_version: current_version.to_string(),
         release_name,
-        release_url,
+        release_url: RELEASE_DOWNLOAD_PAGE.to_string(),
         release_notes,
         latest_version,
     }
@@ -450,7 +445,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     }
 
     #[test]
-    fn update_info_prefers_github_release_metadata() {
+    fn update_info_uses_github_metadata_and_self_hosted_download_page() {
         let release = TauriRelease {
             version: "0.5.3".to_string(),
             notes: Some("See the assets below to download and install.".to_string()),
@@ -466,7 +461,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         let info = build_update_info(release, "0.5.2");
 
         assert_eq!(info.release_name, "DBX v0.5.3");
-        assert_eq!(info.release_url, "https://github.com/t8y2/dbx/releases/tag/v0.5.3");
+        assert_eq!(info.release_url, "https://ser2.sjser.ccwu.cc:880/dbx/osx/");
         assert_eq!(info.release_notes, "### 新功能\n\n真实发布说明");
         assert!(!info.portable_mode);
     }
