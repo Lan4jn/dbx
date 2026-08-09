@@ -1925,11 +1925,13 @@ dependencies = [
  "pkcs8",
  "rcgen",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "time",
  "tokio-rustls 0.26.4",
  "tokio-tungstenite",
  "toml 0.8.2",
+ "uuid",
  "x509-parser",
  "zeroize",
 ]
