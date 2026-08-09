@@ -1,6 +1,8 @@
 #[cfg(feature = "server")]
 pub mod config;
 pub mod error;
+#[cfg(feature = "server")]
+pub mod pki;
 pub mod protocol;
 
 pub use error::{GatewayError, GatewayErrorCode};

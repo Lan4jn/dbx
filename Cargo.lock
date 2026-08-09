@@ -1919,8 +1919,10 @@ name = "dbx-gateway"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hex",
  "hyper-util",
  "p12-keystore",
+ "pkcs8",
  "rcgen",
  "serde",
  "thiserror 2.0.19",

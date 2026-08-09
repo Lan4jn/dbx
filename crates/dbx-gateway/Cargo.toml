@@ -8,8 +8,10 @@ license = "Apache-2.0"
 default = ["server"]
 server = [
     "dep:clap",
+    "dep:hex",
     "dep:hyper-util",
     "dep:p12-keystore",
+    "dep:pkcs8",
     "dep:rcgen",
     "dep:time",
     "dep:tokio-rustls",
@@ -34,9 +36,11 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 clap = { version = "4", features = ["derive"], optional = true }
+hex = { version = "0.4", optional = true }
 hyper-util = { version = "0.1", optional = true }
 p12-keystore = { version = "0.2", optional = true }
-rcgen = { version = "0.14", optional = true }
+pkcs8 = { version = "=0.11.0-rc.11", default-features = false, features = ["encryption", "pem"], optional = true }
+rcgen = { version = "0.14", features = ["x509-parser"], optional = true }
 time = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
