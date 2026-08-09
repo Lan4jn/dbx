@@ -1,0 +1,45 @@
+[package]
+name = "dbx-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+default = ["server"]
+server = [
+    "dep:clap",
+    "dep:hyper-util",
+    "dep:p12-keystore",
+    "dep:rcgen",
+    "dep:time",
+    "dep:tokio-rustls",
+    "dep:tokio-tungstenite",
+    "dep:toml",
+    "dep:x509-parser",
+    "dep:zeroize",
+]
+
+[[bin]]
+name = "dbx-gateway"
+path = "src/bin/dbx-gateway.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "dbx-gateway-pki"
+path = "src/bin/dbx-gateway-pki.rs"
+required-features = ["server"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+clap = { version = "4", features = ["derive"], optional = true }
+hyper-util = { version = "0.1", optional = true }
+p12-keystore = { version = "0.2", optional = true }
+rcgen = { version = "0.14", optional = true }
+time = { version = "0.3", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+toml = { version = "0.8", optional = true }
+x509-parser = { version = "0.18", optional = true }
+zeroize = { version = "1", features = ["derive"], optional = true }
