@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use dbx_gateway::{run_gateway_command, GatewayCommand};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "DBX database gateway")]
@@ -18,9 +20,19 @@ enum Command {
     CheckConfig,
 }
 
-fn main() -> Result<(), dbx_gateway::GatewayError> {
-    let _cli = Cli::parse();
-    dbx_gateway::command_not_implemented()
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let command = match cli.command {
+        Command::Serve => GatewayCommand::Serve,
+        Command::CheckConfig => GatewayCommand::CheckConfig,
+    };
+    let result = run_gateway_command(command, &cli.config);
+    if result.exit_code == 0 {
+        println!("{}", result.message);
+    } else {
+        eprintln!("{}", result.message);
+    }
+    ExitCode::from(result.exit_code)
 }
 
 #[cfg(test)]
