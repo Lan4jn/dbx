@@ -214,6 +214,23 @@ fn rejects_private_key_permissions_other_than_0600() {
     assert!(error.message.contains("0600"));
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_private_key_permissions_with_special_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new();
+    write_credentials(dir.path());
+    fs::set_permissions(dir.path().join("certs/server.key"), fs::Permissions::from_mode(0o1600)).unwrap();
+    let config_path = dir.path().join("gateway.toml");
+    write_file(&config_path, &main_config(""));
+
+    let error = load_config_file(&config_path).unwrap_err();
+
+    assert_eq!(error.code, GatewayErrorCode::ConfigInvalid);
+    assert!(error.message.contains("0600"));
+}
+
 #[test]
 fn check_config_uses_loader_and_maps_results_to_exit_codes() {
     let dir = TempDir::new();

@@ -201,7 +201,7 @@ fn validate_private_key_permissions(path: &Path) -> Result<(), GatewayError> {
         .map_err(|_| config_error("configuration private_key metadata could not be read"))?
         .permissions()
         .mode()
-        & 0o777;
+        & 0o7777;
     if mode != 0o600 {
         return Err(config_error("configuration private_key permissions must be 0600"));
     }
