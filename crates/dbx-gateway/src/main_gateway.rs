@@ -37,8 +37,8 @@ use crate::pki::{
 };
 use crate::protocol::{
     decode_client_message, decode_edge_data_open, decode_edge_message, decode_edge_registration, encode_control_frame,
-    ClientEvent, ClientMessage, EdgeToMain, MainToEdge, RegisteredTarget, SessionId, SessionTickets, Stage,
-    MAX_DATA_FRAME_SIZE,
+    ClientEvent, ClientMessage, EdgeToMain, GatewayEdgeRoutes, GatewayRoute, MainToEdge, RegisteredTarget, SessionId,
+    SessionTickets, Stage, MAX_DATA_FRAME_SIZE,
 };
 use crate::reverse_proxy::{empty_proxy_body, full_proxy_body, FixedUpstreamProxy, ProxyBody};
 use crate::state::GatewayState;
@@ -82,6 +82,7 @@ struct RouteConfig {
     enrollment: Option<Arc<MainEnrollmentConfig>>,
     allowed_edge_ids: HashSet<String>,
     revoked_edge_serials: HashSet<String>,
+    client_route_acl: BTreeMap<String, Vec<String>>,
     fallback: Option<Arc<FixedUpstreamProxy>>,
 }
 
@@ -370,6 +371,7 @@ fn build_runtime(config: &MainConfig) -> Result<MainRuntime, GatewayError> {
             enrollment: config.enrollment.clone().map(Arc::new),
             allowed_edge_ids: config.allowed_edge_ids.iter().cloned().collect(),
             revoked_edge_serials: config.revoked_edge_serials.iter().map(|serial| normalize_serial(serial)).collect(),
+            client_route_acl: config.client_route_acl.clone(),
             fallback: config.fallback_upstream.as_deref().map(FixedUpstreamProxy::new).transpose()?.map(Arc::new),
         }),
     })
@@ -467,7 +469,7 @@ async fn route(
                         Some(data_websocket_config()),
                     )
                     .await;
-                    run_dbx_connection(socket, permit, client_id, task_services, stop).await;
+                    run_dbx_connection(socket, permit, client_id, routes, task_services, stop).await;
                 });
                 track_task(&services.control_tasks, task);
                 return Ok(switching_protocols(version, accept_key));
@@ -835,6 +837,7 @@ async fn run_dbx_connection(
     mut socket: ServerSocket,
     _permit: OwnedSemaphorePermit,
     client_id: String,
+    routes: Arc<RouteConfig>,
     services: MainServices,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -854,10 +857,38 @@ async fn run_dbx_connection(
         close_control_socket(&mut socket).await;
         return;
     };
-    let Ok(ClientMessage::OpenRoute { edge_id, target_id, .. }) = decode_client_message(&frame) else {
+    let Ok(message) = decode_client_message(&frame) else {
         send_client_error(&mut socket, GatewayErrorCode::ProtocolMismatch).await;
         return;
     };
+    let ClientMessage::OpenRoute { edge_id, target_id, .. } = message else {
+        let entries = registry.read().await;
+        let edges = entries
+            .iter()
+            .map(|(edge_id, entry)| GatewayEdgeRoutes {
+                edge_id: edge_id.clone(),
+                online: entry.online,
+                routes: entry
+                    .targets
+                    .values()
+                    .filter(|target| {
+                        client_route_allowed(&routes.client_route_acl, &client_id, edge_id, &target.target_id)
+                    })
+                    .map(|target| GatewayRoute {
+                        target_id: target.target_id.clone(),
+                        display_name: target.display_name.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let _ = send_client_event(&mut socket, ClientEvent::Routes { edges }).await;
+        close_control_socket(&mut socket).await;
+        return;
+    };
+    if !client_route_allowed(&routes.client_route_acl, &client_id, &edge_id, &target_id) {
+        send_client_error(&mut socket, GatewayErrorCode::RouteDenied).await;
+        return;
+    }
     let route_control = {
         let entries = registry.read().await;
         match entries.get(&edge_id) {
@@ -954,6 +985,18 @@ async fn run_dbx_connection(
     let _ = relay_websockets(socket, edge_socket, Duration::from_secs(300), stream_stop).await;
     stop_task.abort();
     let _ = adjust_active_streams(&registry, &edge_id, connection_id, false, &mut stop).await;
+}
+
+fn client_route_allowed(acl: &BTreeMap<String, Vec<String>>, client_id: &str, edge_id: &str, target_id: &str) -> bool {
+    if acl.is_empty() {
+        return true;
+    }
+    acl.get(client_id).is_some_and(|rules| {
+        rules.iter().any(|rule| {
+            let Some((allowed_edge, allowed_target)) = rule.split_once('/') else { return false };
+            (allowed_edge == "*" || allowed_edge == edge_id) && (allowed_target == "*" || allowed_target == target_id)
+        })
+    })
 }
 
 async fn adjust_active_streams(

@@ -43,13 +43,28 @@ impl ProtocolVersion {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     OpenRoute { version: ProtocolVersion, request_id: Uuid, edge_id: String, target_id: String },
+    ListRoutes { version: ProtocolVersion, request_id: Uuid },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     Stage { stage: Stage },
+    Routes { edges: Vec<GatewayEdgeRoutes> },
     Error { code: GatewayErrorCode },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayRoute {
+    pub target_id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayEdgeRoutes {
+    pub edge_id: String,
+    pub online: bool,
+    pub routes: Vec<GatewayRoute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,7 +257,9 @@ pub fn decode_control_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, Gate
 pub fn decode_client_message(frame: &[u8]) -> Result<ClientMessage, GatewayError> {
     let message: ClientMessage = decode_control_frame(frame)?;
     match &message {
-        ClientMessage::OpenRoute { version, .. } => version.ensure_compatible()?,
+        ClientMessage::OpenRoute { version, .. } | ClientMessage::ListRoutes { version, .. } => {
+            version.ensure_compatible()?
+        }
     }
     Ok(message)
 }
@@ -329,8 +346,29 @@ mod tests {
         }))
         .unwrap();
 
-        let ClientMessage::OpenRoute { version, .. } = decode_client_message(&frame).unwrap();
+        let ClientMessage::OpenRoute { version, .. } = decode_client_message(&frame).unwrap() else {
+            panic!("expected open route");
+        };
         assert!(version.ensure_compatible().is_ok());
+    }
+
+    #[test]
+    fn route_discovery_round_trip_contains_only_logical_routes() {
+        let event = ClientEvent::Routes {
+            edges: vec![GatewayEdgeRoutes {
+                edge_id: "edge-prod-01".to_string(),
+                online: true,
+                routes: vec![GatewayRoute {
+                    target_id: "postgres-primary".to_string(),
+                    display_name: "Primary PostgreSQL".to_string(),
+                }],
+            }],
+        };
+
+        let frame = encode_control_frame(&event).unwrap();
+        let decoded: ClientEvent = decode_control_frame(&frame).unwrap();
+        assert_eq!(decoded, event);
+        assert!(!String::from_utf8(frame).unwrap().contains("5432"));
     }
 
     #[test]

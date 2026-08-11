@@ -119,6 +119,7 @@ impl Fixture {
             enrollment: None,
             allowed_edge_ids: Vec::new(),
             revoked_edge_serials: Vec::new(),
+            client_route_acl: BTreeMap::new(),
             fallback_upstream: None,
             health_listen: None,
             state_file: Some(dir.0.join("main-state.sqlite3")),
@@ -382,6 +383,62 @@ async fn control_restart_restores_only_offline_logical_routes() {
         ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::EdgeOffline }
     );
     restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_discovers_online_logical_routes_without_database_addresses() {
+    let mut fixture = Fixture::new();
+    fixture.config.client_route_acl.insert("desktop-routes".to_string(), vec!["edge-routes/postgres".to_string()]);
+    let gateway = fixture.start().await;
+    let edge = EdgeGateway::start(fixture.edge_config(gateway.local_addr(), "edge-routes")).unwrap();
+    wait_for_edge(&gateway, "edge-routes", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-routes"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    let request = ClientMessage::ListRoutes { version: ProtocolVersion::current(), request_id: uuid::Uuid::new_v4() };
+    socket.send(Message::Binary(encode_control_frame(&request).unwrap().into())).await.unwrap();
+
+    let Message::Binary(authenticated) = socket.next().await.unwrap().unwrap() else { panic!("expected stage") };
+    assert_eq!(
+        serde_json::from_slice::<ClientEvent>(&authenticated).unwrap(),
+        ClientEvent::Stage { stage: Stage::MainAuthenticated }
+    );
+    let Message::Binary(routes) = socket.next().await.unwrap().unwrap() else { panic!("expected routes") };
+    let event = serde_json::from_slice::<ClientEvent>(&routes).unwrap();
+    let ClientEvent::Routes { edges } = event else { panic!("expected routes event") };
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].edge_id, "edge-routes");
+    assert!(edges[0].online);
+    assert_eq!(edges[0].routes.iter().map(|route| route.target_id.as_str()).collect::<Vec<_>>(), ["postgres"]);
+    assert!(!String::from_utf8(routes.to_vec()).unwrap().contains("127.0.0.1"));
+
+    let mut denied = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    denied
+        .send(Message::Binary(
+            encode_control_frame(&ClientMessage::OpenRoute {
+                version: ProtocolVersion::current(),
+                request_id: uuid::Uuid::new_v4(),
+                edge_id: "edge-routes".to_string(),
+                target_id: "redis".to_string(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let _authenticated = denied.next().await.unwrap().unwrap();
+    let Message::Binary(error) = denied.next().await.unwrap().unwrap() else { panic!("expected error") };
+    assert_eq!(
+        serde_json::from_slice::<ClientEvent>(&error).unwrap(),
+        ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::RouteDenied }
+    );
+
+    edge.shutdown().await;
+    gateway.shutdown().await;
 }
 
 #[tokio::test]

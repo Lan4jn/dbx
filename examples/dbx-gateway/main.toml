@@ -19,6 +19,9 @@ global_buffer_budget_bytes = 268435456
 tls_handshake_timeout_secs = 10
 http_header_timeout_secs = 10
 
+[client_route_acl]
+desktop-prod = ["edge-prod-01/postgres-primary"]
+
 [enrollment]
 path = "/_dbx/enroll"
 renewal_path = "/_dbx/renew"

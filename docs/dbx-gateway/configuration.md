@@ -19,6 +19,7 @@
 | `state_file` | 无 | Main 的最后已知 Edge/逻辑目标 SQLite；不保存数据库地址。 |
 | `allowed_edge_ids` | 空 | 空表示证书 CA 范围内均可注册；生产建议显式列出。 |
 | `revoked_edge_serials` | 空 | 吊销序列号列表；重载后关闭对应活动会话。 |
+| `client_route_acl` | 空 | DBX Client 证书身份到逻辑路由的白名单；支持 `edge/target`、`edge/*`、`*/*`。空表保持兼容并允许全部已注册逻辑路由。 |
 | `max_connections` | `1024` | Main 总 TCP/TLS 连接上限。 |
 | `max_streams_per_edge` | `256` | 单 Edge 活动数据通道上限。 |
 | `max_streams_per_client` | `32` | 单 DBX 客户端证书身份活动通道上限。 |
@@ -27,6 +28,15 @@
 | `global_buffer_budget_bytes` | `268435456` | 数据通道全局缓冲预算，至少 2 MiB。 |
 | `tls_handshake_timeout_secs` | `10` | TLS 握手超时。 |
 | `http_header_timeout_secs` | `10` | 首个 HTTP 请求头超时。 |
+
+生产环境建议显式配置客户端路由权限。证书 URI SAN 为 `urn:dbx-gateway:client:desktop-prod` 时，身份 key 是 `desktop-prod`：
+
+```toml
+[client_route_acl]
+desktop-prod = ["edge-prod-01/postgres-primary", "edge-reporting/*"]
+```
+
+路由发现和实际打开数据通道使用同一套 ACL；未授权目标不会出现在 DBX 中，直接请求也会返回 `route_denied`。规则只包含逻辑 ID，不包含数据库地址。
 
 `[enrollment]` 字段：
 

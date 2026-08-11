@@ -1,5 +1,6 @@
 #![cfg(all(feature = "server", unix))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -96,6 +97,7 @@ impl Fixture {
             enrollment: None,
             allowed_edge_ids: Vec::new(),
             revoked_edge_serials: Vec::new(),
+            client_route_acl: BTreeMap::new(),
             fallback_upstream: Some(upstream),
             health_listen: None,
             state_file: None,

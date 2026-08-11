@@ -39,6 +39,8 @@ pub struct MainConfig {
     #[serde(default)]
     pub revoked_edge_serials: Vec<String>,
     #[serde(default)]
+    pub client_route_acl: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     pub fallback_upstream: Option<String>,
     #[serde(default)]
     pub health_listen: Option<String>,
@@ -247,6 +249,13 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             {
                 return Err(config_error("connection limits and timeouts must be greater than zero"));
             }
+            if main.client_route_acl.iter().any(|(client_id, routes)| {
+                !valid_identity(client_id)
+                    || routes.is_empty()
+                    || routes.iter().any(|route| !valid_client_route_rule(route))
+            }) {
+                return Err(config_error("client_route_acl contains an invalid client identity or route rule"));
+            }
             if let Some(enrollment) = &main.enrollment {
                 if !valid_reserved_path(&enrollment.path)
                     || !valid_reserved_path(&enrollment.renewal_path)
@@ -315,6 +324,15 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             }
         }
     }
+}
+
+fn valid_client_route_rule(rule: &str) -> bool {
+    let Some((edge_id, target_id)) = rule.split_once('/') else { return false };
+    !edge_id.is_empty()
+        && !target_id.is_empty()
+        && !target_id.contains('/')
+        && (edge_id == "*" || valid_identity(edge_id))
+        && (target_id == "*" || valid_identity(target_id))
 }
 
 fn default_edge_path() -> String {

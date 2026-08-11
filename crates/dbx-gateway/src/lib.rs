@@ -107,6 +107,7 @@ enum GatewaySignal {
     Reload,
 }
 
+#[cfg(feature = "server")]
 async fn wait_for_gateway_signal() -> Result<GatewaySignal, GatewayError> {
     #[cfg(unix)]
     {

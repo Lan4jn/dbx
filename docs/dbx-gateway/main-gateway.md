@@ -86,11 +86,16 @@ stream {
 ```toml
 allowed_edge_ids = ["edge-prod-01"]
 
+[client_route_acl]
+desktop-prod = ["edge-prod-01/postgres-primary"]
+
 [enrollment]
 allowed_edge_ids = ["edge-prod-01"]
 ```
 
-第一项控制已持证 Edge 注册，第二项控制自动领证。删除 Edge ID 或把证书序列号加入 `revoked_edge_serials` 后，在 Main 主机以 `root` 执行：
+`client_route_acl` 的 key 对应 DBX Client 证书 URI SAN 中的身份，例如 `urn:dbx-gateway:client:desktop-prod`。规则支持 `edge/target`、`edge/*` 和 `*/*`；配置 ACL 后，没有条目的客户端默认拒绝。路由发现与打开数据通道执行同一套检查。
+
+`allowed_edge_ids` 控制已持证 Edge 注册，`enrollment.allowed_edge_ids` 控制自动领证。删除 Edge ID 或把证书序列号加入 `revoked_edge_serials` 后，在 Main 主机以 `root` 执行：
 
 ```bash
 systemctl kill -s HUP dbx-gateway-main.service

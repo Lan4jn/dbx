@@ -117,6 +117,7 @@ async fn reload_preserves_valid_runtime_on_error_and_closes_revoked_edge() {
         enrollment: None,
         allowed_edge_ids: vec!["edge-ops".to_string()],
         revoked_edge_serials: Vec::new(),
+        client_route_acl: BTreeMap::new(),
         fallback_upstream: None,
         health_listen: Some("127.0.0.1:0".to_string()),
         state_file: Some(dir.0.join("main-state.sqlite3")),
