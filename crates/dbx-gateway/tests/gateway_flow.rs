@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -24,6 +26,8 @@ use rustls::{ClientConfig, RootCertStore};
 use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::process::{Child, Command};
 use tokio::time::{advance, sleep, timeout, Instant};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
@@ -396,6 +400,70 @@ async fn data_tcp_round_trip_reports_all_gateway_stages() {
     .unwrap();
     edge.shutdown().await;
     echo_task.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_smoke_round_trips_one_mebibyte_and_stops_cleanly() {
+    let fixture = Fixture::new();
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_address = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                return;
+            }
+            stream.write_all(&buffer[..count]).await.unwrap();
+        }
+    });
+
+    let port = unused_port().await;
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let edge_config = fixture.edge_config(address, "edge-process-smoke");
+    let main_config_path = fixture._dir.0.join("main.toml");
+    let edge_config_path = fixture._dir.0.join("edge.toml");
+    fs::write(&main_config_path, main_config_toml(&fixture.config, address)).unwrap();
+    fs::write(&edge_config_path, edge_config_toml(&edge_config, echo_address)).unwrap();
+
+    let main = spawn_gateway(&main_config_path);
+    wait_for_listener(address).await;
+    let edge = spawn_gateway(&edge_config_path);
+
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:process-smoke"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = wait_for_process_route(address, &fixture.server_ca, &client).await;
+    let mut payload = (0..1024 * 1024).map(|index| ((index * 73 + 41) % 251) as u8).collect::<Vec<_>>();
+    payload[..21].copy_from_slice(b"process-smoke-payload");
+    socket.send(Message::Binary(payload.clone().into())).await.unwrap();
+    let mut returned = Vec::with_capacity(payload.len());
+    while returned.len() < payload.len() {
+        let Message::Binary(frame) =
+            timeout(std::time::Duration::from_secs(5), socket.next()).await.expect("echo timed out").unwrap().unwrap()
+        else {
+            panic!("expected echoed bytes");
+        };
+        returned.extend_from_slice(&frame);
+    }
+    assert_eq!(returned, payload);
+    socket.close(None).await.unwrap();
+    echo_task.await.unwrap();
+
+    let edge_output = stop_gateway(edge).await;
+    let main_output = stop_gateway(main).await;
+    for output in [edge_output, main_output] {
+        assert!(output.status.success(), "gateway failed: {}", String::from_utf8_lossy(&output.stderr));
+        let logs = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(!logs.contains("BEGIN PRIVATE KEY"));
+        assert!(!logs.contains(&echo_address.to_string()));
+        assert!(!logs.contains("process-smoke-payload"));
+    }
 }
 
 #[cfg(unix)]
@@ -882,6 +950,109 @@ fn issue_client_with_ekus(
 fn valid_window() -> (OffsetDateTime, OffsetDateTime) {
     let now = OffsetDateTime::now_utc();
     (now - Duration::minutes(5), now + Duration::days(1))
+}
+
+#[cfg(unix)]
+async fn unused_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[cfg(unix)]
+fn main_config_toml(config: &MainConfig, address: SocketAddr) -> String {
+    format!(
+        "mode = \"main\"\nlisten = {:?}\ncertificate = {:?}\nprivate_key = {:?}\nedge_ca_certificate = {:?}\nclient_ca_certificate = {:?}\nedge_path = {:?}\ndbx_path = {:?}\nmax_connections = {}\ntls_handshake_timeout_secs = {}\nhttp_header_timeout_secs = {}\n",
+        address.to_string(),
+        config.certificate.to_string_lossy(),
+        config.private_key.to_string_lossy(),
+        config.edge_ca_certificate.to_string_lossy(),
+        config.client_ca_certificate.to_string_lossy(),
+        config.edge_path,
+        config.dbx_path,
+        config.max_connections,
+        config.tls_handshake_timeout_secs,
+        config.http_header_timeout_secs,
+    )
+}
+
+#[cfg(unix)]
+fn edge_config_toml(config: &EdgeConfig, target: SocketAddr) -> String {
+    format!(
+        "mode = \"edge\"\nedge_id = {:?}\nmain_url = {:?}\ncertificate = {:?}\nprivate_key = {:?}\nca_certificate = {:?}\n\n[targets.postgres]\ndisplay_name = \"PostgreSQL\"\naddress = {{ tcp = {:?} }}\n",
+        config.edge_id,
+        config.main_url,
+        config.certificate.to_string_lossy(),
+        config.private_key.to_string_lossy(),
+        config.ca_certificate.to_string_lossy(),
+        target.to_string(),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_gateway(config: &std::path::Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_dbx-gateway"))
+        .arg("--config")
+        .arg(config)
+        .arg("serve")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+async fn wait_for_listener(address: SocketAddr) {
+    timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if TcpStream::connect(address).await.is_ok() {
+                return;
+            }
+            sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("main gateway did not start listening");
+}
+
+#[cfg(unix)]
+async fn wait_for_process_route(
+    address: SocketAddr,
+    server_ca: &CertificateDer<'static>,
+    identity: &ClientIdentity,
+) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let mut socket = connect_dbx_socket(address, server_ca, identity).await;
+            request_route(&mut socket, "edge-process-smoke", "postgres").await;
+            assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::MainAuthenticated });
+            match next_client_event(&mut socket).await {
+                ClientEvent::Stage { stage: Stage::RouteAuthorized } => {
+                    for stage in [Stage::EdgeChannelReady, Stage::TargetConnected, Stage::StreamReady] {
+                        assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage });
+                    }
+                    return socket;
+                }
+                ClientEvent::Error { .. } => {
+                    let _ = socket.close(None).await;
+                    sleep(std::time::Duration::from_millis(50)).await;
+                }
+                event => panic!("unexpected client event while waiting for edge: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("edge gateway did not register")
+}
+
+#[cfg(unix)]
+async fn stop_gateway(child: Child) -> std::process::Output {
+    let pid = child.id().expect("gateway process already exited");
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("gateway did not stop after SIGTERM")
+        .unwrap()
 }
 
 async fn request(

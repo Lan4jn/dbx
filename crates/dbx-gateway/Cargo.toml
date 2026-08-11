@@ -67,4 +67,4 @@ x509-parser = { version = "0.18", optional = true }
 zeroize = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["process", "test-util"] }
