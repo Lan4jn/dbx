@@ -9,6 +9,8 @@ pub mod main_gateway;
 pub mod pki;
 pub mod protocol;
 #[cfg(feature = "server")]
+pub mod stream;
+#[cfg(feature = "server")]
 pub mod tls;
 
 pub use error::{GatewayError, GatewayErrorCode};

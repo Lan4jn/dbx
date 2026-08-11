@@ -5,17 +5,18 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval_at, sleep_until, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream};
 
-use crate::config::EdgeConfig;
+use crate::config::{EdgeConfig, TargetAddress};
 use crate::protocol::{
-    decode_control_frame, encode_control_frame, EdgeRegistration, EdgeToMain, MainToEdge, ProtocolVersion,
-    RegisteredTarget, MAX_CONTROL_FRAME_SIZE,
+    decode_control_frame, encode_control_frame, EdgeDataOpen, EdgeRegistration, EdgeToMain, MainToEdge,
+    ProtocolVersion, RegisteredTarget, SessionId, MAX_CONTROL_FRAME_SIZE, MAX_DATA_FRAME_SIZE,
 };
+use crate::stream::relay_websocket_to_io;
 use crate::tls::{load_certificates, load_private_key, load_roots};
 use crate::{GatewayError, GatewayErrorCode};
 
@@ -88,6 +89,7 @@ impl Default for ReconnectBackoff {
 
 async fn run(config: EdgeConfig, tls: Arc<ClientConfig>, mut stop: watch::Receiver<bool>) {
     let mut backoff = ReconnectBackoff::new();
+    let mut data_tasks = JoinSet::new();
     loop {
         if *stop.borrow() {
             return;
@@ -102,7 +104,10 @@ async fn run(config: EdgeConfig, tls: Arc<ClientConfig>, mut stop: watch::Receiv
             }
         };
         let retry_from = if let Ok(Ok(socket)) = connected {
-            let (registered, disconnected_at) = run_control_session(socket, &config, stop.clone()).await;
+            let (registered, disconnected_at) =
+                run_control_session(socket, &config, tls.clone(), stop.clone(), &mut data_tasks).await;
+            data_tasks.abort_all();
+            while data_tasks.join_next().await.is_some() {}
             backoff.record_registration(registered);
             disconnected_at
         } else {
@@ -135,6 +140,17 @@ async fn connect(
     .map_err(|_| internal_error("Edge control connection failed"))
 }
 
+async fn connect_data(
+    config: &EdgeConfig,
+    tls: Arc<ClientConfig>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, GatewayError> {
+    let url = format!("{}/data", config.main_url.trim_end_matches('/'));
+    connect_async_tls_with_config(&url, Some(data_websocket_config()), false, Some(Connector::Rustls(tls)))
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|_| internal_error("Edge data connection failed"))
+}
+
 pub(crate) fn control_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .read_buffer_size(16 * 1024)
@@ -144,10 +160,21 @@ pub(crate) fn control_websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(MAX_CONTROL_FRAME_SIZE))
 }
 
+pub(crate) fn data_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(64 * 1024)
+        .write_buffer_size(64 * 1024)
+        .max_write_buffer_size(MAX_DATA_FRAME_SIZE * 2)
+        .max_message_size(Some(MAX_DATA_FRAME_SIZE))
+        .max_frame_size(Some(MAX_DATA_FRAME_SIZE))
+}
+
 async fn run_control_session(
     mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     config: &EdgeConfig,
+    tls: Arc<ClientConfig>,
     mut stop: watch::Receiver<bool>,
+    data_tasks: &mut JoinSet<Option<EdgeToMain>>,
 ) -> (bool, Instant) {
     let registration = EdgeRegistration {
         version: ProtocolVersion::current(),
@@ -194,12 +221,29 @@ async fn run_control_session(
                     return (registered, Instant::now());
                 }
             }
+            completed = data_tasks.join_next(), if !data_tasks.is_empty() => {
+                if let Some(Ok(Some(message))) = completed {
+                    let Ok(frame) = encode_control_frame(&message) else { return (registered, Instant::now()) };
+                    if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
+                        return (registered, Instant::now());
+                    }
+                }
+            }
             incoming = socket.next() => {
                 let Some(Ok(message)) = incoming else { return (registered, Instant::now()) };
                 match message {
                     Message::Binary(frame) => match decode_control_frame::<MainToEdge>(&frame) {
                         Ok(MainToEdge::HeartbeatAck { .. }) => registered = true,
-                        Ok(MainToEdge::OpenDataChannel { .. }) if registered => {}
+                        Ok(MainToEdge::OpenDataChannel { session_id, target_id, expires_at_unix_ms }) if registered => {
+                            data_tasks.spawn(run_data_channel(
+                                config.clone(),
+                                tls.clone(),
+                                session_id,
+                                target_id,
+                                expires_at_unix_ms,
+                                stop.clone(),
+                            ));
+                        }
                         _ => return (registered, Instant::now()),
                     },
                     Message::Ping(data) => {
@@ -219,6 +263,64 @@ async fn run_control_session(
     }
 }
 
+async fn run_data_channel(
+    config: EdgeConfig,
+    tls: Arc<ClientConfig>,
+    session_id: SessionId,
+    target_id: String,
+    expires_at_unix_ms: i64,
+    stop: watch::Receiver<bool>,
+) -> Option<EdgeToMain> {
+    let failed = || EdgeToMain::DataChannelFailed { version: ProtocolVersion::current(), session_id };
+    if unix_time_ms() > expires_at_unix_ms {
+        return Some(failed());
+    }
+    let Some(target) = config.targets.get(&target_id) else { return Some(failed()) };
+    match &target.address {
+        TargetAddress::Tcp { tcp } => {
+            let Ok(Ok(local)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp)).await else {
+                return Some(failed());
+            };
+            if !relay_data_channel(config, tls, session_id, target_id, local, stop).await {
+                return Some(failed());
+            }
+        }
+        TargetAddress::Unix { unix } => {
+            #[cfg(unix)]
+            if let Ok(Ok(local)) = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(unix)).await {
+                if relay_data_channel(config, tls, session_id, target_id, local, stop).await {
+                    return None;
+                }
+            }
+            return Some(failed());
+        }
+    }
+    None
+}
+
+async fn relay_data_channel<I>(
+    config: EdgeConfig,
+    tls: Arc<ClientConfig>,
+    session_id: SessionId,
+    target_id: String,
+    local: I,
+    stop: watch::Receiver<bool>,
+) -> bool
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Ok(Ok(mut socket)) = tokio::time::timeout(CONNECT_TIMEOUT, connect_data(&config, tls)).await else {
+        return false;
+    };
+    let open = EdgeDataOpen { version: ProtocolVersion::current(), session_id, target_id };
+    let Ok(frame) = encode_control_frame(&open) else { return false };
+    if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
+        return false;
+    }
+    let _ = relay_websocket_to_io(socket, local, Duration::from_secs(300), stop).await;
+    true
+}
+
 async fn send_control_message(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, message: Message) -> bool {
     matches!(tokio::time::timeout(CONTROL_IO_TIMEOUT, socket.send(message)).await, Ok(Ok(())))
 }
@@ -231,6 +333,13 @@ fn jitter_percent() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::from(duration.subsec_nanos()) % 21)
+        .unwrap_or_default()
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or_default()
 }
 

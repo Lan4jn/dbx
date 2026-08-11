@@ -9,12 +9,15 @@ use http_body_util::Empty;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, RwLock, RwLockWriteGuard, Semaphore};
+use tokio::sync::{
+    mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, RwLockWriteGuard, Semaphore,
+};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout, Instant};
 use tokio_rustls::TlsAcceptor;
@@ -25,10 +28,12 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 use crate::config::MainConfig;
-use crate::edge_gateway::control_websocket_config;
+use crate::edge_gateway::{control_websocket_config, data_websocket_config};
 use crate::protocol::{
-    decode_edge_message, decode_edge_registration, encode_control_frame, EdgeToMain, MainToEdge, RegisteredTarget,
+    decode_client_message, decode_edge_data_open, decode_edge_message, decode_edge_registration, encode_control_frame,
+    ClientEvent, ClientMessage, EdgeToMain, MainToEdge, RegisteredTarget, SessionId, SessionTickets, Stage,
 };
+use crate::stream::relay_websockets;
 use crate::tls::{GatewayTls, PeerIdentity};
 use crate::{GatewayError, GatewayErrorCode};
 
@@ -36,6 +41,30 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub type EdgeRegistry = Arc<RwLock<HashMap<String, EdgeEntry>>>;
+type ServerSocket = WebSocketStream<TokioIo<Upgraded>>;
+type PendingRoutes = Arc<AsyncMutex<HashMap<SessionId, PendingRoute>>>;
+
+struct PendingRoute {
+    edge_id: String,
+    target_id: String,
+    client_id: String,
+    connection_id: Uuid,
+    edge_stop: watch::Receiver<bool>,
+    sender: oneshot::Sender<Result<EdgeDataChannel, GatewayErrorCode>>,
+}
+
+struct EdgeDataChannel {
+    socket: ServerSocket,
+    _permit: OwnedSemaphorePermit,
+    connection_id: Uuid,
+    edge_stop: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum EdgeSocketRole {
+    Control,
+    Data,
+}
 
 #[derive(Clone, Debug)]
 pub struct EdgeIdentity {
@@ -52,6 +81,7 @@ pub struct EdgeEntry {
     pub control_tx: mpsc::Sender<MainToEdge>,
     pub active_streams: usize,
     pub connection_id: Uuid,
+    pub session_shutdown: watch::Sender<bool>,
     pub online: bool,
 }
 
@@ -70,9 +100,12 @@ impl MainGateway {
         let local_addr = listener.local_addr().map_err(|_| internal_error("main listener address unavailable"))?;
         let acceptor = TlsAcceptor::from(tls.server_config.clone());
         let edge_path = Arc::<str>::from(config.edge_path);
+        let edge_data_path = Arc::<str>::from(format!("{}/data", edge_path.trim_end_matches('/')));
         let dbx_path = Arc::<str>::from(config.dbx_path);
         let registry = EdgeRegistry::default();
         let task_registry = registry.clone();
+        let tickets = Arc::new(AsyncMutex::new(SessionTickets::new(Duration::from_secs(15))));
+        let pending_routes = PendingRoutes::default();
         let control_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let task_control_tasks = control_tasks.clone();
         let connection_slots = Arc::new(Semaphore::new(config.max_connections));
@@ -109,8 +142,11 @@ impl MainGateway {
                 let acceptor = acceptor.clone();
                 let tls = tls.clone();
                 let edge_path = edge_path.clone();
+                let edge_data_path = edge_data_path.clone();
                 let dbx_path = dbx_path.clone();
                 let registry = task_registry.clone();
+                let tickets = tickets.clone();
+                let pending_routes = pending_routes.clone();
                 let control_tasks = task_control_tasks.clone();
                 let connection_stop = task_shutdown.subscribe();
                 connections.spawn(async move {
@@ -133,8 +169,11 @@ impl MainGateway {
                         route(
                             request,
                             edge_path.clone(),
+                            edge_data_path.clone(),
                             dbx_path.clone(),
                             registry.clone(),
+                            tickets.clone(),
+                            pending_routes.clone(),
                             control_tasks.clone(),
                             connection_permit.clone(),
                             connection_stop.clone(),
@@ -188,47 +227,87 @@ impl Drop for MainGateway {
 async fn route(
     mut request: Request<Incoming>,
     edge_path: Arc<str>,
+    edge_data_path: Arc<str>,
     dbx_path: Arc<str>,
     registry: EdgeRegistry,
+    tickets: Arc<AsyncMutex<SessionTickets>>,
+    pending_routes: PendingRoutes,
     control_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     connection_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     stop: watch::Receiver<bool>,
 ) -> Result<Response<Empty<Bytes>>, Infallible> {
     let identity = request.extensions().get::<PeerIdentity>().cloned();
     if let Some(PeerIdentity::Edge { edge_id, serial, fingerprint_sha256 }) = identity {
-        if request.uri().path() == edge_path.as_ref() {
+        if request.uri().path() == edge_path.as_ref() || request.uri().path() == edge_data_path.as_ref() {
             if let Some(accept_key) = websocket_accept_key(&request) {
                 let Some(permit) = connection_permit.lock().ok().and_then(|mut permit| permit.take()) else {
                     return Ok(empty_response(StatusCode::NOT_FOUND));
                 };
                 let version = request.version();
+                let (websocket_config, socket_role) = if request.uri().path() == edge_data_path.as_ref() {
+                    (data_websocket_config(), EdgeSocketRole::Data)
+                } else {
+                    (control_websocket_config(), EdgeSocketRole::Control)
+                };
                 let control = tokio::spawn(async move {
-                    let _permit = permit;
                     let Ok(upgraded) = hyper::upgrade::on(&mut request).await else {
                         return;
                     };
-                    let socket = WebSocketStream::from_raw_socket(
-                        TokioIo::new(upgraded),
-                        Role::Server,
-                        Some(control_websocket_config()),
+                    let socket =
+                        WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(websocket_config))
+                            .await;
+                    run_edge_control(
+                        socket,
+                        permit,
+                        socket_role,
+                        edge_id,
+                        serial,
+                        fingerprint_sha256,
+                        registry,
+                        tickets,
+                        pending_routes,
+                        stop,
                     )
                     .await;
-                    run_edge_control(socket, edge_id, serial, fingerprint_sha256, registry, stop).await;
                 });
-                if let Ok(mut tasks) = control_tasks.lock() {
-                    tasks.retain(|task| !task.is_finished());
-                    tasks.push(control);
-                }
+                track_task(&control_tasks, control);
                 return Ok(switching_protocols(version, accept_key));
             }
             return Ok(empty_response(StatusCode::OK));
         }
         return Ok(empty_response(StatusCode::NOT_FOUND));
     }
-    if matches!(identity, Some(PeerIdentity::DbxClient { .. })) && request.uri().path() == dbx_path.as_ref() {
-        return Ok(empty_response(StatusCode::OK));
+    if let Some(PeerIdentity::DbxClient { client_id, .. }) = identity {
+        if request.uri().path() == dbx_path.as_ref() {
+            if let Some(accept_key) = websocket_accept_key(&request) {
+                let Some(permit) = connection_permit.lock().ok().and_then(|mut permit| permit.take()) else {
+                    return Ok(empty_response(StatusCode::NOT_FOUND));
+                };
+                let version = request.version();
+                let task = tokio::spawn(async move {
+                    let Ok(upgraded) = hyper::upgrade::on(&mut request).await else { return };
+                    let socket = WebSocketStream::from_raw_socket(
+                        TokioIo::new(upgraded),
+                        Role::Server,
+                        Some(data_websocket_config()),
+                    )
+                    .await;
+                    run_dbx_connection(socket, permit, client_id, registry, tickets, pending_routes, stop).await;
+                });
+                track_task(&control_tasks, task);
+                return Ok(switching_protocols(version, accept_key));
+            }
+            return Ok(empty_response(StatusCode::OK));
+        }
     }
     Ok(empty_response(StatusCode::NOT_FOUND))
+}
+
+fn track_task(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: JoinHandle<()>) {
+    if let Ok(mut tasks) = tasks.lock() {
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
 }
 
 fn websocket_accept_key(request: &Request<Incoming>) -> Option<String> {
@@ -259,16 +338,18 @@ fn empty_response(status: StatusCode) -> Response<Empty<Bytes>> {
     Response::builder().status(status).body(Empty::new()).expect("fixed response is valid")
 }
 
-async fn run_edge_control<S>(
-    mut socket: WebSocketStream<S>,
+async fn run_edge_control(
+    mut socket: ServerSocket,
+    permit: OwnedSemaphorePermit,
+    socket_role: EdgeSocketRole,
     certificate_edge_id: String,
     serial: String,
     fingerprint_sha256: [u8; 32],
     registry: EdgeRegistry,
+    tickets: Arc<AsyncMutex<SessionTickets>>,
+    pending_routes: PendingRoutes,
     mut stop: watch::Receiver<bool>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) {
     let incoming = tokio::select! {
         incoming = timeout(HEARTBEAT_TIMEOUT, socket.next()) => incoming,
         _ = wait_for_stop(&mut stop) => {
@@ -280,6 +361,25 @@ async fn run_edge_control<S>(
         close_control_socket(&mut socket).await;
         return;
     };
+    if matches!(socket_role, EdgeSocketRole::Data) {
+        let Ok(open) = decode_edge_data_open(&frame) else {
+            close_control_socket(&mut socket).await;
+            return;
+        };
+        accept_edge_data_channel(
+            socket,
+            permit,
+            &certificate_edge_id,
+            open.session_id,
+            &open.target_id,
+            registry,
+            tickets,
+            pending_routes,
+        )
+        .await;
+        return;
+    }
+    let _permit = permit;
     let Ok(registration) = decode_edge_registration(&frame) else {
         close_control_socket(&mut socket).await;
         return;
@@ -294,6 +394,7 @@ async fn run_edge_control<S>(
     };
 
     let connection_id = Uuid::new_v4();
+    let (session_shutdown, _) = watch::channel(false);
     let (control_tx, mut control_rx) = mpsc::channel(32);
     let duplicate = {
         let Some(mut entries) = registry_write_until_stop(&registry, &mut stop).await else {
@@ -312,6 +413,7 @@ async fn run_edge_control<S>(
                     control_tx,
                     active_streams: 0,
                     connection_id,
+                    session_shutdown: session_shutdown.clone(),
                     online: true,
                 },
             );
@@ -348,23 +450,39 @@ async fn run_edge_control<S>(
             incoming = socket.next() => {
                 let Some(Ok(message)) = incoming else { break };
                 match message {
-                    Message::Binary(frame) => {
-                        let Ok(EdgeToMain::Heartbeat { .. }) = decode_edge_message(&frame) else { break };
-                        let now = Instant::now();
-                        let Some(mut entries) = registry_write_until_stop(&registry, &mut stop).await else {
-                            close_control_socket(&mut socket).await;
-                            break;
-                        };
-                        let Some(entry) = entries.get_mut(&certificate_edge_id).filter(|entry| entry.connection_id == connection_id) else {
-                            break;
-                        };
-                        entry.last_heartbeat = now;
-                        drop(entries);
-                        heartbeat_deadline.as_mut().reset(now + HEARTBEAT_TIMEOUT);
-                        let Ok(frame) = encode_control_frame(&MainToEdge::HeartbeatAck { unix_ms: unix_time_ms() }) else { break };
-                        if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
-                            break;
+                    Message::Binary(frame) => match decode_edge_message(&frame) {
+                        Ok(EdgeToMain::Heartbeat { .. }) => {
+                            let now = Instant::now();
+                            let Some(mut entries) = registry_write_until_stop(&registry, &mut stop).await else {
+                                close_control_socket(&mut socket).await;
+                                break;
+                            };
+                            let Some(entry) = entries.get_mut(&certificate_edge_id).filter(|entry| entry.connection_id == connection_id) else {
+                                break;
+                            };
+                            entry.last_heartbeat = now;
+                            drop(entries);
+                            heartbeat_deadline.as_mut().reset(now + HEARTBEAT_TIMEOUT);
+                            let Ok(frame) = encode_control_frame(&MainToEdge::HeartbeatAck { unix_ms: unix_time_ms() }) else { break };
+                            if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
+                                break;
+                            }
                         }
+                        Ok(EdgeToMain::DataChannelFailed { session_id, .. }) => {
+                            let route = {
+                                let mut routes = pending_routes.lock().await;
+                                let matches = routes
+                                    .get(&session_id)
+                                    .is_some_and(|route| {
+                                        route.edge_id == certificate_edge_id && route.connection_id == connection_id
+                                    });
+                                matches.then(|| routes.remove(&session_id)).flatten()
+                            };
+                            if let Some(route) = route {
+                                let _ = route.sender.send(Err(GatewayErrorCode::TargetUnavailable));
+                            }
+                        }
+                        Err(_) => break,
                     }
                     Message::Ping(data) => {
                         if !send_control_message(&mut socket, Message::Pong(data)).await {
@@ -377,7 +495,216 @@ async fn run_edge_control<S>(
             }
         }
     }
+    let _ = session_shutdown.send(true);
     mark_offline(&registry, &certificate_edge_id, connection_id, &mut stop).await;
+}
+
+async fn accept_edge_data_channel(
+    mut socket: ServerSocket,
+    permit: OwnedSemaphorePermit,
+    edge_id: &str,
+    session_id: SessionId,
+    target_id: &str,
+    registry: EdgeRegistry,
+    tickets: Arc<AsyncMutex<SessionTickets>>,
+    pending_routes: PendingRoutes,
+) {
+    let route = {
+        let mut routes = pending_routes.lock().await;
+        let matches =
+            routes.get(&session_id).is_some_and(|route| route.edge_id == edge_id && route.target_id == target_id);
+        matches.then(|| routes.remove(&session_id)).flatten()
+    };
+    let Some(route) = route else {
+        close_control_socket(&mut socket).await;
+        return;
+    };
+    let still_online = registry
+        .read()
+        .await
+        .get(edge_id)
+        .is_some_and(|entry| entry.online && entry.connection_id == route.connection_id);
+    if !still_online {
+        close_control_socket(&mut socket).await;
+        return;
+    }
+    if tickets.lock().await.consume(&session_id, edge_id, target_id, &route.client_id).is_err() {
+        close_control_socket(&mut socket).await;
+        return;
+    }
+    if let Err(Ok(channel)) = route.sender.send(Ok(EdgeDataChannel {
+        socket,
+        _permit: permit,
+        connection_id: route.connection_id,
+        edge_stop: route.edge_stop,
+    })) {
+        let mut socket = channel.socket;
+        close_control_socket(&mut socket).await;
+    }
+}
+
+async fn run_dbx_connection(
+    mut socket: ServerSocket,
+    _permit: OwnedSemaphorePermit,
+    client_id: String,
+    registry: EdgeRegistry,
+    tickets: Arc<AsyncMutex<SessionTickets>>,
+    pending_routes: PendingRoutes,
+    mut stop: watch::Receiver<bool>,
+) {
+    if !send_client_event(&mut socket, ClientEvent::Stage { stage: Stage::MainAuthenticated }).await {
+        return;
+    }
+    let incoming = tokio::select! {
+        incoming = timeout(Duration::from_secs(10), socket.next()) => incoming,
+        _ = wait_for_stop(&mut stop) => return,
+    };
+    let Ok(Some(Ok(Message::Binary(frame)))) = incoming else {
+        close_control_socket(&mut socket).await;
+        return;
+    };
+    let Ok(ClientMessage::OpenRoute { edge_id, target_id, .. }) = decode_client_message(&frame) else {
+        send_client_error(&mut socket, GatewayErrorCode::ProtocolMismatch).await;
+        return;
+    };
+    let route_control = {
+        let entries = registry.read().await;
+        match entries.get(&edge_id) {
+            Some(entry) if !entry.online => Err(GatewayErrorCode::EdgeOffline),
+            Some(entry) if !entry.targets.contains_key(&target_id) => Err(GatewayErrorCode::RouteDenied),
+            Some(entry) => Ok((entry.control_tx.clone(), entry.connection_id, entry.session_shutdown.subscribe())),
+            None => Err(GatewayErrorCode::EdgeOffline),
+        }
+    };
+    let (control_tx, connection_id, mut edge_stop) = match route_control {
+        Ok(route_control) => route_control,
+        Err(code) => {
+            send_client_error(&mut socket, code).await;
+            return;
+        }
+    };
+    if !send_client_event(&mut socket, ClientEvent::Stage { stage: Stage::RouteAuthorized }).await {
+        return;
+    }
+    let ticket = match tickets.lock().await.issue(&edge_id, &target_id, &client_id) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            send_client_error(&mut socket, error.code).await;
+            return;
+        }
+    };
+    let (sender, receiver) = oneshot::channel();
+    pending_routes.lock().await.insert(
+        ticket.session_id,
+        PendingRoute {
+            edge_id: edge_id.clone(),
+            target_id: target_id.clone(),
+            client_id,
+            connection_id,
+            edge_stop: edge_stop.clone(),
+            sender,
+        },
+    );
+    let request = MainToEdge::OpenDataChannel {
+        session_id: ticket.session_id,
+        target_id: target_id.clone(),
+        expires_at_unix_ms: ticket.expires_at_unix_ms,
+    };
+    if !matches!(timeout(CONTROL_IO_TIMEOUT, control_tx.send(request)).await, Ok(Ok(()))) {
+        cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
+        send_client_error(&mut socket, GatewayErrorCode::EdgeOffline).await;
+        return;
+    }
+    let channel = tokio::select! {
+        channel = timeout(Duration::from_secs(15), receiver) => channel,
+        _ = wait_for_stop(&mut stop) => {
+            cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
+            return;
+        },
+        _ = wait_for_stop(&mut edge_stop) => {
+            cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
+            send_client_error(&mut socket, GatewayErrorCode::EdgeOffline).await;
+            return;
+        },
+        _ = socket.next() => {
+            cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
+            return;
+        },
+    };
+    let Ok(Ok(Ok(channel))) = channel else {
+        let code = match channel {
+            Ok(Ok(Err(code))) => code,
+            _ => GatewayErrorCode::TargetUnavailable,
+        };
+        cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
+        send_client_error(&mut socket, code).await;
+        return;
+    };
+    let EdgeDataChannel { socket: edge_socket, _permit: edge_permit, connection_id, edge_stop } = channel;
+    let _edge_permit = edge_permit;
+    if !adjust_active_streams(&registry, &edge_id, connection_id, true, &mut stop).await {
+        return;
+    }
+    for stage in [Stage::EdgeChannelReady, Stage::TargetConnected, Stage::StreamReady] {
+        if !send_client_event(&mut socket, ClientEvent::Stage { stage }).await {
+            let _ = adjust_active_streams(&registry, &edge_id, connection_id, false, &mut stop).await;
+            return;
+        }
+    }
+    let (stream_stop, stop_task) = combine_stop(stop.clone(), edge_stop);
+    let _ = relay_websockets(socket, edge_socket, Duration::from_secs(300), stream_stop).await;
+    stop_task.abort();
+    let _ = adjust_active_streams(&registry, &edge_id, connection_id, false, &mut stop).await;
+}
+
+async fn adjust_active_streams(
+    registry: &EdgeRegistry,
+    edge_id: &str,
+    connection_id: Uuid,
+    increment: bool,
+    stop: &mut watch::Receiver<bool>,
+) -> bool {
+    let Some(mut entries) = registry_write_until_stop(registry, stop).await else { return false };
+    let Some(entry) = entries.get_mut(edge_id).filter(|entry| entry.connection_id == connection_id) else {
+        return false;
+    };
+    entry.active_streams =
+        if increment { entry.active_streams.saturating_add(1) } else { entry.active_streams.saturating_sub(1) };
+    true
+}
+
+async fn cleanup_pending(
+    session_id: SessionId,
+    pending_routes: &PendingRoutes,
+    tickets: &Arc<AsyncMutex<SessionTickets>>,
+) {
+    pending_routes.lock().await.remove(&session_id);
+    tickets.lock().await.discard(&session_id);
+}
+
+fn combine_stop(
+    mut global: watch::Receiver<bool>,
+    mut edge: watch::Receiver<bool>,
+) -> (watch::Receiver<bool>, JoinHandle<()>) {
+    let (sender, receiver) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            _ = wait_for_stop(&mut global) => {}
+            _ = wait_for_stop(&mut edge) => {}
+        }
+        let _ = sender.send(true);
+    });
+    (receiver, task)
+}
+
+async fn send_client_event(socket: &mut ServerSocket, event: ClientEvent) -> bool {
+    let Ok(frame) = encode_control_frame(&event) else { return false };
+    send_control_message(socket, Message::Binary(frame.into())).await
+}
+
+async fn send_client_error(socket: &mut ServerSocket, code: GatewayErrorCode) {
+    let _ = send_client_event(socket, ClientEvent::Error { code }).await;
+    close_control_socket(socket).await;
 }
 
 async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {

@@ -10,7 +10,10 @@ use std::sync::Arc;
 use dbx_gateway::config::{EdgeConfig, EdgeTarget, MainConfig, TargetAddress};
 use dbx_gateway::edge_gateway::{EdgeGateway, ReconnectBackoff};
 use dbx_gateway::main_gateway::MainGateway;
-use dbx_gateway::protocol::{encode_control_frame, EdgeRegistration, ProtocolVersion, RegisteredTarget};
+use dbx_gateway::protocol::{
+    encode_control_frame, ClientEvent, ClientMessage, EdgeRegistration, EdgeToMain, ProtocolVersion, RegisteredTarget,
+    Stage,
+};
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -196,6 +199,19 @@ async fn control_rejects_registration_id_that_differs_from_certificate() {
     edge.shutdown().await;
 }
 
+#[tokio::test]
+async fn control_registration_is_rejected_on_the_edge_data_path() {
+    let fixture = Fixture::new();
+    let gateway = fixture.start().await;
+    let mut config = fixture.edge_config(gateway.local_addr(), "edge-wrong-path");
+    config.main_url.push_str("/data");
+    let mut socket = connect_control_socket(&config).await;
+    send_registration(&mut socket, &config).await;
+
+    let _ = timeout(std::time::Duration::from_secs(2), socket.next()).await.unwrap();
+    assert!(!gateway.registry().read().await.contains_key("edge-wrong-path"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn control_rejects_duplicate_online_edge_id() {
     let fixture = Fixture::new();
@@ -307,6 +323,244 @@ async fn control_edge_reconnects_after_main_restart() {
     wait_for_edge(&restarted, "edge-restart", true).await;
 
     edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn data_tcp_round_trip_reports_all_gateway_stages() {
+    let fixture = Fixture::new();
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_address = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                return;
+            }
+            stream.write_all(&buffer[..count]).await.unwrap();
+        }
+    });
+    let gateway = fixture.start().await;
+    let mut edge_config = fixture.edge_config(gateway.local_addr(), "edge-data");
+    edge_config.targets.get_mut("postgres").unwrap().address = TargetAddress::Tcp { tcp: echo_address.to_string() };
+    let edge = EdgeGateway::start(edge_config).unwrap();
+    wait_for_edge(&gateway, "edge-data", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-data"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    let request = ClientMessage::OpenRoute {
+        version: ProtocolVersion::current(),
+        request_id: uuid::Uuid::new_v4(),
+        edge_id: "edge-data".to_string(),
+        target_id: "postgres".to_string(),
+    };
+    socket.send(Message::Binary(encode_control_frame(&request).unwrap().into())).await.unwrap();
+
+    for expected in [
+        Stage::MainAuthenticated,
+        Stage::RouteAuthorized,
+        Stage::EdgeChannelReady,
+        Stage::TargetConnected,
+        Stage::StreamReady,
+    ] {
+        let Message::Binary(frame) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected a stage frame");
+        };
+        assert_eq!(serde_json::from_slice::<ClientEvent>(&frame).unwrap(), ClientEvent::Stage { stage: expected });
+    }
+    assert_eq!(gateway.registry().read().await["edge-data"].active_streams, 1);
+
+    let payload = (0..256 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+    socket.send(Message::Binary(payload.clone().into())).await.unwrap();
+    let mut returned = Vec::with_capacity(payload.len());
+    while returned.len() < payload.len() {
+        let Message::Binary(frame) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected echoed bytes");
+        };
+        returned.extend_from_slice(&frame);
+    }
+    assert_eq!(returned, payload);
+
+    socket.close(None).await.unwrap();
+    timeout(std::time::Duration::from_secs(2), async {
+        while gateway.registry().read().await["edge-data"].active_streams != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    edge.shutdown().await;
+    echo_task.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn data_unix_socket_round_trip() {
+    let fixture = Fixture::new();
+    let socket_path = fixture._dir.0.join("database.sock");
+    let echo = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                return;
+            }
+            stream.write_all(&buffer[..count]).await.unwrap();
+        }
+    });
+    let gateway = fixture.start().await;
+    let mut edge_config = fixture.edge_config(gateway.local_addr(), "edge-unix");
+    edge_config.targets.get_mut("postgres").unwrap().address = TargetAddress::Unix { unix: socket_path };
+    let edge = EdgeGateway::start(edge_config).unwrap();
+    wait_for_edge(&gateway, "edge-unix", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-unix"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    request_route(&mut socket, "edge-unix", "postgres").await;
+    assert_route_stages(&mut socket).await;
+
+    socket.send(Message::Binary(b"unix-echo".to_vec().into())).await.unwrap();
+    let Message::Binary(returned) = socket.next().await.unwrap().unwrap() else {
+        panic!("expected echoed bytes");
+    };
+    assert_eq!(returned.as_ref(), b"unix-echo");
+    socket.close(None).await.unwrap();
+    edge.shutdown().await;
+    echo_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn data_unknown_target_is_denied_without_exposing_an_address() {
+    let fixture = Fixture::new();
+    let gateway = fixture.start().await;
+    let edge = EdgeGateway::start(fixture.edge_config(gateway.local_addr(), "edge-routes")).unwrap();
+    wait_for_edge(&gateway, "edge-routes", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-routes"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    request_route(&mut socket, "edge-routes", "missing").await;
+
+    assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::MainAuthenticated });
+    assert_eq!(
+        next_client_event(&mut socket).await,
+        ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::RouteDenied }
+    );
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn data_local_connection_refusal_is_reported_promptly() {
+    let fixture = Fixture::new();
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unused_address = unused.local_addr().unwrap();
+    drop(unused);
+    let gateway = fixture.start().await;
+    let mut edge_config = fixture.edge_config(gateway.local_addr(), "edge-refused");
+    edge_config.targets.get_mut("postgres").unwrap().address = TargetAddress::Tcp { tcp: unused_address.to_string() };
+    let edge = EdgeGateway::start(edge_config).unwrap();
+    wait_for_edge(&gateway, "edge-refused", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-refused"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    request_route(&mut socket, "edge-refused", "postgres").await;
+
+    assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::MainAuthenticated });
+    assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::RouteAuthorized });
+    let event = timeout(std::time::Duration::from_secs(2), next_client_event(&mut socket)).await.unwrap();
+    assert_eq!(event, ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::TargetUnavailable });
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn data_control_disconnect_closes_active_streams() {
+    let fixture = Fixture::new();
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_address = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut buffer = [0_u8; 1024];
+        while stream.read(&mut buffer).await.unwrap_or(0) != 0 {}
+    });
+    let gateway = fixture.start().await;
+    let mut edge_config = fixture.edge_config(gateway.local_addr(), "edge-disconnect-data");
+    edge_config.targets.get_mut("postgres").unwrap().address = TargetAddress::Tcp { tcp: echo_address.to_string() };
+    let edge = EdgeGateway::start(edge_config).unwrap();
+    wait_for_edge(&gateway, "edge-disconnect-data", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-disconnect-data"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    request_route(&mut socket, "edge-disconnect-data", "postgres").await;
+    assert_route_stages(&mut socket).await;
+
+    edge.shutdown().await;
+    wait_for_edge(&gateway, "edge-disconnect-data", false).await;
+    let closed = timeout(std::time::Duration::from_secs(2), socket.next()).await.unwrap();
+    assert!(matches!(closed, None | Some(Err(_)) | Some(Ok(Message::Close(_)))));
+    echo_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn data_client_disconnect_releases_a_pending_connection_slot() {
+    let fixture = Fixture::new();
+    let mut main_config = fixture.config.clone();
+    main_config.max_connections = 2;
+    let gateway = MainGateway::bind(main_config).await.unwrap();
+    let edge_config = fixture.edge_config(gateway.local_addr(), "edge-pending");
+    let mut edge_socket = connect_control_socket(&edge_config).await;
+    send_registration(&mut edge_socket, &edge_config).await;
+    edge_socket
+        .send(Message::Binary(
+            encode_control_frame(&EdgeToMain::Heartbeat { version: ProtocolVersion::current() }).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = edge_socket.next().await;
+    wait_for_edge(&gateway, "edge-pending", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-pending"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    request_route(&mut socket, "edge-pending", "postgres").await;
+    assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::MainAuthenticated });
+    assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::RouteAuthorized });
+
+    socket.close(None).await.unwrap();
+    timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(request(gateway.local_addr(), &fixture.server_ca, None, EDGE_PATH).await, Ok(404)) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -673,6 +927,28 @@ async fn connect_with_versions(
     Ok(TlsConnector::from(Arc::new(config)).connect(ServerName::try_from("localhost").unwrap(), stream).await?)
 }
 
+async fn connect_dbx_socket(
+    address: SocketAddr,
+    server_ca: &CertificateDer<'static>,
+    identity: &ClientIdentity,
+) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    let mut roots = RootCertStore::empty();
+    roots.add(server_ca.clone()).unwrap();
+    let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_client_auth_cert(identity.certificates.clone(), identity.private_key.clone_key())
+        .unwrap();
+    connect_async_tls_with_config(
+        format!("wss://localhost:{}{DBX_PATH}", address.port()),
+        None,
+        false,
+        Some(Connector::Rustls(Arc::new(client))),
+    )
+    .await
+    .unwrap()
+    .0
+}
+
 async fn connect_control_socket(config: &EdgeConfig) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
     let certificates =
         rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(&config.certificate).unwrap()))
@@ -712,6 +988,35 @@ async fn send_registration(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream
             .collect(),
     };
     socket.send(Message::Binary(encode_control_frame(&registration).unwrap().into())).await.unwrap();
+}
+
+async fn request_route(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, edge_id: &str, target_id: &str) {
+    let request = ClientMessage::OpenRoute {
+        version: ProtocolVersion::current(),
+        request_id: uuid::Uuid::new_v4(),
+        edge_id: edge_id.to_string(),
+        target_id: target_id.to_string(),
+    };
+    socket.send(Message::Binary(encode_control_frame(&request).unwrap().into())).await.unwrap();
+}
+
+async fn assert_route_stages(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    for stage in [
+        Stage::MainAuthenticated,
+        Stage::RouteAuthorized,
+        Stage::EdgeChannelReady,
+        Stage::TargetConnected,
+        Stage::StreamReady,
+    ] {
+        assert_eq!(next_client_event(socket).await, ClientEvent::Stage { stage });
+    }
+}
+
+async fn next_client_event(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> ClientEvent {
+    let Message::Binary(frame) = socket.next().await.unwrap().unwrap() else {
+        panic!("expected a client event");
+    };
+    serde_json::from_slice(&frame).unwrap()
 }
 
 async fn wait_for_edge(gateway: &MainGateway, edge_id: &str, online: bool) {

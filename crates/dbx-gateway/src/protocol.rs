@@ -10,6 +10,7 @@ use crate::{GatewayError, GatewayErrorCode};
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_CONTROL_FRAME_SIZE: usize = 64 * 1024;
+pub const MAX_DATA_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_SESSION_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_MAX_SESSION_TICKETS: usize = 4096;
 
@@ -46,6 +47,13 @@ pub enum ClientMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientEvent {
+    Stage { stage: Stage },
+    Error { code: GatewayErrorCode },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum MainToEdge {
     OpenDataChannel { session_id: SessionId, target_id: String, expires_at_unix_ms: i64 },
     HeartbeatAck { unix_ms: i64 },
@@ -55,6 +63,7 @@ pub enum MainToEdge {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EdgeToMain {
     Heartbeat { version: ProtocolVersion },
+    DataChannelFailed { version: ProtocolVersion, session_id: SessionId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +81,13 @@ pub struct EdgeRegistration {
     pub version: ProtocolVersion,
     pub edge_id: String,
     pub targets: Vec<RegisteredTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeDataOpen {
+    pub version: ProtocolVersion,
+    pub session_id: SessionId,
+    pub target_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +198,12 @@ impl SessionTickets {
         Ok(())
     }
 
+    pub fn discard(&mut self, session_id: &SessionId) {
+        if let Some(binding) = self.entries.remove(session_id) {
+            self.expirations.remove(&(binding.expires_at, *session_id));
+        }
+    }
+
     fn purge_expired(&mut self, now: Instant) {
         while let Some(&(expires_at, session_id)) = self.expirations.first() {
             if expires_at > now {
@@ -234,8 +256,16 @@ pub fn decode_edge_registration(frame: &[u8]) -> Result<EdgeRegistration, Gatewa
 pub fn decode_edge_message(frame: &[u8]) -> Result<EdgeToMain, GatewayError> {
     let message: EdgeToMain = decode_control_frame(frame)?;
     match &message {
-        EdgeToMain::Heartbeat { version } => version.ensure_compatible()?,
+        EdgeToMain::Heartbeat { version } | EdgeToMain::DataChannelFailed { version, .. } => {
+            version.ensure_compatible()?
+        }
     }
+    Ok(message)
+}
+
+pub fn decode_edge_data_open(frame: &[u8]) -> Result<EdgeDataOpen, GatewayError> {
+    let message: EdgeDataOpen = decode_control_frame(frame)?;
+    message.version.ensure_compatible()?;
     Ok(message)
 }
 
