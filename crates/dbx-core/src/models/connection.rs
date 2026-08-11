@@ -183,6 +183,8 @@ pub enum TransportLayerConfig {
     Proxy(ProxyTunnelConfig),
     #[serde(rename = "http_tunnel")]
     HttpTunnel(HttpTunnelConfig),
+    #[serde(rename = "dbx_gateway")]
+    DbxGateway(DbxGatewayConfig),
 }
 
 impl TransportLayerConfig {
@@ -192,6 +194,7 @@ impl TransportLayerConfig {
             (TransportLayerConfig::Ssh(_), TransportLayerConfig::Ssh(_))
                 | (TransportLayerConfig::Proxy(_), TransportLayerConfig::Proxy(_))
                 | (TransportLayerConfig::HttpTunnel(_), TransportLayerConfig::HttpTunnel(_))
+                | (TransportLayerConfig::DbxGateway(_), TransportLayerConfig::DbxGateway(_))
         )
     }
 
@@ -200,6 +203,7 @@ impl TransportLayerConfig {
             TransportLayerConfig::Ssh(layer) => &layer.id,
             TransportLayerConfig::Proxy(layer) => &layer.id,
             TransportLayerConfig::HttpTunnel(layer) => &layer.id,
+            TransportLayerConfig::DbxGateway(layer) => &layer.id,
         }
     }
 
@@ -208,6 +212,7 @@ impl TransportLayerConfig {
             TransportLayerConfig::Ssh(layer) => &layer.profile_id,
             TransportLayerConfig::Proxy(layer) => &layer.profile_id,
             TransportLayerConfig::HttpTunnel(layer) => &layer.profile_id,
+            TransportLayerConfig::DbxGateway(layer) => &layer.profile_id,
         }
     }
 
@@ -218,6 +223,10 @@ impl TransportLayerConfig {
     pub fn resolved_from_profile(&self, profile: &TransportLayerConfig) -> TransportLayerConfig {
         let mut resolved = profile.clone();
         let (id, enabled, profile_id) = (self.id().to_string(), self.enabled(), self.profile_id().to_string());
+        let route = match self {
+            TransportLayerConfig::DbxGateway(layer) => Some((layer.edge_id.clone(), layer.target_id.clone())),
+            _ => None,
+        };
         match &mut resolved {
             TransportLayerConfig::Ssh(layer) => {
                 layer.id = id;
@@ -233,6 +242,15 @@ impl TransportLayerConfig {
                 layer.id = id;
                 layer.enabled = enabled;
                 layer.profile_id = profile_id;
+            }
+            TransportLayerConfig::DbxGateway(layer) => {
+                layer.id = id;
+                layer.enabled = enabled;
+                layer.profile_id = profile_id;
+                if let Some((edge_id, target_id)) = route {
+                    layer.edge_id = edge_id;
+                    layer.target_id = target_id;
+                }
             }
         }
         resolved
@@ -250,6 +268,7 @@ impl TransportLayerConfig {
             TransportLayerConfig::HttpTunnel(layer) => {
                 layer.token = String::new();
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
 
@@ -258,6 +277,7 @@ impl TransportLayerConfig {
             TransportLayerConfig::Ssh(layer) => &layer.name,
             TransportLayerConfig::Proxy(layer) => &layer.name,
             TransportLayerConfig::HttpTunnel(layer) => &layer.name,
+            TransportLayerConfig::DbxGateway(layer) => &layer.name,
         }
     }
 
@@ -266,6 +286,7 @@ impl TransportLayerConfig {
             TransportLayerConfig::Ssh(layer) => layer.enabled,
             TransportLayerConfig::Proxy(layer) => layer.enabled,
             TransportLayerConfig::HttpTunnel(layer) => layer.enabled,
+            TransportLayerConfig::DbxGateway(layer) => layer.enabled,
         }
     }
 
@@ -276,6 +297,7 @@ impl TransportLayerConfig {
             // HTTP script tunnel layers dial a PHP script URL instead of a host:port
             // endpoint, and are validated as the outermost transport layer.
             TransportLayerConfig::HttpTunnel(_) => ("", 0),
+            TransportLayerConfig::DbxGateway(layer) => (&layer.main_url, 0),
         }
     }
 }
@@ -376,6 +398,32 @@ pub struct HttpTunnelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbxGatewayConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_id: String,
+    #[serde(default)]
+    pub main_url: String,
+    #[serde(default)]
+    pub identity_id: String,
+    #[serde(default)]
+    pub server_ca_pem: String,
+    #[serde(default)]
+    pub server_spki_sha256: String,
+    #[serde(default = "default_dbx_gateway_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub edge_id: String,
+    #[serde(default)]
+    pub target_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachedDatabaseConfig {
     pub name: String,
     pub path: String,
@@ -394,6 +442,10 @@ pub fn default_ssh_connect_timeout_secs() -> u64 {
 }
 
 pub fn default_http_tunnel_connect_timeout_secs() -> u64 {
+    10
+}
+
+pub fn default_dbx_gateway_connect_timeout_secs() -> u64 {
     10
 }
 
@@ -823,7 +875,9 @@ impl ConnectionConfig {
             .into_iter()
             .filter_map(|layer| match layer {
                 TransportLayerConfig::Ssh(ssh) => Some(ssh),
-                TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => None,
+                TransportLayerConfig::Proxy(_)
+                | TransportLayerConfig::HttpTunnel(_)
+                | TransportLayerConfig::DbxGateway(_) => None,
             })
             .collect()
     }
@@ -2146,11 +2200,73 @@ fn bracket_ipv6(host: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_profile_resolution_preserves_connection_route() {
+        let reference = TransportLayerConfig::DbxGateway(DbxGatewayConfig {
+            id: "layer-1".to_string(),
+            name: String::new(),
+            enabled: true,
+            profile_id: "profile-1".to_string(),
+            main_url: String::new(),
+            identity_id: String::new(),
+            server_ca_pem: String::new(),
+            server_spki_sha256: String::new(),
+            connect_timeout_secs: 10,
+            edge_id: "edge-prod-01".to_string(),
+            target_id: "postgres-primary".to_string(),
+        });
+        let profile = TransportLayerConfig::DbxGateway(DbxGatewayConfig {
+            id: "profile-1".to_string(),
+            name: "Production gateway".to_string(),
+            enabled: true,
+            profile_id: String::new(),
+            main_url: "wss://gateway.example.com/_dbx/client".to_string(),
+            identity_id: "identity-1".to_string(),
+            server_ca_pem: "PUBLIC CA".to_string(),
+            server_spki_sha256: String::new(),
+            connect_timeout_secs: 15,
+            edge_id: String::new(),
+            target_id: String::new(),
+        });
+
+        let TransportLayerConfig::DbxGateway(resolved) = reference.resolved_from_profile(&profile) else {
+            panic!("expected gateway layer")
+        };
+        assert_eq!(resolved.id, "layer-1");
+        assert_eq!(resolved.profile_id, "profile-1");
+        assert_eq!(resolved.main_url, "wss://gateway.example.com/_dbx/client");
+        assert_eq!(resolved.identity_id, "identity-1");
+        assert_eq!(resolved.edge_id, "edge-prod-01");
+        assert_eq!(resolved.target_id, "postgres-primary");
+    }
+
+    #[test]
+    fn gateway_profile_round_trip_contains_no_private_identity_material() {
+        let layer = TransportLayerConfig::DbxGateway(DbxGatewayConfig {
+            id: "profile-1".to_string(),
+            name: "Production gateway".to_string(),
+            enabled: true,
+            profile_id: String::new(),
+            main_url: "wss://gateway.example.com/_dbx/client".to_string(),
+            identity_id: "identity-1".to_string(),
+            server_ca_pem: "PUBLIC CA".to_string(),
+            server_spki_sha256: "ab".repeat(32),
+            connect_timeout_secs: 15,
+            edge_id: String::new(),
+            target_id: String::new(),
+        });
+
+        let json = serde_json::to_string(&layer).unwrap();
+        assert!(json.contains("identity-1"));
+        assert!(!json.contains("private_key"));
+        assert!(!json.contains("pkcs12"));
+        assert_eq!(serde_json::from_str::<TransportLayerConfig>(&json).unwrap(), layer);
+    }
     use super::{
         database_info_from_protocol_value, default_query_timeout_secs, default_redis_key_separator,
         default_ssh_connect_timeout_secs, sqlserver_legacy_compatibility_param,
         without_sqlserver_legacy_compatibility_param, ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo,
-        DatabaseType, IdentifierCase, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+        DatabaseType, DbxGatewayConfig, IdentifierCase, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
     };
     use std::str::FromStr;
 

@@ -2337,6 +2337,7 @@ impl AppState {
             TransportLayerConfig::HttpTunnel(_) => {
                 Err("Tunnel test is not supported for HTTP tunnel profiles.".to_string())
             }
+            TransportLayerConfig::DbxGateway(_) => Err("DBX Gateway identity provider is unavailable.".to_string()),
         }
     }
 

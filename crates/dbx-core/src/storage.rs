@@ -689,6 +689,7 @@ fn scrub_transport_layer_secrets(config: &mut ConnectionConfig) {
             TransportLayerConfig::HttpTunnel(http) => {
                 http.token.clear();
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
 }
@@ -2251,6 +2252,7 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
                     &http.token,
                 )?;
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
     persist_secret_in_tx(tx, &config.id, "redis_sentinel_password", &config.redis_sentinel_password)?;
@@ -2532,7 +2534,9 @@ impl Storage {
                                 TransportLayerConfig::Ssh(layer) => {
                                     self.get_secret(&id, &ssh_tunnel_password_key(index, layer)).await?
                                 }
-                                TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => None,
+                                TransportLayerConfig::Proxy(_)
+                                | TransportLayerConfig::HttpTunnel(_)
+                                | TransportLayerConfig::DbxGateway(_) => None,
                             })
                             .unwrap_or_default();
                         ssh.key_passphrase = self
@@ -2545,7 +2549,9 @@ impl Storage {
                                 TransportLayerConfig::Ssh(layer) => {
                                     self.get_secret(&id, &ssh_tunnel_key_passphrase_key(index, layer)).await?
                                 }
-                                TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => None,
+                                TransportLayerConfig::Proxy(_)
+                                | TransportLayerConfig::HttpTunnel(_)
+                                | TransportLayerConfig::DbxGateway(_) => None,
                             })
                             .unwrap_or_default();
                     }
@@ -2567,6 +2573,7 @@ impl Storage {
                             .await?
                             .unwrap_or_default();
                     }
+                    TransportLayerConfig::DbxGateway(_) => {}
                 }
             }
             config.redis_sentinel_password = self.get_secret(&id, "redis_sentinel_password").await?.unwrap_or_default();

@@ -798,6 +798,7 @@ fn scrub_connection_secrets(config: &mut ConnectionConfig) {
             TransportLayerConfig::HttpTunnel(http) => {
                 http.token.clear();
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
     config.redis_sentinel_password.clear();
@@ -856,6 +857,7 @@ async fn build_sensitive_payload(
                         &http.token,
                     );
                 }
+                TransportLayerConfig::DbxGateway(_) => {}
             }
         }
         push_secret(&mut connection_secrets, &config.id, "redis_sentinel_password", &config.redis_sentinel_password);
@@ -1045,6 +1047,7 @@ async fn clear_connection_secrets(storage: &Storage, connections: &[ConnectionCo
                 TransportLayerConfig::HttpTunnel(_) => {
                     storage.delete_secret(&config.id, &transport_layer_http_tunnel_token_key(index, layer)).await?;
                 }
+                TransportLayerConfig::DbxGateway(_) => {}
             }
         }
     }

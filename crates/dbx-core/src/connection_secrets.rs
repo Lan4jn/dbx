@@ -208,6 +208,7 @@ fn persist_transport_layer_secrets(
         TransportLayerConfig::HttpTunnel(http) => {
             persist_secret(store, connection_id, &transport_layer_http_tunnel_token_key(index, layer), &http.token)?;
         }
+        TransportLayerConfig::DbxGateway(_) => {}
     }
     Ok(())
 }
@@ -275,6 +276,7 @@ fn hydrate_transport_layer_secrets(
                     *needs_rewrite = true;
                 }
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
     Ok(())
@@ -649,6 +651,7 @@ fn sanitize_connections(configs: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
                     TransportLayerConfig::HttpTunnel(http) => {
                         http.token.clear();
                     }
+                    TransportLayerConfig::DbxGateway(_) => {}
                 }
             }
             config.redis_sentinel_password.clear();

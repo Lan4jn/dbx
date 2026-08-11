@@ -119,6 +119,9 @@ pub async fn start_transport_layers(
                 )
                 .await
                 .map_err(|err| format!("HTTP tunnel layer {} failed: {err}", index + 1))?,
+            TransportLayerConfig::DbxGateway(_) => {
+                return Err("DBX Gateway transport is unavailable".to_string());
+            }
         };
 
         final_local_port = local_port;
@@ -170,6 +173,7 @@ enum PlannedLayerType {
     Ssh,
     Proxy,
     HttpTunnel,
+    DbxGateway,
 }
 
 #[cfg(test)]
@@ -222,6 +226,7 @@ fn plan_transport_layers_with_resolver(
             TransportLayerConfig::Ssh(_) => PlannedLayerType::Ssh,
             TransportLayerConfig::Proxy(_) => PlannedLayerType::Proxy,
             TransportLayerConfig::HttpTunnel(_) => PlannedLayerType::HttpTunnel,
+            TransportLayerConfig::DbxGateway(_) => PlannedLayerType::DbxGateway,
         };
         planned.push(PlannedTransportLayer {
             layer_type,
