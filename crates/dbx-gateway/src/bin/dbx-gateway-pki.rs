@@ -8,8 +8,8 @@ use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 use dbx_gateway::pki::{
-    write_output_file, CertificateRole, ClientIssueRequest, EdgeIssueRequest, PkiStore, RevocationReason,
-    ServerIssueRequest,
+    serve_remote, serve_unix, write_output_file, CertificateRole, ClientIssueRequest, EdgeIssueRequest,
+    PkiEnrollmentService, PkiStore, RemotePkiConfig, RevocationReason, ServerIssueRequest,
 };
 use dbx_gateway::state::GatewayState;
 use dbx_gateway::GatewayError;
@@ -24,11 +24,51 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Serve(ServeArgs),
     Init(InitArgs),
     Server(ServerCommand),
     Client(ClientCommand),
     Edge(EdgeCommand),
     Enrollment(EnrollmentCommand),
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceFileConfig {
+    data_dir: PathBuf,
+    password_file: PathBuf,
+    #[serde(default = "default_state_file")]
+    state_file: PathBuf,
+    unix: Option<UnixServiceConfig>,
+    remote: Option<RemoteServiceConfig>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnixServiceConfig {
+    path: PathBuf,
+    allowed_uid: u32,
+    allowed_gid: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteServiceConfig {
+    listen: String,
+    certificate: PathBuf,
+    private_key: PathBuf,
+    main_ra_ca_certificate: PathBuf,
+    allowed_ra_uri_sans: Vec<String>,
+}
+
+fn default_state_file() -> PathBuf {
+    PathBuf::from("gateway-state.sqlite3")
 }
 
 #[derive(Debug, Args)]
@@ -184,6 +224,7 @@ async fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<String, GatewayError> {
     match cli.command {
+        Command::Serve(args) => serve(args).await,
         Command::Init(args) => {
             let password = read_password_file(&args.password_file)?;
             PkiStore::init(&args.data_dir, &password)?;
@@ -206,6 +247,81 @@ async fn dispatch(cli: Cli) -> Result<String, GatewayError> {
             EnrollmentAction::Revoke(args) => revoke_enrollment(args).await,
         },
     }
+}
+
+async fn serve(args: ServeArgs) -> Result<String, GatewayError> {
+    let config_path = fs::canonicalize(&args.config).map_err(|_| pki_error("PKI service config could not be read"))?;
+    let contents = fs::read_to_string(&config_path).map_err(|_| pki_error("PKI service config could not be read"))?;
+    let mut config: ServiceFileConfig =
+        toml::from_str(&contents).map_err(|_| pki_error("PKI service config is invalid"))?;
+    if config.unix.is_none() && config.remote.is_none() {
+        return Err(pki_error("PKI service requires a Unix or remote listener"));
+    }
+    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    resolve_service_path(&mut config.data_dir, base);
+    resolve_service_path(&mut config.password_file, base);
+    resolve_service_path(&mut config.state_file, base);
+    if let Some(unix) = &mut config.unix {
+        resolve_service_path(&mut unix.path, base);
+    }
+    if let Some(remote) = &mut config.remote {
+        resolve_service_path(&mut remote.certificate, base);
+        resolve_service_path(&mut remote.private_key, base);
+        resolve_service_path(&mut remote.main_ra_ca_certificate, base);
+    }
+
+    let password = read_password_file(&config.password_file)?;
+    let state = GatewayState::open(config.state_file).await?;
+    let store = PkiStore::open(&config.data_dir)?;
+    let service = PkiEnrollmentService::new(state, store, password);
+    let unix = match config.unix {
+        Some(unix) => Some(serve_unix(unix.path, unix.allowed_uid, unix.allowed_gid, service.clone()).await?),
+        None => None,
+    };
+    let remote = match config.remote {
+        Some(remote) => Some(
+            serve_remote(
+                RemotePkiConfig {
+                    listen: remote.listen,
+                    certificate: remote.certificate,
+                    private_key: remote.private_key,
+                    main_ra_ca_certificate: remote.main_ra_ca_certificate,
+                    allowed_ra_uri_sans: remote.allowed_ra_uri_sans,
+                },
+                service,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    wait_for_shutdown_signal().await?;
+    if let Some(server) = unix {
+        server.shutdown().await;
+    }
+    if let Some(server) = remote {
+        server.shutdown().await;
+    }
+    Ok("PKI service stopped".to_string())
+}
+
+fn resolve_service_path(path: &mut PathBuf, base: &Path) {
+    if path.is_relative() {
+        *path = base.join(&*path);
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<(), GatewayError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).map_err(|_| pki_error("signal handler failed"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(|_| pki_error("signal handler failed")),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.map_err(|_| pki_error("signal handler failed"))
 }
 
 async fn create_enrollment(args: EnrollmentCreateArgs) -> Result<String, GatewayError> {
@@ -397,7 +513,7 @@ mod tests {
         let command = Cli::command();
         let names = command.get_subcommands().map(|item| item.get_name()).collect::<Vec<_>>();
 
-        assert_eq!(names, ["init", "server", "client", "edge", "enrollment"]);
+        assert_eq!(names, ["serve", "init", "server", "client", "edge", "enrollment"]);
         let command = Cli::command();
         for role in ["server", "client", "edge"] {
             let role_command = command.find_subcommand(role).unwrap();

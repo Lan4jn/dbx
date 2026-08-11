@@ -1,4 +1,5 @@
 mod issue;
+mod service;
 mod store;
 
 use std::fmt;
@@ -6,6 +7,10 @@ use std::str::FromStr;
 
 pub use issue::{
     ClientIssueRequest, EdgeIssueRequest, IssuedCertificate, IssuedClientBundle, IssuedKeyPair, ServerIssueRequest,
+};
+pub use service::{
+    enroll_over_remote, enroll_over_unix, serve_remote, serve_unix, EnrollCsrRequest, EnrollCsrResponse,
+    PkiEnrollmentService, RemotePkiConfig, RemotePkiServer, UnixPkiServer,
 };
 pub use store::{write_output_file, GeneratedCrl, PkiStore};
 

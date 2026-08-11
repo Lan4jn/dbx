@@ -21,6 +21,7 @@ const ROOT: &str = "root";
 const MAX_SERIAL_BYTES: usize = 20;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone)]
 pub struct PkiStore {
     pub(crate) data_dir: PathBuf,
 }

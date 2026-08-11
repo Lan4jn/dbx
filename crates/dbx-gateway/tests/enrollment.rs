@@ -5,7 +5,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use dbx_gateway::pki::{
+    enroll_over_remote, enroll_over_unix, serve_remote, serve_unix, EnrollCsrRequest, PkiEnrollmentService, PkiStore,
+    RemotePkiConfig,
+};
 use dbx_gateway::state::GatewayState;
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    SanType,
+};
+use x509_parser::extensions::GeneralName;
+use x509_parser::pem::parse_x509_pem;
+use x509_parser::prelude::parse_x509_certificate;
+use zeroize::Zeroizing;
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -17,7 +29,7 @@ impl TempDir {
             let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!("dbx-gateway-enrollment-{}-{id}", std::process::id()));
             match fs::create_dir(&path) {
-                Ok(()) => return Self(path),
+                Ok(()) => return Self(fs::canonicalize(path).unwrap()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("failed to create test directory: {error}"),
             }
@@ -92,4 +104,175 @@ async fn token_replace_is_required_for_an_edge_with_an_active_certificate() {
 
     assert!(token.replace);
     assert!(state.certificate_is_revoked("01AB").await.unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pki_service_unix_socket_issues_only_the_token_bound_edge_identity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) = test_state().await;
+    let password = Zeroizing::new("test-ca-password".to_string());
+    let store = PkiStore::init(&dir.0.join("pki"), &password).unwrap();
+    let service = PkiEnrollmentService::new(state.clone(), store, password);
+    let socket_path = dir.0.join("pki.sock");
+    let server =
+        serve_unix(socket_path.clone(), unsafe { libc::geteuid() }, unsafe { libc::getegid() }, service.clone())
+            .await
+            .unwrap();
+    assert_eq!(fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777, 0o660);
+
+    let token = state.enrollments.create("edge-prod-01", Duration::from_secs(600), false).await.unwrap();
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, "attacker-controlled");
+    params.subject_alt_names.push(SanType::URI("urn:dbx-gateway:client:attacker".try_into().unwrap()));
+    let csr = params.serialize_request(&key).unwrap();
+    let rejected = EnrollCsrRequest {
+        token: Zeroizing::new(token.secret.to_string()),
+        claimed_edge_id: "edge-prod-02".to_string(),
+        csr_der: csr.der().to_vec(),
+    };
+    assert!(enroll_over_unix(&socket_path, &rejected).await.is_err());
+
+    let response = enroll_over_unix(
+        &socket_path,
+        &EnrollCsrRequest {
+            token: Zeroizing::new(token.secret.to_string()),
+            claimed_edge_id: "edge-prod-01".to_string(),
+            csr_der: csr.der().to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let (_, pem) = parse_x509_pem(response.certificate_pem.as_bytes()).unwrap();
+    let (_, certificate) = parse_x509_certificate(&pem.contents).unwrap();
+    let eku = certificate.extended_key_usage().unwrap().unwrap();
+    assert!(eku.value.client_auth);
+    assert!(!eku.value.server_auth);
+    let sans = certificate.subject_alternative_name().unwrap().unwrap();
+    let uris = sans
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some(*uri),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(uris, ["urn:dbx-gateway:edge:edge-prod-01"]);
+    assert_eq!(certificate.public_key().subject_public_key.data.as_ref(), key.public_key_raw());
+
+    server.shutdown().await;
+
+    let server_ca = test_ca("remote-server-ca");
+    let ra_ca = test_ca("main-ra-ca");
+    let server_identity = issue_test_identity(&server_ca, "localhost", None, true);
+    let allowed_ra = issue_test_identity(&ra_ca, "main-ra", Some("urn:dbx-gateway:ra:main-01"), false);
+    let denied_ra = issue_test_identity(&ra_ca, "other-ra", Some("urn:dbx-gateway:ra:other"), false);
+    let server_ca_path = dir.0.join("remote-server-ca.pem");
+    let ra_ca_path = dir.0.join("main-ra-ca.pem");
+    let server_cert = dir.0.join("remote-server.pem");
+    let server_key = dir.0.join("remote-server.key");
+    let allowed_cert = dir.0.join("main-ra.pem");
+    let allowed_key = dir.0.join("main-ra.key");
+    let denied_cert = dir.0.join("other-ra.pem");
+    let denied_key = dir.0.join("other-ra.key");
+    fs::write(&server_ca_path, &server_ca.certificate_pem).unwrap();
+    fs::write(&ra_ca_path, &ra_ca.certificate_pem).unwrap();
+    write_test_identity(&server_cert, &server_key, &server_identity, &server_ca.certificate_pem);
+    write_test_identity(&allowed_cert, &allowed_key, &allowed_ra, &ra_ca.certificate_pem);
+    write_test_identity(&denied_cert, &denied_key, &denied_ra, &ra_ca.certificate_pem);
+    let remote = serve_remote(
+        RemotePkiConfig {
+            listen: "127.0.0.1:0".to_string(),
+            certificate: server_cert,
+            private_key: server_key,
+            main_ra_ca_certificate: ra_ca_path,
+            allowed_ra_uri_sans: vec!["urn:dbx-gateway:ra:main-01".to_string()],
+        },
+        service,
+    )
+    .await
+    .unwrap();
+    let remote_token = state.enrollments.create("edge-remote-01", Duration::from_secs(600), false).await.unwrap();
+    let remote_key = KeyPair::generate().unwrap();
+    let remote_csr = CertificateParams::default().serialize_request(&remote_key).unwrap();
+    let remote_request = EnrollCsrRequest {
+        token: Zeroizing::new(remote_token.secret.to_string()),
+        claimed_edge_id: "edge-remote-01".to_string(),
+        csr_der: remote_csr.der().to_vec(),
+    };
+    assert!(enroll_over_remote(
+        remote.local_addr(),
+        "localhost",
+        &server_ca_path,
+        &denied_cert,
+        &denied_key,
+        &remote_request,
+    )
+    .await
+    .is_err());
+    let remote_response = enroll_over_remote(
+        remote.local_addr(),
+        "localhost",
+        &server_ca_path,
+        &allowed_cert,
+        &allowed_key,
+        &remote_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(remote_response.edge_id, "edge-remote-01");
+    remote.shutdown().await;
+}
+
+struct TestCa {
+    certificate_pem: String,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+struct TestIdentity {
+    certificate_pem: String,
+    private_key_pem: String,
+}
+
+fn test_ca(name: &str) -> TestCa {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+    let certificate = params.self_signed(&key).unwrap();
+    TestCa { certificate_pem: certificate.pem(), issuer: Issuer::new(params, key) }
+}
+
+fn issue_test_identity(ca: &TestCa, name: &str, uri: Option<&str>, server: bool) -> TestIdentity {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, name);
+    params.extended_key_usages =
+        vec![if server { ExtendedKeyUsagePurpose::ServerAuth } else { ExtendedKeyUsagePurpose::ClientAuth }];
+    params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::hours(12);
+    if server {
+        params.subject_alt_names.push(SanType::DnsName("localhost".try_into().unwrap()));
+    }
+    if let Some(uri) = uri {
+        params.subject_alt_names.push(SanType::URI(uri.try_into().unwrap()));
+    }
+    let certificate = params.signed_by(&key, &ca.issuer).unwrap();
+    TestIdentity { certificate_pem: certificate.pem(), private_key_pem: key.serialize_pem() }
+}
+
+fn write_test_identity(certificate: &std::path::Path, key: &std::path::Path, identity: &TestIdentity, ca_pem: &str) {
+    fs::write(certificate, format!("{}{ca_pem}", identity.certificate_pem)).unwrap();
+    fs::write(key, &identity.private_key_pem).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
