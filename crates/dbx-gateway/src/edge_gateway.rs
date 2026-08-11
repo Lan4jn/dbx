@@ -554,7 +554,11 @@ async fn run_control_session(
                 match message {
                     Message::Binary(frame) => match decode_control_frame::<MainToEdge>(&frame) {
                         Ok(MainToEdge::HeartbeatAck { .. }) => registered = true,
-                        Ok(MainToEdge::OpenDataChannel { session_id, target_id, expires_at_unix_ms }) if registered => {
+                        Ok(MainToEdge::OpenDataChannel { session_id, target_id, expires_at_unix_ms }) => {
+                            // Main can authorize a route immediately after accepting registration,
+                            // before the first HeartbeatAck reaches this task. A valid command on
+                            // the authenticated control socket also confirms registration.
+                            registered = true;
                             data_tasks.spawn(run_data_channel(
                                 config.clone(),
                                 tls.clone(),
