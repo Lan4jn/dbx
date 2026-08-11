@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
 use crate::enrollment::EnrollmentStore;
+use crate::protocol::RegisteredTarget;
 use crate::{GatewayError, GatewayErrorCode};
 
 #[derive(Clone)]
@@ -133,6 +135,48 @@ impl GatewayState {
         let edge_id = edge_id.to_string();
         run_db(self.path.clone(), move |connection| {
             connection.query_row("SELECT COUNT(*) FROM revocations WHERE edge_id = ?1", [edge_id], |row| row.get(0))
+        })
+        .await
+    }
+
+    pub async fn replace_edge_routes(
+        &self,
+        edge_id: &str,
+        targets: &BTreeMap<String, RegisteredTarget>,
+    ) -> Result<(), GatewayError> {
+        let edge_id = edge_id.to_string();
+        let targets =
+            targets.values().map(|target| (target.target_id.clone(), target.display_name.clone())).collect::<Vec<_>>();
+        run_db(self.path.clone(), move |connection| {
+            let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            transaction.execute("DELETE FROM edge_routes WHERE edge_id = ?1", [&edge_id])?;
+            for (target_id, display_name) in targets {
+                transaction.execute(
+                    "INSERT INTO edge_routes (edge_id, target_id, display_name) VALUES (?1, ?2, ?3)",
+                    params![edge_id, target_id, display_name],
+                )?;
+            }
+            transaction.commit()
+        })
+        .await
+    }
+
+    pub async fn load_edge_routes(&self) -> Result<BTreeMap<String, BTreeMap<String, RegisteredTarget>>, GatewayError> {
+        run_db(self.path.clone(), move |connection| {
+            let mut statement = connection
+                .prepare("SELECT edge_id, target_id, display_name FROM edge_routes ORDER BY edge_id, target_id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?;
+            let mut edges = BTreeMap::<String, BTreeMap<String, RegisteredTarget>>::new();
+            for row in rows {
+                let (edge_id, target_id, display_name) = row?;
+                edges
+                    .entry(edge_id)
+                    .or_default()
+                    .insert(target_id.clone(), RegisteredTarget { target_id, display_name });
+            }
+            Ok(edges)
         })
         .await
     }

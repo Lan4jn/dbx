@@ -98,6 +98,7 @@ impl Fixture {
             revoked_edge_serials: Vec::new(),
             fallback_upstream: Some(upstream),
             health_listen: None,
+            state_file: None,
             max_streams_per_edge: 256,
             max_streams_per_client: 32,
             connection_rate_per_second: 64,

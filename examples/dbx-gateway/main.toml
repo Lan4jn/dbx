@@ -1,6 +1,7 @@
 mode = "main"
 listen = "0.0.0.0:443"
 health_listen = "127.0.0.1:9080"
+state_file = "/var/lib/dbx-gateway/main-state.sqlite3"
 certificate = "/etc/dbx-gateway/certs/main.pem"
 private_key = "/etc/dbx-gateway/certs/main.key"
 edge_ca_certificate = "/etc/dbx-gateway/certs/edge-ca.pem"

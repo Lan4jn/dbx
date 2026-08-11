@@ -22,11 +22,11 @@ install -m 0640 examples/edge.toml /etc/dbx-gateway/edge.toml
 ```bash
 openssl x509 -in main.pem -pubkey -noout \
   | openssl pkey -pubin -outform DER \
-  | openssl dgst -sha256 -binary \
-  | openssl base64 -A
+  | openssl dgst -sha256 -hex \
+  | awk '{print $NF}'
 ```
 
-预期输出单行 Base64 值。通过另一条可信渠道核对后写入 `server_spki_sha256`。pin 错误会使首次领证 fail closed；不要为“先跑起来”而关闭校验。
+预期输出单行 64 位十六进制值。通过另一条可信渠道核对后写入 `server_spki_sha256`。pin 错误会使首次领证 fail closed；不要为“先跑起来”而关闭校验。
 
 ## 令牌领证
 

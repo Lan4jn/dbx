@@ -41,6 +41,7 @@ use crate::protocol::{
     MAX_DATA_FRAME_SIZE,
 };
 use crate::reverse_proxy::{empty_proxy_body, full_proxy_body, FixedUpstreamProxy, ProxyBody};
+use crate::state::GatewayState;
 use crate::stream::relay_websockets;
 use crate::tls::{GatewayTls, PeerIdentity};
 use crate::{GatewayError, GatewayErrorCode};
@@ -101,12 +102,23 @@ struct MainImmutableConfig {
     connection_rate_per_second: u32,
     connection_rate_burst: u32,
     global_buffer_budget_bytes: usize,
+    state_file: Option<std::path::PathBuf>,
 }
 
 struct StreamLimits {
     clients: IdentityConcurrency,
     edges: IdentityConcurrency,
     buffers: BufferBudget,
+}
+
+#[derive(Clone)]
+struct MainServices {
+    registry: EdgeRegistry,
+    tickets: Arc<AsyncMutex<SessionTickets>>,
+    pending_routes: PendingRoutes,
+    control_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    stream_limits: Arc<StreamLimits>,
+    state: Option<GatewayState>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,22 +164,45 @@ impl MainGateway {
             connection_rate_per_second: config.connection_rate_per_second,
             connection_rate_burst: config.connection_rate_burst,
             global_buffer_budget_bytes: config.global_buffer_budget_bytes,
+            state_file: config.state_file.clone(),
         };
         let listener =
             TcpListener::bind(&config.listen).await.map_err(|_| internal_error("main listener could not bind"))?;
         let local_addr = listener.local_addr().map_err(|_| internal_error("main listener address unavailable"))?;
+        let state = match &config.state_file {
+            Some(path) => Some(GatewayState::open(path.clone()).await?),
+            None => None,
+        };
         let registry = EdgeRegistry::default();
+        if let Some(state) = &state {
+            let mut entries = registry.write().await;
+            for (edge_id, targets) in state.load_edge_routes().await? {
+                let (control_tx, _) = mpsc::channel(1);
+                let (session_shutdown, _) = watch::channel(false);
+                entries.insert(
+                    edge_id.clone(),
+                    EdgeEntry {
+                        identity: EdgeIdentity { edge_id, serial: String::new(), fingerprint_sha256: [0; 32] },
+                        targets,
+                        last_heartbeat: Instant::now(),
+                        control_tx,
+                        active_streams: 0,
+                        connection_id: Uuid::new_v4(),
+                        session_shutdown,
+                        online: false,
+                    },
+                );
+            }
+        }
         let health = match &config.health_listen {
             Some(listen) => Some(
                 HealthServer::bind(listen, registry.clone(), &config.certificate, config.enrollment.is_some()).await?,
             ),
             None => None,
         };
-        let task_registry = registry.clone();
         let tickets = Arc::new(AsyncMutex::new(SessionTickets::new(Duration::from_secs(15))));
         let pending_routes = PendingRoutes::default();
         let control_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
-        let task_control_tasks = control_tasks.clone();
         let task_runtime = runtime.clone();
         let connection_slots = Arc::new(Semaphore::new(config.max_connections));
         let connection_rates =
@@ -177,6 +212,9 @@ impl MainGateway {
             edges: IdentityConcurrency::new(config.max_streams_per_edge),
             buffers: BufferBudget::new(config.global_buffer_budget_bytes),
         });
+        let services =
+            MainServices { registry: registry.clone(), tickets, pending_routes, control_tasks, stream_limits, state };
+        let task_services = services.clone();
         let tls_handshake_timeout = Duration::from_secs(config.tls_handshake_timeout_secs);
         let http_header_timeout = Duration::from_secs(config.http_header_timeout_secs);
         let (shutdown, mut stop) = watch::channel(false);
@@ -214,12 +252,8 @@ impl MainGateway {
                 let acceptor = TlsAcceptor::from(runtime.tls.server_config.clone());
                 let tls = runtime.tls.clone();
                 let routes = runtime.routes.clone();
-                let registry = task_registry.clone();
-                let tickets = tickets.clone();
-                let pending_routes = pending_routes.clone();
-                let control_tasks = task_control_tasks.clone();
                 let connection_stop = task_shutdown.subscribe();
-                let stream_limits = stream_limits.clone();
+                let services = task_services.clone();
                 connections.spawn(async move {
                     let Ok(Ok(stream)) = timeout(tls_handshake_timeout, acceptor.accept(stream)).await else {
                         return;
@@ -233,28 +267,13 @@ impl MainGateway {
                     let service = service_fn(move |mut request: Request<Incoming>| {
                         request.extensions_mut().insert(identity.clone());
                         let routes = routes.clone();
-                        let registry = registry.clone();
-                        let tickets = tickets.clone();
-                        let pending_routes = pending_routes.clone();
-                        let control_tasks = control_tasks.clone();
+                        let services = services.clone();
                         let connection_permit = connection_permit.clone();
                         let connection_stop = connection_stop.clone();
                         let first_request_tx = first_request_tx.clone();
-                        let stream_limits = stream_limits.clone();
                         async move {
-                            let response = route(
-                                request,
-                                routes,
-                                peer,
-                                registry,
-                                tickets,
-                                pending_routes,
-                                control_tasks,
-                                connection_permit,
-                                stream_limits,
-                                connection_stop,
-                            )
-                            .await;
+                            let response =
+                                route(request, routes, peer, services, connection_permit, connection_stop).await;
                             if let Ok(mut sender) = first_request_tx.lock() {
                                 if let Some(sender) = sender.take() {
                                     let _ = sender.send(());
@@ -280,7 +299,8 @@ impl MainGateway {
             }
             connections.abort_all();
             while connections.join_next().await.is_some() {}
-            let controls = task_control_tasks.lock().map(|mut tasks| std::mem::take(&mut *tasks)).unwrap_or_default();
+            let controls =
+                task_services.control_tasks.lock().map(|mut tasks| std::mem::take(&mut *tasks)).unwrap_or_default();
             for control in controls {
                 let _ = control.await;
             }
@@ -307,6 +327,7 @@ impl MainGateway {
             || config.connection_rate_per_second != self.immutable.connection_rate_per_second
             || config.connection_rate_burst != self.immutable.connection_rate_burst
             || config.global_buffer_budget_bytes != self.immutable.global_buffer_budget_bytes
+            || config.state_file != self.immutable.state_file
         {
             return Err(GatewayError {
                 code: GatewayErrorCode::ConfigInvalid,
@@ -373,12 +394,8 @@ async fn route(
     mut request: Request<Incoming>,
     routes: Arc<RouteConfig>,
     peer: SocketAddr,
-    registry: EdgeRegistry,
-    tickets: Arc<AsyncMutex<SessionTickets>>,
-    pending_routes: PendingRoutes,
-    control_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    services: MainServices,
     connection_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
-    stream_limits: Arc<StreamLimits>,
     stop: watch::Receiver<bool>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let identity = request.extensions().get::<PeerIdentity>().cloned();
@@ -407,6 +424,7 @@ async fn route(
                 } else {
                     (control_websocket_config(), EdgeSocketRole::Control)
                 };
+                let task_services = services.clone();
                 let control = tokio::spawn(async move {
                     let Ok(upgraded) = hyper::upgrade::on(&mut request).await else {
                         return;
@@ -421,14 +439,12 @@ async fn route(
                         edge_id,
                         serial,
                         fingerprint_sha256,
-                        registry,
-                        tickets,
-                        pending_routes,
+                        task_services,
                         stop,
                     )
                     .await;
                 });
-                track_task(&control_tasks, control);
+                track_task(&services.control_tasks, control);
                 return Ok(switching_protocols(version, accept_key));
             }
             return Ok(empty_response(StatusCode::OK));
@@ -442,6 +458,7 @@ async fn route(
                     return Ok(empty_response(StatusCode::NOT_FOUND));
                 };
                 let version = request.version();
+                let task_services = services.clone();
                 let task = tokio::spawn(async move {
                     let Ok(upgraded) = hyper::upgrade::on(&mut request).await else { return };
                     let socket = WebSocketStream::from_raw_socket(
@@ -450,19 +467,9 @@ async fn route(
                         Some(data_websocket_config()),
                     )
                     .await;
-                    run_dbx_connection(
-                        socket,
-                        permit,
-                        client_id,
-                        registry,
-                        tickets,
-                        pending_routes,
-                        stream_limits,
-                        stop,
-                    )
-                    .await;
+                    run_dbx_connection(socket, permit, client_id, task_services, stop).await;
                 });
-                track_task(&control_tasks, task);
+                track_task(&services.control_tasks, task);
                 return Ok(switching_protocols(version, accept_key));
             }
             return Ok(empty_response(StatusCode::OK));
@@ -610,11 +617,10 @@ async fn run_edge_control(
     certificate_edge_id: String,
     serial: String,
     fingerprint_sha256: [u8; 32],
-    registry: EdgeRegistry,
-    tickets: Arc<AsyncMutex<SessionTickets>>,
-    pending_routes: PendingRoutes,
+    services: MainServices,
     mut stop: watch::Receiver<bool>,
 ) {
+    let MainServices { registry, tickets, pending_routes, state, .. } = services;
     let incoming = tokio::select! {
         incoming = timeout(HEARTBEAT_TIMEOUT, socket.next()) => incoming,
         _ = wait_for_stop(&mut stop) => {
@@ -689,9 +695,20 @@ async fn run_edge_control(
         close_control_socket(&mut socket).await;
         return;
     }
-
     let heartbeat_deadline = tokio::time::sleep(HEARTBEAT_TIMEOUT);
     tokio::pin!(heartbeat_deadline);
+    if let Some(state) = &state {
+        let targets = registry.read().await[&certificate_edge_id].targets.clone();
+        if state.replace_edge_routes(&certificate_edge_id, &targets).await.is_err() {
+            let mut entries = registry.write().await;
+            if entries.get(&certificate_edge_id).is_some_and(|entry| entry.connection_id == connection_id) {
+                entries.remove(&certificate_edge_id);
+            }
+            close_control_socket(&mut socket).await;
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             changed = session_stop.changed() => {
@@ -818,12 +835,10 @@ async fn run_dbx_connection(
     mut socket: ServerSocket,
     _permit: OwnedSemaphorePermit,
     client_id: String,
-    registry: EdgeRegistry,
-    tickets: Arc<AsyncMutex<SessionTickets>>,
-    pending_routes: PendingRoutes,
-    limits: Arc<StreamLimits>,
+    services: MainServices,
     mut stop: watch::Receiver<bool>,
 ) {
+    let MainServices { registry, tickets, pending_routes, stream_limits: limits, .. } = services;
     if !send_client_event(&mut socket, ClientEvent::Stage { stage: Stage::MainAuthenticated }).await {
         return;
     }

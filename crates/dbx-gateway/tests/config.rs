@@ -90,6 +90,17 @@ ca_certificate = "certs/root.pem"
 }
 
 #[test]
+fn packaged_main_and_edge_examples_deserialize() {
+    let main: GatewayConfig = toml::from_str(include_str!("../../../examples/dbx-gateway/main.toml")).unwrap();
+    let edge: GatewayConfig = toml::from_str(include_str!("../../../examples/dbx-gateway/edge.toml")).unwrap();
+
+    assert!(matches!(main, GatewayConfig::Main(_)));
+    let GatewayConfig::Edge(edge) = edge else { panic!("expected Edge example") };
+    assert_eq!(edge.edge_id, "edge-prod-01");
+    assert!(edge.bootstrap.unwrap().enrollment_url.starts_with("https://"));
+}
+
+#[test]
 fn rejects_unknown_fields() {
     let dir = TempDir::new();
     write_credentials(dir.path());

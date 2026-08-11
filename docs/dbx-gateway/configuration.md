@@ -16,6 +16,7 @@
 | `dbx_path` | `/_dbx/client` | DBX 客户端数据路径。 |
 | `fallback_upstream` | 无 | 单个固定绝对 `http://` 或 `https://` 上游；禁止凭据和 fragment。 |
 | `health_listen` | 无 | 仅允许 loopback，例如 `127.0.0.1:9080`。提供 `/healthz`，不登录数据库。 |
+| `state_file` | 无 | Main 的最后已知 Edge/逻辑目标 SQLite；不保存数据库地址。 |
 | `allowed_edge_ids` | 空 | 空表示证书 CA 范围内均可注册；生产建议显式列出。 |
 | `revoked_edge_serials` | 空 | 吊销序列号列表；重载后关闭对应活动会话。 |
 | `max_connections` | `1024` | Main 总 TCP/TLS 连接上限。 |
@@ -51,7 +52,7 @@ Unix 端点只设置 `unix_socket`。远程端点必须同时设置 `remote_addr
 | `bootstrap` | 无 | 证书不存在时必须提供。 |
 | `targets` | 必填 | 以逻辑目标 ID 为 key 的目标表。 |
 
-`[bootstrap]` 字段：`token_file`、`enrollment_url`、`server_spki_sha256` 必填，`renew_before_days` 默认 `30`。SPKI pin 使用 Base64 编码 SHA-256，必须从可信渠道核对。
+`[bootstrap]` 字段：`token_file`、`enrollment_url`、`server_spki_sha256` 必填，`renew_before_days` 默认 `30`。SPKI pin 使用 64 位小写十六进制 SHA-256，必须从可信渠道核对。
 
 每个 `[targets.<id>]` 支持：
 

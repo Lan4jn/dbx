@@ -10,6 +10,8 @@ use dbx_gateway::config::{EdgeConfig, MainConfig};
 use dbx_gateway::edge_gateway::EdgeGateway;
 use dbx_gateway::limits::{BufferBudget, ConnectionRateLimiter, IdentityConcurrency, SecurityEvent, TargetPolicy};
 use dbx_gateway::main_gateway::MainGateway;
+use dbx_gateway::protocol::RegisteredTarget;
+use dbx_gateway::state::GatewayState;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     SanType,
@@ -117,6 +119,7 @@ async fn reload_preserves_valid_runtime_on_error_and_closes_revoked_edge() {
         revoked_edge_serials: Vec::new(),
         fallback_upstream: None,
         health_listen: Some("127.0.0.1:0".to_string()),
+        state_file: Some(dir.0.join("main-state.sqlite3")),
         max_streams_per_edge: 1,
         max_streams_per_client: 32,
         connection_rate_per_second: 64,
@@ -208,6 +211,24 @@ fn limits_rate_concurrency_and_buffer_budget_fail_closed() {
     assert!(budget.try_reserve(512).is_none());
     drop(reservation);
     assert!(budget.try_reserve(1024).is_some());
+}
+
+#[tokio::test]
+async fn persisted_routes_contain_only_offline_logical_metadata() {
+    let dir = TempDir::new();
+    let state_path = dir.0.join("main-state.sqlite3");
+    let state = GatewayState::open(state_path.clone()).await.unwrap();
+    let targets = BTreeMap::from([(
+        "postgres-primary".to_string(),
+        RegisteredTarget { target_id: "postgres-primary".to_string(), display_name: "Primary database".to_string() },
+    )]);
+
+    state.replace_edge_routes("edge-prod-01", &targets).await.unwrap();
+    let restored = state.load_edge_routes().await.unwrap();
+
+    assert_eq!(restored["edge-prod-01"], targets);
+    let database = fs::read(state_path).unwrap();
+    assert!(!database.windows(b"10.20.30.40:5432".len()).any(|window| window == b"10.20.30.40:5432"));
 }
 
 async fn wait_online(main: &MainGateway, online: bool) {

@@ -320,6 +320,7 @@ async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
         revoked_edge_serials: Vec::new(),
         fallback_upstream: None,
         health_listen: None,
+        state_file: None,
         max_streams_per_edge: 256,
         max_streams_per_client: 32,
         connection_rate_per_second: 64,

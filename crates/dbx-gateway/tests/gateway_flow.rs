@@ -121,6 +121,7 @@ impl Fixture {
             revoked_edge_serials: Vec::new(),
             fallback_upstream: None,
             health_listen: None,
+            state_file: Some(dir.0.join("main-state.sqlite3")),
             max_streams_per_edge: 256,
             max_streams_per_client: 32,
             connection_rate_per_second: 64,
@@ -338,6 +339,49 @@ async fn control_edge_reconnects_after_main_restart() {
     wait_for_edge(&restarted, "edge-restart", true).await;
 
     edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_restart_restores_only_offline_logical_routes() {
+    let fixture = Fixture::new();
+    let first = fixture.start().await;
+    let edge = EdgeGateway::start(fixture.edge_config(first.local_addr(), "edge-persisted")).unwrap();
+    wait_for_edge(&first, "edge-persisted", true).await;
+    edge.shutdown().await;
+    wait_for_edge(&first, "edge-persisted", false).await;
+    first.shutdown().await;
+    let state = fs::read(fixture.config.state_file.as_ref().unwrap()).unwrap();
+    assert!(!state.windows(b"127.0.0.1:5432".len()).any(|window| window == b"127.0.0.1:5432"));
+
+    let restarted = fixture.start().await;
+    let registry = restarted.registry();
+    let entries = registry.read().await;
+    let restored = &entries["edge-persisted"];
+    assert!(!restored.online);
+    assert_eq!(restored.targets["postgres"].display_name, "PostgreSQL");
+    drop(entries);
+
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-persisted"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(restarted.local_addr(), &fixture.server_ca, &client).await;
+    let request = ClientMessage::OpenRoute {
+        version: ProtocolVersion::current(),
+        request_id: uuid::Uuid::new_v4(),
+        edge_id: "edge-persisted".to_string(),
+        target_id: "postgres".to_string(),
+    };
+    socket.send(Message::Binary(encode_control_frame(&request).unwrap().into())).await.unwrap();
+    let _authenticated = socket.next().await.unwrap().unwrap();
+    let Message::Binary(error) = socket.next().await.unwrap().unwrap() else { panic!("expected error") };
+    assert_eq!(
+        serde_json::from_slice::<ClientEvent>(&error).unwrap(),
+        ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::EdgeOffline }
+    );
+    restarted.shutdown().await;
 }
 
 #[tokio::test]

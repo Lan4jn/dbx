@@ -681,8 +681,11 @@ fn internal_error(message: &str) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::control_websocket_config;
+    use super::{control_websocket_config, verify_server_pin};
     use crate::protocol::MAX_CONTROL_FRAME_SIZE;
+    use rcgen::{CertificateParams, KeyPair};
+    use sha2::{Digest, Sha256};
+    use x509_parser::prelude::parse_x509_certificate;
 
     #[test]
     fn control_websocket_is_bounded_to_the_protocol_frame_limit() {
@@ -703,5 +706,17 @@ mod tests {
         assert_eq!(backoff.next_delay(0), std::time::Duration::from_secs(2));
         backoff.record_registration(true);
         assert_eq!(backoff.next_delay(0), std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn enrollment_rejects_the_wrong_main_spki_pin() {
+        let key = KeyPair::generate().unwrap();
+        let certificate = CertificateParams::default().self_signed(&key).unwrap();
+        let chain = vec![certificate.der().clone()];
+        let (_, parsed) = parse_x509_certificate(certificate.der()).unwrap();
+        let expected = hex::encode(Sha256::digest(parsed.public_key().raw));
+
+        assert!(verify_server_pin(Some(&chain), &expected).is_ok());
+        assert!(verify_server_pin(Some(&chain), &"00".repeat(32)).is_err());
     }
 }

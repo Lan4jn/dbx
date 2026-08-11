@@ -42,6 +42,8 @@ pub struct MainConfig {
     pub fallback_upstream: Option<String>,
     #[serde(default)]
     pub health_listen: Option<String>,
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
     #[serde(default = "default_max_streams_per_edge")]
     pub max_streams_per_edge: usize,
     #[serde(default = "default_max_streams_per_client")]
@@ -181,6 +183,9 @@ fn resolve_paths(config: &mut GatewayConfig, base_dir: &Path) {
             resolve_path(&mut main.private_key, base_dir);
             resolve_path(&mut main.edge_ca_certificate, base_dir);
             resolve_path(&mut main.client_ca_certificate, base_dir);
+            if let Some(state_file) = &mut main.state_file {
+                resolve_path(state_file, base_dir);
+            }
             if let Some(enrollment) = &mut main.enrollment {
                 match &mut enrollment.pki {
                     PkiEndpointConfig::Unix { unix_socket } => resolve_path(unix_socket, base_dir),
