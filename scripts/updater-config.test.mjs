@@ -10,9 +10,9 @@ test("macOS updater uses the self-hosted release feed", async () => {
     readFile(new URL("../apps/desktop/src/composables/useAppUpdater.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.deepEqual(config.plugins.updater.endpoints, ["https://server.sjserver.fun:880/dbx/osx/latest.json"]);
+  assert.deepEqual(config.plugins.updater.endpoints, ["https://ser2.sjser.ccwu.cc:880/dbx/osx/latest.json"]);
   for (const source of runtimeSources) {
-    assert.match(source, /https:\/\/server\.sjserver\.fun:880\/dbx\/osx\//);
-    assert.doesNotMatch(source, /ser2\.sjser\.ccwu\.cc/);
+    assert.match(source, /https:\/\/ser2\.sjser\.ccwu\.cc:880\/dbx\/osx\//);
+    assert.doesNotMatch(source, /server\.sjserver\.fun/);
   }
 });

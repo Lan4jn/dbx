@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-const LATEST_JSON_CUSTOM_PATH: &str = "https://server.sjserver.fun:880/dbx/osx/latest.json";
+const LATEST_JSON_CUSTOM_PATH: &str = "https://ser2.sjser.ccwu.cc:880/dbx/osx/latest.json";
 const LATEST_JSON_R2_PATH: &str = "releases/latest/latest.json";
 const LATEST_JSON_CNB_PATH: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/latest/download/latest.json";
 const LATEST_EN_NOTES_R2_PATH: &str = "changelog/latest-en.json";
 const GITHUB_RELEASE_API_PREFIX: &str = "https://api.github.com/repos/t8y2/dbx/releases/tags/v";
-const RELEASE_DOWNLOAD_PAGE: &str = "https://server.sjserver.fun:880/dbx/osx/";
+const RELEASE_DOWNLOAD_PAGE: &str = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
 
 #[derive(Debug, Deserialize)]
 pub struct TauriRelease {
@@ -461,7 +461,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         let info = build_update_info(release, "0.5.2");
 
         assert_eq!(info.release_name, "DBX v0.5.3");
-        assert_eq!(info.release_url, "https://server.sjserver.fun:880/dbx/osx/");
+        assert_eq!(info.release_url, "https://ser2.sjser.ccwu.cc:880/dbx/osx/");
         assert_eq!(info.release_notes, "### 新功能\n\n真实发布说明");
         assert!(!info.portable_mode);
     }
@@ -505,14 +505,14 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     fn update_check_candidates_follow_selected_source() {
         assert_eq!(
             super::update_check_candidates(crate::DownloadSource::Official),
-            vec!["https://server.sjserver.fun:880/dbx/osx/latest.json"]
+            vec!["https://ser2.sjser.ccwu.cc:880/dbx/osx/latest.json"]
         );
         assert_eq!(
             super::update_check_candidates(crate::DownloadSource::Cnb),
             vec![
                 "https://cnb.cool/dbxio.com/dbx/-/releases/latest/download/latest.json",
                 "https://dl.dbxio.com/releases/latest/latest.json",
-                "https://server.sjserver.fun:880/dbx/osx/latest.json",
+                "https://ser2.sjser.ccwu.cc:880/dbx/osx/latest.json",
             ]
         );
     }

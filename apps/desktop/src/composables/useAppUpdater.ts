@@ -14,7 +14,7 @@ interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
 }
 
-const SELF_HOSTED_DOWNLOAD_URL = "https://server.sjserver.fun:880/dbx/osx/";
+const SELF_HOSTED_DOWNLOAD_URL = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
 
 export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
   return options.silent !== true;

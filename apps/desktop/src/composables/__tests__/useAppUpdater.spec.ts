@@ -137,6 +137,6 @@ describe("useAppUpdater download attempts", () => {
 
     updater.openLatestRelease();
 
-    await vi.waitFor(() => expect(openMock).toHaveBeenCalledWith("https://server.sjserver.fun:880/dbx/osx/"));
+    await vi.waitFor(() => expect(openMock).toHaveBeenCalledWith("https://ser2.sjser.ccwu.cc:880/dbx/osx/"));
   });
 });
