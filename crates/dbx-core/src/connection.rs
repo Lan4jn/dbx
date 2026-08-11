@@ -208,6 +208,7 @@ pub struct AppState {
     pub tunnels: TunnelManager,
     pub proxy_tunnels: ProxyTunnelManager,
     pub http_tunnels: HttpTunnelManager,
+    pub dbx_gateway: db::dbx_gateway::DbxGatewayManager,
     pub storage: Storage,
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
@@ -1024,6 +1025,7 @@ impl AppState {
             tunnels: TunnelManager::new(data_dir),
             proxy_tunnels: ProxyTunnelManager::new(),
             http_tunnels: HttpTunnelManager::new(),
+            dbx_gateway: db::dbx_gateway::DbxGatewayManager::default(),
             storage,
             plugins: PluginRegistry::new(plugin_dir),
             agent_manager: crate::agent_manager::AgentManager::new_with_base_dir_and_app_version(
@@ -1038,6 +1040,14 @@ impl AppState {
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }
+    }
+
+    pub fn with_gateway_identity_provider(
+        mut self,
+        provider: Arc<dyn db::dbx_gateway::GatewayIdentityProvider>,
+    ) -> Self {
+        self.dbx_gateway = db::dbx_gateway::DbxGatewayManager::new(provider);
+        self
     }
 
     pub fn jdbc_unavailable_error(&self) -> String {
@@ -2337,7 +2347,7 @@ impl AppState {
             TransportLayerConfig::HttpTunnel(_) => {
                 Err("Tunnel test is not supported for HTTP tunnel profiles.".to_string())
             }
-            TransportLayerConfig::DbxGateway(_) => Err("DBX Gateway identity provider is unavailable.".to_string()),
+            TransportLayerConfig::DbxGateway(gateway) => self.dbx_gateway.test_profile(gateway).await,
         }
     }
 
@@ -2365,6 +2375,7 @@ impl AppState {
             &self.tunnels,
             &self.proxy_tunnels,
             &self.http_tunnels,
+            &self.dbx_gateway,
         )
         .await?;
 
@@ -2397,6 +2408,7 @@ impl AppState {
                     &self.tunnels,
                     &self.proxy_tunnels,
                     &self.http_tunnels,
+                    &self.dbx_gateway,
                 )
                 .await
                 {
@@ -2422,6 +2434,7 @@ impl AppState {
                                 &self.tunnels,
                                 &self.proxy_tunnels,
                                 &self.http_tunnels,
+                                &self.dbx_gateway,
                             )
                             .await;
                             continue;
@@ -2437,6 +2450,7 @@ impl AppState {
                     &self.tunnels,
                     &self.proxy_tunnels,
                     &self.http_tunnels,
+                    &self.dbx_gateway,
                 )
                 .await
                 {
@@ -2452,6 +2466,7 @@ impl AppState {
                             &self.tunnels,
                             &self.proxy_tunnels,
                             &self.http_tunnels,
+                            &self.dbx_gateway,
                         )
                         .await;
                         continue;
@@ -2473,6 +2488,7 @@ impl AppState {
                             &self.tunnels,
                             &self.proxy_tunnels,
                             &self.http_tunnels,
+                            &self.dbx_gateway,
                         )
                         .await;
                         db::transport_layer_tunnel::stop_transport_layers(
@@ -2481,6 +2497,7 @@ impl AppState {
                             &self.tunnels,
                             &self.proxy_tunnels,
                             &self.http_tunnels,
+                            &self.dbx_gateway,
                         )
                         .await;
                     }
@@ -2550,6 +2567,7 @@ impl AppState {
                 &self.tunnels,
                 &self.proxy_tunnels,
                 &self.http_tunnels,
+                &self.dbx_gateway,
             )
             .await?;
             routes.push(db::redis_driver::RedisNodeRoute {
@@ -2583,6 +2601,7 @@ impl AppState {
                 &self.tunnels,
                 &self.proxy_tunnels,
                 &self.http_tunnels,
+                &self.dbx_gateway,
             )
             .await?;
             let mut mqc = mqc.with_connect_override("127.0.0.1", amqp_local_port);
@@ -2596,6 +2615,7 @@ impl AppState {
                     &self.tunnels,
                     &self.proxy_tunnels,
                     &self.http_tunnels,
+                    &self.dbx_gateway,
                 )
                 .await
                 {
@@ -2607,6 +2627,7 @@ impl AppState {
                             &self.tunnels,
                             &self.proxy_tunnels,
                             &self.http_tunnels,
+                            &self.dbx_gateway,
                         )
                         .await;
                         db::transport_layer_tunnel::stop_transport_layers(
@@ -2615,6 +2636,7 @@ impl AppState {
                             &self.tunnels,
                             &self.proxy_tunnels,
                             &self.http_tunnels,
+                            &self.dbx_gateway,
                         )
                         .await;
                         return Err(error);
@@ -2667,6 +2689,7 @@ impl AppState {
             &self.tunnels,
             &self.proxy_tunnels,
             &self.http_tunnels,
+            &self.dbx_gateway,
         )
         .await
         {
@@ -2678,6 +2701,7 @@ impl AppState {
                     &self.tunnels,
                     &self.proxy_tunnels,
                     &self.http_tunnels,
+                    &self.dbx_gateway,
                 )
                 .await;
                 return Err(format!("r-nacos console transport failed: {error}"));
@@ -2692,6 +2716,7 @@ impl AppState {
                     &self.tunnels,
                     &self.proxy_tunnels,
                     &self.http_tunnels,
+                    &self.dbx_gateway,
                 )
                 .await;
                 Err(error)
@@ -3606,6 +3631,7 @@ impl AppState {
             &self.tunnels,
             &self.proxy_tunnels,
             &self.http_tunnels,
+            &self.dbx_gateway,
         )
         .await;
         db::transport_layer_tunnel::stop_transport_layers(
@@ -3614,6 +3640,7 @@ impl AppState {
             &self.tunnels,
             &self.proxy_tunnels,
             &self.http_tunnels,
+            &self.dbx_gateway,
         )
         .await;
         db::transport_layer_tunnel::stop_transport_layers(
@@ -3622,6 +3649,7 @@ impl AppState {
             &self.tunnels,
             &self.proxy_tunnels,
             &self.http_tunnels,
+            &self.dbx_gateway,
         )
         .await;
         self.tunnels.stop_tunnel(connection_id).await;

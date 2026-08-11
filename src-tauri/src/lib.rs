@@ -1,6 +1,7 @@
 mod commands;
 mod data_dir;
 mod db;
+mod gateway_identity;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
 mod models;
@@ -1397,6 +1398,8 @@ pub fn run() {
             } else {
                 AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
+            let state =
+                state.with_gateway_identity_provider(Arc::new(gateway_identity::KeyringGatewayIdentityProvider));
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
             let state = Arc::new(state);
@@ -1406,6 +1409,7 @@ pub fn run() {
                 mode: data_dir_resolution.mode.clone(),
             });
             app.manage(state.clone());
+            app.manage(commands::gateway::GatewayIdentityState::default());
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
@@ -1699,6 +1703,11 @@ pub fn run() {
             commands::external_db::pending_open_db_files,
             commands::keychain::read_keychain_password,
             commands::keychain::read_keychain_passwords,
+            commands::gateway::import_gateway_identity,
+            commands::gateway::list_gateway_identities,
+            commands::gateway::delete_gateway_identity,
+            commands::gateway::list_gateway_routes,
+            commands::gateway::test_gateway_profile,
             commands::deep_link::pending_open_connection_links,
             commands::table_import::preview_table_import_file,
             commands::table_import::import_table_file,

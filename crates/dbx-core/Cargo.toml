@@ -66,7 +66,14 @@ cbc = "0.1"
 argon2 = "0.5"
 sha2 = "0.10"
 async-trait = "0.1"
+zeroize = { version = "1", features = ["derive"] }
 bytes = "1"
+dbx-gateway = { path = "../dbx-gateway", default-features = false }
+hex = "0.4"
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+url = "2"
+x509-parser = "0.18"
 font-kit = { version = "0.14.3", optional = true }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 flate2 = "1"
@@ -79,3 +86,8 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 arc-swap = "1"
 insta = { version = "1", features = ["json", "glob"] }
 tempfile = "3"
+
+[dev-dependencies]
+dbx-gateway = { path = "../dbx-gateway", features = ["server"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
