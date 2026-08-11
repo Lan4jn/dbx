@@ -1,6 +1,6 @@
 use std::fs;
 use std::fs::File;
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,6 +11,7 @@ use dbx_gateway::pki::{
     write_output_file, CertificateRole, ClientIssueRequest, EdgeIssueRequest, PkiStore, RevocationReason,
     ServerIssueRequest,
 };
+use dbx_gateway::state::GatewayState;
 use dbx_gateway::GatewayError;
 use zeroize::Zeroizing;
 
@@ -27,6 +28,41 @@ enum Command {
     Server(ServerCommand),
     Client(ClientCommand),
     Edge(EdgeCommand),
+    Enrollment(EnrollmentCommand),
+}
+
+#[derive(Debug, Args)]
+struct EnrollmentCommand {
+    #[command(subcommand)]
+    command: EnrollmentAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum EnrollmentAction {
+    Create(EnrollmentCreateArgs),
+    Revoke(EnrollmentRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+struct EnrollmentCreateArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    edge_id: String,
+    #[arg(long, default_value = "10m", value_parser = parse_ttl)]
+    ttl: std::time::Duration,
+    #[arg(long)]
+    replace: bool,
+    #[arg(long, requires = "replace")]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct EnrollmentRevokeArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    token_id: uuid::Uuid,
 }
 
 #[derive(Debug, Args)]
@@ -132,8 +168,9 @@ struct RevokeArgs {
     reason: String,
 }
 
-fn main() -> ExitCode {
-    match dispatch(Cli::parse()) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match dispatch(Cli::parse()).await {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -145,7 +182,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: Cli) -> Result<String, GatewayError> {
+async fn dispatch(cli: Cli) -> Result<String, GatewayError> {
     match cli.command {
         Command::Init(args) => {
             let password = read_password_file(&args.password_file)?;
@@ -164,7 +201,62 @@ fn dispatch(cli: Cli) -> Result<String, GatewayError> {
             EdgeAction::Issue(args) | EdgeAction::Renew(args) => issue_edge(args),
             EdgeAction::Revoke(args) => revoke(CertificateRole::Edge, args),
         },
+        Command::Enrollment(command) => match command.command {
+            EnrollmentAction::Create(args) => create_enrollment(args).await,
+            EnrollmentAction::Revoke(args) => revoke_enrollment(args).await,
+        },
     }
+}
+
+async fn create_enrollment(args: EnrollmentCreateArgs) -> Result<String, GatewayError> {
+    if args.replace && !args.yes {
+        confirm_replace(&args.edge_id)?;
+    }
+    let state = GatewayState::open(args.data_dir.join("gateway-state.sqlite3")).await?;
+    let token = state.enrollments.create(&args.edge_id, args.ttl, args.replace).await?;
+    Ok(format!(
+        "enrollment token {} for {} expires at {}\n{}",
+        token.id,
+        token.edge_id,
+        token.expires_at,
+        token.secret.as_str()
+    ))
+}
+
+async fn revoke_enrollment(args: EnrollmentRevokeArgs) -> Result<String, GatewayError> {
+    let state = GatewayState::open(args.data_dir.join("gateway-state.sqlite3")).await?;
+    state.enrollments.revoke(args.token_id).await?;
+    Ok(format!("revoked enrollment token {}", args.token_id))
+}
+
+fn confirm_replace(edge_id: &str) -> Result<(), GatewayError> {
+    if !std::io::stdin().is_terminal() {
+        return Err(pki_error("--replace requires interactive confirmation or --yes"));
+    }
+    eprint!("Replace the active certificate for Edge {edge_id}? [y/N] ");
+    std::io::stderr().flush().map_err(|_| pki_error("could not request confirmation"))?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).map_err(|_| pki_error("could not read confirmation"))?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(pki_error("replacement cancelled"))
+    }
+}
+
+fn parse_ttl(value: &str) -> Result<std::time::Duration, String> {
+    let (number, multiplier) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1_u64),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 60 * 60),
+        _ => (value, 1),
+    };
+    let amount = number.parse::<u64>().map_err(|_| "TTL must be a positive duration such as 10m".to_string())?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| "TTL must be a positive duration such as 10m".to_string())?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 fn issue_server(args: ServerIssueArgs) -> Result<String, GatewayError> {
@@ -297,15 +389,15 @@ fn pki_error(message: &str) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_password_file, Cli};
-    use clap::CommandFactory;
+    use super::{read_password_file, Cli, Command, EnrollmentAction};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn pki_help_exposes_nested_role_commands_without_plaintext_passwords() {
         let command = Cli::command();
         let names = command.get_subcommands().map(|item| item.get_name()).collect::<Vec<_>>();
 
-        assert_eq!(names, ["init", "server", "client", "edge"]);
+        assert_eq!(names, ["init", "server", "client", "edge", "enrollment"]);
         let command = Cli::command();
         for role in ["server", "client", "edge"] {
             let role_command = command.find_subcommand(role).unwrap();
@@ -314,6 +406,28 @@ mod tests {
         }
         assert!(Cli::command().get_version().is_some());
         assert_no_plaintext_password_argument(&Cli::command());
+    }
+
+    #[test]
+    fn enrollment_create_defaults_to_ten_minutes() {
+        let cli = Cli::try_parse_from([
+            "dbx-gateway-pki",
+            "enrollment",
+            "create",
+            "--data-dir",
+            "/tmp/pki",
+            "--edge-id",
+            "edge-prod-01",
+        ])
+        .unwrap();
+        let Command::Enrollment(command) = cli.command else {
+            panic!("expected enrollment command");
+        };
+        let EnrollmentAction::Create(args) = command.command else {
+            panic!("expected enrollment create command");
+        };
+
+        assert_eq!(args.ttl, std::time::Duration::from_secs(600));
     }
 
     #[cfg(unix)]

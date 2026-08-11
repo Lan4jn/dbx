@@ -2,12 +2,16 @@
 pub mod config;
 #[cfg(feature = "server")]
 pub mod edge_gateway;
+#[cfg(feature = "server")]
+pub mod enrollment;
 pub mod error;
 #[cfg(feature = "server")]
 pub mod main_gateway;
 #[cfg(feature = "server")]
 pub mod pki;
 pub mod protocol;
+#[cfg(feature = "server")]
+pub mod state;
 #[cfg(feature = "server")]
 pub mod stream;
 #[cfg(feature = "server")]

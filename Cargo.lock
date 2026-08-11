@@ -1918,6 +1918,7 @@ dependencies = [
 name = "dbx-gateway"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "clap",
  "futures-util",
  "hex",
@@ -1928,6 +1929,7 @@ dependencies = [
  "p12-keystore",
  "pkcs8",
  "rcgen",
+ "rusqlite",
  "rustls 0.23.42",
  "rustls-pemfile 2.2.0",
  "serde",
