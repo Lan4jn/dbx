@@ -48,7 +48,7 @@ test("normalizes release tag versions", () => {
 
 test("resolves every update source to the self-hosted download page", () => {
   const fallbackUrl = "https://github.com/t8y2/dbx/releases/latest";
-  const selfHostedUrl = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
+  const selfHostedUrl = "https://server.sjserver.fun:880/dbx/osx/";
   assert.equal(resolveUpdateReleaseUrl(updateInfo({ latest_version: "0.5.39" }), "cnb", fallbackUrl), selfHostedUrl);
   assert.equal(resolveUpdateReleaseUrl(updateInfo({ release_url: "https://github.com/t8y2/dbx/releases/tag/v0.5.39" }), "official", fallbackUrl), selfHostedUrl);
   assert.equal(resolveUpdateReleaseUrl(null, "cnb", fallbackUrl), selfHostedUrl);
