@@ -117,6 +117,8 @@ impl Fixture {
             tls_handshake_timeout_secs: 10,
             http_header_timeout_secs: 10,
             enrollment: None,
+            allowed_edge_ids: Vec::new(),
+            revoked_edge_serials: Vec::new(),
         };
         Self { _dir: dir, config, server_ca: server_ca.certificate, server_ca_certificate, edge_ca, client_ca }
     }

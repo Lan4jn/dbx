@@ -92,21 +92,79 @@ fn edge_tls(config: &EdgeConfig) -> Result<Arc<ClientConfig>, GatewayError> {
     ))
 }
 
-async fn run_entry(mut config: EdgeConfig, tls: Option<Arc<ClientConfig>>, stop: watch::Receiver<bool>) {
-    let tls = match tls {
+async fn run_entry(config: EdgeConfig, tls: Option<Arc<ClientConfig>>, stop: watch::Receiver<bool>) {
+    let mut tls = match tls {
         Some(tls) => tls,
         None => {
             if bootstrap_edge(&config).await.is_err() {
                 return;
             }
-            config.bootstrap = None;
             match edge_tls(&config) {
                 Ok(tls) => tls,
                 Err(_) => return,
             }
         }
     };
+    if config
+        .bootstrap
+        .as_ref()
+        .is_some_and(|bootstrap| certificate_needs_renewal(&config.certificate, bootstrap.renew_before_days))
+        && renew_edge_certificate(&config, tls.clone()).await.is_ok()
+    {
+        if let Ok(reloaded) = edge_tls(&config) {
+            tls = reloaded;
+        }
+    }
     run(config, tls, stop).await;
+}
+
+async fn renew_edge_certificate(config: &EdgeConfig, tls: Arc<ClientConfig>) -> Result<(), GatewayError> {
+    let bootstrap = config.bootstrap.as_ref().ok_or_else(|| internal_error("Edge renewal endpoint is unavailable"))?;
+    let key_pem = Zeroizing::new(
+        fs::read_to_string(&config.private_key).map_err(|_| internal_error("Edge private key could not be read"))?,
+    );
+    let key = KeyPair::from_pem(&key_pem).map_err(|_| internal_error("Edge private key could not be parsed"))?;
+    let csr = CertificateParams::default()
+        .serialize_request(&key)
+        .map_err(|_| internal_error("Edge renewal CSR could not be generated"))?;
+    let renewal_url = renewal_url(&bootstrap.enrollment_url)?;
+    let body = serde_json::to_vec(&serde_json::json!({ "csr_der": csr.der().as_ref() }))
+        .map_err(|_| internal_error("Edge renewal request could not be encoded"))?;
+    let response = post_main_request(&renewal_url, tls, &bootstrap.server_spki_sha256, &body).await?;
+    let response: EnrollCsrResponse =
+        serde_json::from_slice(&response).map_err(|_| internal_error("Edge renewal response was invalid"))?;
+    validate_enrolled_certificate(&response, &config.edge_id, key.public_key_raw())?;
+    let certificate_temp = temporary_path(&config.certificate);
+    let chain = format!("{}{}", response.certificate_pem, response.chain_pem);
+    write_public_temp(&certificate_temp, chain.as_bytes())?;
+    fs::rename(&certificate_temp, &config.certificate)
+        .map_err(|_| internal_error("renewed Edge certificate could not be installed"))?;
+    sync_parent(&config.certificate)
+}
+
+fn certificate_needs_renewal(path: &std::path::Path, renew_before_days: u64) -> bool {
+    let Ok(pem) = fs::read(path) else { return false };
+    let Ok((_, pem)) = parse_x509_pem(&pem) else { return false };
+    let Ok((_, certificate)) = parse_x509_certificate(&pem.contents) else {
+        return false;
+    };
+    let Ok(days) = i64::try_from(renew_before_days) else {
+        return false;
+    };
+    certificate.validity().not_after.to_datetime() <= time::OffsetDateTime::now_utc() + time::Duration::days(days)
+}
+
+fn renewal_url(enrollment_url: &str) -> Result<String, GatewayError> {
+    let mut uri: hyper::Uri = enrollment_url.parse().map_err(|_| internal_error("Edge renewal URL is invalid"))?;
+    let renewed_path = uri
+        .path()
+        .strip_suffix("/enroll")
+        .map(|prefix| format!("{prefix}/renew"))
+        .unwrap_or_else(|| format!("{}/renew", uri.path().trim_end_matches('/')));
+    let mut parts = uri.into_parts();
+    parts.path_and_query = Some(renewed_path.parse().map_err(|_| internal_error("Edge renewal URL is invalid"))?);
+    uri = hyper::Uri::from_parts(parts).map_err(|_| internal_error("Edge renewal URL is invalid"))?;
+    Ok(uri.to_string())
 }
 
 async fn bootstrap_edge(config: &EdgeConfig) -> Result<(), GatewayError> {
@@ -154,10 +212,25 @@ async fn request_enrollment(
     ca_certificate: &std::path::Path,
     request: &EnrollCsrRequest,
 ) -> Result<EnrollCsrResponse, GatewayError> {
-    let uri: hyper::Uri =
-        bootstrap.enrollment_url.parse().map_err(|_| internal_error("Edge enrollment URL is invalid"))?;
+    let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(load_roots(ca_certificate)?)
+        .with_no_client_auth();
+    let body =
+        serde_json::to_vec(request).map_err(|_| internal_error("Edge enrollment request could not be encoded"))?;
+    let response =
+        post_main_request(&bootstrap.enrollment_url, Arc::new(client), &bootstrap.server_spki_sha256, &body).await?;
+    serde_json::from_slice(&response).map_err(|_| internal_error("Edge enrollment response was invalid"))
+}
+
+async fn post_main_request(
+    url: &str,
+    client: Arc<ClientConfig>,
+    server_spki_sha256: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, GatewayError> {
+    let uri: hyper::Uri = url.parse().map_err(|_| internal_error("Main request URL is invalid"))?;
     if uri.scheme_str() != Some("https") {
-        return Err(internal_error("Edge enrollment URL is invalid"));
+        return Err(internal_error("Main request URL is invalid"));
     }
     let host = uri.host().ok_or_else(|| internal_error("Edge enrollment URL is invalid"))?;
     let port = uri.port_u16().unwrap_or(443);
@@ -166,27 +239,22 @@ async fn request_enrollment(
         .map_err(|_| internal_error("Main enrollment endpoint could not be resolved"))?
         .next()
         .ok_or_else(|| internal_error("Main enrollment endpoint could not be resolved"))?;
-    let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(load_roots(ca_certificate)?)
-        .with_no_client_auth();
     let stream =
         TcpStream::connect(address).await.map_err(|_| internal_error("Main enrollment endpoint is unavailable"))?;
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|_| internal_error("Edge enrollment server name is invalid"))?;
-    let mut stream = TlsConnector::from(Arc::new(client))
+    let mut stream = TlsConnector::from(client)
         .connect(server_name, stream)
         .await
         .map_err(|_| internal_error("Main enrollment TLS was rejected"))?;
-    verify_server_pin(stream.get_ref().1.peer_certificates(), &bootstrap.server_spki_sha256)?;
-    let body =
-        serde_json::to_vec(request).map_err(|_| internal_error("Edge enrollment request could not be encoded"))?;
+    verify_server_pin(stream.get_ref().1.peer_certificates(), server_spki_sha256)?;
     let path = uri.path_and_query().map(|value| value.as_str()).unwrap_or("/");
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await.map_err(|_| internal_error("Edge enrollment request could not be sent"))?;
-    stream.write_all(&body).await.map_err(|_| internal_error("Edge enrollment request could not be sent"))?;
+    stream.write_all(body).await.map_err(|_| internal_error("Edge enrollment request could not be sent"))?;
     let mut response = Vec::new();
     stream
         .take(512 * 1024)
@@ -202,8 +270,7 @@ async fn request_enrollment(
     if !head.lines().next().is_some_and(|line| line.contains(" 200 ")) {
         return Err(internal_error("Edge enrollment was rejected"));
     }
-    serde_json::from_slice(&response[separator + 4..])
-        .map_err(|_| internal_error("Edge enrollment response was invalid"))
+    Ok(response[separator + 4..].to_vec())
 }
 
 fn verify_server_pin(

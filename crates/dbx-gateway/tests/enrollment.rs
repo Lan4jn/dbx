@@ -12,8 +12,8 @@ use dbx_gateway::config::{
 use dbx_gateway::edge_gateway::EdgeGateway;
 use dbx_gateway::main_gateway::MainGateway;
 use dbx_gateway::pki::{
-    enroll_over_remote, enroll_over_unix, serve_remote, serve_unix, EnrollCsrRequest, PkiEnrollmentService, PkiStore,
-    RemotePkiConfig,
+    enroll_over_remote, enroll_over_unix, renew_over_unix, serve_remote, serve_unix, EnrollCsrRequest,
+    PkiEnrollmentService, PkiStore, RemotePkiConfig, RenewCsrRequest,
 };
 use dbx_gateway::state::GatewayState;
 use rcgen::{
@@ -115,7 +115,7 @@ async fn token_replace_is_required_for_an_edge_with_an_active_certificate() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pki_service_unix_socket_issues_only_the_token_bound_edge_identity() {
+async fn pki_service_and_renewal_issue_only_the_authenticated_edge_identity() {
     use std::os::unix::fs::PermissionsExt;
 
     let (dir, state) = test_state().await;
@@ -169,6 +169,31 @@ async fn pki_service_unix_socket_issues_only_the_token_bound_edge_identity() {
         .collect::<Vec<_>>();
     assert_eq!(uris, ["urn:dbx-gateway:edge:edge-prod-01"]);
     assert_eq!(certificate.public_key().subject_public_key.data.as_ref(), key.public_key_raw());
+
+    let renewal_key = KeyPair::generate().unwrap();
+    let renewal_csr = CertificateParams::default().serialize_request(&renewal_key).unwrap();
+    let renewed = renew_over_unix(
+        &socket_path,
+        &RenewCsrRequest {
+            edge_id: "edge-prod-01".to_string(),
+            current_serial: response.serial_hex.clone(),
+            csr_der: renewal_csr.der().to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(renewed.serial_hex, response.serial_hex);
+    assert!(state.certificate_is_revoked(&response.serial_hex).await.unwrap());
+    assert!(renew_over_unix(
+        &socket_path,
+        &RenewCsrRequest {
+            edge_id: "edge-prod-01".to_string(),
+            current_serial: response.serial_hex.clone(),
+            csr_der: renewal_csr.der().to_vec(),
+        },
+    )
+    .await
+    .is_err());
 
     let failed_token = state.enrollments.create("edge-failed-csr", Duration::from_secs(600), false).await.unwrap();
     let failed = EnrollCsrRequest {
@@ -287,9 +312,12 @@ async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
         http_header_timeout_secs: 5,
         enrollment: Some(MainEnrollmentConfig {
             path: "/_dbx/enroll".to_string(),
+            renewal_path: "/_dbx/renew".to_string(),
             allowed_edge_ids: vec!["edge-bootstrap-01".to_string()],
             pki: PkiEndpointConfig::Unix { unix_socket: pki_socket },
         }),
+        allowed_edge_ids: Vec::new(),
+        revoked_edge_serials: Vec::new(),
     })
     .await
     .unwrap();
@@ -318,6 +346,7 @@ async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
             token_file: token_file.clone(),
             enrollment_url: format!("https://localhost:{}/_dbx/enroll", main.local_addr().port()),
             server_spki_sha256: server_pin.clone(),
+            renew_before_days: 120,
         }),
     })
     .unwrap();
@@ -336,6 +365,7 @@ async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
     assert!(private_key.is_file());
     assert_eq!(fs::metadata(&private_key).unwrap().permissions().mode() & 0o777, 0o600);
     assert!(!token_file.exists());
+    assert_eq!(state.revocation_count_for_edge("edge-bootstrap-01").await.unwrap(), 1);
     assert!(!walk_file_names(&dir.0.join("pki")).iter().any(|name| name.contains("edge-bootstrap.key")));
 
     let denied_token = state.enrollments.create("edge-not-allowed", Duration::from_secs(600), false).await.unwrap();
@@ -355,6 +385,7 @@ async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
             token_file: denied_token_file.clone(),
             enrollment_url: format!("https://localhost:{}/_dbx/enroll", main.local_addr().port()),
             server_spki_sha256: server_pin,
+            renew_before_days: 30,
         }),
     })
     .unwrap();

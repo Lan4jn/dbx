@@ -9,8 +9,9 @@ pub use issue::{
     ClientIssueRequest, EdgeIssueRequest, IssuedCertificate, IssuedClientBundle, IssuedKeyPair, ServerIssueRequest,
 };
 pub use service::{
-    enroll_over_remote, enroll_over_unix, serve_remote, serve_unix, EnrollCsrRequest, EnrollCsrResponse,
-    PkiEnrollmentService, RemotePkiConfig, RemotePkiServer, UnixPkiServer,
+    enroll_over_remote, enroll_over_unix, renew_over_remote, renew_over_unix, serve_remote, serve_unix,
+    EnrollCsrRequest, EnrollCsrResponse, PkiEnrollmentService, RemotePkiConfig, RemotePkiServer, RenewCsrRequest,
+    UnixPkiServer,
 };
 pub use store::{write_output_file, GeneratedCrl, PkiStore};
 

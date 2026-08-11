@@ -55,16 +55,39 @@ async fn dispatch_gateway_command(
         GatewayCommand::Serve => {
             match config {
                 config::GatewayConfig::Main(config) => {
-                    let gateway = main_gateway::MainGateway::bind(config).await?;
-                    let signal = wait_for_shutdown_signal().await;
-                    gateway.shutdown().await;
-                    signal?;
+                    let gateway = main_gateway::MainGateway::bind(*config).await?;
+                    loop {
+                        match wait_for_gateway_signal().await? {
+                            GatewaySignal::Shutdown => {
+                                gateway.shutdown().await;
+                                break;
+                            }
+                            GatewaySignal::Reload => {
+                                if let Ok(config::GatewayConfig::Main(config)) = config::load_config_file(config_path) {
+                                    let _ = gateway.reload(*config).await;
+                                }
+                            }
+                        }
+                    }
                 }
                 config::GatewayConfig::Edge(config) => {
-                    let gateway = edge_gateway::EdgeGateway::start(config)?;
-                    let signal = wait_for_shutdown_signal().await;
-                    gateway.shutdown().await;
-                    signal?;
+                    let mut gateway = edge_gateway::EdgeGateway::start(*config)?;
+                    loop {
+                        match wait_for_gateway_signal().await? {
+                            GatewaySignal::Shutdown => {
+                                gateway.shutdown().await;
+                                break;
+                            }
+                            GatewaySignal::Reload => {
+                                if let Ok(config::GatewayConfig::Edge(config)) = config::load_config_file(config_path) {
+                                    if let Ok(reloaded) = edge_gateway::EdgeGateway::start(*config) {
+                                        gateway.shutdown().await;
+                                        gateway = reloaded;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Ok("gateway stopped")
@@ -73,19 +96,26 @@ async fn dispatch_gateway_command(
 }
 
 #[cfg(feature = "server")]
-async fn wait_for_shutdown_signal() -> Result<(), GatewayError> {
+enum GatewaySignal {
+    Shutdown,
+    Reload,
+}
+
+async fn wait_for_gateway_signal() -> Result<GatewaySignal, GatewayError> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut terminate = signal(SignalKind::terminate()).map_err(|_| signal_error())?;
+        let mut reload = signal(SignalKind::hangup()).map_err(|_| signal_error())?;
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result.map_err(|_| signal_error()),
-            _ = terminate.recv() => Ok(()),
+            result = tokio::signal::ctrl_c() => result.map(|_| GatewaySignal::Shutdown).map_err(|_| signal_error()),
+            _ = terminate.recv() => Ok(GatewaySignal::Shutdown),
+            _ = reload.recv() => Ok(GatewaySignal::Reload),
         }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.map_err(|_| signal_error())
+    tokio::signal::ctrl_c().await.map(|_| GatewaySignal::Shutdown).map_err(|_| signal_error())
 }
 
 #[cfg(feature = "server")]

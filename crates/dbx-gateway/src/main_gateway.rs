@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -29,7 +30,9 @@ use uuid::Uuid;
 
 use crate::config::{MainConfig, MainEnrollmentConfig, PkiEndpointConfig};
 use crate::edge_gateway::{control_websocket_config, data_websocket_config};
-use crate::pki::{enroll_over_remote, enroll_over_unix, EnrollCsrRequest};
+use crate::pki::{
+    enroll_over_remote, enroll_over_unix, renew_over_remote, renew_over_unix, EnrollCsrRequest, RenewCsrRequest,
+};
 use crate::protocol::{
     decode_client_message, decode_edge_data_open, decode_edge_message, decode_edge_registration, encode_control_frame,
     ClientEvent, ClientMessage, EdgeToMain, MainToEdge, RegisteredTarget, SessionId, SessionTickets, Stage,
@@ -72,6 +75,21 @@ struct RouteConfig {
     edge_data_path: Arc<str>,
     dbx_path: Arc<str>,
     enrollment: Option<Arc<MainEnrollmentConfig>>,
+    allowed_edge_ids: HashSet<String>,
+    revoked_edge_serials: HashSet<String>,
+}
+
+struct MainRuntime {
+    tls: Arc<GatewayTls>,
+    routes: Arc<RouteConfig>,
+}
+
+#[derive(Clone)]
+struct MainImmutableConfig {
+    listen: String,
+    max_connections: usize,
+    tls_handshake_timeout_secs: u64,
+    http_header_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -98,28 +116,29 @@ pub struct MainGateway {
     registry: EdgeRegistry,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
+    runtime: Arc<ArcSwap<MainRuntime>>,
+    immutable: MainImmutableConfig,
 }
 
 impl MainGateway {
     pub async fn bind(config: MainConfig) -> Result<Self, GatewayError> {
-        let tls = Arc::new(GatewayTls::load(&config)?);
+        let runtime = Arc::new(ArcSwap::from_pointee(build_runtime(&config)?));
+        let immutable = MainImmutableConfig {
+            listen: config.listen.clone(),
+            max_connections: config.max_connections,
+            tls_handshake_timeout_secs: config.tls_handshake_timeout_secs,
+            http_header_timeout_secs: config.http_header_timeout_secs,
+        };
         let listener =
             TcpListener::bind(&config.listen).await.map_err(|_| internal_error("main listener could not bind"))?;
         let local_addr = listener.local_addr().map_err(|_| internal_error("main listener address unavailable"))?;
-        let acceptor = TlsAcceptor::from(tls.server_config.clone());
-        let edge_path = Arc::<str>::from(config.edge_path);
-        let routes = Arc::new(RouteConfig {
-            edge_data_path: Arc::<str>::from(format!("{}/data", edge_path.trim_end_matches('/'))),
-            edge_path,
-            dbx_path: Arc::<str>::from(config.dbx_path),
-            enrollment: config.enrollment.map(Arc::new),
-        });
         let registry = EdgeRegistry::default();
         let task_registry = registry.clone();
         let tickets = Arc::new(AsyncMutex::new(SessionTickets::new(Duration::from_secs(15))));
         let pending_routes = PendingRoutes::default();
         let control_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let task_control_tasks = control_tasks.clone();
+        let task_runtime = runtime.clone();
         let connection_slots = Arc::new(Semaphore::new(config.max_connections));
         let tls_handshake_timeout = Duration::from_secs(config.tls_handshake_timeout_secs);
         let http_header_timeout = Duration::from_secs(config.http_header_timeout_secs);
@@ -151,9 +170,10 @@ impl MainGateway {
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
                     continue;
                 };
-                let acceptor = acceptor.clone();
-                let tls = tls.clone();
-                let routes = routes.clone();
+                let runtime = task_runtime.load_full();
+                let acceptor = TlsAcceptor::from(runtime.tls.server_config.clone());
+                let tls = runtime.tls.clone();
+                let routes = runtime.routes.clone();
                 let registry = task_registry.clone();
                 let tickets = tickets.clone();
                 let pending_routes = pending_routes.clone();
@@ -209,7 +229,7 @@ impl MainGateway {
                 let _ = control.await;
             }
         });
-        Ok(Self { local_addr, registry, shutdown, task })
+        Ok(Self { local_addr, registry, shutdown, task, runtime, immutable })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -220,10 +240,57 @@ impl MainGateway {
         self.registry.clone()
     }
 
+    pub async fn reload(&self, config: MainConfig) -> Result<(), GatewayError> {
+        if config.listen != self.immutable.listen
+            || config.max_connections != self.immutable.max_connections
+            || config.tls_handshake_timeout_secs != self.immutable.tls_handshake_timeout_secs
+            || config.http_header_timeout_secs != self.immutable.http_header_timeout_secs
+        {
+            return Err(GatewayError {
+                code: GatewayErrorCode::ConfigInvalid,
+                message: "restart_required: immutable Main settings changed".to_string(),
+            });
+        }
+        let runtime = Arc::new(build_runtime(&config)?);
+        self.runtime.store(runtime.clone());
+        let entries = self.registry.read().await;
+        for entry in entries.values() {
+            if !edge_allowed(&runtime.routes, &entry.identity.edge_id, &entry.identity.serial) {
+                let _ = entry.session_shutdown.send(true);
+            }
+        }
+        drop(entries);
+        Ok(())
+    }
+
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
         let _ = (&mut self.task).await;
     }
+}
+
+fn build_runtime(config: &MainConfig) -> Result<MainRuntime, GatewayError> {
+    let edge_path = Arc::<str>::from(config.edge_path.clone());
+    Ok(MainRuntime {
+        tls: Arc::new(GatewayTls::load(config)?),
+        routes: Arc::new(RouteConfig {
+            edge_data_path: Arc::<str>::from(format!("{}/data", edge_path.trim_end_matches('/'))),
+            edge_path,
+            dbx_path: Arc::<str>::from(config.dbx_path.clone()),
+            enrollment: config.enrollment.clone().map(Arc::new),
+            allowed_edge_ids: config.allowed_edge_ids.iter().cloned().collect(),
+            revoked_edge_serials: config.revoked_edge_serials.iter().map(|serial| normalize_serial(serial)).collect(),
+        }),
+    })
+}
+
+fn edge_allowed(routes: &RouteConfig, edge_id: &str, serial: &str) -> bool {
+    (routes.allowed_edge_ids.is_empty() || routes.allowed_edge_ids.contains(edge_id))
+        && !routes.revoked_edge_serials.contains(&normalize_serial(serial))
+}
+
+fn normalize_serial(serial: &str) -> String {
+    serial.chars().filter(|character| character.is_ascii_hexdigit()).flat_map(char::to_lowercase).collect()
 }
 
 impl Drop for MainGateway {
@@ -249,6 +316,14 @@ async fn route(
         return Ok(handle_enrollment(request, routes.enrollment.clone().expect("checked above")).await);
     }
     if let Some(PeerIdentity::Edge { edge_id, serial, fingerprint_sha256 }) = identity {
+        if !edge_allowed(&routes, &edge_id, &serial) {
+            return Ok(empty_response(StatusCode::NOT_FOUND));
+        }
+        if routes.enrollment.as_ref().is_some_and(|config| request.uri().path() == config.renewal_path) {
+            return Ok(
+                handle_renewal(request, routes.enrollment.clone().expect("checked above"), edge_id, serial).await
+            );
+        }
         if request.uri().path() == routes.edge_path.as_ref() || request.uri().path() == routes.edge_data_path.as_ref() {
             if let Some(accept_key) = websocket_accept_key(&request) {
                 let Some(permit) = connection_permit.lock().ok().and_then(|mut permit| permit.take()) else {
@@ -314,6 +389,58 @@ async fn route(
     Ok(empty_response(StatusCode::NOT_FOUND))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EdgeRenewalBody {
+    csr_der: Vec<u8>,
+}
+
+async fn handle_renewal(
+    request: Request<Incoming>,
+    config: Arc<MainEnrollmentConfig>,
+    edge_id: String,
+    current_serial: String,
+) -> Response<Full<Bytes>> {
+    if request.method() != Method::POST {
+        return empty_response(StatusCode::NOT_FOUND);
+    }
+    let body = match Limited::new(request.into_body(), 256 * 1024).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return empty_response(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let body: EdgeRenewalBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(_) => return empty_response(StatusCode::BAD_REQUEST),
+    };
+    let renewal = RenewCsrRequest { edge_id, current_serial, csr_der: body.csr_der };
+    let response = match &config.pki {
+        PkiEndpointConfig::Unix { unix_socket } => renew_over_unix(unix_socket, &renewal).await,
+        PkiEndpointConfig::Remote { remote_address, server_name, ca_certificate, certificate, private_key } => {
+            match remote_address.parse() {
+                Ok(address) => {
+                    renew_over_remote(address, server_name, ca_certificate, certificate, private_key, &renewal).await
+                }
+                Err(_) => return empty_response(StatusCode::NOT_FOUND),
+            }
+        }
+    };
+    json_response(response)
+}
+
+fn json_response(response: Result<crate::pki::EnrollCsrResponse, GatewayError>) -> Response<Full<Bytes>> {
+    let Ok(response) = response else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    match serde_json::to_vec(&response) {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .expect("fixed response is valid"),
+        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 fn track_task(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: JoinHandle<()>) {
     if let Ok(mut tasks) = tasks.lock() {
         tasks.retain(|task| !task.is_finished());
@@ -375,17 +502,7 @@ async fn handle_enrollment(request: Request<Incoming>, config: Arc<MainEnrollmen
             }
         }
     };
-    let Ok(response) = response else {
-        return empty_response(StatusCode::NOT_FOUND);
-    };
-    match serde_json::to_vec(&response) {
-        Ok(body) => Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .expect("fixed response is valid"),
-        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    json_response(response)
 }
 
 async fn run_edge_control(
@@ -444,7 +561,7 @@ async fn run_edge_control(
     };
 
     let connection_id = Uuid::new_v4();
-    let (session_shutdown, _) = watch::channel(false);
+    let (session_shutdown, mut session_stop) = watch::channel(false);
     let (control_tx, mut control_rx) = mpsc::channel(32);
     let duplicate = {
         let Some(mut entries) = registry_write_until_stop(&registry, &mut stop).await else {
@@ -479,6 +596,12 @@ async fn run_edge_control(
     tokio::pin!(heartbeat_deadline);
     loop {
         tokio::select! {
+            changed = session_stop.changed() => {
+                if changed.is_err() || *session_stop.borrow() {
+                    close_control_socket(&mut socket).await;
+                    break;
+                }
+            }
             _ = &mut heartbeat_deadline => {
                 close_control_socket(&mut socket).await;
                 break;

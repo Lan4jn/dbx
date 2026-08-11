@@ -81,6 +81,61 @@ impl GatewayState {
         })
         .await
     }
+
+    pub async fn certificate_is_active(&self, edge_id: &str, serial_hex: &str) -> Result<bool, GatewayError> {
+        let edge_id = edge_id.to_string();
+        let serial_hex = normalized_serial(serial_hex);
+        run_db(self.path.clone(), move |connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM issued_certificates
+                 WHERE edge_id = ?1 AND lower(serial_hex) = ?2 AND revoked_at IS NULL)",
+                params![edge_id, serial_hex],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn rotate_issued_certificate(
+        &self,
+        edge_id: &str,
+        previous_serial: &str,
+        new_serial: &str,
+    ) -> Result<(), GatewayError> {
+        let edge_id = edge_id.to_string();
+        let previous_serial = normalized_serial(previous_serial);
+        let new_serial = new_serial.to_ascii_lowercase();
+        run_db(self.path.clone(), move |connection| {
+            let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let now = unix_now();
+            let changed = transaction.execute(
+                "UPDATE issued_certificates SET revoked_at = ?3
+                 WHERE edge_id = ?1 AND lower(serial_hex) = ?2 AND revoked_at IS NULL",
+                params![edge_id, previous_serial, now],
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            transaction.execute(
+                "INSERT INTO revocations (serial_hex, edge_id, revoked_at, reason) VALUES (?1, ?2, ?3, 'superseded')",
+                params![previous_serial, edge_id, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO issued_certificates (serial_hex, edge_id, issued_at, revoked_at) VALUES (?1, ?2, ?3, NULL)",
+                params![new_serial, edge_id, now],
+            )?;
+            transaction.commit()
+        })
+        .await
+    }
+
+    pub async fn revocation_count_for_edge(&self, edge_id: &str) -> Result<u64, GatewayError> {
+        let edge_id = edge_id.to_string();
+        run_db(self.path.clone(), move |connection| {
+            connection.query_row("SELECT COUNT(*) FROM revocations WHERE edge_id = ?1", [edge_id], |row| row.get(0))
+        })
+        .await
+    }
 }
 
 pub(crate) async fn run_db<T, F>(path: PathBuf, operation: F) -> Result<T, GatewayError>
@@ -104,4 +159,8 @@ pub(crate) fn unix_now() -> i64 {
 
 pub(crate) fn state_error(message: impl Into<String>) -> GatewayError {
     GatewayError { code: GatewayErrorCode::Internal, message: message.into() }
+}
+
+fn normalized_serial(serial: &str) -> String {
+    serial.chars().filter(|character| character.is_ascii_hexdigit()).flat_map(char::to_lowercase).collect()
 }

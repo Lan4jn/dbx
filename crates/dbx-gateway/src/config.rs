@@ -10,8 +10,8 @@ use crate::{GatewayError, GatewayErrorCode};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayConfig {
-    Main(MainConfig),
-    Edge(EdgeConfig),
+    Main(Box<MainConfig>),
+    Edge(Box<EdgeConfig>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +34,10 @@ pub struct MainConfig {
     pub http_header_timeout_secs: u64,
     #[serde(default)]
     pub enrollment: Option<MainEnrollmentConfig>,
+    #[serde(default)]
+    pub allowed_edge_ids: Vec<String>,
+    #[serde(default)]
+    pub revoked_edge_serials: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +45,8 @@ pub struct MainConfig {
 pub struct MainEnrollmentConfig {
     #[serde(default = "default_enrollment_path")]
     pub path: String,
+    #[serde(default = "default_renewal_path")]
+    pub renewal_path: String,
     pub allowed_edge_ids: Vec<String>,
     pub pki: PkiEndpointConfig,
 }
@@ -79,6 +85,8 @@ pub struct EdgeBootstrapConfig {
     pub token_file: PathBuf,
     pub enrollment_url: String,
     pub server_spki_sha256: String,
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,8 +222,12 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             }
             if let Some(enrollment) = &main.enrollment {
                 if !valid_reserved_path(&enrollment.path)
+                    || !valid_reserved_path(&enrollment.renewal_path)
                     || enrollment.path == main.edge_path
                     || enrollment.path == main.dbx_path
+                    || enrollment.renewal_path == enrollment.path
+                    || enrollment.renewal_path == main.edge_path
+                    || enrollment.renewal_path == main.dbx_path
                     || enrollment.allowed_edge_ids.is_empty()
                     || enrollment.allowed_edge_ids.iter().any(|id| !valid_identity(id))
                 {
@@ -227,6 +239,13 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
                     remote_address.parse::<SocketAddr>().map_err(|_| config_error("remote PKI address is invalid"))?;
                     validate_credentials(certificate, private_key, ca_certificate)?;
                 }
+            }
+            if main.allowed_edge_ids.iter().any(|id| !valid_identity(id))
+                || main.revoked_edge_serials.iter().any(|serial| {
+                    serial.is_empty() || !serial.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':')
+                })
+            {
+                return Err(config_error("Edge ACL or revoked serial list is invalid"));
             }
             Ok(())
         }
@@ -271,6 +290,14 @@ fn default_dbx_path() -> String {
 
 fn default_enrollment_path() -> String {
     "/_dbx/enroll".to_string()
+}
+
+fn default_renew_before_days() -> u64 {
+    30
+}
+
+fn default_renewal_path() -> String {
+    "/_dbx/renew".to_string()
 }
 
 fn valid_identity(id: &str) -> bool {

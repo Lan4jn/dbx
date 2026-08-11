@@ -36,6 +36,14 @@ pub struct EnrollCsrResponse {
     pub chain_pem: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenewCsrRequest {
+    pub edge_id: String,
+    pub current_serial: String,
+    pub csr_der: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct PkiEnrollmentService {
     state: GatewayState,
@@ -46,6 +54,33 @@ pub struct PkiEnrollmentService {
 impl PkiEnrollmentService {
     pub fn new(state: GatewayState, store: PkiStore, ca_password: Zeroizing<String>) -> Self {
         Self { state, store, ca_password: Arc::new(ca_password) }
+    }
+
+    pub async fn renew(&self, request: RenewCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
+        if request.csr_der.len() as u64 > MAX_ENROLLMENT_REQUEST_BYTES
+            || !self.state.certificate_is_active(&request.edge_id, &request.current_serial).await?
+        {
+            return Err(service_error(GatewayErrorCode::RouteDenied, "renewal request rejected"));
+        }
+        let store = self.store.clone();
+        let password = self.ca_password.clone();
+        let edge_id = request.edge_id.clone();
+        let csr_der = request.csr_der;
+        let issued = tokio::task::spawn_blocking(move || {
+            store.issue_edge(
+                EdgeIssueRequest { edge_id: &edge_id, csr_der: &csr_der, validity: time::Duration::days(90) },
+                &password,
+            )
+        })
+        .await
+        .map_err(|_| service_error(GatewayErrorCode::Internal, "edge certificate could not be renewed"))??;
+        self.state.rotate_issued_certificate(&request.edge_id, &request.current_serial, &issued.serial_hex).await?;
+        Ok(EnrollCsrResponse {
+            edge_id: request.edge_id,
+            serial_hex: issued.serial_hex,
+            certificate_pem: issued.certificate_pem,
+            chain_pem: issued.chain_pem,
+        })
     }
 
     pub async fn enroll(&self, request: EnrollCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
@@ -211,7 +246,14 @@ pub async fn enroll_over_unix(path: &Path, request: &EnrollCsrRequest) -> Result
     let stream = UnixStream::connect(path)
         .await
         .map_err(|_| service_error(GatewayErrorCode::EdgeOffline, "PKI service unavailable"))?;
-    exchange(stream, request).await
+    exchange(stream, &ServiceRequest::Enroll { request }).await
+}
+
+pub async fn renew_over_unix(path: &Path, request: &RenewCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
+    let stream = UnixStream::connect(path)
+        .await
+        .map_err(|_| service_error(GatewayErrorCode::EdgeOffline, "PKI service unavailable"))?;
+    exchange(stream, &ServiceRequest::Renew { request }).await
 }
 
 pub async fn enroll_over_remote(
@@ -235,7 +277,31 @@ pub async fn enroll_over_remote(
         .connect(name, stream)
         .await
         .map_err(|_| service_error(GatewayErrorCode::IdentityRejected, "PKI service TLS rejected"))?;
-    exchange(stream, request).await
+    exchange(stream, &ServiceRequest::Enroll { request }).await
+}
+
+pub async fn renew_over_remote(
+    address: std::net::SocketAddr,
+    server_name: &str,
+    ca_certificate: &Path,
+    certificate: &Path,
+    private_key: &Path,
+    request: &RenewCsrRequest,
+) -> Result<EnrollCsrResponse, GatewayError> {
+    let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(load_roots(ca_certificate)?)
+        .with_client_auth_cert(load_certificates(certificate)?, load_private_key(private_key)?)
+        .map_err(|_| service_error(GatewayErrorCode::ConfigInvalid, "PKI RA identity is invalid"))?;
+    let stream = TcpStream::connect(address)
+        .await
+        .map_err(|_| service_error(GatewayErrorCode::EdgeOffline, "PKI service unavailable"))?;
+    let name = ServerName::try_from(server_name.to_string())
+        .map_err(|_| service_error(GatewayErrorCode::ConfigInvalid, "PKI server name is invalid"))?;
+    let stream = TlsConnector::from(Arc::new(client))
+        .connect(name, stream)
+        .await
+        .map_err(|_| service_error(GatewayErrorCode::IdentityRejected, "PKI service TLS rejected"))?;
+    exchange(stream, &ServiceRequest::Renew { request }).await
 }
 
 async fn handle_unix(
@@ -257,8 +323,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let body = read_frame(&mut stream).await?;
-    let result = match serde_json::from_slice::<EnrollCsrRequest>(&body) {
-        Ok(request) => service.enroll(request).await,
+    let result = match serde_json::from_slice::<OwnedServiceRequest>(&body) {
+        Ok(OwnedServiceRequest::Enroll { request }) => service.enroll(request).await,
+        Ok(OwnedServiceRequest::Renew { request }) => service.renew(request).await,
         Err(_) => Err(service_error(GatewayErrorCode::ProtocolMismatch, "enrollment request rejected")),
     };
     let response = match result {
@@ -270,7 +337,7 @@ where
     write_frame(&mut stream, &body).await
 }
 
-async fn exchange<S>(mut stream: S, request: &EnrollCsrRequest) -> Result<EnrollCsrResponse, GatewayError>
+async fn exchange<S>(mut stream: S, request: &ServiceRequest<'_>) -> Result<EnrollCsrResponse, GatewayError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -284,6 +351,20 @@ where
         WireResponse::Ok { response } => Ok(response),
         WireResponse::Error { code } => Err(service_error(code, "enrollment request rejected")),
     }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum ServiceRequest<'a> {
+    Enroll { request: &'a EnrollCsrRequest },
+    Renew { request: &'a RenewCsrRequest },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum OwnedServiceRequest {
+    Enroll { request: EnrollCsrRequest },
+    Renew { request: RenewCsrRequest },
 }
 
 async fn read_frame<S>(stream: &mut S) -> Result<Vec<u8>, GatewayError>
