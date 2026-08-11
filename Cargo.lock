@@ -1919,6 +1919,7 @@ name = "dbx-gateway"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures-util",
  "hex",
  "http-body-util",
  "hyper",

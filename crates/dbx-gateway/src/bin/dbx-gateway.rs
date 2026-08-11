@@ -20,13 +20,14 @@ enum Command {
     CheckConfig,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = match cli.command {
         Command::Serve => GatewayCommand::Serve,
         Command::CheckConfig => GatewayCommand::CheckConfig,
     };
-    let result = run_gateway_command(command, &cli.config);
+    let result = run_gateway_command(command, &cli.config).await;
     if result.exit_code == 0 {
         println!("{}", result.message);
     } else {

@@ -130,7 +130,7 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, GatewayError> {
+pub(crate) fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, GatewayError> {
     let file = open_regular_file(path, None, "certificate file")?;
     let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
         .collect::<Result<Vec<_>, _>>()
@@ -142,7 +142,7 @@ fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Gatewa
     }
 }
 
-fn load_roots(path: &Path) -> Result<RootCertStore, GatewayError> {
+pub(crate) fn load_roots(path: &Path) -> Result<RootCertStore, GatewayError> {
     let mut roots = RootCertStore::empty();
     for certificate in load_certificates(path)? {
         roots.add(certificate).map_err(|_| tls_error("CA certificate was rejected"))?;
@@ -150,7 +150,7 @@ fn load_roots(path: &Path) -> Result<RootCertStore, GatewayError> {
     Ok(roots)
 }
 
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, GatewayError> {
+pub(crate) fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, GatewayError> {
     let file = open_regular_file(path, Some(0o600), "private key file")?;
     rustls_pemfile::private_key(&mut BufReader::new(file))
         .map_err(|_| tls_error("private key file was rejected"))?

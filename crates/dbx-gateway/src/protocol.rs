@@ -51,6 +51,12 @@ pub enum MainToEdge {
     HeartbeatAck { unix_ms: i64 },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EdgeToMain {
+    Heartbeat { version: ProtocolVersion },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -71,6 +77,7 @@ pub struct EdgeRegistration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredTarget {
     pub target_id: String,
+    pub display_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -224,6 +231,14 @@ pub fn decode_edge_registration(frame: &[u8]) -> Result<EdgeRegistration, Gatewa
     Ok(registration)
 }
 
+pub fn decode_edge_message(frame: &[u8]) -> Result<EdgeToMain, GatewayError> {
+    let message: EdgeToMain = decode_control_frame(frame)?;
+    match &message {
+        EdgeToMain::Heartbeat { version } => version.ensure_compatible()?,
+    }
+    Ok(message)
+}
+
 pub fn decode_unauthenticated_control_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, UnauthenticatedRejection> {
     decode_control_frame(frame).map_err(|_| UnauthenticatedRejection::Rejected)
 }
@@ -314,11 +329,14 @@ mod tests {
         let registration = EdgeRegistration {
             version: ProtocolVersion::current(),
             edge_id: "edge-1".to_string(),
-            targets: vec![RegisteredTarget { target_id: "postgres".to_string() }],
+            targets: vec![RegisteredTarget {
+                target_id: "postgres".to_string(),
+                display_name: "PostgreSQL".to_string(),
+            }],
         };
 
         let value = serde_json::to_value(registration).unwrap();
-        assert_eq!(value["targets"][0], json!({ "target_id": "postgres" }));
+        assert_eq!(value["targets"][0], json!({ "target_id": "postgres", "display_name": "PostgreSQL" }));
     }
 
     #[test]

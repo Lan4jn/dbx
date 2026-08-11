@@ -341,23 +341,23 @@ fn rejects_private_key_permissions_with_special_bits() {
     assert!(error.message.contains("0600"));
 }
 
-#[test]
-fn check_config_uses_loader_and_maps_results_to_exit_codes() {
+#[tokio::test]
+async fn check_config_uses_loader_and_maps_results_to_exit_codes() {
     let dir = TempDir::new();
     write_credentials(dir.path());
     let valid_path = dir.path().join("valid.toml");
     write_file(&valid_path, &main_config(""));
 
-    let success = run_gateway_command(GatewayCommand::CheckConfig, &valid_path);
+    let success = run_gateway_command(GatewayCommand::CheckConfig, &valid_path).await;
     assert_eq!(success.exit_code, 0);
     assert!(success.message.contains("valid"));
 
     let missing_path = dir.path().join("missing.toml");
-    let failure = run_gateway_command(GatewayCommand::CheckConfig, &missing_path);
+    let failure = run_gateway_command(GatewayCommand::CheckConfig, &missing_path).await;
     assert_eq!(failure.exit_code, 2);
     assert!(failure.message.contains("configuration"));
 
-    let runtime_failure = run_gateway_command(GatewayCommand::Serve, &valid_path);
+    let runtime_failure = run_gateway_command(GatewayCommand::Serve, &valid_path).await;
     assert_eq!(runtime_failure.exit_code, 1);
-    assert!(runtime_failure.message.contains("not implemented"));
+    assert!(!runtime_failure.message.contains("not implemented"));
 }

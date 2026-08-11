@@ -1,5 +1,7 @@
 #[cfg(feature = "server")]
 pub mod config;
+#[cfg(feature = "server")]
+pub mod edge_gateway;
 pub mod error;
 #[cfg(feature = "server")]
 pub mod main_gateway;
@@ -26,8 +28,8 @@ pub struct GatewayCommandResult {
 }
 
 #[cfg(feature = "server")]
-pub fn run_gateway_command(command: GatewayCommand, config_path: &std::path::Path) -> GatewayCommandResult {
-    match dispatch_gateway_command(command, config_path) {
+pub async fn run_gateway_command(command: GatewayCommand, config_path: &std::path::Path) -> GatewayCommandResult {
+    match dispatch_gateway_command(command, config_path).await {
         Ok(message) => GatewayCommandResult { exit_code: 0, message: message.to_string() },
         Err(error) => GatewayCommandResult {
             exit_code: if error.code == GatewayErrorCode::ConfigInvalid { 2 } else { 1 },
@@ -37,20 +39,50 @@ pub fn run_gateway_command(command: GatewayCommand, config_path: &std::path::Pat
 }
 
 #[cfg(feature = "server")]
-fn dispatch_gateway_command(
+async fn dispatch_gateway_command(
     command: GatewayCommand,
     config_path: &std::path::Path,
 ) -> Result<&'static str, GatewayError> {
-    config::load_config_file(config_path)?;
+    let config = config::load_config_file(config_path)?;
     match command {
         GatewayCommand::CheckConfig => Ok("configuration is valid"),
         GatewayCommand::Serve => {
-            command_not_implemented()?;
-            unreachable!()
+            match config {
+                config::GatewayConfig::Main(config) => {
+                    let gateway = main_gateway::MainGateway::bind(config).await?;
+                    let signal = wait_for_shutdown_signal().await;
+                    gateway.shutdown().await;
+                    signal?;
+                }
+                config::GatewayConfig::Edge(config) => {
+                    let gateway = edge_gateway::EdgeGateway::start(config)?;
+                    let signal = wait_for_shutdown_signal().await;
+                    gateway.shutdown().await;
+                    signal?;
+                }
+            }
+            Ok("gateway stopped")
         }
     }
 }
 
-pub fn command_not_implemented() -> Result<(), GatewayError> {
-    Err(GatewayError { code: GatewayErrorCode::Internal, message: "command is not implemented".to_string() })
+#[cfg(feature = "server")]
+async fn wait_for_shutdown_signal() -> Result<(), GatewayError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = signal(SignalKind::terminate()).map_err(|_| signal_error())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(|_| signal_error()),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.map_err(|_| signal_error())
+}
+
+#[cfg(feature = "server")]
+fn signal_error() -> GatewayError {
+    GatewayError { code: GatewayErrorCode::Internal, message: "shutdown signal handler could not start".to_string() }
 }
