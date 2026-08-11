@@ -119,6 +119,7 @@ impl Fixture {
             enrollment: None,
             allowed_edge_ids: Vec::new(),
             revoked_edge_serials: Vec::new(),
+            fallback_upstream: None,
         };
         Self { _dir: dir, config, server_ca: server_ca.certificate, server_ca_certificate, edge_ca, client_ca }
     }

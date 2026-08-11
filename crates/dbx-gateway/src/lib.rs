@@ -11,6 +11,8 @@ pub mod main_gateway;
 pub mod pki;
 pub mod protocol;
 #[cfg(feature = "server")]
+pub mod reverse_proxy;
+#[cfg(feature = "server")]
 pub mod state;
 #[cfg(feature = "server")]
 pub mod stream;

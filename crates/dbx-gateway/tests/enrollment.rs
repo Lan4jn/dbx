@@ -318,6 +318,7 @@ async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
         }),
         allowed_edge_ids: Vec::new(),
         revoked_edge_serials: Vec::new(),
+        fallback_upstream: None,
     })
     .await
     .unwrap();

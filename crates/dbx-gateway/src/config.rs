@@ -38,6 +38,8 @@ pub struct MainConfig {
     pub allowed_edge_ids: Vec<String>,
     #[serde(default)]
     pub revoked_edge_serials: Vec<String>,
+    #[serde(default)]
+    pub fallback_upstream: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,6 +249,9 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             {
                 return Err(config_error("Edge ACL or revoked serial list is invalid"));
             }
+            if let Some(upstream) = &main.fallback_upstream {
+                validate_fallback_upstream(upstream)?;
+            }
             Ok(())
         }
         GatewayConfig::Edge(edge) => {
@@ -302,6 +307,17 @@ fn default_renewal_path() -> String {
 
 fn valid_identity(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_fallback_upstream(value: &str) -> Result<(), GatewayError> {
+    let uri: hyper::Uri = value.parse().map_err(|_| config_error("fallback upstream URL is invalid"))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri.authority().is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err(config_error("fallback upstream URL is invalid"));
+    }
+    Ok(())
 }
 
 fn default_max_connections() -> usize {

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::service::service_fn;
@@ -37,6 +37,7 @@ use crate::protocol::{
     decode_client_message, decode_edge_data_open, decode_edge_message, decode_edge_registration, encode_control_frame,
     ClientEvent, ClientMessage, EdgeToMain, MainToEdge, RegisteredTarget, SessionId, SessionTickets, Stage,
 };
+use crate::reverse_proxy::{empty_proxy_body, full_proxy_body, FixedUpstreamProxy, ProxyBody};
 use crate::stream::relay_websockets;
 use crate::tls::{GatewayTls, PeerIdentity};
 use crate::{GatewayError, GatewayErrorCode};
@@ -77,6 +78,7 @@ struct RouteConfig {
     enrollment: Option<Arc<MainEnrollmentConfig>>,
     allowed_edge_ids: HashSet<String>,
     revoked_edge_serials: HashSet<String>,
+    fallback: Option<Arc<FixedUpstreamProxy>>,
 }
 
 struct MainRuntime {
@@ -160,8 +162,8 @@ impl MainGateway {
                     }
                     result = listener.accept() => result,
                 };
-                let stream = match accepted {
-                    Ok((stream, _)) => stream,
+                let (stream, peer) = match accepted {
+                    Ok((stream, peer)) => (stream, peer),
                     Err(_) => {
                         sleep(Duration::from_millis(50)).await;
                         continue;
@@ -190,22 +192,35 @@ impl MainGateway {
                     let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
                     let first_request_tx = Arc::new(Mutex::new(Some(first_request_tx)));
                     let service = service_fn(move |mut request: Request<Incoming>| {
-                        if let Ok(mut sender) = first_request_tx.lock() {
-                            if let Some(sender) = sender.take() {
-                                let _ = sender.send(());
-                            }
-                        }
                         request.extensions_mut().insert(identity.clone());
-                        route(
-                            request,
-                            routes.clone(),
-                            registry.clone(),
-                            tickets.clone(),
-                            pending_routes.clone(),
-                            control_tasks.clone(),
-                            connection_permit.clone(),
-                            connection_stop.clone(),
-                        )
+                        let routes = routes.clone();
+                        let registry = registry.clone();
+                        let tickets = tickets.clone();
+                        let pending_routes = pending_routes.clone();
+                        let control_tasks = control_tasks.clone();
+                        let connection_permit = connection_permit.clone();
+                        let connection_stop = connection_stop.clone();
+                        let first_request_tx = first_request_tx.clone();
+                        async move {
+                            let response = route(
+                                request,
+                                routes,
+                                peer,
+                                registry,
+                                tickets,
+                                pending_routes,
+                                control_tasks,
+                                connection_permit,
+                                connection_stop,
+                            )
+                            .await;
+                            if let Ok(mut sender) = first_request_tx.lock() {
+                                if let Some(sender) = sender.take() {
+                                    let _ = sender.send(());
+                                }
+                            }
+                            response
+                        }
                     });
                     let mut builder = auto::Builder::new(TokioExecutor::new());
                     builder.http1().timer(TokioTimer::new()).header_read_timeout(http_header_timeout);
@@ -280,6 +295,7 @@ fn build_runtime(config: &MainConfig) -> Result<MainRuntime, GatewayError> {
             enrollment: config.enrollment.clone().map(Arc::new),
             allowed_edge_ids: config.allowed_edge_ids.iter().cloned().collect(),
             revoked_edge_serials: config.revoked_edge_serials.iter().map(|serial| normalize_serial(serial)).collect(),
+            fallback: config.fallback_upstream.as_deref().map(FixedUpstreamProxy::new).transpose()?.map(Arc::new),
         }),
     })
 }
@@ -302,13 +318,14 @@ impl Drop for MainGateway {
 async fn route(
     mut request: Request<Incoming>,
     routes: Arc<RouteConfig>,
+    peer: SocketAddr,
     registry: EdgeRegistry,
     tickets: Arc<AsyncMutex<SessionTickets>>,
     pending_routes: PendingRoutes,
     control_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     connection_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     stop: watch::Receiver<bool>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<ProxyBody>, Infallible> {
     let identity = request.extensions().get::<PeerIdentity>().cloned();
     if matches!(identity, Some(PeerIdentity::Anonymous))
         && routes.enrollment.as_ref().is_some_and(|config| request.uri().path() == config.path)
@@ -386,7 +403,23 @@ async fn route(
             return Ok(empty_response(StatusCode::OK));
         }
     }
+    if reserved_path(&routes, request.uri().path()) {
+        return Ok(empty_response(StatusCode::NOT_FOUND));
+    }
+    if let Some(proxy) = &routes.fallback {
+        return Ok(proxy.fallback(request, peer).await.unwrap_or_else(|_| empty_response(StatusCode::BAD_GATEWAY)));
+    }
     Ok(empty_response(StatusCode::NOT_FOUND))
+}
+
+fn reserved_path(routes: &RouteConfig, path: &str) -> bool {
+    path == routes.edge_path.as_ref()
+        || path == routes.edge_data_path.as_ref()
+        || path == routes.dbx_path.as_ref()
+        || routes
+            .enrollment
+            .as_ref()
+            .is_some_and(|enrollment| path == enrollment.path || path == enrollment.renewal_path)
 }
 
 #[derive(serde::Deserialize)]
@@ -400,7 +433,7 @@ async fn handle_renewal(
     config: Arc<MainEnrollmentConfig>,
     edge_id: String,
     current_serial: String,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     if request.method() != Method::POST {
         return empty_response(StatusCode::NOT_FOUND);
     }
@@ -427,7 +460,7 @@ async fn handle_renewal(
     json_response(response)
 }
 
-fn json_response(response: Result<crate::pki::EnrollCsrResponse, GatewayError>) -> Response<Full<Bytes>> {
+fn json_response(response: Result<crate::pki::EnrollCsrResponse, GatewayError>) -> Response<ProxyBody> {
     let Ok(response) = response else {
         return empty_response(StatusCode::NOT_FOUND);
     };
@@ -435,7 +468,7 @@ fn json_response(response: Result<crate::pki::EnrollCsrResponse, GatewayError>) 
         Ok(body) => Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(body)))
+            .body(full_proxy_body(Bytes::from(body)))
             .expect("fixed response is valid"),
         Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -461,22 +494,22 @@ fn websocket_accept_key(request: &Request<Incoming>) -> Option<String> {
         .then(|| derive_accept_key(key.as_bytes()))
 }
 
-fn switching_protocols(version: Version, accept_key: String) -> Response<Full<Bytes>> {
+fn switching_protocols(version: Version, accept_key: String) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .version(version)
         .header(CONNECTION, "Upgrade")
         .header(UPGRADE, "websocket")
         .header(SEC_WEBSOCKET_ACCEPT, accept_key)
-        .body(Full::new(Bytes::new()))
+        .body(empty_proxy_body())
         .expect("fixed WebSocket response is valid")
 }
 
-fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder().status(status).body(Full::new(Bytes::new())).expect("fixed response is valid")
+fn empty_response(status: StatusCode) -> Response<ProxyBody> {
+    Response::builder().status(status).body(empty_proxy_body()).expect("fixed response is valid")
 }
 
-async fn handle_enrollment(request: Request<Incoming>, config: Arc<MainEnrollmentConfig>) -> Response<Full<Bytes>> {
+async fn handle_enrollment(request: Request<Incoming>, config: Arc<MainEnrollmentConfig>) -> Response<ProxyBody> {
     if request.method() != Method::POST {
         return empty_response(StatusCode::NOT_FOUND);
     }

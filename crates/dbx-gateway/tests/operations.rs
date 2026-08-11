@@ -112,6 +112,7 @@ async fn reload_preserves_valid_runtime_on_error_and_closes_revoked_edge() {
         enrollment: None,
         allowed_edge_ids: vec!["edge-ops".to_string()],
         revoked_edge_serials: Vec::new(),
+        fallback_upstream: None,
     };
     let main = MainGateway::bind(config.clone()).await.unwrap();
     let edge = EdgeGateway::start(EdgeConfig {
