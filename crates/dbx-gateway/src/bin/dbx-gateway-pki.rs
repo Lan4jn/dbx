@@ -272,7 +272,7 @@ async fn serve(args: ServeArgs) -> Result<String, GatewayError> {
 
     let password = read_password_file(&config.password_file)?;
     let state = GatewayState::open(config.state_file).await?;
-    let store = PkiStore::open(&config.data_dir)?;
+    let store = PkiStore::open_online_edge(&config.data_dir)?;
     let service = PkiEnrollmentService::new(state, store, password);
     let unix = match config.unix {
         Some(unix) => Some(serve_unix(unix.path, unix.allowed_uid, unix.allowed_gid, service.clone()).await?),

@@ -83,6 +83,12 @@ impl PkiStore {
         Ok(Self { data_dir: data_dir.to_path_buf() })
     }
 
+    pub fn open_online_edge(data_dir: &Path) -> Result<Self, GatewayError> {
+        validate_directory(data_dir, "PKI data directory")?;
+        validate_existing_role(data_dir, CertificateRole::Edge.as_str())?;
+        Ok(Self { data_dir: data_dir.to_path_buf() })
+    }
+
     pub fn root_certificate_path(&self) -> PathBuf {
         certificate_path(&self.data_dir, ROOT)
     }
@@ -275,14 +281,19 @@ fn validate_existing_pki(data_dir: &Path) -> Result<(), GatewayError> {
     for role in
         [ROOT, CertificateRole::Server.as_str(), CertificateRole::Edge.as_str(), CertificateRole::Client.as_str()]
     {
-        let role_dir = data_dir.join(role);
-        validate_directory(&role_dir, "PKI role directory")?;
-        validate_regular_file(&certificate_path(data_dir, role), None, "CA certificate")?;
-        validate_regular_file(&private_key_path(data_dir, role), Some(0o600), "CA private key")?;
-        let issued = role_dir.join("issued");
-        if fs::symlink_metadata(&issued).is_ok() {
-            validate_directory(&issued, "issued certificate directory")?;
-        }
+        validate_existing_role(data_dir, role)?;
+    }
+    Ok(())
+}
+
+fn validate_existing_role(data_dir: &Path, role: &str) -> Result<(), GatewayError> {
+    let role_dir = data_dir.join(role);
+    validate_directory(&role_dir, "PKI role directory")?;
+    validate_regular_file(&certificate_path(data_dir, role), None, "CA certificate")?;
+    validate_regular_file(&private_key_path(data_dir, role), Some(0o600), "CA private key")?;
+    let issued = role_dir.join("issued");
+    if fs::symlink_metadata(&issued).is_ok() {
+        validate_directory(&issued, "issued certificate directory")?;
     }
     Ok(())
 }

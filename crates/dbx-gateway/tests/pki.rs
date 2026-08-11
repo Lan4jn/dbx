@@ -47,6 +47,32 @@ fn initializes_role_separated_offline_ca_store() {
 }
 
 #[test]
+fn online_edge_store_does_not_require_root_server_or_client_private_keys() {
+    let offline = temp_dir();
+    let online = temp_dir();
+    let password = Zeroizing::new("ca-password".to_string());
+    PkiStore::init(&offline, &password).unwrap();
+    fs::create_dir(online.join("edge")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&online, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(online.join("edge"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::copy(offline.join("edge/ca.crt.pem"), online.join("edge/ca.crt.pem")).unwrap();
+    fs::copy(offline.join("edge/ca.key.encrypted.pem"), online.join("edge/ca.key.encrypted.pem")).unwrap();
+
+    assert!(PkiStore::open_online_edge(&online).is_ok());
+    assert!(PkiStore::open(&online).is_err());
+    assert!(!online.join("root/ca.key.encrypted.pem").exists());
+    assert!(!online.join("server/ca.key.encrypted.pem").exists());
+    assert!(!online.join("client/ca.key.encrypted.pem").exists());
+
+    fs::remove_dir_all(offline).unwrap();
+    fs::remove_dir_all(online).unwrap();
+}
+
+#[test]
 fn initialization_fails_closed_for_existing_pki_and_empty_password() {
     let data_dir = temp_dir();
     let password = Zeroizing::new("ca-password".to_string());
