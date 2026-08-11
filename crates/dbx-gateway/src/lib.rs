@@ -2,8 +2,12 @@
 pub mod config;
 pub mod error;
 #[cfg(feature = "server")]
+pub mod main_gateway;
+#[cfg(feature = "server")]
 pub mod pki;
 pub mod protocol;
+#[cfg(feature = "server")]
+pub mod tls;
 
 pub use error::{GatewayError, GatewayErrorCode};
 

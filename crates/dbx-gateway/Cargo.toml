@@ -9,11 +9,18 @@ default = ["server"]
 server = [
     "dep:clap",
     "dep:hex",
+    "dep:http-body-util",
+    "dep:hyper",
     "dep:hyper-util",
+    "dep:libc",
     "dep:p12-keystore",
     "dep:pkcs8",
     "dep:rcgen",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:sha2",
     "dep:time",
+    "dep:tokio",
     "dep:tokio-rustls",
     "dep:tokio-tungstenite",
     "dep:toml",
@@ -39,11 +46,18 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 clap = { version = "4", features = ["derive"], optional = true }
 hex = { version = "0.4", optional = true }
-hyper-util = { version = "0.1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["server", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
+libc = { version = "0.2", optional = true }
 p12-keystore = { version = "0.2", optional = true }
 pkcs8 = { version = "=0.11.0-rc.11", default-features = false, features = ["encryption", "pem"], optional = true }
 rcgen = { version = "0.14", features = ["x509-parser"], optional = true }
+rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+sha2 = { version = "0.10", optional = true }
 time = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 toml = { version = "0.8", optional = true }

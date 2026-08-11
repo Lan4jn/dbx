@@ -20,7 +20,18 @@ pub struct MainConfig {
     pub listen: String,
     pub certificate: PathBuf,
     pub private_key: PathBuf,
-    pub ca_certificate: PathBuf,
+    pub edge_ca_certificate: PathBuf,
+    pub client_ca_certificate: PathBuf,
+    #[serde(default = "default_edge_path")]
+    pub edge_path: String,
+    #[serde(default = "default_dbx_path")]
+    pub dbx_path: String,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub tls_handshake_timeout_secs: u64,
+    #[serde(default = "default_http_header_timeout_secs")]
+    pub http_header_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,13 +106,14 @@ pub fn load_config_file(path: &Path) -> Result<GatewayConfig, GatewayError> {
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, GatewayError> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-
-    std::env::current_dir()
-        .map(|current_dir| current_dir.join(path))
-        .map_err(|_| config_error("configuration path could not be resolved"))
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current_dir| current_dir.join(path))
+            .map_err(|_| config_error("configuration path could not be resolved"))?
+    };
+    fs::canonicalize(absolute).map_err(|_| config_error("configuration path could not be resolved"))
 }
 
 fn resolve_paths(config: &mut GatewayConfig, base_dir: &Path) {
@@ -109,7 +121,8 @@ fn resolve_paths(config: &mut GatewayConfig, base_dir: &Path) {
         GatewayConfig::Main(main) => {
             resolve_path(&mut main.certificate, base_dir);
             resolve_path(&mut main.private_key, base_dir);
-            resolve_path(&mut main.ca_certificate, base_dir);
+            resolve_path(&mut main.edge_ca_certificate, base_dir);
+            resolve_path(&mut main.client_ca_certificate, base_dir);
         }
         GatewayConfig::Edge(edge) => {
             resolve_path(&mut edge.certificate, base_dir);
@@ -135,7 +148,23 @@ fn resolve_path(path: &mut PathBuf, base_dir: &Path) {
 
 fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
     match config {
-        GatewayConfig::Main(main) => validate_credentials(&main.certificate, &main.private_key, &main.ca_certificate),
+        GatewayConfig::Main(main) => {
+            validate_regular_file(&main.certificate, "certificate")?;
+            validate_regular_file(&main.edge_ca_certificate, "edge_ca_certificate")?;
+            validate_regular_file(&main.client_ca_certificate, "client_ca_certificate")?;
+            validate_regular_file(&main.private_key, "private_key")?;
+            validate_private_key_permissions(&main.private_key)?;
+            if !valid_reserved_path(&main.edge_path)
+                || !valid_reserved_path(&main.dbx_path)
+                || main.edge_path == main.dbx_path
+            {
+                return Err(config_error("reserved paths must be distinct absolute paths"));
+            }
+            if main.max_connections == 0 || main.tls_handshake_timeout_secs == 0 || main.http_header_timeout_secs == 0 {
+                return Err(config_error("connection limits and timeouts must be greater than zero"));
+            }
+            Ok(())
+        }
         GatewayConfig::Edge(edge) => {
             if edge.edge_id.trim().is_empty() {
                 return Err(config_error("configuration edge_id must not be empty"));
@@ -149,6 +178,30 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             validate_credentials(&edge.certificate, &edge.private_key, &edge.ca_certificate)
         }
     }
+}
+
+fn default_edge_path() -> String {
+    "/_dbx/edge".to_string()
+}
+
+fn default_dbx_path() -> String {
+    "/_dbx/client".to_string()
+}
+
+fn default_max_connections() -> usize {
+    1024
+}
+
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_http_header_timeout_secs() -> u64 {
+    10
+}
+
+fn valid_reserved_path(path: &str) -> bool {
+    path.starts_with('/') && !path.starts_with("//") && !path.contains(['?', '#'])
 }
 
 fn validate_target(target: &EdgeTarget) -> Result<(), GatewayError> {
@@ -190,17 +243,36 @@ fn validate_credentials(certificate: &Path, private_key: &Path, ca_certificate: 
 }
 
 fn validate_regular_file(path: &Path, field: &str) -> Result<(), GatewayError> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
+    validate_no_symlink_components(path, field)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         _ => Err(config_error(format!("configuration {field} must reference an existing regular file"))),
     }
+}
+
+fn validate_no_symlink_components(path: &Path, field: &str) -> Result<(), GatewayError> {
+    use std::path::Component;
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(config_error(format!("configuration {field} path must not contain parent traversal")));
+        }
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|_| config_error(format!("configuration {field} path could not be inspected")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(config_error(format!("configuration {field} path must not contain symbolic links")));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 fn validate_private_key_permissions(path: &Path) -> Result<(), GatewayError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = fs::metadata(path)
+    let mode = fs::symlink_metadata(path)
         .map_err(|_| config_error("configuration private_key metadata could not be read"))?
         .permissions()
         .mode()

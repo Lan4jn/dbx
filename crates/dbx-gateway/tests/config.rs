@@ -17,7 +17,7 @@ impl TempDir {
             let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!("dbx-gateway-config-{}-{id}", std::process::id()));
             match fs::create_dir(&path) {
-                Ok(()) => return Self(path),
+                Ok(()) => return Self(fs::canonicalize(path).unwrap()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("failed to create test directory: {error}"),
             }
@@ -58,6 +58,8 @@ fn make_private_key(path: &Path) {
 fn write_credentials(dir: &Path) {
     write_file(&dir.join("certs/server.pem"), "test certificate");
     write_file(&dir.join("certs/root.pem"), "test CA certificate");
+    write_file(&dir.join("certs/edge-ca.pem"), "test Edge CA certificate");
+    write_file(&dir.join("certs/client-ca.pem"), "test Client CA certificate");
     make_private_key(&dir.join("certs/server.key"));
 }
 
@@ -67,7 +69,8 @@ fn main_config(extra: &str) -> String {
 listen = "127.0.0.1:8443"
 certificate = "certs/server.pem"
 private_key = "certs/server.key"
-ca_certificate = "certs/root.pem"
+edge_ca_certificate = "certs/edge-ca.pem"
+client_ca_certificate = "certs/client-ca.pem"
 {extra}
 "#
     )
@@ -100,6 +103,24 @@ fn rejects_unknown_fields() {
 }
 
 #[test]
+fn rejects_legacy_single_main_ca() {
+    let dir = TempDir::new();
+    write_credentials(dir.path());
+    let config_path = dir.path().join("gateway.toml");
+    write_file(
+        &config_path,
+        r#"mode = "main"
+listen = "127.0.0.1:8443"
+certificate = "certs/server.pem"
+private_key = "certs/server.key"
+ca_certificate = "certs/root.pem"
+"#,
+    );
+
+    assert_eq!(load_config_file(&config_path).unwrap_err().code, GatewayErrorCode::ConfigInvalid);
+}
+
+#[test]
 fn rejects_main_without_server_certificate_or_key() {
     let dir = TempDir::new();
     let config_path = dir.path().join("gateway.toml");
@@ -107,7 +128,8 @@ fn rejects_main_without_server_certificate_or_key() {
         &config_path,
         r#"mode = "main"
 listen = "127.0.0.1:8443"
-ca_certificate = "certs/root.pem"
+edge_ca_certificate = "certs/edge-ca.pem"
+client_ca_certificate = "certs/client-ca.pem"
 "#,
     );
 
@@ -219,7 +241,70 @@ fn resolves_relative_credential_paths_from_config_directory() {
 
     assert_eq!(main.certificate, dir.path().join("certs/server.pem"));
     assert_eq!(main.private_key, dir.path().join("certs/server.key"));
-    assert_eq!(main.ca_certificate, dir.path().join("certs/root.pem"));
+    assert_eq!(main.edge_ca_certificate, dir.path().join("certs/edge-ca.pem"));
+    assert_eq!(main.client_ca_certificate, dir.path().join("certs/client-ca.pem"));
+    assert_eq!(main.edge_path, "/_dbx/edge");
+    assert_eq!(main.dbx_path, "/_dbx/client");
+    assert_eq!(main.max_connections, 1024);
+    assert_eq!(main.tls_handshake_timeout_secs, 10);
+    assert_eq!(main.http_header_timeout_secs, 10);
+}
+
+#[test]
+fn rejects_zero_connection_limits_and_timeouts() {
+    for setting in ["max_connections = 0", "tls_handshake_timeout_secs = 0", "http_header_timeout_secs = 0"] {
+        let dir = TempDir::new();
+        write_credentials(dir.path());
+        let config_path = dir.path().join("gateway.toml");
+        write_file(&config_path, &main_config(setting));
+
+        assert_eq!(load_config_file(&config_path).unwrap_err().code, GatewayErrorCode::ConfigInvalid);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symbolic_link_credentials() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new();
+    write_credentials(dir.path());
+    let private_key = dir.path().join("certs/server.key");
+    let real_key = dir.path().join("certs/real-server.key");
+    fs::rename(&private_key, &real_key).unwrap();
+    symlink(&real_key, &private_key).unwrap();
+    let config_path = dir.path().join("gateway.toml");
+    write_file(&config_path, &main_config(""));
+
+    assert_eq!(load_config_file(&config_path).unwrap_err().code, GatewayErrorCode::ConfigInvalid);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_credentials_beneath_a_symbolic_link_directory() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new();
+    write_credentials(dir.path());
+    let real_certs = dir.path().join("real-certs");
+    fs::rename(dir.path().join("certs"), &real_certs).unwrap();
+    symlink(&real_certs, dir.path().join("certs")).unwrap();
+    let config_path = dir.path().join("gateway.toml");
+    write_file(&config_path, &main_config(""));
+
+    assert_eq!(load_config_file(&config_path).unwrap_err().code, GatewayErrorCode::ConfigInvalid);
+}
+
+#[test]
+fn rejects_parent_directory_components_in_credential_paths() {
+    let dir = TempDir::new();
+    write_credentials(dir.path());
+    let config_path = dir.path().join("gateway.toml");
+    let config =
+        main_config("").replace("certificate = \"certs/server.pem\"", "certificate = \"certs/../certs/server.pem\"");
+    write_file(&config_path, &config);
+
+    assert_eq!(load_config_file(&config_path).unwrap_err().code, GatewayErrorCode::ConfigInvalid);
 }
 
 #[cfg(unix)]
