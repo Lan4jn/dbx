@@ -23,6 +23,7 @@ use x509_parser::prelude::parse_x509_certificate;
 use zeroize::Zeroizing;
 
 use crate::config::{EdgeBootstrapConfig, EdgeConfig, TargetAddress};
+use crate::limits::TargetPolicy;
 use crate::pki::{EnrollCsrRequest, EnrollCsrResponse};
 use crate::protocol::{
     decode_control_frame, encode_control_frame, EdgeDataOpen, EdgeRegistration, EdgeToMain, MainToEdge,
@@ -597,9 +598,17 @@ async fn run_data_channel(
     let Some(target) = config.targets.get(&target_id) else { return Some(failed()) };
     match &target.address {
         TargetAddress::Tcp { tcp } => {
-            let Ok(Ok(local)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(tcp)).await else {
+            let Ok(addresses) = TargetPolicy::new(target.allow_remote).resolve_and_validate(tcp).await else {
                 return Some(failed());
             };
+            let mut local = None;
+            for address in addresses {
+                if let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+                    local = Some(stream);
+                    break;
+                }
+            }
+            let Some(local) = local else { return Some(failed()) };
             if !relay_data_channel(config, tls, session_id, target_id, local, stop).await {
                 return Some(failed());
             }

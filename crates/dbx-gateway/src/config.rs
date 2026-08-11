@@ -40,6 +40,18 @@ pub struct MainConfig {
     pub revoked_edge_serials: Vec<String>,
     #[serde(default)]
     pub fallback_upstream: Option<String>,
+    #[serde(default)]
+    pub health_listen: Option<String>,
+    #[serde(default = "default_max_streams_per_edge")]
+    pub max_streams_per_edge: usize,
+    #[serde(default = "default_max_streams_per_client")]
+    pub max_streams_per_client: usize,
+    #[serde(default = "default_connection_rate_per_second")]
+    pub connection_rate_per_second: u32,
+    #[serde(default = "default_connection_rate_burst")]
+    pub connection_rate_burst: u32,
+    #[serde(default = "default_global_buffer_budget_bytes")]
+    pub global_buffer_budget_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,7 +231,15 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             {
                 return Err(config_error("reserved paths must be distinct absolute paths"));
             }
-            if main.max_connections == 0 || main.tls_handshake_timeout_secs == 0 || main.http_header_timeout_secs == 0 {
+            if main.max_connections == 0
+                || main.max_streams_per_edge == 0
+                || main.max_streams_per_client == 0
+                || main.connection_rate_per_second == 0
+                || main.connection_rate_burst == 0
+                || main.global_buffer_budget_bytes < 2 * 1024 * 1024
+                || main.tls_handshake_timeout_secs == 0
+                || main.http_header_timeout_secs == 0
+            {
                 return Err(config_error("connection limits and timeouts must be greater than zero"));
             }
             if let Some(enrollment) = &main.enrollment {
@@ -251,6 +271,13 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             }
             if let Some(upstream) = &main.fallback_upstream {
                 validate_fallback_upstream(upstream)?;
+            }
+            if let Some(health) = &main.health_listen {
+                let address: SocketAddr =
+                    health.parse().map_err(|_| config_error("health listen address is invalid"))?;
+                if !address.ip().is_loopback() {
+                    return Err(config_error("health listen address must be loopback"));
+                }
             }
             Ok(())
         }
@@ -322,6 +349,26 @@ fn validate_fallback_upstream(value: &str) -> Result<(), GatewayError> {
 
 fn default_max_connections() -> usize {
     1024
+}
+
+fn default_max_streams_per_edge() -> usize {
+    256
+}
+
+fn default_max_streams_per_client() -> usize {
+    32
+}
+
+fn default_connection_rate_per_second() -> u32 {
+    64
+}
+
+fn default_connection_rate_burst() -> u32 {
+    128
+}
+
+fn default_global_buffer_budget_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 fn default_tls_handshake_timeout_secs() -> u64 {

@@ -120,6 +120,12 @@ impl Fixture {
             allowed_edge_ids: Vec::new(),
             revoked_edge_serials: Vec::new(),
             fallback_upstream: None,
+            health_listen: None,
+            max_streams_per_edge: 256,
+            max_streams_per_client: 32,
+            connection_rate_per_second: 64,
+            connection_rate_burst: 128,
+            global_buffer_budget_bytes: 256 * 1024 * 1024,
         };
         Self { _dir: dir, config, server_ca: server_ca.certificate, server_ca_certificate, edge_ca, client_ca }
     }
@@ -405,6 +411,61 @@ async fn data_tcp_round_trip_reports_all_gateway_stages() {
     .unwrap();
     edge.shutdown().await;
     echo_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn data_rejects_streams_above_the_per_edge_limit() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_streams_per_edge = 1;
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_address = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut buffer = [0_u8; 1];
+        let _ = stream.read(&mut buffer).await;
+    });
+    let gateway = fixture.start().await;
+    let mut edge_config = fixture.edge_config(gateway.local_addr(), "edge-limited");
+    edge_config.targets.get_mut("postgres").unwrap().address = TargetAddress::Tcp { tcp: echo_address.to_string() };
+    let edge = EdgeGateway::start(edge_config).unwrap();
+    wait_for_edge(&gateway, "edge-limited", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-limited"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+
+    let mut first = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    let request = ClientMessage::OpenRoute {
+        version: ProtocolVersion::current(),
+        request_id: uuid::Uuid::new_v4(),
+        edge_id: "edge-limited".to_string(),
+        target_id: "postgres".to_string(),
+    };
+    first.send(Message::Binary(encode_control_frame(&request).unwrap().into())).await.unwrap();
+    for _ in 0..5 {
+        assert!(matches!(first.next().await.unwrap().unwrap(), Message::Binary(_)));
+    }
+    assert_eq!(gateway.registry().read().await["edge-limited"].active_streams, 1);
+
+    let mut second = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    second.send(Message::Binary(encode_control_frame(&request).unwrap().into())).await.unwrap();
+    let Message::Binary(authenticated) = second.next().await.unwrap().unwrap() else { panic!("expected stage") };
+    assert_eq!(
+        serde_json::from_slice::<ClientEvent>(&authenticated).unwrap(),
+        ClientEvent::Stage { stage: Stage::MainAuthenticated }
+    );
+    let Message::Binary(rejected) = second.next().await.unwrap().unwrap() else { panic!("expected error") };
+    assert_eq!(
+        serde_json::from_slice::<ClientEvent>(&rejected).unwrap(),
+        ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::CapacityExceeded }
+    );
+
+    first.close(None).await.unwrap();
+    edge.shutdown().await;
+    echo_task.await.unwrap();
+    gateway.shutdown().await;
 }
 
 #[cfg(unix)]

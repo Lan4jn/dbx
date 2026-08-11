@@ -6,6 +6,10 @@ pub mod edge_gateway;
 pub mod enrollment;
 pub mod error;
 #[cfg(feature = "server")]
+pub mod health;
+#[cfg(feature = "server")]
+pub mod limits;
+#[cfg(feature = "server")]
 pub mod main_gateway;
 #[cfg(feature = "server")]
 pub mod pki;

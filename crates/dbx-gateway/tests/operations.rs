@@ -4,15 +4,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dbx_gateway::config::{EdgeConfig, MainConfig};
 use dbx_gateway::edge_gateway::EdgeGateway;
+use dbx_gateway::limits::{BufferBudget, ConnectionRateLimiter, IdentityConcurrency, SecurityEvent, TargetPolicy};
 use dbx_gateway::main_gateway::MainGateway;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     SanType,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::parse_x509_certificate;
 
@@ -113,6 +116,12 @@ async fn reload_preserves_valid_runtime_on_error_and_closes_revoked_edge() {
         allowed_edge_ids: vec!["edge-ops".to_string()],
         revoked_edge_serials: Vec::new(),
         fallback_upstream: None,
+        health_listen: Some("127.0.0.1:0".to_string()),
+        max_streams_per_edge: 1,
+        max_streams_per_client: 32,
+        connection_rate_per_second: 64,
+        connection_rate_burst: 128,
+        global_buffer_budget_bytes: 256 * 1024 * 1024,
     };
     let main = MainGateway::bind(config.clone()).await.unwrap();
     let edge = EdgeGateway::start(EdgeConfig {
@@ -126,6 +135,17 @@ async fn reload_preserves_valid_runtime_on_error_and_closes_revoked_edge() {
     })
     .unwrap();
     wait_online(&main, true).await;
+
+    let mut health = TcpStream::connect(main.health_addr().unwrap()).await.unwrap();
+    health.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut health_response = String::new();
+    health.read_to_string(&mut health_response).await.unwrap();
+    assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(health_response.contains("\"online_edges\":1"));
+    assert!(health_response.contains("\"database_checks\":0"));
+    assert!(health_response.contains("\"process_id\":"));
+    assert!(health_response.contains("\"server_certificate_not_after_unix\":"));
+    assert!(health_response.contains("\"pki_configured\":false"));
 
     let mut invalid = config.clone();
     invalid.certificate = dir.0.join("missing.pem");
@@ -141,6 +161,53 @@ async fn reload_preserves_valid_runtime_on_error_and_closes_revoked_edge() {
 
     edge.shutdown().await;
     main.shutdown().await;
+}
+
+#[tokio::test]
+async fn limits_target_policy_rejects_unsafe_addresses() {
+    assert!(TargetPolicy::new(false).resolve_and_validate("127.0.0.1:5432").await.is_ok());
+    assert!(TargetPolicy::new(false).resolve_and_validate("0.0.0.0:5432").await.is_err());
+    assert!(TargetPolicy::new(true).resolve_and_validate("169.254.169.254:80").await.is_err());
+    assert!(TargetPolicy::new(true).resolve_and_validate("[fe80::1]:80").await.is_err());
+}
+
+#[test]
+fn limits_security_events_never_serialize_payload_secrets() {
+    let event = SecurityEvent {
+        request_id: Some("request-1"),
+        peer_role: Some("dbx_client"),
+        peer_id: Some("desktop-1"),
+        edge_id: Some("edge-ops"),
+        target_id: Some("postgres"),
+        stage: Some("stream_ready"),
+        ..SecurityEvent::default()
+    };
+    let encoded = event.to_json();
+    for secret in ["SELECT secret_marker", "token-secret-marker", "BEGIN PRIVATE KEY"] {
+        assert!(!encoded.contains(secret));
+    }
+}
+
+#[test]
+fn limits_rate_concurrency_and_buffer_budget_fail_closed() {
+    let rate = ConnectionRateLimiter::new(1, 2);
+    let now = Instant::now();
+    assert!(rate.allow("127.0.0.1", now));
+    assert!(rate.allow("127.0.0.1", now));
+    assert!(!rate.allow("127.0.0.1", now));
+    assert!(rate.allow("127.0.0.1", now + Duration::from_secs(1)));
+
+    let concurrency = IdentityConcurrency::new(1);
+    let first = concurrency.try_acquire("desktop-1").unwrap();
+    assert!(concurrency.try_acquire("desktop-1").is_none());
+    drop(first);
+    assert!(concurrency.try_acquire("desktop-1").is_some());
+
+    let budget = BufferBudget::new(1024);
+    let reservation = budget.try_reserve(768).unwrap();
+    assert!(budget.try_reserve(512).is_none());
+    drop(reservation);
+    assert!(budget.try_reserve(1024).is_some());
 }
 
 async fn wait_online(main: &MainGateway, online: bool) {

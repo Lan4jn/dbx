@@ -30,12 +30,15 @@ use uuid::Uuid;
 
 use crate::config::{MainConfig, MainEnrollmentConfig, PkiEndpointConfig};
 use crate::edge_gateway::{control_websocket_config, data_websocket_config};
+use crate::health::HealthServer;
+use crate::limits::{BufferBudget, ConnectionRateLimiter, IdentityConcurrency};
 use crate::pki::{
     enroll_over_remote, enroll_over_unix, renew_over_remote, renew_over_unix, EnrollCsrRequest, RenewCsrRequest,
 };
 use crate::protocol::{
     decode_client_message, decode_edge_data_open, decode_edge_message, decode_edge_registration, encode_control_frame,
     ClientEvent, ClientMessage, EdgeToMain, MainToEdge, RegisteredTarget, SessionId, SessionTickets, Stage,
+    MAX_DATA_FRAME_SIZE,
 };
 use crate::reverse_proxy::{empty_proxy_body, full_proxy_body, FixedUpstreamProxy, ProxyBody};
 use crate::stream::relay_websockets;
@@ -92,6 +95,18 @@ struct MainImmutableConfig {
     max_connections: usize,
     tls_handshake_timeout_secs: u64,
     http_header_timeout_secs: u64,
+    health_listen: Option<String>,
+    max_streams_per_edge: usize,
+    max_streams_per_client: usize,
+    connection_rate_per_second: u32,
+    connection_rate_burst: u32,
+    global_buffer_budget_bytes: usize,
+}
+
+struct StreamLimits {
+    clients: IdentityConcurrency,
+    edges: IdentityConcurrency,
+    buffers: BufferBudget,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +135,7 @@ pub struct MainGateway {
     task: JoinHandle<()>,
     runtime: Arc<ArcSwap<MainRuntime>>,
     immutable: MainImmutableConfig,
+    health: Option<HealthServer>,
 }
 
 impl MainGateway {
@@ -130,11 +146,23 @@ impl MainGateway {
             max_connections: config.max_connections,
             tls_handshake_timeout_secs: config.tls_handshake_timeout_secs,
             http_header_timeout_secs: config.http_header_timeout_secs,
+            health_listen: config.health_listen.clone(),
+            max_streams_per_edge: config.max_streams_per_edge,
+            max_streams_per_client: config.max_streams_per_client,
+            connection_rate_per_second: config.connection_rate_per_second,
+            connection_rate_burst: config.connection_rate_burst,
+            global_buffer_budget_bytes: config.global_buffer_budget_bytes,
         };
         let listener =
             TcpListener::bind(&config.listen).await.map_err(|_| internal_error("main listener could not bind"))?;
         let local_addr = listener.local_addr().map_err(|_| internal_error("main listener address unavailable"))?;
         let registry = EdgeRegistry::default();
+        let health = match &config.health_listen {
+            Some(listen) => Some(
+                HealthServer::bind(listen, registry.clone(), &config.certificate, config.enrollment.is_some()).await?,
+            ),
+            None => None,
+        };
         let task_registry = registry.clone();
         let tickets = Arc::new(AsyncMutex::new(SessionTickets::new(Duration::from_secs(15))));
         let pending_routes = PendingRoutes::default();
@@ -142,6 +170,13 @@ impl MainGateway {
         let task_control_tasks = control_tasks.clone();
         let task_runtime = runtime.clone();
         let connection_slots = Arc::new(Semaphore::new(config.max_connections));
+        let connection_rates =
+            Arc::new(ConnectionRateLimiter::new(config.connection_rate_per_second, config.connection_rate_burst));
+        let stream_limits = Arc::new(StreamLimits {
+            clients: IdentityConcurrency::new(config.max_streams_per_client),
+            edges: IdentityConcurrency::new(config.max_streams_per_edge),
+            buffers: BufferBudget::new(config.global_buffer_budget_bytes),
+        });
         let tls_handshake_timeout = Duration::from_secs(config.tls_handshake_timeout_secs);
         let http_header_timeout = Duration::from_secs(config.http_header_timeout_secs);
         let (shutdown, mut stop) = watch::channel(false);
@@ -169,6 +204,9 @@ impl MainGateway {
                         continue;
                     }
                 };
+                if !connection_rates.allow(&peer.ip().to_string(), std::time::Instant::now()) {
+                    continue;
+                }
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
                     continue;
                 };
@@ -181,6 +219,7 @@ impl MainGateway {
                 let pending_routes = pending_routes.clone();
                 let control_tasks = task_control_tasks.clone();
                 let connection_stop = task_shutdown.subscribe();
+                let stream_limits = stream_limits.clone();
                 connections.spawn(async move {
                     let Ok(Ok(stream)) = timeout(tls_handshake_timeout, acceptor.accept(stream)).await else {
                         return;
@@ -201,6 +240,7 @@ impl MainGateway {
                         let connection_permit = connection_permit.clone();
                         let connection_stop = connection_stop.clone();
                         let first_request_tx = first_request_tx.clone();
+                        let stream_limits = stream_limits.clone();
                         async move {
                             let response = route(
                                 request,
@@ -211,6 +251,7 @@ impl MainGateway {
                                 pending_routes,
                                 control_tasks,
                                 connection_permit,
+                                stream_limits,
                                 connection_stop,
                             )
                             .await;
@@ -244,7 +285,7 @@ impl MainGateway {
                 let _ = control.await;
             }
         });
-        Ok(Self { local_addr, registry, shutdown, task, runtime, immutable })
+        Ok(Self { local_addr, registry, shutdown, task, runtime, immutable, health })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -260,6 +301,12 @@ impl MainGateway {
             || config.max_connections != self.immutable.max_connections
             || config.tls_handshake_timeout_secs != self.immutable.tls_handshake_timeout_secs
             || config.http_header_timeout_secs != self.immutable.http_header_timeout_secs
+            || config.health_listen != self.immutable.health_listen
+            || config.max_streams_per_edge != self.immutable.max_streams_per_edge
+            || config.max_streams_per_client != self.immutable.max_streams_per_client
+            || config.connection_rate_per_second != self.immutable.connection_rate_per_second
+            || config.connection_rate_burst != self.immutable.connection_rate_burst
+            || config.global_buffer_budget_bytes != self.immutable.global_buffer_budget_bytes
         {
             return Err(GatewayError {
                 code: GatewayErrorCode::ConfigInvalid,
@@ -281,6 +328,13 @@ impl MainGateway {
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
         let _ = (&mut self.task).await;
+        if let Some(health) = self.health.take() {
+            health.shutdown().await;
+        }
+    }
+
+    pub fn health_addr(&self) -> Option<SocketAddr> {
+        self.health.as_ref().map(HealthServer::local_addr)
     }
 }
 
@@ -324,6 +378,7 @@ async fn route(
     pending_routes: PendingRoutes,
     control_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     connection_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    stream_limits: Arc<StreamLimits>,
     stop: watch::Receiver<bool>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let identity = request.extensions().get::<PeerIdentity>().cloned();
@@ -395,7 +450,17 @@ async fn route(
                         Some(data_websocket_config()),
                     )
                     .await;
-                    run_dbx_connection(socket, permit, client_id, registry, tickets, pending_routes, stop).await;
+                    run_dbx_connection(
+                        socket,
+                        permit,
+                        client_id,
+                        registry,
+                        tickets,
+                        pending_routes,
+                        stream_limits,
+                        stop,
+                    )
+                    .await;
                 });
                 track_task(&control_tasks, task);
                 return Ok(switching_protocols(version, accept_key));
@@ -756,11 +821,16 @@ async fn run_dbx_connection(
     registry: EdgeRegistry,
     tickets: Arc<AsyncMutex<SessionTickets>>,
     pending_routes: PendingRoutes,
+    limits: Arc<StreamLimits>,
     mut stop: watch::Receiver<bool>,
 ) {
     if !send_client_event(&mut socket, ClientEvent::Stage { stage: Stage::MainAuthenticated }).await {
         return;
     }
+    let Some(_client_stream_permit) = limits.clients.try_acquire(&client_id) else {
+        send_client_error(&mut socket, GatewayErrorCode::CapacityExceeded).await;
+        return;
+    };
     let incoming = tokio::select! {
         incoming = timeout(Duration::from_secs(10), socket.next()) => incoming,
         _ = wait_for_stop(&mut stop) => return,
@@ -788,6 +858,14 @@ async fn run_dbx_connection(
             send_client_error(&mut socket, code).await;
             return;
         }
+    };
+    let Some(_edge_stream_permit) = limits.edges.try_acquire(&edge_id) else {
+        send_client_error(&mut socket, GatewayErrorCode::CapacityExceeded).await;
+        return;
+    };
+    let Some(_buffer_reservation) = limits.buffers.try_reserve(MAX_DATA_FRAME_SIZE * 2) else {
+        send_client_error(&mut socket, GatewayErrorCode::CapacityExceeded).await;
+        return;
     };
     if !send_client_event(&mut socket, ClientEvent::Stage { stage: Stage::RouteAuthorized }).await {
         return;
