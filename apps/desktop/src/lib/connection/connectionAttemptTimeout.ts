@@ -69,7 +69,7 @@ export function connectionAttemptTimeoutMs(config: Pick<ConnectionConfig, "conne
   for (const unresolvedLayer of config.transport_layers ?? []) {
     const layer = resolvedTimeoutLayer(unresolvedLayer, resolveTunnelProfile);
     if (layer.enabled === false) continue;
-    if (layer.type === "ssh" || layer.type === "http_tunnel") {
+    if (layer.type === "ssh" || layer.type === "http_tunnel" || layer.type === "dbx_gateway") {
       timeouts.push(positiveSeconds(layer.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS));
     }
   }
