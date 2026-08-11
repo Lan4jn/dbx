@@ -45,6 +45,37 @@ for path in "${required_paths[@]}"; do
   fi
 done
 
+require_heading() {
+  local document="$1"
+  local heading="$2"
+  if ! grep -qF "$heading" "$runtime_dir/$document"; then
+    echo "missing documentation heading '$heading' in $document" >&2
+    exit 1
+  fi
+}
+require_heading docs/dbx-gateway.md "## 信任边界"
+require_heading docs/dbx-gateway.md "## 网络拓扑"
+require_heading docs/dbx-gateway.md "## 文档入口"
+require_heading docs/dbx-gateway/main-gateway.md "## 安装"
+require_heading docs/dbx-gateway/main-gateway.md "## HTTPS 回退"
+require_heading docs/dbx-gateway/main-gateway.md "## ACL"
+require_heading docs/dbx-gateway/main-gateway.md "## systemd"
+require_heading docs/dbx-gateway/main-gateway.md "## 升级与回滚"
+require_heading docs/dbx-gateway/edge-gateway.md "## 令牌领证"
+require_heading docs/dbx-gateway/edge-gateway.md "## 本地目标"
+require_heading docs/dbx-gateway/edge-gateway.md "## 重连与迁移"
+require_heading docs/dbx-gateway/pki.md "## 离线 Root CA"
+require_heading docs/dbx-gateway/pki.md "## 在线 Edge CA"
+require_heading docs/dbx-gateway/pki.md "## 续期与吊销"
+require_heading docs/dbx-gateway/pki.md "## 备份与恢复"
+require_heading docs/dbx-gateway/configuration.md "## Main 字段"
+require_heading docs/dbx-gateway/configuration.md "## Edge 字段"
+require_heading docs/dbx-gateway/configuration.md "## PKI 字段"
+require_heading docs/dbx-gateway/operations.md "## 抓包验收"
+require_heading docs/dbx-gateway/operations.md "## 到期监控"
+require_heading docs/dbx-gateway/operations.md "## 故障排查"
+require_heading docs/dbx-gateway/operations.md "## 卸载"
+
 (cd "$runtime_dir" && sha256sum -c SHA256SUMS)
 "$runtime_dir/bin/dbx-gateway" --help >/dev/null
 "$runtime_dir/bin/dbx-gateway" --version >/dev/null
