@@ -116,6 +116,7 @@ impl Fixture {
             max_connections: 1024,
             tls_handshake_timeout_secs: 10,
             http_header_timeout_secs: 10,
+            enrollment: None,
         };
         Self { _dir: dir, config, server_ca: server_ca.certificate, server_ca_certificate, edge_ca, client_ca }
     }
@@ -164,6 +165,7 @@ impl Fixture {
                     },
                 ),
             ]),
+            bootstrap: None,
         }
     }
 }

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::Empty;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::service::service_fn;
@@ -27,8 +27,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
-use crate::config::MainConfig;
+use crate::config::{MainConfig, MainEnrollmentConfig, PkiEndpointConfig};
 use crate::edge_gateway::{control_websocket_config, data_websocket_config};
+use crate::pki::{enroll_over_remote, enroll_over_unix, EnrollCsrRequest};
 use crate::protocol::{
     decode_client_message, decode_edge_data_open, decode_edge_message, decode_edge_registration, encode_control_frame,
     ClientEvent, ClientMessage, EdgeToMain, MainToEdge, RegisteredTarget, SessionId, SessionTickets, Stage,
@@ -66,6 +67,13 @@ enum EdgeSocketRole {
     Data,
 }
 
+struct RouteConfig {
+    edge_path: Arc<str>,
+    edge_data_path: Arc<str>,
+    dbx_path: Arc<str>,
+    enrollment: Option<Arc<MainEnrollmentConfig>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct EdgeIdentity {
     pub edge_id: String,
@@ -100,8 +108,12 @@ impl MainGateway {
         let local_addr = listener.local_addr().map_err(|_| internal_error("main listener address unavailable"))?;
         let acceptor = TlsAcceptor::from(tls.server_config.clone());
         let edge_path = Arc::<str>::from(config.edge_path);
-        let edge_data_path = Arc::<str>::from(format!("{}/data", edge_path.trim_end_matches('/')));
-        let dbx_path = Arc::<str>::from(config.dbx_path);
+        let routes = Arc::new(RouteConfig {
+            edge_data_path: Arc::<str>::from(format!("{}/data", edge_path.trim_end_matches('/'))),
+            edge_path,
+            dbx_path: Arc::<str>::from(config.dbx_path),
+            enrollment: config.enrollment.map(Arc::new),
+        });
         let registry = EdgeRegistry::default();
         let task_registry = registry.clone();
         let tickets = Arc::new(AsyncMutex::new(SessionTickets::new(Duration::from_secs(15))));
@@ -141,9 +153,7 @@ impl MainGateway {
                 };
                 let acceptor = acceptor.clone();
                 let tls = tls.clone();
-                let edge_path = edge_path.clone();
-                let edge_data_path = edge_data_path.clone();
-                let dbx_path = dbx_path.clone();
+                let routes = routes.clone();
                 let registry = task_registry.clone();
                 let tickets = tickets.clone();
                 let pending_routes = pending_routes.clone();
@@ -168,9 +178,7 @@ impl MainGateway {
                         request.extensions_mut().insert(identity.clone());
                         route(
                             request,
-                            edge_path.clone(),
-                            edge_data_path.clone(),
-                            dbx_path.clone(),
+                            routes.clone(),
                             registry.clone(),
                             tickets.clone(),
                             pending_routes.clone(),
@@ -226,25 +234,28 @@ impl Drop for MainGateway {
 
 async fn route(
     mut request: Request<Incoming>,
-    edge_path: Arc<str>,
-    edge_data_path: Arc<str>,
-    dbx_path: Arc<str>,
+    routes: Arc<RouteConfig>,
     registry: EdgeRegistry,
     tickets: Arc<AsyncMutex<SessionTickets>>,
     pending_routes: PendingRoutes,
     control_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     connection_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     stop: watch::Receiver<bool>,
-) -> Result<Response<Empty<Bytes>>, Infallible> {
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let identity = request.extensions().get::<PeerIdentity>().cloned();
+    if matches!(identity, Some(PeerIdentity::Anonymous))
+        && routes.enrollment.as_ref().is_some_and(|config| request.uri().path() == config.path)
+    {
+        return Ok(handle_enrollment(request, routes.enrollment.clone().expect("checked above")).await);
+    }
     if let Some(PeerIdentity::Edge { edge_id, serial, fingerprint_sha256 }) = identity {
-        if request.uri().path() == edge_path.as_ref() || request.uri().path() == edge_data_path.as_ref() {
+        if request.uri().path() == routes.edge_path.as_ref() || request.uri().path() == routes.edge_data_path.as_ref() {
             if let Some(accept_key) = websocket_accept_key(&request) {
                 let Some(permit) = connection_permit.lock().ok().and_then(|mut permit| permit.take()) else {
                     return Ok(empty_response(StatusCode::NOT_FOUND));
                 };
                 let version = request.version();
-                let (websocket_config, socket_role) = if request.uri().path() == edge_data_path.as_ref() {
+                let (websocket_config, socket_role) = if request.uri().path() == routes.edge_data_path.as_ref() {
                     (data_websocket_config(), EdgeSocketRole::Data)
                 } else {
                     (control_websocket_config(), EdgeSocketRole::Control)
@@ -278,7 +289,7 @@ async fn route(
         return Ok(empty_response(StatusCode::NOT_FOUND));
     }
     if let Some(PeerIdentity::DbxClient { client_id, .. }) = identity {
-        if request.uri().path() == dbx_path.as_ref() {
+        if request.uri().path() == routes.dbx_path.as_ref() {
             if let Some(accept_key) = websocket_accept_key(&request) {
                 let Some(permit) = connection_permit.lock().ok().and_then(|mut permit| permit.take()) else {
                     return Ok(empty_response(StatusCode::NOT_FOUND));
@@ -323,19 +334,58 @@ fn websocket_accept_key(request: &Request<Incoming>) -> Option<String> {
         .then(|| derive_accept_key(key.as_bytes()))
 }
 
-fn switching_protocols(version: Version, accept_key: String) -> Response<Empty<Bytes>> {
+fn switching_protocols(version: Version, accept_key: String) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .version(version)
         .header(CONNECTION, "Upgrade")
         .header(UPGRADE, "websocket")
         .header(SEC_WEBSOCKET_ACCEPT, accept_key)
-        .body(Empty::new())
+        .body(Full::new(Bytes::new()))
         .expect("fixed WebSocket response is valid")
 }
 
-fn empty_response(status: StatusCode) -> Response<Empty<Bytes>> {
-    Response::builder().status(status).body(Empty::new()).expect("fixed response is valid")
+fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder().status(status).body(Full::new(Bytes::new())).expect("fixed response is valid")
+}
+
+async fn handle_enrollment(request: Request<Incoming>, config: Arc<MainEnrollmentConfig>) -> Response<Full<Bytes>> {
+    if request.method() != Method::POST {
+        return empty_response(StatusCode::NOT_FOUND);
+    }
+    let body = match Limited::new(request.into_body(), 256 * 1024).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return empty_response(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: EnrollCsrRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return empty_response(StatusCode::BAD_REQUEST),
+    };
+    if !config.allowed_edge_ids.iter().any(|edge_id| edge_id == &request.claimed_edge_id) {
+        return empty_response(StatusCode::NOT_FOUND);
+    }
+    let response = match &config.pki {
+        PkiEndpointConfig::Unix { unix_socket } => enroll_over_unix(unix_socket, &request).await,
+        PkiEndpointConfig::Remote { remote_address, server_name, ca_certificate, certificate, private_key } => {
+            match remote_address.parse() {
+                Ok(address) => {
+                    enroll_over_remote(address, server_name, ca_certificate, certificate, private_key, &request).await
+                }
+                Err(_) => return empty_response(StatusCode::NOT_FOUND),
+            }
+        }
+    };
+    let Ok(response) = response else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    match serde_json::to_vec(&response) {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .expect("fixed response is valid"),
+        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn run_edge_control(

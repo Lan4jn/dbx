@@ -32,6 +32,32 @@ pub struct MainConfig {
     pub tls_handshake_timeout_secs: u64,
     #[serde(default = "default_http_header_timeout_secs")]
     pub http_header_timeout_secs: u64,
+    #[serde(default)]
+    pub enrollment: Option<MainEnrollmentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainEnrollmentConfig {
+    #[serde(default = "default_enrollment_path")]
+    pub path: String,
+    pub allowed_edge_ids: Vec<String>,
+    pub pki: PkiEndpointConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PkiEndpointConfig {
+    Unix {
+        unix_socket: PathBuf,
+    },
+    Remote {
+        remote_address: String,
+        server_name: String,
+        ca_certificate: PathBuf,
+        certificate: PathBuf,
+        private_key: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +69,16 @@ pub struct EdgeConfig {
     pub private_key: PathBuf,
     pub ca_certificate: PathBuf,
     pub targets: BTreeMap<String, EdgeTarget>,
+    #[serde(default)]
+    pub bootstrap: Option<EdgeBootstrapConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeBootstrapConfig {
+    pub token_file: PathBuf,
+    pub enrollment_url: String,
+    pub server_spki_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,11 +159,24 @@ fn resolve_paths(config: &mut GatewayConfig, base_dir: &Path) {
             resolve_path(&mut main.private_key, base_dir);
             resolve_path(&mut main.edge_ca_certificate, base_dir);
             resolve_path(&mut main.client_ca_certificate, base_dir);
+            if let Some(enrollment) = &mut main.enrollment {
+                match &mut enrollment.pki {
+                    PkiEndpointConfig::Unix { unix_socket } => resolve_path(unix_socket, base_dir),
+                    PkiEndpointConfig::Remote { ca_certificate, certificate, private_key, .. } => {
+                        resolve_path(ca_certificate, base_dir);
+                        resolve_path(certificate, base_dir);
+                        resolve_path(private_key, base_dir);
+                    }
+                }
+            }
         }
         GatewayConfig::Edge(edge) => {
             resolve_path(&mut edge.certificate, base_dir);
             resolve_path(&mut edge.private_key, base_dir);
             resolve_path(&mut edge.ca_certificate, base_dir);
+            if let Some(bootstrap) = &mut edge.bootstrap {
+                resolve_path(&mut bootstrap.token_file, base_dir);
+            }
             for (name, target) in &mut edge.targets {
                 if target.display_name.is_empty() {
                     target.display_name.clone_from(name);
@@ -163,10 +212,26 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             if main.max_connections == 0 || main.tls_handshake_timeout_secs == 0 || main.http_header_timeout_secs == 0 {
                 return Err(config_error("connection limits and timeouts must be greater than zero"));
             }
+            if let Some(enrollment) = &main.enrollment {
+                if !valid_reserved_path(&enrollment.path)
+                    || enrollment.path == main.edge_path
+                    || enrollment.path == main.dbx_path
+                    || enrollment.allowed_edge_ids.is_empty()
+                    || enrollment.allowed_edge_ids.iter().any(|id| !valid_identity(id))
+                {
+                    return Err(config_error("enrollment path and allowed Edge IDs are invalid"));
+                }
+                if let PkiEndpointConfig::Remote { remote_address, ca_certificate, certificate, private_key, .. } =
+                    &enrollment.pki
+                {
+                    remote_address.parse::<SocketAddr>().map_err(|_| config_error("remote PKI address is invalid"))?;
+                    validate_credentials(certificate, private_key, ca_certificate)?;
+                }
+            }
             Ok(())
         }
         GatewayConfig::Edge(edge) => {
-            if edge.edge_id.trim().is_empty() {
+            if !valid_identity(&edge.edge_id) {
                 return Err(config_error("configuration edge_id must not be empty"));
             }
             if edge.main_url.strip_prefix("wss://").is_none_or(str::is_empty) {
@@ -175,7 +240,23 @@ fn validate_config(config: &GatewayConfig) -> Result<(), GatewayError> {
             for target in edge.targets.values() {
                 validate_target(target)?;
             }
-            validate_credentials(&edge.certificate, &edge.private_key, &edge.ca_certificate)
+            validate_regular_file(&edge.ca_certificate, "ca_certificate")?;
+            let enrolled = edge.certificate.is_file() && edge.private_key.is_file();
+            if enrolled {
+                validate_credentials(&edge.certificate, &edge.private_key, &edge.ca_certificate)
+            } else if let Some(bootstrap) = &edge.bootstrap {
+                validate_regular_file(&bootstrap.token_file, "bootstrap token_file")?;
+                validate_private_key_permissions(&bootstrap.token_file)?;
+                if !bootstrap.enrollment_url.starts_with("https://")
+                    || hex::decode(&bootstrap.server_spki_sha256).is_err()
+                    || bootstrap.server_spki_sha256.len() != 64
+                {
+                    return Err(config_error("Edge bootstrap URL or SPKI pin is invalid"));
+                }
+                Ok(())
+            } else {
+                Err(config_error("Edge credentials are unavailable and bootstrap is not configured"))
+            }
         }
     }
 }
@@ -186,6 +267,14 @@ fn default_edge_path() -> String {
 
 fn default_dbx_path() -> String {
     "/_dbx/client".to_string()
+}
+
+fn default_enrollment_path() -> String {
+    "/_dbx/enroll".to_string()
+}
+
+fn valid_identity(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn default_max_connections() -> usize {

@@ -1,10 +1,16 @@
 #![cfg(feature = "server")]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use dbx_gateway::config::{
+    EdgeBootstrapConfig, EdgeConfig, EdgeTarget, MainConfig, MainEnrollmentConfig, PkiEndpointConfig, TargetAddress,
+};
+use dbx_gateway::edge_gateway::EdgeGateway;
+use dbx_gateway::main_gateway::MainGateway;
 use dbx_gateway::pki::{
     enroll_over_remote, enroll_over_unix, serve_remote, serve_unix, EnrollCsrRequest, PkiEnrollmentService, PkiStore,
     RemotePkiConfig,
@@ -14,6 +20,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     SanType,
 };
+use sha2::Digest;
 use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::parse_x509_certificate;
@@ -163,6 +170,22 @@ async fn pki_service_unix_socket_issues_only_the_token_bound_edge_identity() {
     assert_eq!(uris, ["urn:dbx-gateway:edge:edge-prod-01"]);
     assert_eq!(certificate.public_key().subject_public_key.data.as_ref(), key.public_key_raw());
 
+    let failed_token = state.enrollments.create("edge-failed-csr", Duration::from_secs(600), false).await.unwrap();
+    let failed = EnrollCsrRequest {
+        token: Zeroizing::new(failed_token.secret.to_string()),
+        claimed_edge_id: "edge-failed-csr".to_string(),
+        csr_der: vec![1, 2, 3],
+    };
+    assert!(enroll_over_unix(&socket_path, &failed).await.is_err());
+    let retry_key = KeyPair::generate().unwrap();
+    let retry_csr = CertificateParams::default().serialize_request(&retry_key).unwrap();
+    let retry = EnrollCsrRequest {
+        token: Zeroizing::new(failed_token.secret.to_string()),
+        claimed_edge_id: "edge-failed-csr".to_string(),
+        csr_der: retry_csr.der().to_vec(),
+    };
+    assert!(enroll_over_unix(&socket_path, &retry).await.is_err());
+
     server.shutdown().await;
 
     let server_ca = test_ca("remote-server-ca");
@@ -225,6 +248,143 @@ async fn pki_service_unix_socket_issues_only_the_token_bound_edge_identity() {
     .unwrap();
     assert_eq!(remote_response.edge_id, "edge-remote-01");
     remote.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bootstrap_edge_generates_and_installs_its_own_identity_through_main() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) = test_state().await;
+    let password = Zeroizing::new("bootstrap-ca-password".to_string());
+    let store = PkiStore::init(&dir.0.join("pki"), &password).unwrap();
+    let edge_ca_certificate = store.edge_ca_certificate_path();
+    let service = PkiEnrollmentService::new(state.clone(), store, password);
+    let pki_socket = dir.0.join("b.sock");
+    let pki_server =
+        serve_unix(pki_socket.clone(), unsafe { libc::geteuid() }, unsafe { libc::getegid() }, service).await.unwrap();
+
+    let server_ca = test_ca("bootstrap-server-ca");
+    let server_identity = issue_test_identity(&server_ca, "localhost", None, true);
+    let server_ca_path = dir.0.join("bootstrap-server-ca.pem");
+    let server_certificate = dir.0.join("bootstrap-server.pem");
+    let server_key = dir.0.join("bootstrap-server.key");
+    fs::write(&server_ca_path, &server_ca.certificate_pem).unwrap();
+    write_test_identity(&server_certificate, &server_key, &server_identity, &server_ca.certificate_pem);
+    let (_, server_pem) = parse_x509_pem(server_identity.certificate_pem.as_bytes()).unwrap();
+    let (_, server_x509) = parse_x509_certificate(&server_pem.contents).unwrap();
+    let server_pin = hex::encode(sha2::Sha256::digest(server_x509.public_key().raw));
+    let main = MainGateway::bind(MainConfig {
+        listen: "127.0.0.1:0".to_string(),
+        certificate: server_certificate,
+        private_key: server_key,
+        edge_ca_certificate,
+        client_ca_certificate: server_ca_path.clone(),
+        edge_path: "/_dbx/edge".to_string(),
+        dbx_path: "/_dbx/client".to_string(),
+        max_connections: 64,
+        tls_handshake_timeout_secs: 5,
+        http_header_timeout_secs: 5,
+        enrollment: Some(MainEnrollmentConfig {
+            path: "/_dbx/enroll".to_string(),
+            allowed_edge_ids: vec!["edge-bootstrap-01".to_string()],
+            pki: PkiEndpointConfig::Unix { unix_socket: pki_socket },
+        }),
+    })
+    .await
+    .unwrap();
+
+    let token = state.enrollments.create("edge-bootstrap-01", Duration::from_secs(600), false).await.unwrap();
+    let token_file = dir.0.join("edge-bootstrap.token");
+    fs::write(&token_file, token.secret.as_bytes()).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let certificate = dir.0.join("edge-bootstrap.pem");
+    let private_key = dir.0.join("edge-bootstrap.key");
+    let edge = EdgeGateway::start(EdgeConfig {
+        edge_id: "edge-bootstrap-01".to_string(),
+        main_url: format!("wss://localhost:{}/_dbx/edge", main.local_addr().port()),
+        certificate: certificate.clone(),
+        private_key: private_key.clone(),
+        ca_certificate: server_ca_path,
+        targets: BTreeMap::from([(
+            "postgres".to_string(),
+            EdgeTarget {
+                display_name: "PostgreSQL".to_string(),
+                address: TargetAddress::Tcp { tcp: "127.0.0.1:5432".to_string() },
+                allow_remote: false,
+            },
+        )]),
+        bootstrap: Some(EdgeBootstrapConfig {
+            token_file: token_file.clone(),
+            enrollment_url: format!("https://localhost:{}/_dbx/enroll", main.local_addr().port()),
+            server_spki_sha256: server_pin.clone(),
+        }),
+    })
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if main.registry().read().await.get("edge-bootstrap-01").is_some_and(|entry| entry.online) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(certificate.is_file());
+    assert!(private_key.is_file());
+    assert_eq!(fs::metadata(&private_key).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!token_file.exists());
+    assert!(!walk_file_names(&dir.0.join("pki")).iter().any(|name| name.contains("edge-bootstrap.key")));
+
+    let denied_token = state.enrollments.create("edge-not-allowed", Duration::from_secs(600), false).await.unwrap();
+    let denied_token_file = dir.0.join("edge-denied.token");
+    fs::write(&denied_token_file, denied_token.secret.as_bytes()).unwrap();
+    fs::set_permissions(&denied_token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let denied_certificate = dir.0.join("edge-denied.pem");
+    let denied_private_key = dir.0.join("edge-denied.key");
+    let denied = EdgeGateway::start(EdgeConfig {
+        edge_id: "edge-not-allowed".to_string(),
+        main_url: format!("wss://localhost:{}/_dbx/edge", main.local_addr().port()),
+        certificate: denied_certificate.clone(),
+        private_key: denied_private_key.clone(),
+        ca_certificate: dir.0.join("bootstrap-server-ca.pem"),
+        targets: BTreeMap::new(),
+        bootstrap: Some(EdgeBootstrapConfig {
+            token_file: denied_token_file.clone(),
+            enrollment_url: format!("https://localhost:{}/_dbx/enroll", main.local_addr().port()),
+            server_spki_sha256: server_pin,
+        }),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(denied_token_file.exists());
+    assert!(!denied_certificate.exists());
+    assert!(!denied_private_key.exists());
+
+    denied.shutdown().await;
+    edge.shutdown().await;
+    main.shutdown().await;
+    pki_server.shutdown().await;
+}
+
+fn walk_file_names(path: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
 struct TestCa {

@@ -1,17 +1,29 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
+use rcgen::{CertificateParams, DnType, KeyPair};
 use rustls::ClientConfig;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval_at, sleep_until, Instant, MissedTickBehavior};
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream};
+use x509_parser::extensions::GeneralName;
+use x509_parser::pem::parse_x509_pem;
+use x509_parser::prelude::parse_x509_certificate;
+use zeroize::Zeroizing;
 
-use crate::config::{EdgeConfig, TargetAddress};
+use crate::config::{EdgeBootstrapConfig, EdgeConfig, TargetAddress};
+use crate::pki::{EnrollCsrRequest, EnrollCsrResponse};
 use crate::protocol::{
     decode_control_frame, encode_control_frame, EdgeDataOpen, EdgeRegistration, EdgeToMain, MainToEdge,
     ProtocolVersion, RegisteredTarget, SessionId, MAX_CONTROL_FRAME_SIZE, MAX_DATA_FRAME_SIZE,
@@ -31,14 +43,13 @@ pub struct EdgeGateway {
 
 impl EdgeGateway {
     pub fn start(config: EdgeConfig) -> Result<Self, GatewayError> {
-        let tls = Arc::new(
-            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_root_certificates(load_roots(&config.ca_certificate)?)
-                .with_client_auth_cert(load_certificates(&config.certificate)?, load_private_key(&config.private_key)?)
-                .map_err(|_| tls_error("Edge certificate or private key was rejected"))?,
-        );
+        let tls = match credential_state(&config) {
+            EdgeCredentialState::Enrolled { .. } => Some(edge_tls(&config)?),
+            EdgeCredentialState::Bootstrap { .. } => None,
+            EdgeCredentialState::Unavailable { .. } => return Err(internal_error("Edge credentials are unavailable")),
+        };
         let (shutdown, stop) = watch::channel(false);
-        let task = tokio::spawn(run(config, tls, stop));
+        let task = tokio::spawn(run_entry(config, tls, stop));
         Ok(Self { shutdown, task })
     }
 
@@ -46,6 +57,247 @@ impl EdgeGateway {
         let _ = self.shutdown.send(true);
         let _ = (&mut self.task).await;
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EdgeCredentialState {
+    Enrolled { certificate: PathBuf, private_key: PathBuf },
+    Bootstrap { token_file: PathBuf },
+    Unavailable { reason: String },
+}
+
+pub fn credential_state(config: &EdgeConfig) -> EdgeCredentialState {
+    if config.certificate.is_file() && config.private_key.is_file() {
+        if config.bootstrap.as_ref().is_some_and(|bootstrap| bootstrap.token_file.exists()) {
+            EdgeCredentialState::Unavailable { reason: "bootstrap token cleanup is incomplete".to_string() }
+        } else {
+            EdgeCredentialState::Enrolled {
+                certificate: config.certificate.clone(),
+                private_key: config.private_key.clone(),
+            }
+        }
+    } else if let Some(bootstrap) = &config.bootstrap {
+        EdgeCredentialState::Bootstrap { token_file: bootstrap.token_file.clone() }
+    } else {
+        EdgeCredentialState::Unavailable { reason: "Edge credentials are unavailable".to_string() }
+    }
+}
+
+fn edge_tls(config: &EdgeConfig) -> Result<Arc<ClientConfig>, GatewayError> {
+    Ok(Arc::new(
+        ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(load_roots(&config.ca_certificate)?)
+            .with_client_auth_cert(load_certificates(&config.certificate)?, load_private_key(&config.private_key)?)
+            .map_err(|_| tls_error("Edge certificate or private key was rejected"))?,
+    ))
+}
+
+async fn run_entry(mut config: EdgeConfig, tls: Option<Arc<ClientConfig>>, stop: watch::Receiver<bool>) {
+    let tls = match tls {
+        Some(tls) => tls,
+        None => {
+            if bootstrap_edge(&config).await.is_err() {
+                return;
+            }
+            config.bootstrap = None;
+            match edge_tls(&config) {
+                Ok(tls) => tls,
+                Err(_) => return,
+            }
+        }
+    };
+    run(config, tls, stop).await;
+}
+
+async fn bootstrap_edge(config: &EdgeConfig) -> Result<(), GatewayError> {
+    let bootstrap =
+        config.bootstrap.as_ref().ok_or_else(|| internal_error("Edge bootstrap configuration is unavailable"))?;
+    let token = read_bootstrap_token(&bootstrap.token_file)?;
+    let key = KeyPair::generate().map_err(|_| internal_error("Edge private key could not be generated"))?;
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, &config.edge_id);
+    let csr = params.serialize_request(&key).map_err(|_| internal_error("Edge CSR could not be generated"))?;
+    let private_key_pem = Zeroizing::new(key.serialize_pem());
+    let private_temp = temporary_path(&config.private_key);
+    write_private_temp(&private_temp, private_key_pem.as_bytes())?;
+    let result = async {
+        let response = request_enrollment(
+            bootstrap,
+            &config.ca_certificate,
+            &EnrollCsrRequest { token, claimed_edge_id: config.edge_id.clone(), csr_der: csr.der().to_vec() },
+        )
+        .await?;
+        validate_enrolled_certificate(&response, &config.edge_id, key.public_key_raw())?;
+        let certificate_temp = temporary_path(&config.certificate);
+        let chain = format!("{}{}", response.certificate_pem, response.chain_pem);
+        write_public_temp(&certificate_temp, chain.as_bytes())?;
+        fs::rename(&private_temp, &config.private_key)
+            .map_err(|_| internal_error("Edge private key could not be installed"))?;
+        if fs::rename(&certificate_temp, &config.certificate).is_err() {
+            let _ = fs::remove_file(&config.private_key);
+            return Err(internal_error("Edge certificate could not be installed"));
+        }
+        sync_parent(&config.certificate)?;
+        fs::remove_file(&bootstrap.token_file)
+            .map_err(|_| internal_error("Edge bootstrap token could not be deleted"))?;
+        sync_parent(&bootstrap.token_file)
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&private_temp);
+    }
+    result
+}
+
+async fn request_enrollment(
+    bootstrap: &EdgeBootstrapConfig,
+    ca_certificate: &std::path::Path,
+    request: &EnrollCsrRequest,
+) -> Result<EnrollCsrResponse, GatewayError> {
+    let uri: hyper::Uri =
+        bootstrap.enrollment_url.parse().map_err(|_| internal_error("Edge enrollment URL is invalid"))?;
+    if uri.scheme_str() != Some("https") {
+        return Err(internal_error("Edge enrollment URL is invalid"));
+    }
+    let host = uri.host().ok_or_else(|| internal_error("Edge enrollment URL is invalid"))?;
+    let port = uri.port_u16().unwrap_or(443);
+    let address = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| internal_error("Main enrollment endpoint could not be resolved"))?
+        .next()
+        .ok_or_else(|| internal_error("Main enrollment endpoint could not be resolved"))?;
+    let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(load_roots(ca_certificate)?)
+        .with_no_client_auth();
+    let stream =
+        TcpStream::connect(address).await.map_err(|_| internal_error("Main enrollment endpoint is unavailable"))?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| internal_error("Edge enrollment server name is invalid"))?;
+    let mut stream = TlsConnector::from(Arc::new(client))
+        .connect(server_name, stream)
+        .await
+        .map_err(|_| internal_error("Main enrollment TLS was rejected"))?;
+    verify_server_pin(stream.get_ref().1.peer_certificates(), &bootstrap.server_spki_sha256)?;
+    let body =
+        serde_json::to_vec(request).map_err(|_| internal_error("Edge enrollment request could not be encoded"))?;
+    let path = uri.path_and_query().map(|value| value.as_str()).unwrap_or("/");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.map_err(|_| internal_error("Edge enrollment request could not be sent"))?;
+    stream.write_all(&body).await.map_err(|_| internal_error("Edge enrollment request could not be sent"))?;
+    let mut response = Vec::new();
+    stream
+        .take(512 * 1024)
+        .read_to_end(&mut response)
+        .await
+        .map_err(|_| internal_error("Edge enrollment response could not be read"))?;
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| internal_error("Edge enrollment response was invalid"))?;
+    let head = std::str::from_utf8(&response[..separator])
+        .map_err(|_| internal_error("Edge enrollment response was invalid"))?;
+    if !head.lines().next().is_some_and(|line| line.contains(" 200 ")) {
+        return Err(internal_error("Edge enrollment was rejected"));
+    }
+    serde_json::from_slice(&response[separator + 4..])
+        .map_err(|_| internal_error("Edge enrollment response was invalid"))
+}
+
+fn verify_server_pin(
+    certificates: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+    expected: &str,
+) -> Result<(), GatewayError> {
+    let leaf = certificates
+        .and_then(|certificates| certificates.first())
+        .ok_or_else(|| internal_error("Main enrollment certificate is unavailable"))?;
+    let (_, certificate) =
+        parse_x509_certificate(leaf.as_ref()).map_err(|_| internal_error("Main enrollment certificate is invalid"))?;
+    let actual = hex::encode(Sha256::digest(certificate.public_key().raw));
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(internal_error("Main enrollment SPKI pin was rejected"))
+    }
+}
+
+fn validate_enrolled_certificate(
+    response: &EnrollCsrResponse,
+    edge_id: &str,
+    public_key: &[u8],
+) -> Result<(), GatewayError> {
+    if response.edge_id != edge_id {
+        return Err(internal_error("enrolled Edge identity did not match"));
+    }
+    let (_, pem) = parse_x509_pem(response.certificate_pem.as_bytes())
+        .map_err(|_| internal_error("enrolled Edge certificate was invalid"))?;
+    let (_, certificate) =
+        parse_x509_certificate(&pem.contents).map_err(|_| internal_error("enrolled Edge certificate was invalid"))?;
+    let sans = certificate
+        .subject_alternative_name()
+        .map_err(|_| internal_error("enrolled Edge certificate was invalid"))?
+        .ok_or_else(|| internal_error("enrolled Edge certificate was invalid"))?;
+    let expected = format!("urn:dbx-gateway:edge:{edge_id}");
+    let matches = sans
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some(*uri),
+            _ => None,
+        })
+        .eq([expected.as_str()]);
+    if !matches || certificate.public_key().subject_public_key.data.as_ref() != public_key {
+        return Err(internal_error("enrolled Edge certificate was invalid"));
+    }
+    Ok(())
+}
+
+fn read_bootstrap_token(path: &std::path::Path) -> Result<Zeroizing<String>, GatewayError> {
+    let token = fs::read_to_string(path).map_err(|_| internal_error("Edge bootstrap token could not be read"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        Err(internal_error("Edge bootstrap token was empty"))
+    } else {
+        Ok(Zeroizing::new(token))
+    }
+}
+
+fn temporary_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()))
+}
+
+fn write_private_temp(path: &std::path::Path, bytes: &[u8]) -> Result<(), GatewayError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file =
+        options.open(path).map_err(|_| internal_error("Edge private key temporary file could not be created"))?;
+    file.write_all(bytes).map_err(|_| internal_error("Edge private key temporary file could not be written"))?;
+    file.sync_all().map_err(|_| internal_error("Edge private key temporary file could not be synced"))
+}
+
+fn write_public_temp(path: &std::path::Path, bytes: &[u8]) -> Result<(), GatewayError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| internal_error("Edge certificate temporary file could not be created"))?;
+    file.write_all(bytes).map_err(|_| internal_error("Edge certificate temporary file could not be written"))?;
+    file.sync_all().map_err(|_| internal_error("Edge certificate temporary file could not be synced"))
+}
+
+fn sync_parent(path: &std::path::Path) -> Result<(), GatewayError> {
+    let parent = path.parent().ok_or_else(|| internal_error("Edge credential directory is invalid"))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| internal_error("Edge credential directory could not be synced"))
 }
 
 impl Drop for EdgeGateway {
