@@ -14,7 +14,23 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import type { ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, HttpTunnelConfig, IdentifierCase, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import type {
+  ConnectionConfig,
+  ConnectionTestResult,
+  DatabaseConnectionInfo,
+  DatabaseType,
+  DbxGatewayConfig,
+  GatewayEdgeRoutes,
+  HttpTunnelConfig,
+  IdentifierCase,
+  JdbcDriverInfo,
+  JdbcLocalBundleInfo,
+  JdbcMavenBundleInfo,
+  ProxyTunnelConfig,
+  SshConfigHostEntry,
+  SshTunnelConfig,
+  TransportLayerConfig,
+} from "@/types/database";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosMetricsMode, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
@@ -80,6 +96,7 @@ import {
   List,
   ListFilter,
   Loader2,
+  Network,
   Pencil,
   Pipette,
   Plus,
@@ -95,6 +112,7 @@ import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, fil
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import CloudflareD1ConnectionFields from "@/components/connection/CloudflareD1ConnectionFields.vue";
+import ConnectionNetworkPath from "@/components/connection/ConnectionNetworkPath.vue";
 import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/database/oceanbaseConnectionMode";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
@@ -369,6 +387,21 @@ function defaultHttpTunnel(): HttpTunnelConfig {
   };
 }
 
+function defaultGatewayTunnel(): DbxGatewayConfig {
+  return {
+    id: uuid(),
+    name: "",
+    enabled: true,
+    main_url: "",
+    identity_id: "",
+    server_ca_pem: "",
+    server_spki_sha256: "",
+    connect_timeout_secs: 10,
+    edge_id: "",
+    target_id: "",
+  };
+}
+
 function normalizeProxyTunnel(layer: Partial<ProxyTunnelConfig>): ProxyTunnelConfig {
   return {
     id: layer.id || uuid(),
@@ -395,12 +428,28 @@ function normalizeHttpTunnel(layer: Partial<HttpTunnelConfig>): HttpTunnelConfig
   };
 }
 
+function normalizeGatewayTunnel(layer: Partial<DbxGatewayConfig>): DbxGatewayConfig {
+  return {
+    ...defaultGatewayTunnel(),
+    ...layer,
+    id: layer.id || uuid(),
+    enabled: layer.enabled !== false,
+    profile_id: layer.profile_id || undefined,
+    connect_timeout_secs: Number(layer.connect_timeout_secs) || 10,
+    edge_id: layer.edge_id || "",
+    target_id: layer.target_id || "",
+  };
+}
+
 function normalizeTransportLayer(layer: Partial<TransportLayerConfig>): TransportLayerConfig {
   if (layer.type === "proxy") {
     return { type: "proxy", ...normalizeProxyTunnel(layer) };
   }
   if (layer.type === "http_tunnel") {
     return { type: "http_tunnel", ...normalizeHttpTunnel(layer) };
+  }
+  if (layer.type === "dbx_gateway") {
+    return { type: "dbx_gateway", ...normalizeGatewayTunnel(layer) };
   }
   return { type: "ssh", ...normalizeSshTunnel(layer as Partial<SshTunnelConfig>) };
 }
@@ -2146,10 +2195,65 @@ const selectedTransportLayer = computed(() => {
 const selectedSshLayer = computed(() => (selectedTransportLayer.value?.type === "ssh" ? selectedTransportLayer.value : null));
 const selectedProxyLayer = computed(() => (selectedTransportLayer.value?.type === "proxy" ? selectedTransportLayer.value : null));
 const selectedHttpTunnelLayer = computed(() => (selectedTransportLayer.value?.type === "http_tunnel" ? selectedTransportLayer.value : null));
+const selectedGatewayLayer = computed(() => (selectedTransportLayer.value?.type === "dbx_gateway" ? selectedTransportLayer.value : null));
 
 const tunnelProfiles = computed(() => tunnelProfileStore.profiles);
+const gatewayTunnelProfiles = computed(() => tunnelProfiles.value.filter((profile) => profile.type === "dbx_gateway"));
+const compatibleTunnelProfiles = computed(() => tunnelProfiles.value.filter((profile) => profile.type === selectedTransportLayer.value?.type));
 const selectedLayerProfileId = computed(() => selectedTransportLayer.value?.profile_id || "");
 const selectedLayerProfile = computed(() => tunnelProfileStore.profileById(selectedLayerProfileId.value));
+const hasGatewayLayer = computed(() => transportLayers.value.some((layer) => layer.type === "dbx_gateway"));
+const gatewayRouteGroups = ref<GatewayEdgeRoutes[]>([]);
+const gatewayRouteSearch = ref("");
+const gatewayRoutesError = ref("");
+const gatewayRoutesLoadedProfileId = ref("");
+const gatewayRoutePickerOpen = ref(false);
+const isLoadingGatewayRoutes = ref(false);
+
+const filteredGatewayRouteGroups = computed(() => {
+  const query = gatewayRouteSearch.value.trim().toLowerCase();
+  if (!query) return gatewayRouteGroups.value;
+  return gatewayRouteGroups.value
+    .map((edge) => ({
+      ...edge,
+      routes: edge.routes.filter((route) => `${edge.edge_id} ${route.target_id} ${route.display_name}`.toLowerCase().includes(query)),
+    }))
+    .filter((edge) => edge.routes.length > 0 || edge.edge_id.toLowerCase().includes(query));
+});
+
+const selectedGatewayRouteLabel = computed(() => {
+  const layer = selectedGatewayLayer.value;
+  if (!layer?.edge_id || !layer.target_id) return t("connection.gatewayRoutePlaceholder");
+  const edge = gatewayRouteGroups.value.find((candidate) => candidate.edge_id === layer.edge_id);
+  const route = edge?.routes.find((candidate) => candidate.target_id === layer.target_id);
+  return route ? `${edge?.edge_id} / ${route.display_name || route.target_id}` : `${layer.edge_id} / ${layer.target_id}`;
+});
+
+const networkGatewayLayer = computed(() => transportLayers.value.find((layer) => layer.type === "dbx_gateway"));
+const networkGatewayRouteLabel = computed(() => {
+  const layer = networkGatewayLayer.value;
+  if (!layer?.edge_id || !layer.target_id) return "";
+  const edge = gatewayRouteGroups.value.find((candidate) => candidate.edge_id === layer.edge_id);
+  const route = edge?.routes.find((candidate) => candidate.target_id === layer.target_id);
+  return route?.display_name || layer.target_id;
+});
+const networkPathPhase = computed<"idle" | "testing" | "success" | "failure">(() => {
+  if (isTesting.value) return "testing";
+  if (!testResult.value) return "idle";
+  return testResult.value.ok ? "success" : "failure";
+});
+const networkPathFingerprint = computed(() =>
+  JSON.stringify({
+    host: form.value.host,
+    port: form.value.port,
+    database: form.value.database,
+    connectionString: form.value.connection_string,
+    transportLayers: form.value.transport_layers,
+  }),
+);
+watch(networkPathFingerprint, (current, previous) => {
+  if (current !== previous) resetTestState();
+});
 
 function tunnelProfileOptionLabel(profile: (typeof tunnelProfiles.value)[number]): string {
   const summary = tunnelProfileSummary(profile);
@@ -2168,14 +2272,60 @@ function applyTunnelProfileSelection(value: unknown) {
     const profile = tunnelProfileStore.profileById(String(value));
     if (!profile) return;
     const stub = tunnelProfileReferenceLayer(profile, selected);
+    if (stub.type === "dbx_gateway") {
+      stub.edge_id = selected.type === "dbx_gateway" ? selected.edge_id : "";
+      stub.target_id = selected.type === "dbx_gateway" ? selected.target_id : "";
+    }
     form.value.transport_layers = transportLayers.value.map((layer) => (layer.id === selected.id ? stub : layer));
   }
   resetTestState();
 }
 
+async function refreshGatewayRoutes() {
+  const profile = selectedLayerProfile.value;
+  if (profile?.type !== "dbx_gateway" || isLoadingGatewayRoutes.value) return;
+  isLoadingGatewayRoutes.value = true;
+  gatewayRoutesError.value = "";
+  try {
+    const identities = await api.listGatewayIdentities();
+    if (!identities.some((identity) => identity.id === profile.identity_id)) {
+      throw new Error(t("connection.gatewayIdentityMissing"));
+    }
+    gatewayRouteGroups.value = await api.listGatewayRoutes(profile);
+    gatewayRoutesLoadedProfileId.value = profile.id;
+  } catch (error) {
+    gatewayRouteGroups.value = [];
+    gatewayRoutesLoadedProfileId.value = "";
+    gatewayRoutesError.value = translateBackendError(t, String(error));
+  } finally {
+    isLoadingGatewayRoutes.value = false;
+  }
+}
+
+function selectGatewayRoute(edge: GatewayEdgeRoutes, targetId: string) {
+  if (!edge.online || !selectedGatewayLayer.value) return;
+  selectedGatewayLayer.value.edge_id = edge.edge_id;
+  selectedGatewayLayer.value.target_id = targetId;
+  gatewayRoutePickerOpen.value = false;
+  resetTestState();
+}
+
+watch(
+  () => (selectedGatewayLayer.value ? selectedLayerProfileId.value : ""),
+  (profileId) => {
+    gatewayRouteSearch.value = "";
+    gatewayRoutesError.value = "";
+    gatewayRouteGroups.value = [];
+    gatewayRoutesLoadedProfileId.value = "";
+    if (profileId) void refreshGatewayRoutes();
+  },
+  { immediate: true },
+);
+
 function transportLayerDefaultName(layer: TransportLayerConfig, index: number): string {
   if (layer.type === "proxy") return `Proxy ${index + 1}`;
   if (layer.type === "http_tunnel") return t("connection.httpTunnelDefaultName", { index: index + 1 });
+  if (layer.type === "dbx_gateway") return t("connection.gatewayDefaultName");
   return t("connection.sshHopDefaultName", { index: index + 1 });
 }
 
@@ -2185,7 +2335,7 @@ function transportLayerDisplayName(layer: TransportLayerConfig, index: number): 
     if (profile) return profile.name?.trim() || tunnelProfileSummary(profile) || transportLayerDefaultName(layer, index);
     return layer.name?.trim() || t("connection.tunnelProfileMissingName");
   }
-  const target = layer.type === "http_tunnel" ? layer.url?.trim() : layer.host?.trim();
+  const target = layer.type === "http_tunnel" ? layer.url?.trim() : layer.type === "dbx_gateway" ? [layer.edge_id, layer.target_id].filter(Boolean).join(" / ") : layer.host?.trim();
   return layer.name?.trim() || target || transportLayerDefaultName(layer, index);
 }
 
@@ -4176,7 +4326,7 @@ function ensureSelectedTransportLayer() {
 function addSshTunnel() {
   const next: TransportLayerConfig = { type: "ssh", ...defaultSshTunnel() };
   next.name = t("connection.sshHopDefaultName", { index: transportLayers.value.length + 1 });
-  form.value.transport_layers = [...transportLayers.value, next];
+  form.value.transport_layers = normalizeGatewayLayerOrder([...transportLayers.value, next]);
   selectedTransportLayerId.value = next.id;
   resetTestState();
 }
@@ -4184,7 +4334,7 @@ function addSshTunnel() {
 function addProxyTunnel() {
   const next: TransportLayerConfig = { type: "proxy", ...defaultProxyTunnel() };
   next.name = `Proxy ${transportLayers.value.length + 1}`;
-  form.value.transport_layers = [...transportLayers.value, next];
+  form.value.transport_layers = normalizeGatewayLayerOrder([...transportLayers.value, next]);
   selectedTransportLayerId.value = next.id;
   resetTestState();
 }
@@ -4197,9 +4347,24 @@ function addHttpTunnel() {
   resetTestState();
 }
 
-function duplicateTransportLayer(layer: TransportLayerConfig) {
-  const next = normalizeTransportLayer({ ...layer, id: uuid(), name: layer.name ? `${layer.name} copy` : "" });
+function addGatewayTunnel() {
+  if (hasGatewayLayer.value) return;
+  const next: TransportLayerConfig = { type: "dbx_gateway", ...defaultGatewayTunnel(), name: t("connection.gatewayDefaultName") };
   form.value.transport_layers = [...transportLayers.value, next];
+  selectedTransportLayerId.value = next.id;
+  resetTestState();
+}
+
+function normalizeGatewayLayerOrder(layers: TransportLayerConfig[]): TransportLayerConfig[] {
+  // gateway layers are normalized to the end so drag/drop cannot produce an invalid chain.
+  const gateway = layers.find((layer) => layer.type === "dbx_gateway");
+  return gateway ? [...layers.filter((layer) => layer.type !== "dbx_gateway"), gateway] : layers;
+}
+
+function duplicateTransportLayer(layer: TransportLayerConfig) {
+  if (layer.type === "dbx_gateway") return;
+  const next = normalizeTransportLayer({ ...layer, id: uuid(), name: layer.name ? `${layer.name} copy` : "" });
+  form.value.transport_layers = normalizeGatewayLayerOrder([...transportLayers.value, next]);
   selectedTransportLayerId.value = next.id;
   resetTestState();
 }
@@ -4215,6 +4380,7 @@ function moveTransportLayer(id: string, direction: -1 | 1) {
   const index = layers.findIndex((layer) => layer.id === id);
   const target = index + direction;
   if (index < 0 || target < 0 || target >= layers.length) return;
+  if (layers[index].type === "dbx_gateway" || layers[target].type === "dbx_gateway") return;
   [layers[index], layers[target]] = [layers[target], layers[index]];
   form.value.transport_layers = layers;
   resetTestState();
@@ -4230,16 +4396,23 @@ function dropTransportLayer(targetId: string) {
   if (sourceIndex < 0 || targetIndex < 0) return;
   const [source] = layers.splice(sourceIndex, 1);
   layers.splice(targetIndex, 0, source);
-  form.value.transport_layers = layers;
+  form.value.transport_layers = normalizeGatewayLayerOrder(layers);
   resetTestState();
 }
 
-function changeSelectedTransportLayerType(type: "ssh" | "proxy" | "http_tunnel") {
+function changeSelectedTransportLayerType(type: "ssh" | "proxy" | "http_tunnel" | "dbx_gateway") {
   const selected = selectedTransportLayer.value;
   if (!selected || selected.type === type) return;
+  if (type === "dbx_gateway" && hasGatewayLayer.value) return;
   const replacement: TransportLayerConfig =
-    type === "proxy" ? { type: "proxy", ...defaultProxyTunnel(), id: selected.id, name: selected.name } : type === "http_tunnel" ? { type: "http_tunnel", ...defaultHttpTunnel(), id: selected.id, name: selected.name } : { type: "ssh", ...defaultSshTunnel(), id: selected.id, name: selected.name };
-  form.value.transport_layers = transportLayers.value.map((layer) => (layer.id === selected.id ? replacement : layer));
+    type === "proxy"
+      ? { type: "proxy", ...defaultProxyTunnel(), id: selected.id, name: selected.name }
+      : type === "http_tunnel"
+        ? { type: "http_tunnel", ...defaultHttpTunnel(), id: selected.id, name: selected.name }
+        : type === "dbx_gateway"
+          ? { type: "dbx_gateway", ...defaultGatewayTunnel(), id: selected.id, name: selected.name }
+          : { type: "ssh", ...defaultSshTunnel(), id: selected.id, name: selected.name };
+  form.value.transport_layers = normalizeGatewayLayerOrder(transportLayers.value.map((layer) => (layer.id === selected.id ? replacement : layer)));
   resetTestState();
 }
 
@@ -4280,8 +4453,25 @@ function updateSelectedSshAuthMethod(value: unknown) {
 
 function validateTransportLayers(config: LegacyConnectionConfig) {
   const layers = config.transport_layers || [];
+  const gatewayLayers = layers.filter((layer) => layer.enabled !== false && layer.type === "dbx_gateway");
+  if (gatewayLayers.length > 1) throw new Error(t("connection.gatewayOnlyOne"));
   layers.forEach((layer, index) => {
     if (layer.enabled === false) return;
+    if (layer.type === "dbx_gateway") {
+      // A gateway must be the final transport layer because it owns the logical database route.
+      if (index !== layers.length - 1) throw new Error(t("connection.gatewayInvalidOrder"));
+      if (!layer.profile_id) throw new Error(t("connection.gatewayProfileRequired"));
+      const profile = tunnelProfileStore.profileById(layer.profile_id);
+      if (profile?.type !== "dbx_gateway") throw new Error(t("connection.gatewayProfileRequired"));
+      if (!profile.identity_id) throw new Error(t("connection.gatewayIdentityMissing"));
+      if (!layer.edge_id || !layer.target_id) throw new Error(t("connection.gatewayRouteRequired"));
+      if (gatewayRoutesError.value) throw new Error(gatewayRoutesError.value);
+      if (gatewayRoutesLoadedProfileId.value !== profile.id) throw new Error(t("connection.gatewayRoutesUnavailable"));
+      const edge = gatewayRouteGroups.value.find((candidate) => candidate.edge_id === layer.edge_id);
+      if (!edge?.online) throw new Error(t("connection.gatewayEdgeOffline", { edge: layer.edge_id }));
+      if (!edge.routes.some((route) => route.target_id === layer.target_id)) throw new Error(t("connection.gatewayRouteUnavailable"));
+      return;
+    }
     // Profile-referencing layers are stubs: the shared profile supplies the
     // whole configuration at connect time, so there is nothing to validate.
     if (layer.profile_id) return;
@@ -4860,6 +5050,7 @@ function openExternalUrl(url: string) {
       <template v-else>
         <div class="connection-config-step flex min-h-0 flex-1 flex-col gap-4 overflow-hidden">
           <Tabs v-model="configTab" class="flex min-h-0 flex-1 flex-col">
+            <ConnectionNetworkPath :layers="transportLayers" :profiles="tunnelProfiles" :host="form.host" :port="form.port" :database="form.database" :gateway-route-label="networkGatewayRouteLabel" :phase="networkPathPhase" :error-message="testResult?.message || ''" class="mb-1 border-b" />
             <div class="flex items-center justify-between border-b pb-2">
               <TabsList>
                 <TabsTrigger value="connection">{{ t("connection.basicTab") }}</TabsTrigger>
@@ -6813,7 +7004,7 @@ function openExternalUrl(url: string) {
                         </span>
                         <Tooltip>
                           <TooltipTrigger as-child>
-                            <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="index === 0" @click.stop="moveTransportLayer(hop.id, -1)">
+                            <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="index === 0 || hop.type === 'dbx_gateway'" @click.stop="moveTransportLayer(hop.id, -1)">
                               <ArrowUp class="h-3.5 w-3.5" />
                             </Button>
                           </TooltipTrigger>
@@ -6821,7 +7012,7 @@ function openExternalUrl(url: string) {
                         </Tooltip>
                         <Tooltip>
                           <TooltipTrigger as-child>
-                            <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="index === transportLayers.length - 1" @click.stop="moveTransportLayer(hop.id, 1)">
+                            <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="index === transportLayers.length - 1 || transportLayers[index + 1]?.type === 'dbx_gateway'" @click.stop="moveTransportLayer(hop.id, 1)">
                               <ArrowDown class="h-3.5 w-3.5" />
                             </Button>
                           </TooltipTrigger>
@@ -6842,7 +7033,11 @@ function openExternalUrl(url: string) {
                         <Plus class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.httpTunnelAdd") }}
                       </Button>
-                      <Button v-if="selectedTransportLayer" type="button" variant="outline" size="sm" @click="duplicateTransportLayer(selectedTransportLayer)">
+                      <Button type="button" variant="outline" size="sm" :disabled="hasGatewayLayer" @click="addGatewayTunnel">
+                        <Network class="mr-1.5 h-3.5 w-3.5" />
+                        {{ t("connection.gatewayAdd") }}
+                      </Button>
+                      <Button v-if="selectedTransportLayer && selectedTransportLayer.type !== 'dbx_gateway'" type="button" variant="outline" size="sm" @click="duplicateTransportLayer(selectedTransportLayer)">
                         <Copy class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.sshHopDuplicate") }}
                       </Button>
@@ -6859,7 +7054,7 @@ function openExternalUrl(url: string) {
                     <Label :class="connectionLabelSmallClass">{{ t("connection.sshHopName") }}</Label>
                     <Input v-model="selectedTransportLayer.name" class="col-span-3" :placeholder="t('connection.sshHopNamePlaceholder')" />
                   </div>
-                  <div v-if="tunnelProfiles.length || selectedLayerProfileId" class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="selectedGatewayLayer || tunnelProfiles.length || selectedLayerProfileId" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.tunnelProfile") }}</Label>
                     <div class="col-span-3 flex min-w-0 items-center gap-2">
                       <Select :model-value="selectedLayerProfileId || 'custom'" @update:model-value="applyTunnelProfileSelection">
@@ -6867,8 +7062,8 @@ function openExternalUrl(url: string) {
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="custom">{{ t("connection.tunnelProfileCustom") }}</SelectItem>
-                          <SelectItem v-for="profile in tunnelProfiles" :key="profile.id" :value="profile.id">{{ tunnelProfileOptionLabel(profile) }}</SelectItem>
+                          <SelectItem v-if="!selectedGatewayLayer" value="custom">{{ t("connection.tunnelProfileCustom") }}</SelectItem>
+                          <SelectItem v-for="profile in compatibleTunnelProfiles" :key="profile.id" :value="profile.id">{{ tunnelProfileOptionLabel(profile) }}</SelectItem>
                         </SelectContent>
                       </Select>
                       <Button type="button" variant="outline" size="sm" class="shrink-0" @click="emit('openTunnelProfileSettings')">
@@ -6887,6 +7082,57 @@ function openExternalUrl(url: string) {
                       <span v-else class="text-red-500">{{ t("connection.tunnelProfileMissing") }}</span>
                     </div>
                   </div>
+                  <template v-if="selectedGatewayLayer">
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.gatewayRoute") }}</Label>
+                      <div class="col-span-3 grid min-w-0 gap-2">
+                        <div class="flex min-w-0 items-center gap-2">
+                          <Popover v-model:open="gatewayRoutePickerOpen">
+                            <PopoverTrigger as-child>
+                              <Button type="button" variant="outline" class="h-9 min-w-0 flex-1 justify-between font-normal" :disabled="!selectedLayerProfileId || isLoadingGatewayRoutes">
+                                <span class="min-w-0 truncate" :title="selectedGatewayRouteLabel">{{ selectedGatewayRouteLabel }}</span>
+                                <Network class="ml-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                              </Button>
+                            </PopoverTrigger>
+                            <PopoverContent align="start" class="w-[min(28rem,calc(100vw-2rem))] p-2">
+                              <Input v-model="gatewayRouteSearch" class="mb-2 h-9" :placeholder="t('connection.gatewayRouteSearch')" />
+                              <div class="h-64 overflow-y-auto">
+                                <p v-if="!filteredGatewayRouteGroups.length" class="px-2 py-8 text-center text-xs text-muted-foreground">{{ t("connection.gatewayRoutesEmpty") }}</p>
+                                <section v-for="edge in filteredGatewayRouteGroups" :key="edge.edge_id" class="border-b py-1 last:border-b-0">
+                                  <div class="flex min-w-0 items-center gap-2 px-2 py-1 text-xs font-medium">
+                                    <span class="min-w-0 flex-1 truncate" :title="edge.edge_id">{{ edge.edge_id }}</span>
+                                    <span class="shrink-0 text-[11px]" :class="edge.online ? 'text-emerald-600' : 'text-muted-foreground'">{{ edge.online ? t("connection.gatewayEdgeOnline") : t("connection.gatewayEdgeOffline", { edge: edge.edge_id }) }}</span>
+                                  </div>
+                                  <button
+                                    v-for="route in edge.routes"
+                                    :key="route.target_id"
+                                    type="button"
+                                    class="flex h-9 w-full min-w-0 items-center rounded px-2 text-left text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                    :disabled="!edge.online"
+                                    :title="`${edge.edge_id} / ${route.display_name || route.target_id}`"
+                                    @click="selectGatewayRoute(edge, route.target_id)"
+                                  >
+                                    <span class="min-w-0 flex-1 truncate">{{ route.display_name || route.target_id }}</span>
+                                    <span class="ml-2 max-w-40 shrink-0 truncate text-muted-foreground">{{ route.target_id }}</span>
+                                  </button>
+                                </section>
+                              </div>
+                            </PopoverContent>
+                          </Popover>
+                          <Tooltip>
+                            <TooltipTrigger as-child>
+                              <Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="!selectedLayerProfileId || isLoadingGatewayRoutes" @click="refreshGatewayRoutes">
+                                <RefreshCw class="h-4 w-4" :class="isLoadingGatewayRoutes ? 'animate-spin' : ''" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.gatewayRoutesRefresh") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
+                        <p v-if="gatewayRoutesError" class="text-xs text-red-500" role="alert">{{ gatewayRoutesError }}</p>
+                        <p v-else-if="!gatewayTunnelProfiles.length" class="text-xs text-muted-foreground">{{ t("connection.gatewayNoProfiles") }}</p>
+                      </div>
+                    </div>
+                  </template>
                   <div v-if="!selectedLayerProfileId" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">Type</Label>
                     <Select :model-value="selectedTransportLayer.type" @update:model-value="(value: any) => changeSelectedTransportLayerType(value)">
@@ -6897,6 +7143,7 @@ function openExternalUrl(url: string) {
                         <SelectItem value="ssh">SSH</SelectItem>
                         <SelectItem value="proxy">Proxy</SelectItem>
                         <SelectItem value="http_tunnel">{{ t("connection.httpTunnel") }}</SelectItem>
+                        <SelectItem value="dbx_gateway">{{ t("connection.gateway") }}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>

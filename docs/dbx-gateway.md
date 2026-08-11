@@ -51,6 +51,23 @@ Nginx、HAProxy 或云负载均衡只能使用 TCP/TLS passthrough。不能在�
 6. 启动 Edge；Edge 本地生成私钥、经 Main 领证、删除令牌并用 mTLS 重新连接。
 7. 在 DBX 连接中选择 `edge-prod-01 / postgres-primary` 并测试链路。
 
+## DBX 桌面端配置
+
+Gateway 身份依赖系统钥匙串，因此只能在 DBX 桌面端配置和使用。浏览器版会显示桌面端限定提示，不会上传 PKCS#12，也不会回退为明文私钥存储。
+
+1. 打开 `设置 > 隧道`，点击“新增 Gateway”。
+2. 在“导入身份”中填写便于识别的名称和 PKCS#12 密码，点击“导入 PKCS#12”并选择 `.p12` 或 `.pfx`。导入成功后密码立即从界面内存清空，私钥只进入系统钥匙串。
+3. 在 Gateway 档案中填写 Main URL，例如 `wss://gateway.example.com/_dbx/client`；选择刚导入的客户端身份；导入专用 CA PEM，并按需填写 64 位小写十六进制 SPKI SHA-256 Pin 和连接超时。
+4. 点击“测试 Main”。该测试只验证 Main、mTLS 身份和服务端 CA/SPKI，不要求选择 Edge 或数据库目标。测试失败时先检查客户端身份是否存在、证书是否过期、Main URL、CA/SPKI 和网络可达性。
+5. 保存档案。Gateway 档案只管理 Main、客户端身份、CA/SPKI 和超时，不包含 Edge 或 target。
+6. 新建或编辑数据库连接，进入“传输”选项卡，点击“添加 Gateway”。Gateway 一条连接最多一个，并且必须位于传输链最后一层；DBX 会阻止把它拖到 SSH、Proxy 或 HTTP Tunnel 之前。
+7. 选择共享 Gateway 档案，点击刷新图标读取当前客户端证书获准访问的逻辑路由。使用搜索框按 Edge ID、target ID 或显示名称筛选，然后选择在线 Edge 下的 target。离线 Edge 仍会显示，但不能用于新连接。
+8. 点击“测试连接”，成功后保存。连接记录只保留 Gateway 档案 ID、Edge ID 和 target ID，不复制 Main 配置、PKCS#12 密码或身份私钥。
+
+以下状态会阻止测试和保存，并在连接弹窗中显示明确错误：Gateway 档案不存在或未选择、钥匙串中的身份已删除、Main 不可达、授权路由尚未刷新、route 未选择、route 已被 ACL 移除、Edge 离线。配置变更后，之前的测试成功状态会失效，必须重新测试。
+
+删除身份时进入 `设置 > 隧道`，在身份列表点击删除图标。确认框会显示有多少 Gateway 档案仍引用该身份；删除后这些档案会进入“身份缺失”状态并 fail closed。应先迁移引用到新身份，再删除旧身份。
+
 ## 文档入口
 
 - [Main Gateway 部署](dbx-gateway/main-gateway.md)

@@ -87,6 +87,24 @@ dbx-gateway-pki client issue \
 
 预期输出 `issued client certificate <serial>`，导出目录包含 `certificate.pem`、`chain.pem`、`private-key.pem` 和 `client.p12`。把 `client.p12` 与密码分渠道交付给 DBX 用户，导入后删除传输副本。遗失设备时按 Client 角色吊销对应 serial，并重新签发新 identity 或新证书。
 
+### 导入 DBX 桌面端
+
+在 DBX 中打开 `设置 > 隧道 > 新增 Gateway`：
+
+1. 在“导入身份”区域填写身份显示名称和 bundle 密码。
+2. 点击“导入 PKCS#12”，选择签发目录中的 `client.p12`。文件选择器只接受 `.p12` 和 `.pfx`。
+3. 导入成功后，从“客户端身份”下拉框选择该身份。DBX 会立即清空导入密码；PKCS#12 私钥和密码不会写入连接 JSON、SQLite 普通字段、导出文件或云同步快照。
+4. 导入专用 Server CA PEM；需要双重固定时再填写 Main Server 公钥的 SPKI SHA-256 Pin。Pin 格式为 64 位小写十六进制，不是证书指纹的 Base64 文本。
+5. 点击“测试 Main”。成功只表示 Main URL、客户端证书和服务端 CA/SPKI 校验通过；数据库路由在具体连接的“传输”选项卡中选择。
+
+若提示密码错误或 PKCS#12 无法解析，重新核对 bundle 密码和文件完整性，不要尝试把私钥 PEM 粘贴进 Gateway 档案。若提示身份过期、吊销或不存在，应由 PKI 管理员重新签发，导入新 identity，并把引用该身份的 Gateway 档案迁移后再删除旧 identity。
+
+删除入口仍在 `设置 > 隧道` 的身份列表。DBX 会在确认框中显示引用数量；删除系统钥匙串 identity 后，所有引用它的 Gateway 档案和数据库连接都会拒绝测试/连接，不会从历史配置或缓存回退读取私钥。
+
+### 在连接中选择授权路由
+
+导入身份并保存 Gateway 档案后，新建或编辑数据库连接，进入 `传输 > 添加 Gateway`。选择共享档案并刷新授权路由，按 Edge 分组选择在线 target。离线 Edge 可见但不可选；Main 不可达、身份缺失、route 未选择或 ACL 已移除时，测试和保存都会 fail closed。具体连接只保存 `profile_id`、`edge_id` 和 `target_id`，不会复制 Main URL、CA、SPKI 或身份材料。
+
 ## 续期与吊销
 
 Edge 在证书到期前 `renew_before_days`（默认 30 天）用当前 mTLS 身份提交新 CSR。PKI 从已认证证书读取权威 Edge ID，忽略 CSR 中试图声明的其他 ID；新私钥仍只在 Edge 本地生成。过期或已吊销证书不能续期，必须创建新的 replace token。
