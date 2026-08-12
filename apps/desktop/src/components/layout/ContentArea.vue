@@ -20,6 +20,7 @@ import QueryEditor from "@/components/editor/QueryEditor.vue";
 import ColumnInfoPanel from "@/components/editor/ColumnInfoPanel.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import QueryErrorActions from "@/components/common/QueryErrorActions.vue";
+import QueryErrorDetails from "@/components/common/QueryErrorDetails.vue";
 import QueryMessagesView from "@/components/layout/QueryMessagesView.vue";
 import QueryResultToolbarActions from "@/components/layout/QueryResultToolbarActions.vue";
 import QueryResultViewSwitcher from "@/components/layout/QueryResultViewSwitcher.vue";
@@ -82,6 +83,7 @@ import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGr
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
+import { buildSqlErrorPresentation, sqlErrorDocumentRange } from "@/lib/sql/sqlDiagnostics";
 import { databaseDisplayNameForTab, executionSummaryItems, queryResultExecutionSql, resultGridCacheKey, resultRunItems, resultSourceRange, resultSqlForGrid, statementExecutionMarkers, tabularResultItems, type ExecutionSummaryItem } from "@/lib/tabs/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
@@ -367,6 +369,23 @@ const activeQueryError = computed(() => {
   if (!result || !isQueryExecutionErrorResult(result)) return "";
   return String(result.rows[0]?.[0] ?? "");
 });
+const activeQueryErrorSql = computed(() => props.activeTab.result?.sourceStatement || props.activeTab.lastExecutedSql || "");
+const activeQueryErrorPresentation = computed(() => {
+  if (!activeQueryError.value || !activeQueryErrorSql.value) return null;
+  return buildSqlErrorPresentation(activeQueryError.value, activeQueryErrorSql.value);
+});
+const activeQueryErrorEditorRange = computed(() => {
+  const presentation = activeQueryErrorPresentation.value;
+  if (!presentation) return null;
+  const result = props.activeTab.result;
+  const sourceRange = resultSourceRange(props.activeTab.sql, result, props.activeTab.activeResultIndex, activeEffectiveDatabaseType.value) ?? (activeQueryErrorSql.value === props.activeTab.sql ? { from: 0, to: props.activeTab.sql.length } : undefined);
+  return sqlErrorDocumentRange(presentation, sourceRange);
+});
+
+function locateActiveQueryError() {
+  const range = activeQueryErrorEditorRange.value;
+  if (range) queryEditorRef.value?.focusRange(range);
+}
 const hasQueryOutput = computed(
   () =>
     !!props.activeTab.result ||
@@ -1592,6 +1611,9 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
                 <template v-if="activeTab.result && isQueryExecutionErrorResult(activeTab.result)" #error-actions="{ errorMessage }">
                   <QueryErrorActions :error-message="String(errorMessage)" :connection-id="activeTab.connectionId" @change-query-timeout="activeTab.connectionId && emit('openConnectionSettings', activeTab.connectionId, 'advanced')" @fix-with-ai="(message) => emit('fixWithAi', message)" />
                 </template>
+                <template v-if="activeQueryErrorPresentation" #error-details>
+                  <QueryErrorDetails :presentation="activeQueryErrorPresentation" :can-locate="!!activeQueryErrorEditorRange" @locate="locateActiveQueryError" />
+                </template>
               </DataGrid>
               <QueryLoadingState
                 v-else-if="!activeTab.result && activeTab.isExecuting"
@@ -1912,6 +1934,9 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
         >
           <template v-if="activeTab.result && isQueryExecutionErrorResult(activeTab.result)" #error-actions="{ errorMessage }">
             <QueryErrorActions :error-message="String(errorMessage)" :connection-id="activeTab.connectionId" @change-query-timeout="activeTab.connectionId && emit('openConnectionSettings', activeTab.connectionId, 'advanced')" @fix-with-ai="(message) => emit('fixWithAi', message)" />
+          </template>
+          <template v-if="activeQueryErrorPresentation" #error-details>
+            <QueryErrorDetails :presentation="activeQueryErrorPresentation" :can-locate="!!activeQueryErrorEditorRange" @locate="locateActiveQueryError" />
           </template>
         </DataGrid>
         <QueryLoadingState v-else-if="activeTab.isExecuting" class="h-full" :label-key="queryExecutionLabelKey(activeTab)" :elapsed-seconds="queryRunningElapsedSeconds" show-cancel :cancel-disabled="!canCancelQueryExecution(activeTab)" :cancelling="activeTab.isCancelling" @cancel="emit('cancel')" />

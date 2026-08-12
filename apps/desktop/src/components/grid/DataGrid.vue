@@ -9694,6 +9694,9 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               @hover-suggestion="suggestionIndex = $event"
             />
             <ErrorBanner v-if="isErrorResult" variant="centered" :message="errorMessage">
+              <template #details>
+                <slot name="error-details" :error-message="errorMessage" />
+              </template>
               <template #actions>
                 <slot name="error-actions" :error-message="errorMessage" />
               </template>

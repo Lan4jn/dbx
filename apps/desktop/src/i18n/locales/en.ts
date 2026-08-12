@@ -1906,6 +1906,8 @@ export default {
     searchColumn: "Search column/comment...",
     noColumnsFound: "No columns found",
     queryError: "Query Error",
+    queryErrorLocation: "Line {line}, column {column}",
+    locateQueryError: "Locate in editor",
     saveErrorTitle: "Failed to Save Changes",
     dataUnavailable: "Table data needs to be reloaded.",
     cachedResultUnavailable: "The cached result is missing or incompatible.",

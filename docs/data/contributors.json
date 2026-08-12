@@ -1,13 +1,13 @@
 {
   "repository": "t8y2/dbx",
-  "generatedAt": "2026-08-11T18:19:22.170Z",
+  "generatedAt": "2026-08-11T19:10:06.950Z",
   "stars": 14124,
   "contributors": [
     {
       "login": "t8y2",
       "avatarUrl": "https://avatars.githubusercontent.com/u/77960507?v=4",
       "profileUrl": "https://github.com/t8y2",
-      "commits": 2913,
+      "commits": 2914,
       "mergedPullRequests": 15,
       "firstContributionAt": "2026-04-30T08:14:51Z",
       "latestContributionAt": "2026-07-30T13:10:01Z"
@@ -25,10 +25,10 @@
       "login": "eryajf",
       "avatarUrl": "https://avatars.githubusercontent.com/u/33259379?v=4",
       "profileUrl": "https://github.com/eryajf",
-      "commits": 142,
-      "mergedPullRequests": 141,
+      "commits": 143,
+      "mergedPullRequests": 142,
       "firstContributionAt": "2026-06-08T11:45:45Z",
-      "latestContributionAt": "2026-08-11T16:09:22Z"
+      "latestContributionAt": "2026-08-11T18:20:06Z"
     },
     {
       "login": "Abeautifulsnow",
@@ -373,6 +373,15 @@
       "latestContributionAt": "2026-07-10T11:27:07Z"
     },
     {
+      "login": "AndrewDi",
+      "avatarUrl": "https://avatars.githubusercontent.com/u/7589147?v=4",
+      "profileUrl": "https://github.com/AndrewDi",
+      "commits": 5,
+      "mergedPullRequests": 5,
+      "firstContributionAt": "2026-08-03T09:45:43Z",
+      "latestContributionAt": "2026-08-11T18:05:55Z"
+    },
+    {
       "login": "antwa",
       "avatarUrl": "https://avatars.githubusercontent.com/u/5325867?v=4",
       "profileUrl": "https://github.com/antwa",
@@ -434,15 +443,6 @@
       "mergedPullRequests": 5,
       "firstContributionAt": "2026-06-30T16:59:33Z",
       "latestContributionAt": "2026-07-08T16:35:34Z"
-    },
-    {
-      "login": "AndrewDi",
-      "avatarUrl": "https://avatars.githubusercontent.com/u/7589147?v=4",
-      "profileUrl": "https://github.com/AndrewDi",
-      "commits": 4,
-      "mergedPullRequests": 5,
-      "firstContributionAt": "2026-08-03T09:45:43Z",
-      "latestContributionAt": "2026-08-11T18:05:55Z"
     },
     {
       "login": "Caisin",
