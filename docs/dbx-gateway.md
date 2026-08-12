@@ -70,6 +70,7 @@ Gateway 身份依赖系统钥匙串，因此只能在 DBX 桌面端配置和使�
 
 ## 文档入口
 
+- [完整部署与使用说明书](dbx-gateway/deployment-manual.md)
 - [Main Gateway 部署](dbx-gateway/main-gateway.md)
 - [Edge Gateway 部署](dbx-gateway/edge-gateway.md)
 - [PKI 与证书](dbx-gateway/pki.md)
