@@ -65,6 +65,86 @@ pub async fn start_transport_layers(
     http_tunnels: &HttpTunnelManager,
     dbx_gateway: &DbxGatewayManager,
 ) -> Result<u16, String> {
+    start_transport_layers_with_final_ssh_local_port(
+        connection_id,
+        layers,
+        remote_host,
+        remote_port,
+        None,
+        ssh_tunnels,
+        proxy_tunnels,
+        http_tunnels,
+        dbx_gateway,
+    )
+    .await
+}
+
+pub(crate) async fn start_transport_layers_with_final_ssh_local_port(
+    connection_id: &str,
+    layers: &[TransportLayerConfig],
+    remote_host: &str,
+    remote_port: u16,
+    final_ssh_local_port: Option<u16>,
+    ssh_tunnels: &TunnelManager,
+    proxy_tunnels: &ProxyTunnelManager,
+    http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
+) -> Result<u16, String> {
+    start_transport_layers_internal(
+        connection_id,
+        layers,
+        remote_host,
+        remote_port,
+        final_ssh_local_port,
+        false,
+        ssh_tunnels,
+        proxy_tunnels,
+        http_tunnels,
+        dbx_gateway,
+    )
+    .await
+}
+
+#[cfg(feature = "mq-admin")]
+pub(crate) async fn start_transport_layers_with_final_ssh_socks5(
+    connection_id: &str,
+    layers: &[TransportLayerConfig],
+    ssh_tunnels: &TunnelManager,
+    proxy_tunnels: &ProxyTunnelManager,
+    http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
+) -> Result<u16, String> {
+    if !matches!(layers.last(), Some(TransportLayerConfig::Ssh(_))) {
+        return Err("Dynamic SOCKS5 routing requires SSH as the final transport layer".to_string());
+    }
+    start_transport_layers_internal(
+        connection_id,
+        layers,
+        "",
+        0,
+        None,
+        true,
+        ssh_tunnels,
+        proxy_tunnels,
+        http_tunnels,
+        dbx_gateway,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_transport_layers_internal(
+    connection_id: &str,
+    layers: &[TransportLayerConfig],
+    remote_host: &str,
+    remote_port: u16,
+    final_ssh_local_port: Option<u16>,
+    final_ssh_socks5: bool,
+    ssh_tunnels: &TunnelManager,
+    proxy_tunnels: &ProxyTunnelManager,
+    http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
+) -> Result<u16, String> {
     if layers.is_empty() {
         return Err("No transport layers configured".to_string());
     }
@@ -87,8 +167,27 @@ pub async fn start_transport_layers(
         };
 
         let local_port = match layer {
+            TransportLayerConfig::Ssh(resolved) if is_last && final_ssh_socks5 => ssh_tunnels
+                .start_socks5_proxy(
+                    &layer_id,
+                    &connect_endpoint.host,
+                    connect_endpoint.port,
+                    &resolved.host,
+                    resolved.port,
+                    &resolved.user,
+                    &resolved.password,
+                    &resolved.key_path,
+                    &resolved.key_passphrase,
+                    resolved.use_ssh_agent,
+                    &resolved.ssh_agent_sock_path,
+                    &resolved.auth_method,
+                    effective_ssh_connect_timeout_secs(resolved.connect_timeout_secs),
+                    resolved.allow_exec_channel_proxy,
+                )
+                .await
+                .map_err(|err| format!("SSH layer {} failed: {err}", index + 1))?,
             TransportLayerConfig::Ssh(resolved) => ssh_tunnels
-                .start_tunnel(
+                .start_tunnel_on_local_port(
                     &layer_id,
                     &connect_endpoint.host,
                     connect_endpoint.port,
@@ -105,6 +204,8 @@ pub async fn start_transport_layers(
                     &target_endpoint.host,
                     target_endpoint.port,
                     is_last && resolved.expose_lan,
+                    resolved.allow_exec_channel_proxy,
+                    if is_last { final_ssh_local_port } else { None },
                 )
                 .await
                 .map_err(|err| format!("SSH layer {} failed: {err}", index + 1))?,
@@ -292,6 +393,7 @@ mod tests {
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
             auth_method: "password".to_string(),
+            allow_exec_channel_proxy: false,
         })
     }
 

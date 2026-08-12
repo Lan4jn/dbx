@@ -69,14 +69,17 @@ public final class DbxJdbcPlugin {
         false,
         false,
         false,
+        false,
         StatementMaxRowsMode.READ_LOOP_ONLY
     );
     private static final JdbcDriverQuirks USE_CATALOG_QUIRKS = DEFAULT_QUIRKS.withUseCatalogFallbackSql(true);
+    private static final JdbcDriverQuirks HIVE_QUIRKS = USE_CATALOG_QUIRKS.withSchemasAsDatabasesFallback(true);
     private static final JdbcDriverQuirks KINGBASE_QUIRKS = DEFAULT_QUIRKS.withIgnoreCatalogForSchemaMetadata(true);
     private static final JdbcDriverQuirks TAOS_QUIRKS = DEFAULT_QUIRKS.withPreferExecuteQueryForResultSetSql(true);
     private static final JdbcDriverQuirks YASHAN_QUIRKS = new JdbcDriverQuirks(
         true,
         true,
+        false,
         false,
         false,
         false,
@@ -90,11 +93,13 @@ public final class DbxJdbcPlugin {
         false,
         false,
         false,
+        false,
         StatementMaxRowsMode.READ_LOOP_ONLY
     );
     private static final JdbcDriverQuirks ORACLE_QUIRKS = new JdbcDriverQuirks(
         false,
         true,
+        false,
         false,
         false,
         false,
@@ -106,7 +111,7 @@ public final class DbxJdbcPlugin {
         new JdbcDriverQuirkRule("jdbc:mariadb:", USE_CATALOG_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:starrocks:", USE_CATALOG_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:doris:", USE_CATALOG_QUIRKS),
-        new JdbcDriverQuirkRule("jdbc:hive2:", USE_CATALOG_QUIRKS),
+        new JdbcDriverQuirkRule("jdbc:hive2:", HIVE_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:kingbase", KINGBASE_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:yasdb:", YASHAN_QUIRKS),
         new JdbcDriverQuirkRule("jdbc:iris:", IRIS_QUIRKS),
@@ -127,6 +132,7 @@ public final class DbxJdbcPlugin {
         boolean useCatalogFallbackSql,
         boolean ignoreCatalogForSchemaMetadata,
         boolean preferExecuteQueryForResultSetSql,
+        boolean schemasAsDatabasesFallback,
         StatementMaxRowsMode statementMaxRowsMode
     ) {
         JdbcDriverQuirks withUseCatalogFallbackSql(boolean value) {
@@ -137,6 +143,7 @@ public final class DbxJdbcPlugin {
                 value,
                 ignoreCatalogForSchemaMetadata,
                 preferExecuteQueryForResultSetSql,
+                schemasAsDatabasesFallback,
                 statementMaxRowsMode
             );
         }
@@ -149,6 +156,7 @@ public final class DbxJdbcPlugin {
                 useCatalogFallbackSql,
                 value,
                 preferExecuteQueryForResultSetSql,
+                schemasAsDatabasesFallback,
                 statementMaxRowsMode
             );
         }
@@ -160,6 +168,20 @@ public final class DbxJdbcPlugin {
                 caseInsensitiveSchemaMetadata,
                 useCatalogFallbackSql,
                 ignoreCatalogForSchemaMetadata,
+                value,
+                schemasAsDatabasesFallback,
+                statementMaxRowsMode
+            );
+        }
+
+        JdbcDriverQuirks withSchemasAsDatabasesFallback(boolean value) {
+            return new JdbcDriverQuirks(
+                skipExecutionContext,
+                useOracleMetadata,
+                caseInsensitiveSchemaMetadata,
+                useCatalogFallbackSql,
+                ignoreCatalogForSchemaMetadata,
+                preferExecuteQueryForResultSetSql,
                 value,
                 statementMaxRowsMode
             );
@@ -519,8 +541,25 @@ public final class DbxJdbcPlugin {
             applyOracleProperties(connection, properties);
         }
         sharedConnection = DriverManager.getConnection(url, properties);
+        configurePhoenixAutoCommit(connection, url, sharedConnection);
         sharedConnectionKey = key;
         return sharedConnection;
+    }
+
+    private static void configurePhoenixAutoCommit(JsonNode connection, String url, Connection jdbcConnection)
+        throws SQLException {
+        if (!isPhoenixConnection(connection, url) || jdbcConnection.getAutoCommit()) {
+            return;
+        }
+        jdbcConnection.setAutoCommit(true);
+    }
+
+    private static boolean isPhoenixConnection(JsonNode connection, String url) {
+        if (urlMatchesPrefix(url, "jdbc:phoenix:")) {
+            return true;
+        }
+        String driverClass = optionalText(connection, "jdbc_driver_class");
+        return driverClass != null && driverClass.equalsIgnoreCase("org.apache.phoenix.jdbc.PhoenixDriver");
     }
 
     private static void applyJdbcxExtensionSecurity(JsonNode connection, String url, Properties properties) {
@@ -1304,7 +1343,7 @@ public final class DbxJdbcPlugin {
             }
         }
         if (isKyuubiDriver(connection)) {
-            return USE_CATALOG_QUIRKS;
+            return HIVE_QUIRKS;
         }
         return DEFAULT_QUIRKS;
     }
@@ -1333,14 +1372,19 @@ public final class DbxJdbcPlugin {
     private static JsonNode listDatabases(JsonNode connection) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
-        if (driverQuirks(connection).useOracleMetadata()) {
+        JdbcDriverQuirks quirks = driverQuirks(connection);
+        if (quirks.useOracleMetadata()) {
             return result;
         }
-        try (ResultSet rs = conn.getMetaData().getCatalogs()) {
+        DatabaseMetaData metadata = conn.getMetaData();
+        try (ResultSet rs = metadata.getCatalogs()) {
             while (rs.next()) {
                 String name = rs.getString("TABLE_CAT");
                 addDatabase(result, name);
             }
+        }
+        if (result.isEmpty() && quirks.schemasAsDatabasesFallback()) {
+            addSchemaDatabases(result, metadata);
         }
         addDatabase(result, optionalText(connection, "database"));
         try {
@@ -1348,6 +1392,15 @@ public final class DbxJdbcPlugin {
         } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
         }
         return result;
+    }
+
+    private static void addSchemaDatabases(ArrayNode result, DatabaseMetaData metadata) {
+        try (ResultSet rs = metadata.getSchemas()) {
+            while (rs.next()) {
+                addDatabase(result, rs.getString("TABLE_SCHEM"));
+            }
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
+        }
     }
 
     private static void addDatabase(ArrayNode result, String name) {
@@ -1586,12 +1639,12 @@ public final class DbxJdbcPlugin {
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
-        Set<String> primaryKeys = safePrimaryKeys(meta, catalog, schemaPattern, table);
-        appendColumns(result, meta, catalog, schemaPattern, table, primaryKeys);
+        JdbcMetadataIdentity identity = appendColumns(result, meta, catalog, schemaPattern, table);
         if (result.isEmpty() && catalog != null) {
-            primaryKeys = safePrimaryKeys(meta, null, schemaPattern, table);
-            appendColumns(result, meta, null, schemaPattern, table, primaryKeys);
+            identity = appendColumns(result, meta, null, schemaPattern, table);
         }
+        Set<String> primaryKeys = safePrimaryKeys(meta, identity.catalog(), identity.schema(), identity.table());
+        markPrimaryKeyColumns(result, primaryKeys);
         if (quirks.useCatalogFallbackSql()) {
             mergeShowFullColumnMetadata(conn, result, schemaPattern, table);
         }
@@ -2280,22 +2333,31 @@ public final class DbxJdbcPlugin {
         return "'" + (value == null ? "" : value).replace("'", "''") + "'";
     }
 
-    private static void appendColumns(
+    private static JdbcMetadataIdentity appendColumns(
         ArrayNode result,
         DatabaseMetaData meta,
         String catalog,
         String schema,
-        String table,
-        Set<String> primaryKeys
+        String table
     ) throws SQLException {
+        JdbcMetadataIdentity identity = new JdbcMetadataIdentity(catalog, schema, table);
+        boolean identityResolved = false;
         try (ResultSet rs = meta.getColumns(catalog, schema, table, "%")) {
             while (rs.next()) {
+                if (!identityResolved) {
+                    identity = new JdbcMetadataIdentity(
+                        metadataIdentityValue(rs, "TABLE_CAT", catalog, true),
+                        metadataIdentityValue(rs, "TABLE_SCHEM", schema, true),
+                        metadataIdentityValue(rs, "TABLE_NAME", table, false)
+                    );
+                    identityResolved = true;
+                }
                 String name = rs.getString("COLUMN_NAME");
                 ObjectNode item = columnNode(result, name);
                 item.put("data_type", rs.getString("TYPE_NAME"));
                 item.put("is_nullable", columnIsNullable(rs));
                 putNullablePreferValue(item, "column_default", rs.getString("COLUMN_DEF"));
-                item.put("is_primary_key", primaryKeys.contains(name));
+                item.put("is_primary_key", false);
                 item.putNull("extra");
                 putNullablePreferValue(item, "comment", rs.getString("REMARKS"));
                 putNullableInt(item, "numeric_precision", rs.getObject("COLUMN_SIZE"));
@@ -2303,7 +2365,54 @@ public final class DbxJdbcPlugin {
                 putNullableInt(item, "character_maximum_length", rs.getObject("COLUMN_SIZE"));
             }
         }
+        return identity;
     }
+
+    private static String metadataIdentityValue(ResultSet rs, String field, String fallback, boolean nullIsMeaningful) {
+        try {
+            String value = rs.getString(field);
+            if (value == null) {
+                return nullIsMeaningful ? null : fallback;
+            }
+            return value.isBlank() ? fallback : value;
+        } catch (SQLException ignored) {
+            return fallback;
+        }
+    }
+
+    private static void markPrimaryKeyColumns(ArrayNode columns, Set<String> primaryKeys) {
+        Map<String, ObjectNode> exactMatches = new HashMap<>();
+        Map<String, ObjectNode> caseInsensitiveMatches = new HashMap<>();
+        for (JsonNode column : columns) {
+            if (!(column instanceof ObjectNode objectNode)) {
+                continue;
+            }
+            String columnName = objectNode.path("name").asText();
+            exactMatches.put(columnName, objectNode);
+            String normalizedName = columnName.toLowerCase(Locale.ROOT);
+            if (caseInsensitiveMatches.containsKey(normalizedName)) {
+                caseInsensitiveMatches.put(normalizedName, null);
+            } else {
+                caseInsensitiveMatches.put(normalizedName, objectNode);
+            }
+        }
+        for (String primaryKey : primaryKeys) {
+            if (primaryKey == null) {
+                continue;
+            }
+            ObjectNode exactMatch = exactMatches.get(primaryKey);
+            if (exactMatch != null) {
+                exactMatch.put("is_primary_key", true);
+                continue;
+            }
+            ObjectNode caseInsensitiveMatch = caseInsensitiveMatches.get(primaryKey.toLowerCase(Locale.ROOT));
+            if (caseInsensitiveMatch != null) {
+                caseInsensitiveMatch.put("is_primary_key", true);
+            }
+        }
+    }
+
+    private record JdbcMetadataIdentity(String catalog, String schema, String table) {}
 
     private static boolean columnIsNullable(ResultSet rs) throws SQLException {
         try {

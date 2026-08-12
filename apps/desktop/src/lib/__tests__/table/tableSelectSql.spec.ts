@@ -34,6 +34,17 @@ describe("qualifiedTableName — SQLite attached databases", () => {
   });
 });
 
+describe("qualifiedTableName — GBase 8s", () => {
+  it("omits the metadata owner for GBase 8s table data", () => {
+    expect(qualifiedTableName({ databaseType: "informix", driverProfile: "gbase8s", identifierQuote: "", schema: "gbasedbt", tableName: "connection_smoke" })).toBe("connection_smoke");
+    expect(quoteTableDataIdentifier("informix", "connection_smoke", "")).toBe("connection_smoke");
+  });
+
+  it("keeps native Informix owner qualification", () => {
+    expect(qualifiedTableName({ databaseType: "informix", identifierQuote: "", schema: "gbasedbt", tableName: "connection_smoke" })).toBe("gbasedbt.connection_smoke");
+  });
+});
+
 describe("quoteTableIdentifier", () => {
   it("backtick-quotes mysql identifiers", () => {
     expect(quoteTableIdentifier("mysql", "orders")).toBe("`orders`");

@@ -35,6 +35,7 @@ ORDER BY DB_NAME`
 const xuguListSchemasSQL = `
 SELECT SCHEMA_NAME
 FROM ALL_SCHEMAS
+WHERE DB_ID = CURRENT_DB_ID
 ORDER BY SCHEMA_NAME`
 const xuguCatalogTableNameSelectSQL = `
 SELECT s.SCHEMA_NAME, t.TABLE_NAME
@@ -44,19 +45,22 @@ const xuguCatalogSequenceNameSelectSQL = `
 SELECT s.SCHEMA_NAME, q.SEQ_NAME
 FROM ALL_SEQUENCES q
 JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
-WHERE q.IS_SYS = FALSE`
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND q.IS_SYS = FALSE`
 const xuguCatalogSynonymSelectSQL = `
 SELECT s.SCHEMA_NAME, y.SYNO_NAME, t.SCHEMA_NAME AS TARGET_SCHEMA, y.TARG_NAME
 FROM ALL_SYNONYMS y
 JOIN ALL_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
 LEFT JOIN ALL_SCHEMAS t ON t.DB_ID = y.DB_ID AND t.SCHEMA_ID = y.TARG_SCHE_ID
-WHERE y.IS_PUBLIC = FALSE`
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND y.IS_PUBLIC = FALSE`
 const xuguPrimaryKeyColumnsSQL = `
 SELECT c.DEFINE
 FROM ALL_CONSTRAINTS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
   AND c.CONS_TYPE = 'P'`
 const xuguListColumnsSQL = `
@@ -64,7 +68,8 @@ SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.ON_NULL, c.COMMENTS, c.
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
   AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
 ORDER BY c.COL_NO`
@@ -73,7 +78,8 @@ SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.COMMENTS, c.SCALE, c."V
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
   AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
 ORDER BY c.COL_NO`
@@ -82,7 +88,8 @@ SELECT i.INDEX_NAME, i.KEYS, i.IS_UNIQUE, i.IS_PRIMARY, i.INDEX_TYPE, i.FILTER
 FROM ALL_INDEXES i
 JOIN ALL_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
 ORDER BY i.INDEX_NAME`
 const xuguTableMetadataSQL = `
@@ -92,7 +99,8 @@ SELECT t.TEMP_TYPE, t.ON_COMMIT_DEL, t.PCTFREE, t.COPY_NUM,
        t.SUBPARTI_TYPE, t.SUBPARTI_NUM, t.SUBPARTI_KEY, t.COMMENTS
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?`
 const xuguTableIdentitySQL = `
 SELECT c.COL_NAME, q.MIN_VAL, q.STEP_VAL, q.IS_SYS
@@ -100,7 +108,8 @@ FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 JOIN ALL_SEQUENCES q ON q.DB_ID = c.DB_ID AND q.SEQ_ID = c.SERIAL_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
   AND c.IS_SERIAL = TRUE`
 const xuguTableConstraintsSQL = `
@@ -113,7 +122,8 @@ JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
 LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
   AND c.CONS_TYPE <> 'F'
 ORDER BY c.CONS_NAME`
@@ -131,7 +141,8 @@ JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
 LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
   AND c.CONS_TYPE = 'F'
 ORDER BY c.CONS_NAME`
@@ -141,7 +152,8 @@ SELECT p.PARTI_NO, p.PARTI_NAME, p.PARTI_VAL, p.ONLINE,
 FROM ALL_PARTIS p
 JOIN ALL_TABLES t ON t.DB_ID = p.DB_ID AND t.TABLE_ID = p.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
 ORDER BY p.PARTI_NO`
 const xuguTableSubpartitionsSQL = `
@@ -150,7 +162,8 @@ SELECT p.SUBPARTI_NO, p.SUBPARTI_NAME, p.SUBPARTI_VAL,
 FROM ALL_SUBPARTIS p
 JOIN ALL_TABLES t ON t.DB_ID = p.DB_ID AND t.TABLE_ID = p.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ?
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?
 ORDER BY p.SUBPARTI_NO`
 
@@ -291,11 +304,13 @@ type tableInfo struct {
 }
 
 type objectInfo struct {
-	Name       string  `json:"name"`
-	ObjectType string  `json:"object_type"`
-	Schema     string  `json:"schema"`
-	Comment    *string `json:"comment"`
-	Valid      *bool   `json:"valid,omitempty"`
+	Name                      string       `json:"name"`
+	ObjectType                string       `json:"object_type"`
+	Schema                    string       `json:"schema"`
+	Comment                   *string      `json:"comment"`
+	Valid                     *bool        `json:"valid,omitempty"`
+	Trigger                   *triggerInfo `json:"trigger,omitempty"`
+	XuguTypeMembersExpandable *bool        `json:"xugu_type_members_expandable,omitempty"`
 }
 
 type metadataListConstraints struct {
@@ -477,9 +492,16 @@ type xuguPartitionInfo struct {
 }
 
 type triggerInfo struct {
-	Name   string `json:"name"`
-	Event  string `json:"event"`
-	Timing string `json:"timing"`
+	Name      string  `json:"name"`
+	Event     string  `json:"event"`
+	Timing    string  `json:"timing"`
+	Level     string  `json:"level"`
+	Condition *string `json:"condition,omitempty"`
+	Language  *string `json:"language,omitempty"`
+	Enabled   *bool   `json:"enabled,omitempty"`
+	Valid     *bool   `json:"valid,omitempty"`
+	Comment   *string `json:"comment,omitempty"`
+	CreatedAt *string `json:"created_at,omitempty"`
 }
 
 type server struct {
@@ -925,6 +947,16 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		}
 		schema := stringParam(params, "schema")
 		result, err := s.listObjects(schema, metadataListConstraintsFromParams(params))
+		return result, false, err
+	case "completion_assistant_search_v1":
+		var request completionAssistantRequest
+		if err := decodeParams(params, &request); err != nil {
+			return nil, false, err
+		}
+		if err := s.useDatabase(request.Database); err != nil {
+			return nil, false, err
+		}
+		result, err := s.completionAssistantSearch(request)
 		return result, false, err
 	case "list_data_types":
 		return xuguDataTypes, false, nil
@@ -1679,7 +1711,8 @@ func (s *server) currentSchema() (string, error) {
 SELECT s.SCHEMA_NAME
 FROM SYS_SCHEMAS s
 JOIN SYS_USERS u ON u.DB_ID = s.DB_ID AND u.USER_ID = s.USER_ID
-WHERE UPPER(u.USER_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(u.USER_NAME) = UPPER(?)
 ORDER BY CASE WHEN UPPER(s.SCHEMA_NAME) = UPPER(?) THEN 0 ELSE 1 END, s.SCHEMA_NAME`, []any{s.params.Username, s.params.Username})
 	if err != nil {
 		if fallback := strings.ToUpper(strings.TrimSpace(s.params.Username)); fallback != "" && isXuguMetadataUnavailableError(err) {
@@ -1842,6 +1875,9 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	if err != nil {
 		return nil, err
 	}
+	if isOnlyXuguObjectType(constraints, "TRIGGER") {
+		return s.listSchemaTriggers(schema, constraints)
+	}
 	query := xuguListObjectsQuery(schema, constraints)
 	rows, err := s.queryRows(query.SQL, query.Args)
 	if err != nil {
@@ -1912,18 +1948,77 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	return readXuguObjectRows(rows, schema)
 }
 
+func isOnlyXuguObjectType(constraints metadataListConstraints, objectType string) bool {
+	objectTypes := normalizedXuguObjectTypes(constraints.ObjectTypes)
+	return len(objectTypes) == 1 && objectTypes[0] == objectType
+}
+
+func (s *server) listSchemaTriggers(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
+	query := xuguSchemaTriggersQuery(schema, constraints)
+	rows, err := s.queryRows(query.SQL, query.Args)
+	if err != nil {
+		if isXuguMetadataUnavailableError(err) {
+			return []objectInfo{}, nil
+		}
+		return nil, err
+	}
+	defer s.closeRows(rows)
+
+	var result []objectInfo
+	for rows.Next() {
+		var item objectInfo
+		var event, timing, level, condition, language, enabled, valid, comment, createdAt any
+		if err := rows.Scan(&item.Name, &item.ObjectType, &comment, &valid, &event, &timing, &level, &condition, &language, &enabled, &createdAt); err != nil {
+			return nil, err
+		}
+		item.Schema = schema
+		item.Comment = optionalString(xuguString(comment))
+		item.Valid = optionalBool(valid)
+		item.Trigger = &triggerInfo{
+			Name:      item.Name,
+			Event:     triggerEventName(event),
+			Timing:    triggerTimingName(timing),
+			Level:     triggerLevelName(level),
+			Condition: optionalString(xuguString(condition)),
+			Language:  optionalString(xuguString(language)),
+			Enabled:   optionalBool(enabled),
+			Valid:     item.Valid,
+			Comment:   item.Comment,
+			CreatedAt: optionalString(xuguString(createdAt)),
+		}
+		result = append(result, item)
+	}
+	return emptyIfNil(result), rows.Err()
+}
+
+func xuguSchemaTriggersQuery(schema string, constraints metadataListConstraints) xuguMetadataListQuery {
+	return xuguConstrainedMetadataListQuery(`
+SELECT tr.TRIG_NAME AS OBJECT_NAME, 'TRIGGER' AS OBJECT_TYPE, tr.COMMENTS, tr.VALID,
+       tr.TRIG_EVENT, tr.TRIG_TIME, tr.TRIG_TYPE, tr.TRIG_COND, tr.LANGUAGE, tr.ENABLE, tr.CREATE_TIME
+FROM ALL_TRIGGERS tr
+JOIN ALL_SCHEMAS s ON s.DB_ID = tr.DB_ID AND s.SCHEMA_ID = tr.SCHEMA_ID
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`,
+		"OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID, TRIG_EVENT, TRIG_TIME, TRIG_TYPE, TRIG_COND, LANGUAGE, ENABLE, CREATE_TIME",
+		"OBJECT_NAME", "OBJECT_TYPE", []any{schema}, constraints)
+}
+
 func readXuguObjectRows(rows *sql.Rows, schema string) ([]objectInfo, error) {
 	var result []objectInfo
 	for rows.Next() {
 		var item objectInfo
-		var valid any
+		var valid, xuguTypeMembersExpandable any
 		item.Schema = schema
-		if err := rows.Scan(&item.Name, &item.ObjectType, &item.Comment, &valid); err != nil {
+		if err := rows.Scan(&item.Name, &item.ObjectType, &item.Comment, &valid, &xuguTypeMembersExpandable); err != nil {
 			return nil, err
 		}
 		if valid != nil {
 			value := truthy(valid)
 			item.Valid = &value
+		}
+		if normalizeValue(xuguTypeMembersExpandable) != nil {
+			value := truthy(xuguTypeMembersExpandable)
+			item.XuguTypeMembersExpandable = &value
 		}
 		result = append(result, item)
 	}
@@ -2025,12 +2120,14 @@ func xuguListTablesQuery(schema string, constraints metadataListConstraints) xug
 SELECT t.TABLE_NAME, 'TABLE' AS TABLE_TYPE, t.COMMENTS
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectType: "VIEW", sql: `
 SELECT v.VIEW_NAME AS TABLE_NAME, 'VIEW' AS TABLE_TYPE, v.COMMENTS
 FROM ALL_VIEWS v
 JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 	}
 	selected := normalizedXuguObjectTypes(constraints.ObjectTypes)
 	selectedSet := make(map[string]bool, len(selected))
@@ -2069,60 +2166,71 @@ func xuguListObjectsQuery(schema string, constraints metadataListConstraints) xu
 	}
 	sources := []objectSource{
 		{objectTypes: []string{"TABLE"}, sql: `
-SELECT t.TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, t.COMMENTS, NULL AS VALID
+SELECT t.TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, t.COMMENTS, NULL AS VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectTypes: []string{"VIEW"}, sql: `
-SELECT v.VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, v.COMMENTS, NULL AS VALID
+SELECT v.VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, v.COMMENTS, v.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_VIEWS v
 JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectTypes: []string{"PROCEDURE", "FUNCTION"}, sql: `
 		SELECT p.PROC_NAME AS OBJECT_NAME,
 		       CASE WHEN p.RET_TYPE IS NULL THEN 'PROCEDURE' ELSE 'FUNCTION' END AS OBJECT_TYPE,
-		       p.COMMENTS, p.VALID
+		       p.COMMENTS, p.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 		FROM ALL_PROCEDURES p
 		JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
-		WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+		WHERE s.DB_ID = CURRENT_DB_ID
+		  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectTypes: []string{"PACKAGE"}, sql: `
-SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE' AS OBJECT_TYPE, p.COMMENTS, p.VALID
+SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE' AS OBJECT_TYPE, p.COMMENTS, p.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_PACKAGES p
 JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectTypes: []string{"PACKAGE_BODY"}, sql: `
-SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE_BODY' AS OBJECT_TYPE, p.COMMENTS, p.ALL_OK
+SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE_BODY' AS OBJECT_TYPE, p.COMMENTS, p.ALL_OK, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_PACKAGES p
 JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND p.BODY IS NOT NULL`},
 		{objectTypes: []string{"TRIGGER"}, sql: `
-SELECT tr.TRIG_NAME AS OBJECT_NAME, 'TRIGGER' AS OBJECT_TYPE, tr.COMMENTS, tr.VALID
+SELECT tr.TRIG_NAME AS OBJECT_NAME, 'TRIGGER' AS OBJECT_TYPE, tr.COMMENTS, tr.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_TRIGGERS tr
 JOIN ALL_SCHEMAS s ON s.DB_ID = tr.DB_ID AND s.SCHEMA_ID = tr.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectTypes: []string{"SEQUENCE"}, sql: `
-		SELECT q.SEQ_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, NULL AS COMMENTS, NULL AS VALID
+		SELECT q.SEQ_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, NULL AS COMMENTS, NULL AS VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_SEQUENCES q
 JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND q.IS_SYS = FALSE`},
 		{objectTypes: []string{"SYNONYM"}, sql: `
-SELECT y.SYNO_NAME AS OBJECT_NAME, 'SYNONYM' AS OBJECT_TYPE, NULL AS COMMENTS, y.VALID
+SELECT y.SYNO_NAME AS OBJECT_NAME, 'SYNONYM' AS OBJECT_TYPE, NULL AS COMMENTS, y.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_SYNONYMS y
 JOIN ALL_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
 	AND y.IS_PUBLIC = FALSE`},
 		{objectTypes: []string{"TYPE"}, sql: `
-SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE' AS OBJECT_TYPE, u.COMMENTS, u.VALID
+SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE' AS OBJECT_TYPE, u.COMMENTS, u.VALID,
+	       CASE WHEN u.UDT_TYPE = 1001 THEN TRUE ELSE FALSE END AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_TYPES u
 JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`},
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)`},
 		{objectTypes: []string{"TYPE_BODY"}, sql: `
-SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE_BODY' AS OBJECT_TYPE, u.COMMENTS, u.VALID
+SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE_BODY' AS OBJECT_TYPE, u.COMMENTS, u.VALID, NULL AS XUGU_TYPE_MEMBERS_EXPANDABLE
 FROM ALL_TYPES u
 JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND u.BODY IS NOT NULL`},
 	}
 
@@ -2159,7 +2267,7 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
 	}
 	return xuguConstrainedMetadataListQuery(
 		strings.Join(baseSQLParts, "\nUNION ALL\n"),
-		"OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID",
+		"OBJECT_NAME, OBJECT_TYPE, COMMENTS, VALID, XUGU_TYPE_MEMBERS_EXPANDABLE",
 		"OBJECT_NAME",
 		"OBJECT_TYPE",
 		baseArgs,
@@ -2489,11 +2597,13 @@ func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
 	}
 	table = strings.ToUpper(strings.TrimSpace(table))
 	rows, err := s.queryRows(`
-SELECT tr.TRIG_NAME, tr.TRIG_EVENT, tr.TRIG_TIME
+SELECT tr.TRIG_NAME, tr.TRIG_EVENT, tr.TRIG_TIME, tr.TRIG_TYPE,
+       tr.TRIG_COND, tr.LANGUAGE, tr.ENABLE, tr.VALID, tr.COMMENTS, tr.CREATE_TIME
 FROM ALL_TRIGGERS tr
 JOIN ALL_TABLES t ON t.DB_ID = tr.DB_ID AND t.TABLE_ID = tr.OBJ_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
 ORDER BY tr.TRIG_NAME`, []any{schema, table})
 	if err != nil {
@@ -2506,12 +2616,19 @@ ORDER BY tr.TRIG_NAME`, []any{schema, table})
 	var result []triggerInfo
 	for rows.Next() {
 		var item triggerInfo
-		var event, timing any
-		if err := rows.Scan(&item.Name, &event, &timing); err != nil {
+		var event, timing, level, condition, language, enabled, valid, comment, createdAt any
+		if err := rows.Scan(&item.Name, &event, &timing, &level, &condition, &language, &enabled, &valid, &comment, &createdAt); err != nil {
 			return nil, err
 		}
 		item.Event = triggerEventName(event)
 		item.Timing = triggerTimingName(timing)
+		item.Level = triggerLevelName(level)
+		item.Condition = optionalString(xuguString(condition))
+		item.Language = optionalString(xuguString(language))
+		item.Enabled = optionalBool(enabled)
+		item.Valid = optionalBool(valid)
+		item.Comment = optionalString(xuguString(comment))
+		item.CreatedAt = optionalString(xuguString(createdAt))
 		result = append(result, item)
 	}
 	return emptyIfNil(result), rows.Err()
@@ -2707,7 +2824,8 @@ SELECT s.SCHEMA_NAME, q.SEQ_NAME,
        q.CACHE_VAL, q.IS_CYCLE, q.COMMENTS
 FROM ALL_SEQUENCES q
 JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
-WHERE s.SCHEMA_NAME = ` + quoteStringLiteral(schema) + `
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND s.SCHEMA_NAME = ` + quoteStringLiteral(schema) + `
   AND q.SEQ_NAME = ` + quoteStringLiteral(name) + `
   AND q.IS_SYS = FALSE`
 }
@@ -3030,10 +3148,10 @@ func xuguCatalogTableNameQuery(schema, table string, caseInsensitive bool) strin
 	if caseInsensitive {
 		schemaExpr = quoteStringLiteral(strings.ToUpper(schema))
 		tableExpr = quoteStringLiteral(strings.ToUpper(table))
-		return xuguCatalogTableNameSelectSQL + "\nWHERE UPPER(s.SCHEMA_NAME) = " + schemaExpr +
+		return xuguCatalogTableNameSelectSQL + "\nWHERE s.DB_ID = CURRENT_DB_ID\n  AND UPPER(s.SCHEMA_NAME) = " + schemaExpr +
 			"\n  AND UPPER(t.TABLE_NAME) = " + tableExpr
 	}
-	return xuguCatalogTableNameSelectSQL + "\nWHERE s.SCHEMA_NAME = " + schemaExpr +
+	return xuguCatalogTableNameSelectSQL + "\nWHERE s.DB_ID = CURRENT_DB_ID\n  AND s.SCHEMA_NAME = " + schemaExpr +
 		"\n  AND t.TABLE_NAME = " + tableExpr
 }
 
@@ -3558,43 +3676,50 @@ func objectSourceQuery(schema, name, objectType string) (string, []any, error) {
 SELECT TO_CHAR(v.DEFINE)
 FROM ALL_VIEWS v
 JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(v.VIEW_NAME) = UPPER(?)`, []any{schema, name}, nil
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(v.VIEW_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TRIGGER":
 		return `
 SELECT TO_CHAR(t.DEFINE)
 FROM ALL_TRIGGERS t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(t.TRIG_NAME) = UPPER(?)`, []any{schema, name}, nil
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(t.TRIG_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PROCEDURE", "FUNCTION":
 		return `
 SELECT TO_CHAR(p.DEFINE)
 FROM ALL_PROCEDURES p
 JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(p.PROC_NAME) = UPPER(?)`, []any{schema, name}, nil
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(p.PROC_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PACKAGE":
 		return `
 SELECT COALESCE(TO_CHAR(k.SPEC), '')
 FROM ALL_PACKAGES k
 JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PACKAGE BODY", "PACKAGE_BODY":
 		return `
 SELECT COALESCE(TO_CHAR(k.BODY), '')
 FROM ALL_PACKAGES k
 JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TYPE":
 		return `
 SELECT COALESCE(TO_CHAR(u.SPEC), '')
 FROM ALL_TYPES u
 JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(u.TYPE_NAME) = UPPER(?)`, []any{schema, name}, nil
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(u.TYPE_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TYPE BODY", "TYPE_BODY":
 		return `
 SELECT COALESCE(TO_CHAR(u.BODY), '')
 FROM ALL_TYPES u
 JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(u.TYPE_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(u.TYPE_NAME) = UPPER(?)
   AND u.BODY IS NOT NULL`, []any{schema, name}, nil
 	default:
 		return "", nil, fmt.Errorf("object source is not supported for %s", objectType)
@@ -4214,6 +4339,14 @@ func optionalString(value string) *string {
 	return &value
 }
 
+func optionalBool(value any) *bool {
+	if normalizeValue(value) == nil {
+		return nil
+	}
+	result := truthy(value)
+	return &result
+}
+
 func xuguPartitionType(value int) string {
 	switch value {
 	case 1:
@@ -4380,7 +4513,8 @@ func (s *server) tableComment(schema, table string) (string, error) {
 SELECT t.COMMENTS
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+WHERE s.DB_ID = CURRENT_DB_ID
+  AND UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)`, []any{schema, table})
 	if err != nil {
 		return "", err
@@ -4817,6 +4951,17 @@ func triggerTimingName(value any) string {
 	}
 }
 
+func triggerLevelName(value any) string {
+	switch fmt.Sprint(normalizeValue(value)) {
+	case "1":
+		return "FOR EACH ROW"
+	case "2":
+		return "FOR STATEMENT"
+	default:
+		return fmt.Sprint(normalizeValue(value))
+	}
+}
+
 func joinValues(values []any, sep string) string {
 	parts := make([]string, len(values))
 	for i, value := range values {
@@ -4950,7 +5095,7 @@ func stripLeadingSQLComments(sqlText string) string {
 
 func isQuerySQL(sqlText string) bool {
 	sqlText = stripLeadingSQLComments(sqlText)
-	for _, keyword := range []string{"select", "with", "show"} {
+	for _, keyword := range []string{"select", "with", "show", "explain"} {
 		if hasLeadingSQLKeyword(sqlText, keyword) {
 			return true
 		}

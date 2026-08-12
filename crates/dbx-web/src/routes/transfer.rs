@@ -527,6 +527,7 @@ mod tests {
 
     fn sqlite_config(id: &str, path: &str) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: id.to_string(),
             name: "SQLite".to_string(),
             note: String::new(),
@@ -540,6 +541,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,

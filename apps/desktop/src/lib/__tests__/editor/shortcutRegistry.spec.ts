@@ -21,7 +21,7 @@ describe("shortcutRegistry editor actions", () => {
     "exPasteSqlInCondition",
     "toggleFold",
   ];
-  const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection"];
+  const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection", "viewTableDdl"];
 
   it("registers the new-data-tab mouse modifier as a configurable sidebar shortcut", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "openDataInNewTab");
@@ -40,6 +40,33 @@ describe("shortcutRegistry editor actions", () => {
     expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, "Win32")).toBe("Ctrl+\\");
     expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab)).toBe("Mod-\\");
     expect(findShortcutConflict("executeSqlInNewResultTab", DEFAULT_SHORTCUT_SETTINGS.executeSqlInNewResultTab, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("registers a conflict-free shortcut for expanding SELECT stars", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "expandSelectStar");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Mod+Shift+X" });
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.expandSelectStar)).toBe("Mod-Shift-x");
+    expect(findShortcutConflict("expandSelectStar", DEFAULT_SHORTCUT_SETTINGS.expandSelectStar, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("keeps current-view search and editor find contextual on Mod+F", () => {
+    const focusSearch = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusSearch");
+    const find = SHORTCUT_DEFINITIONS.find((item) => item.id === "find");
+
+    expect(focusSearch).toMatchObject({ scope: "global", defaultShortcut: "Mod+F" });
+    expect(find).toMatchObject({ scope: "editor", defaultShortcut: "Mod+F" });
+    expect(findShortcutConflict("focusSearch", DEFAULT_SHORTCUT_SETTINGS.focusSearch, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    expect(findShortcutConflict("find", DEFAULT_SHORTCUT_SETTINGS.find, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("uses Shift+Enter for inserting a complete line below", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "insertLineBelow");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Shift+Enter" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow).toBe("Shift+Enter");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow)).toBe("Shift-Enter");
+    expect(findShortcutConflict("insertLineBelow", DEFAULT_SHORTCUT_SETTINGS.insertLineBelow, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
   it("resolves the close-other-tabs default per platform and heals cross-platform synced defaults", () => {

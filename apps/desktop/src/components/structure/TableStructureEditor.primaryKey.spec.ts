@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   invalidateObjectDdl: vi.fn(),
   loadObjectMetadataFacet: vi.fn(),
   invalidateTableMetadataCache: vi.fn(),
+  toast: vi.fn(),
 }));
 
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
@@ -186,7 +187,7 @@ vi.mock("@/stores/settingsStore", () => ({
   }),
 }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false } }) }));
-vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
+vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
 vi.mock("@/lib/sql/sqlHighlighter", () => ({ createShikiSqlHighlighter: vi.fn(async () => (sql: string) => sql) }));
 vi.mock("@/lib/metadata/objectDdlCache", () => ({
   loadObjectDdl: mocks.loadObjectDdl,
@@ -239,7 +240,7 @@ function draft(isPrimaryKey = false) {
   };
 }
 
-async function mountEditor(databaseType: "dameng" | "oracle", isPrimaryKey = false) {
+async function mountEditor(databaseType: "sqlserver" | "postgres" | "sqlite" | "oracle" | "dameng" | "duckdb" | "informix", isPrimaryKey = false) {
   mocks.connection.db_type = databaseType;
   mocks.connection.name = databaseType;
   mocks.connection.driver_label = databaseType;
@@ -360,6 +361,49 @@ describe("TableStructureEditor primary key editing", () => {
         columns: [expect.objectContaining({ isPrimaryKey: false })],
       }),
     );
+  });
+
+  it("keeps the current SQL preview visible while a newer preview is loading", async () => {
+    const root = await mountEditor("dameng", true);
+    const primaryKey = columnCheckbox(root, "structureEditor.primaryKey");
+    const nullable = columnCheckbox(root, "structureEditor.nullable");
+    const firstSql = "ALTER TABLE users DROP CONSTRAINT users_pkey;";
+
+    mocks.buildTableStructureChangeSql.mockResolvedValueOnce({ statements: [firstSql], warnings: [] });
+    primaryKey.checked = false;
+    primaryKey.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await vi.waitFor(() => expect(root.textContent).toContain(firstSql));
+
+    let resolveLatestPreview!: (value: { statements: string[]; warnings: string[] }) => void;
+    mocks.buildTableStructureChangeSql.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveLatestPreview = resolve;
+        }),
+    );
+    nullable.checked = true;
+    nullable.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await vi.waitFor(() => expect(mocks.buildTableStructureChangeSql).toHaveBeenCalledTimes(2));
+    expect(root.textContent).toContain(firstSql);
+    expect(root.textContent).not.toContain("structureEditor.noChanges");
+
+    resolveLatestPreview({ statements: ["ALTER TABLE users ALTER COLUMN id DROP NOT NULL;"], warnings: [] });
+    await vi.waitFor(() => expect(root.textContent).toContain("ALTER TABLE users ALTER COLUMN id DROP NOT NULL;"));
+  });
+});
+
+describe("TableStructureEditor local column order notice", () => {
+  it.each(["sqlserver", "postgres", "sqlite", "oracle", "dameng", "duckdb", "informix"] as const)("does not show the reorder notice when adding a %s column", async (databaseType) => {
+    const root = await mountEditor(databaseType);
+    const addColumnButton = Array.from(root.querySelectorAll("button")).find((button) => button.textContent?.includes("structureEditor.addColumn"));
+    if (!addColumnButton) throw new Error("Missing add column button");
+
+    addColumnButton.click();
+    await nextTick();
+
+    expect(mocks.toast).not.toHaveBeenCalled();
   });
 });
 

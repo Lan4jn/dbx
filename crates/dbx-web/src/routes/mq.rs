@@ -751,6 +751,18 @@ pub async fn list_subscriptions(
     Ok(Json(result))
 }
 
+pub async fn enrich_subscriptions(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<TopicReq>,
+) -> Result<Json<Vec<dbx_core::mq::SubscriptionInfo>>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mq::service::mq_enrich_subscriptions_core(&state.app, &req.connection_id, req.topic)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn create_subscription(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -850,7 +862,7 @@ pub async fn peek_messages(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
     Json(req): Json<PeekMessagesReq>,
-) -> Result<Json<Vec<dbx_core::mq::PeekedMessage>>, AppError> {
+) -> Result<Json<dbx_core::mq::PeekMessagesResult>, AppError> {
     super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
     let result = dbx_core::mq::service::mq_peek_messages_core(
         &state.app,

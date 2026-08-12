@@ -33,6 +33,7 @@ pub fn is_single_connection_pool(db_type: &DatabaseType) -> bool {
             | DatabaseType::OceanbaseOracle
             | DatabaseType::Access
             | DatabaseType::Jdbc
+            | DatabaseType::VictoriaMetrics
     )
 }
 
@@ -56,6 +57,8 @@ pub fn skips_tcp_probe(db_type: &DatabaseType) -> bool {
             | DatabaseType::CloudflareD1
             | DatabaseType::Jdbc
             | DatabaseType::MessageQueue
+            | DatabaseType::Mqtt
+            | DatabaseType::VictoriaMetrics
     ) || is_agent_type(db_type)
 }
 

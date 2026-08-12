@@ -1,4 +1,5 @@
 import type { BackendError } from "@/lib/backend/errorUtils";
+import type { MultiDbResultRunExecution } from "@/types/sqlExecution";
 
 export type DatabaseType =
   | "mysql"
@@ -66,9 +67,12 @@ export type DatabaseType =
   | "zookeeper"
   | "iris"
   | "influxdb"
+  | "victoriametrics"
   | "jdbc"
   | "mq"
-  | "nacos";
+  | "mqtt"
+  | "nacos"
+  | "consul";
 
 export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): boolean {
   return dbType === "elasticsearch" || dbType === "easysearch";
@@ -101,6 +105,7 @@ export interface CompletionAssistantRequest {
   search_in_definitions?: boolean;
   parent_schema?: string | null;
   parent_name?: string | null;
+  parent_type?: "package" | "type" | null;
   match_mode?: CompletionAssistantMatchMode | null;
 }
 
@@ -136,15 +141,24 @@ export interface ConnectionConfig {
   username: string;
   password: string;
   database?: string;
+  default_schema?: string;
   visible_databases?: string[];
   visible_schemas?: Record<string, string[]>;
   show_system_schemas?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
   init_script?: string;
   color?: string;
+  /**
+   * Where this connection's documentation notes are stored. Absent means the
+   * per-connection default inside the app data directory; an explicit path
+   * lets the notes file live in a repository and be reviewed in pull requests.
+   */
+  docs_notes_path?: string;
   transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
+  connect_timeout_inherit?: boolean;
   query_timeout_secs?: number;
+  query_timeout_inherit?: boolean;
   idle_timeout_secs?: number;
   keepalive_interval_secs?: number;
   ssl?: boolean;
@@ -239,6 +253,8 @@ export interface SshTunnelConfig {
    * for connections that already have `use_ssh_agent` configured.
    */
   auth_method?: "password" | "key" | "key+password" | "agent" | "none";
+  /** Allow `nc` through an SSH exec channel when direct-tcpip is prohibited. */
+  allow_exec_channel_proxy?: boolean;
   /**
    * When set, this layer references a shared tunnel profile; the profile's
    * configuration replaces this layer's fields at connect time (only `id`
@@ -398,6 +414,12 @@ export interface JdbcPluginStatus {
 
 export interface DatabaseInfo {
   name: string;
+  size_bytes?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  comment?: string | null;
+  default_charset?: string | null;
+  default_collation?: string | null;
 }
 
 export interface DatabaseStorageInfo {
@@ -446,11 +468,18 @@ export interface ObjectInfo {
   schema?: string | null;
   valid?: boolean | null;
   signature?: string | null;
+  custom_type_kind?: CustomTypeKind | null;
+  has_members?: boolean | null;
   comment?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   parent_schema?: string | null;
   parent_name?: string | null;
+  trigger?: TriggerInfo | null;
+  xugu_type_members_expandable?: boolean | null;
+  /** Xugu package metadata merged from the PACKAGE_BODY catalog row. */
+  xugu_package_body_available?: boolean | null;
+  xugu_package_body_valid?: boolean | null;
 }
 
 export interface ObjectStatistics {
@@ -468,6 +497,61 @@ export interface ObjectSource {
   schema?: string | null;
   source: string;
   editable?: boolean;
+}
+
+export type CustomTypeKind = "base" | "composite" | "domain" | "enum" | "range" | "multirange";
+
+export interface CustomTypeMember {
+  name: string;
+  dataType: string;
+  ordinal: number;
+  nullable?: boolean | null;
+  default?: string | null;
+  comment?: string | null;
+  enumValue?: string | null;
+}
+
+export interface CustomTypeDomainConstraint {
+  name: string;
+  definition: string;
+}
+
+export interface CustomTypeProperties {
+  baseType?: string | null;
+  notNull?: boolean | null;
+  default?: string | null;
+  collation?: string | null;
+  domainConstraints: CustomTypeDomainConstraint[];
+  rangeSubtype?: string | null;
+  rangeMultirangeName?: string | null;
+  rangeCanonicalFunction?: string | null;
+  rangeSubtypeDiffFunction?: string | null;
+  rangeSubtypeOpclass?: string | null;
+  inputFunction?: string | null;
+  outputFunction?: string | null;
+  receiveFunction?: string | null;
+  sendFunction?: string | null;
+  analyzeFunction?: string | null;
+  internallength?: number | null;
+  passedByValue?: boolean | null;
+  alignment?: string | null;
+  storage?: string | null;
+}
+
+export interface CustomTypeDdl {
+  sql: string;
+  complete: boolean;
+  warnings?: string[];
+}
+
+export interface CustomTypeDetails {
+  name: string;
+  schema: string;
+  kind: CustomTypeKind;
+  comment?: string | null;
+  members: CustomTypeMember[];
+  properties: CustomTypeProperties;
+  ddl?: CustomTypeDdl | null;
 }
 
 export interface ColumnInfo {
@@ -519,6 +603,13 @@ export interface TriggerInfo {
   name: string;
   event: string;
   timing: string;
+  level?: string | null;
+  condition?: string | null;
+  language?: string | null;
+  enabled?: boolean | null;
+  valid?: boolean | null;
+  comment?: string | null;
+  created_at?: string | null;
   statement?: string | null;
 }
 
@@ -596,6 +687,15 @@ export interface OwnerInfo {
   owner: string;
 }
 
+/** A database server message carried on a query result (e.g. PostgreSQL RAISE NOTICE, MySQL warnings). */
+export interface QueryMessage {
+  severity: string;
+  message: string;
+  code?: string;
+  detail?: string;
+  hint?: string;
+}
+
 export interface QueryResult {
   columns: string[];
   /** One SRID per geometry/geography column (first non-null observed). */
@@ -610,6 +710,8 @@ export interface QueryResult {
   appended_from_row_count?: number;
   /** Set for synthesized query execution failures. */
   execution_error?: true;
+  /** Set only for SQL Server informational messages emitted by the backend. */
+  server_message?: true;
   /** Structured backend error; authoritative when execution_error is true. */
   error?: BackendError;
   /** Zero-based index of the submitted statement that produced this result. */
@@ -655,6 +757,8 @@ export interface QueryResult {
   /** Absolute offsets in the editor document at execution time. */
   sourceFrom?: number;
   sourceTo?: number;
+  /** Database server messages (notices, warnings) emitted while producing this result. Omitted when empty. */
+  messages?: QueryMessage[];
 }
 
 export type BatchStatementExecutionStatus = "pending" | "running" | "success" | "error" | "skipped" | "cancelled";
@@ -717,6 +821,7 @@ export interface QueryResultRun {
   resultTotalRowCount?: number;
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
+  resultClientSessionId?: string;
   resultAccessedAt?: number;
   resultEstimatedBytes?: number;
   resultCacheKey?: string;
@@ -727,6 +832,7 @@ export interface QueryResultRun {
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
+  multiDbExecution?: MultiDbResultRunExecution;
 }
 
 export interface ParticipantInfo {
@@ -800,6 +906,7 @@ export type TreeNodeType =
   | "function"
   | "type"
   | "type-body"
+  | "type-member"
   | "sequence"
   | "synonym"
   | "package"
@@ -832,6 +939,10 @@ export type TreeNodeType =
   | "table-search-control"
   | "load-more"
   | "column"
+  | "type-attribute"
+  | "type-method"
+  | "type-attributes"
+  | "type-methods"
   | "index"
   | "fkey"
   | "trigger"
@@ -845,6 +956,8 @@ export type TreeNodeType =
   | "etcd-dashboard"
   | "etcd-access-control"
   | "zookeeper-root"
+  | "consul-root"
+  | "consul-overview"
   | "mongo-db"
   | "mongo-gridfs"
   | "mongo-buckets"
@@ -852,7 +965,8 @@ export type TreeNodeType =
   | "mongo-collection"
   | "vector-database"
   | "vector-collection"
-  | "elasticsearch-index";
+  | "elasticsearch-index"
+  | "mqtt-topic";
 
 export interface ConnectionGroup {
   id: string;
@@ -890,6 +1004,18 @@ export interface TreeNode {
   tableName?: string;
   objectName?: string;
   signature?: string;
+  customTypeKind?: CustomTypeKind;
+  hasMembers?: boolean;
+  /** Owning programmable object for a nested metadata member. */
+  parentName?: string;
+  parentSchema?: string;
+  parentType?: TreeNodeType;
+  /** Set only for XuguDB object types whose members can be loaded lazily. */
+  xuguTypeMembersExpandable?: boolean;
+  /** Set on a Xugu package specification when a package body exists. */
+  xuguPackageBodyAvailable?: boolean;
+  /** Validity reported for the Xugu package body, independent of the spec. */
+  xuguPackageBodyValid?: boolean | null;
   tableType?: string;
   comment?: string | null;
   valid?: boolean | null;
@@ -903,12 +1029,18 @@ export interface TreeNode {
   tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;
     offset: number;
     pageSize: number;
   };
+}
+
+export interface CustomTypeTreeMemberMeta {
+  kind: "field" | "enum-value";
+  displayValue?: string;
+  ordinal?: number;
 }
 
 export interface TableNameFilter {
@@ -951,6 +1083,12 @@ export interface ObjectBrowserViewport {
   viewMode: ObjectBrowserViewMode;
 }
 
+export interface ExternalSqlFileVersion {
+  sizeBytes: number;
+  modifiedNs: string;
+  contentHash: string;
+}
+
 export interface QueryTab {
   id: string;
   title: string;
@@ -964,6 +1102,9 @@ export interface QueryTab {
   sql: string;
   savedSqlId?: string;
   externalSqlPath?: string;
+  externalSqlFileVersion?: ExternalSqlFileVersion;
+  externalSqlIgnoredFileVersion?: ExternalSqlFileVersion;
+  externalSqlFileMissing?: boolean;
   originalSql?: string;
   lastExecutedSql?: string;
   resultBaseSql?: string;
@@ -985,6 +1126,7 @@ export interface QueryTab {
   resultTotalRowCount?: number;
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
+  resultClientSessionId?: string;
   resultAccessedAt?: number;
   resultEstimatedBytes?: number;
   resultCacheKey?: string;
@@ -1038,9 +1180,13 @@ export interface QueryTab {
     | "etcd-dashboard"
     | "etcd-access-control"
     | "zookeeper"
+    | "consul"
+    | "consul-overview"
     | "mq"
+    | "mqtt"
     | "nacos"
     | "nacos-dashboard"
+    | "databases"
     | "objects"
     | "structure"
     | "users"
@@ -1052,6 +1198,7 @@ export interface QueryTab {
   hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
   mqInitialTab?: "topics";
+  mqttInitialTopic?: string;
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   nacosTargetDataId?: string;
@@ -1085,6 +1232,9 @@ export interface QueryTab {
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
+  pendingDataChangeCount?: number;
+  /** Ephemeral editor draft that has not yet been applied to the data grid. */
+  hasPendingDataEditorDraft?: boolean;
   /** 冷缓存打开表数据时元数据仍在途：行标识未知，编辑/保存必须等待其落地 */
   tableMetaPending?: boolean;
   /** 取消请求单调计数：isCancelling 是瞬态的（取消失败/查询先完成会被清），

@@ -5,7 +5,9 @@ import {
   connectionObjectTreeNodeSchema,
   connectionObjectTreeQuerySchema,
   connectionQueryExecutionSchema,
+  connectionShouldDiscoverJdbcSchemas,
   connectionShouldLoadIdentifierQuote,
+  connectionUsesConnectionRootSchemaMode,
   connectionUsesDatabaseObjectTreeMode,
   effectiveDatabaseTypeForConnection,
   gaussdbConnectionMode,
@@ -63,6 +65,22 @@ describe("jdbc dialect inference", () => {
     ).toBe("sqlserver");
   });
 
+  it.each([
+    ["jdbc:oracle:thin:@//localhost:1521/XE", "oracle"],
+    ["jdbc:dm://localhost:5236/DAMENG", "dameng"],
+  ] as const)("uses connection-root schemas for %s", (connectionString, dialect) => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: connectionString,
+    };
+
+    expect(inferJdbcDialect(connection)).toBe(dialect);
+    expect(connectionUsesConnectionRootSchemaMode(connection)).toBe(true);
+    expect(connectionUsesDatabaseObjectTreeMode(connection)).toBe(false);
+    expect(connectionObjectTreeQuerySchema(connection, "DBX_TEST", "DBX_TEST")).toBe("DBX_TEST");
+    expect(connectionObjectTreeNodeSchema(connection, "DBX_TEST", "DBX_TEST")).toBe("DBX_TEST");
+  });
+
   it("detects GaussDB-compatible JDBC connections as schema-aware", () => {
     const gaussdbConnection = {
       db_type: "jdbc" as const,
@@ -87,6 +105,8 @@ describe("jdbc dialect inference", () => {
     expect(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_class: "org.postgresql.Driver" })).toBe(true);
     expect(connectionShouldLoadIdentifierQuote({ db_type: "kingbase" })).toBe(true);
     expect(connectionShouldLoadIdentifierQuote({ db_type: "gaussdb" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "gbase", driver_profile: "gbase8s" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "gbase", driver_profile: "gbase8a" })).toBe(false);
     expect(
       connectionShouldLoadIdentifierQuote({
         db_type: "jdbc",
@@ -94,6 +114,11 @@ describe("jdbc dialect inference", () => {
         external_config: { gaussdbIdentifierQuoteStyle: "backtick" },
       }),
     ).toBe(false);
+  });
+
+  it("falls back to a flat table tree when GBase 8s reports no schemas", () => {
+    expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8s" })).toBe(true);
+    expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8a" })).toBe(false);
   });
 
   it("recognizes GaussDB reached through PostgreSQL-compatible JDBC drivers", () => {

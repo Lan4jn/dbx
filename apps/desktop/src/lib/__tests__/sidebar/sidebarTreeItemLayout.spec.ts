@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { alignedCommentLeadingWidth, alignedSidebarCommentLabelWidths, canTreeNodeShowExpander, sidebarTreeNaturalContentWidth, trailingCommentAvailableWidth, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { alignedCommentLeadingWidth, alignedSidebarCommentLabelWidths, canTreeNodeShowExpander, sidebarTreeNaturalContentWidth, sidebarTreeNodeComment, trailingCommentAvailableWidth, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import type { TreeNode } from "@/types/database";
 
 describe("sidebar tree item layout", () => {
   it("keeps a table row constrained when it displays a comment", () => {
@@ -7,8 +8,16 @@ describe("sidebar tree item layout", () => {
     expect(usesFullWidthTreeLabel("table", true, true)).toBe(false);
   });
 
-  it("lets a table name consume the available row width before truncating", () => {
-    expect(treeLabelWidthClass({ fullWidth: false, hasTrailingComment: true })).toBe("min-w-0 flex-1 truncate");
+  it("shows connection notes only after the user opts in", () => {
+    const connection: TreeNode = { id: "connection-1", label: "MySQL", type: "connection", comment: "Production" };
+    expect(sidebarTreeNodeComment(connection, false)).toBeNull();
+    expect(sidebarTreeNodeComment(connection, true)).toBe("Production");
+  });
+
+  it("lets a table name consume the available row width before truncating when aligned", () => {
+    expect(treeLabelWidthClass({ fullWidth: false, hasTrailingComment: true, alignLeading: true })).toBe("min-w-0 flex-1 truncate");
+    // inline/right 模式 label 不撑满，让 comment 紧跟
+    expect(treeLabelWidthClass({ fullWidth: false, hasTrailingComment: true, alignLeading: false })).toBe("min-w-0 shrink truncate");
   });
 
   it("keeps a pinned action next to the name while preserving the aligned comment column", () => {
@@ -22,6 +31,27 @@ describe("sidebar tree item layout", () => {
     expect(canTreeNodeShowExpander({ type: "etcd-root", childCount: 0 })).toBe(false);
     expect(canTreeNodeShowExpander({ type: "etcd-dashboard", childCount: 0 })).toBe(false);
     expect(canTreeNodeShowExpander({ type: "etcd-access-control", childCount: 0 })).toBe(false);
+    expect(canTreeNodeShowExpander({ type: "consul-overview", childCount: 0 })).toBe(false);
+  });
+
+  it("shows an expander only for package nodes explicitly marked as containers", () => {
+    expect(canTreeNodeShowExpander({ type: "package", childCount: 0 })).toBe(false);
+    expect(canTreeNodeShowExpander({ type: "package", childCount: 0, explicitContainer: true })).toBe(true);
+    expect(canTreeNodeShowExpander({ type: "package-body", childCount: 0, explicitContainer: true })).toBe(false);
+    expect(canTreeNodeShowExpander({ type: "procedure", childCount: 0, explicitContainer: true })).toBe(false);
+  });
+
+  it("allows only an explicitly marked Xugu type specification to expand", () => {
+    expect(canTreeNodeShowExpander({ type: "type", childCount: 0, explicitContainer: true })).toBe(true);
+    expect(canTreeNodeShowExpander({ type: "type", childCount: 0 })).toBe(false);
+    expect(canTreeNodeShowExpander({ type: "type-body", childCount: 0, explicitContainer: true })).toBe(false);
+  });
+
+  it("shows an expander only while a custom type may still load children", () => {
+    expect(canTreeNodeShowExpander({ type: "type", childCount: undefined })).toBe(true);
+    expect(canTreeNodeShowExpander({ type: "type", childCount: 2 })).toBe(true);
+    expect(canTreeNodeShowExpander({ type: "type", childCount: 0 })).toBe(false);
+    expect(canTreeNodeShowExpander({ type: "type-member", childCount: undefined })).toBe(false);
   });
 
   it("aligns comments to the longest sibling name without crossing parent groups", () => {

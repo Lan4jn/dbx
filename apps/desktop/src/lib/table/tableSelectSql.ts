@@ -6,6 +6,7 @@ import { isExplicitlyQuotedSqlIdentifier, quoteGaussDbJdbcIdentifier } from "@/l
 
 export interface BuildTableSelectSqlOptions {
   databaseType?: DatabaseType;
+  driverProfile?: string;
   identifierQuote?: string;
   schema?: string;
   tableName: string;
@@ -39,7 +40,7 @@ export function quoteTableIdentifier(databaseType: DatabaseType | undefined, nam
 
 export function quoteTableDataIdentifier(databaseType: DatabaseType | undefined, name: string, identifierQuote?: string): string {
   if ((databaseType === "gaussdb" || databaseType === "opengauss" || databaseType === "postgres") && identifierQuote != null) return quoteGaussDbJdbcIdentifier(name, identifierQuote);
-  if (databaseType === "kingbase" && identifierQuote != null) {
+  if ((databaseType === "kingbase" || databaseType === "informix") && identifierQuote != null) {
     if (!identifierQuote) return name;
     return `${identifierQuote}${name.replaceAll(identifierQuote, identifierQuote + identifierQuote)}${identifierQuote}`;
   }
@@ -50,8 +51,11 @@ function quoteCypherIdentifier(name: string): string {
   return `\`${name.replace(/`/g, "``")}\``;
 }
 
-export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "databaseType" | "identifierQuote" | "schema" | "tableName" | "catalog" | "database">): string {
-  const { databaseType, identifierQuote, schema, tableName, catalog, database } = options;
+export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "databaseType" | "driverProfile" | "identifierQuote" | "schema" | "tableName" | "catalog" | "database">): string {
+  const { databaseType, driverProfile, identifierQuote, schema, tableName, catalog, database } = options;
+  if (databaseType === "informix" && driverProfile?.trim().toLowerCase() === "gbase8s") {
+    return quoteTableDataIdentifier(databaseType, tableName, identifierQuote);
+  }
   // Doris / StarRocks multi-catalog: address external-catalog tables with the
   // 3-part `catalog.database.table` form, which the engines accept directly.
   if (catalog && catalog !== "internal" && (databaseType === "doris" || databaseType === "starrocks")) {
@@ -81,6 +85,11 @@ export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "da
     }
     return quotedTable;
   }
+  if (databaseType === "informix" && identifierQuote != null) {
+    const quotedTable = quoteTableDataIdentifier(databaseType, tableName, identifierQuote);
+    const trimmedSchema = schema?.trim();
+    return trimmedSchema ? `${quoteTableDataIdentifier(databaseType, trimmedSchema, identifierQuote)}.${quotedTable}` : quotedTable;
+  }
   if ((isSchemaAware(databaseType) || databaseType === "sqlite") && !usesDatabaseObjectTreeMode(databaseType) && schema) {
     if (databaseType === "sqlserver") {
       const linked = parseSqlServerLinkedSchema(schema);
@@ -91,11 +100,21 @@ export function qualifiedTableName(options: Pick<BuildTableSelectSqlOptions, "da
   return quoteTableIdentifier(databaseType, tableName);
 }
 
+export function metricSelector(metricName: string): string {
+  const escaped = metricName.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("\n", "\\n");
+  return `{__name__="${escaped}"}`;
+}
+
+export function metricRangeQuery(metricName: string, lookback = "1h"): string {
+  return `${metricSelector(metricName)}[${lookback}]`;
+}
+
 export function normalizeWhereInput(whereInput?: string): string {
   const withoutSemicolon = whereInput?.trim().replace(/;+$/, "").trim() ?? "";
   return withoutSemicolon.replace(/^where\b/i, "").trim();
 }
 
 export async function buildTableSelectSql(options: BuildTableSelectSqlOptions): Promise<string> {
+  if (options.databaseType === "victoriametrics") return metricRangeQuery(options.tableName);
   return api.buildTableSelectSql(options);
 }
