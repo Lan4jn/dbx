@@ -9,8 +9,8 @@ import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { gaussdbMTypeDisplayName } from "@/lib/table/postgresDataTypeHelp";
 import { joinExportedDdls } from "@/lib/export/ddlExport";
-import { formatSqlInsert } from "@/lib/export/exportFormats";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { sidebarStructureExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
 import { fetchTableDataForExport } from "@/lib/table/tableDataExport";
@@ -28,7 +28,7 @@ interface SidebarTreeExportRuntimeOptions {
 export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOptions) {
   const { t } = useI18n();
   const { toast } = useToast();
-  const { addTask: addExportTask } = useExportTracker();
+  const { addTask: addExportTask, updateTableExportTask } = useExportTracker();
   const { activeNode, connectionStore, settingsStore } = options;
 
   async function saveFileContent(content: string, defaultFileName: string, filterName: string, filterExt: string) {
@@ -108,8 +108,12 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
     return includeTable ? [t("contextMenu.structureDocTable"), ...headers] : headers;
   }
 
-  function columnDocCells(target: TreeNode, column: ColumnInfo, includeTable: boolean): unknown[] {
-    const cells = [column.name, column.data_type, column.is_primary_key ? t("contextMenu.structureDocYes") : t("contextMenu.structureDocNo"), column.is_nullable ? t("contextMenu.structureDocYes") : t("contextMenu.structureDocNo"), column.column_default, column.comment];
+  function columnDocCells(target: TreeNode & { connectionId: string }, column: ColumnInfo, includeTable: boolean): unknown[] {
+    const config = connectionStore.getConfig(target.connectionId);
+    const isGaussdbM = effectiveDatabaseTypeForConnection(config) === "gaussdb" && config?.driver_profile?.toLowerCase() === "gaussdb-m";
+    const sourceDataType = column.data_type;
+    const dataType = isGaussdbM && sourceDataType ? gaussdbMTypeDisplayName(sourceDataType) : sourceDataType;
+    const cells = [column.name, dataType, column.is_primary_key ? t("contextMenu.structureDocYes") : t("contextMenu.structureDocNo"), column.is_nullable ? t("contextMenu.structureDocYes") : t("contextMenu.structureDocNo"), column.column_default, column.comment];
     return includeTable ? [structureTargetName(target), ...cells] : cells;
   }
 
@@ -195,12 +199,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
     }
   }
 
-  function columnTypesForResultColumns(columns: string[], tableColumns: ColumnInfo[]): Array<string | undefined> {
-    const typesByName = new Map(tableColumns.map((column) => [column.name.toLocaleLowerCase(), column.data_type]));
-    return columns.map((column) => typesByName.get(column.toLocaleLowerCase()));
-  }
-
-  async function exportDataLegacy(format: "json" | "sql") {
+  async function exportDataLegacy(format: "json") {
     const node = activeNode.value;
     if (!node.connectionId || !node.database) return;
     const connectionId = node.connectionId;
@@ -210,8 +209,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
 
     try {
       await connectionStore.ensureConnected(connectionId);
-      const tableColumns = format === "sql" ? await api.getColumns(connectionId, database, node.schema || database, node.label) : undefined;
-      const queryColumns = config.db_type === "neo4j" ? (tableColumns ?? (await api.getColumns(connectionId, database, node.schema || database, node.label))).map((column) => column.name) : undefined;
+      const queryColumns = config.db_type === "neo4j" ? (await api.getColumns(connectionId, database, node.schema || database, node.label)).map((column) => column.name) : undefined;
       const effectiveDbType = effectiveDatabaseTypeForConnection(config);
       const result = await fetchTableDataForExport({
         databaseType: effectiveDbType,
@@ -233,25 +231,13 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
         }
         await api.exportQueryResultJson(outputPath, result.columns, result.rows);
         toast(t("grid.exported"));
-        return;
       }
-
-      const content = await formatSqlInsert({
-        databaseType: effectiveDbType,
-        schema: node.schema,
-        tableName: node.label,
-        columns: result.columns,
-        columnTypes: tableColumns ? columnTypesForResultColumns(result.columns, tableColumns) : undefined,
-        rows: result.rows,
-      });
-      await saveFileContent(content, `${node.label}.sql`, "SQL", "sql");
-      toast(t("grid.exported"));
     } catch (error: any) {
       toast(t("grid.exportFailed", { message: translateBackendError(t, error) }), 5000);
     }
   }
 
-  async function exportTableData(format: "csv" | "xlsx") {
+  async function exportTableData(format: "csv" | "xlsx" | "sql") {
     const node = activeNode.value;
     if (!node.connectionId || !node.database) return;
     const connectionId = node.connectionId;
@@ -261,22 +247,42 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
 
     let task: ExportTask | null = null;
     try {
-      await connectionStore.ensureConnected(connectionId);
-
       // Choose the destination before registering a background task so cancellation creates no orphan tracker entry.
       let outputPath = `${node.label}.${format}`;
       if (isTauriRuntime()) {
         const { save } = await import("@tauri-apps/plugin-dialog");
+        const filterName = format === "csv" ? "CSV" : format === "xlsx" ? "Excel" : "SQL";
         const path = await save({
           defaultPath: outputPath,
-          filters: [{ name: format === "csv" ? "CSV" : "Excel", extensions: [format] }],
+          filters: [{ name: filterName, extensions: [format] }],
         });
         if (!path) return;
         outputPath = path as string;
       }
 
+      await connectionStore.ensureConnected(connectionId);
       task = addExportTask(node.label, format, outputPath);
       const currentTask = task;
+      const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+      if (effectiveDbType === "victoriametrics") {
+        const result = await fetchTableDataForExport({
+          databaseType: effectiveDbType,
+          schema: node.schema,
+          tableName: node.label,
+          tableType: node.tableType,
+          executePage: (sql) => api.executeQuery(connectionId, database, sql),
+        });
+        if (format === "csv") {
+          await api.exportQueryResultCsv(outputPath, result.columns, result.rows);
+        } else {
+          await api.exportQueryResultXlsx(outputPath, node.label, result.columns, result.column_types ?? result.columns.map(() => ""), undefined, result.rows);
+        }
+        currentTask.status = "Done";
+        currentTask.rowsExported = result.rows.length;
+        currentTask.totalRows = result.rows.length;
+        toast(t("grid.exported"));
+        return;
+      }
       const queryColumns = config.db_type === "neo4j" ? (await api.getColumns(connectionId, database, node.schema || database, node.label)).map((column) => column.name) : undefined;
       const rowLimit = settingsStore.editorSettings.exportRowLimitEnabled ? settingsStore.editorSettings.exportRowLimit : null;
       const request: api.TableExportRequest = {
@@ -290,14 +296,12 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
         format,
         columns: queryColumns,
         batchSize: settingsStore.editorSettings.exportBatchSize,
+        skipCount: format === "sql",
         rowLimit,
       };
 
       await api.startTableExport(request, (progress) => {
-        currentTask.rowsExported = progress.rowsExported;
-        currentTask.totalRows = progress.totalRows;
-        currentTask.status = progress.status;
-        currentTask.errorMessage = progress.errorMessage || null;
+        updateTableExportTask(currentTask.exportId, progress);
         if (progress.status === "Done") toast(t("grid.exported"));
         else if (progress.status === "Error") toast(t("grid.exportFailed", { message: translateBackendError(t, progress.errorMessage || "") }), 5000);
       });
@@ -311,8 +315,8 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
   }
 
   async function exportData(format: "csv" | "json" | "sql") {
-    if (format === "csv") await exportTableData("csv");
-    else await exportDataLegacy(format);
+    if (format === "json") await exportDataLegacy(format);
+    else await exportTableData(format);
   }
 
   async function exportDataXlsx() {

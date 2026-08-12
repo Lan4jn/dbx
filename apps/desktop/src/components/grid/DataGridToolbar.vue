@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
-import { Check, ChevronDown, Copy, Eye, Loader2, Plus, RefreshCcw, RotateCcw, Rows3, Save, TableProperties, Timer, Trash2, Upload } from "@lucide/vue";
+import { Check, ChevronDown, Copy, Download, Eye, Loader2, Plus, RefreshCcw, RotateCcw, Rows3, Save, TableProperties, Timer, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -211,7 +211,7 @@ function actionLabelClass() {
         <TooltipTrigger as-child>
           <DropdownMenuTrigger as-child>
             <Button variant="ghost" size="sm" :class="actionButtonClass" :disabled="exportData?.disabled || !exportData?.items.length">
-              <Upload class="data-grid-topbar-action-icon h-3 w-3" />
+              <Download class="data-grid-topbar-action-icon h-3 w-3" />
               <span class="data-grid-topbar-action-label" :class="actionLabelClass()">{{ exportData?.label }}</span>
             </Button>
           </DropdownMenuTrigger>

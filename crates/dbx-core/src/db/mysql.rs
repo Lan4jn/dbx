@@ -21,7 +21,8 @@ use crate::sql::{starts_with_executable_sql_keyword, starts_with_executable_sql_
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
-    ForeignKeyInfo, IndexInfo, ObjectInfo, ObjectStatistics, QueryResult, SpatialColumnBuilder, TableInfo, TriggerInfo,
+    ForeignKeyInfo, IndexInfo, ObjectInfo, ObjectStatistics, QueryMessage, QueryResult, SpatialColumnBuilder,
+    TableInfo, TriggerInfo,
 };
 
 use super::file_validator::validate_file_path;
@@ -99,6 +100,23 @@ where
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }
 
+fn first_column_value<T>(row: &mysql_async::Row) -> Option<T>
+where
+    T: mysql_async::prelude::FromValue,
+{
+    row_get(row, 0)
+}
+
+async fn query_first_column<T>(conn: &mut mysql_async::Conn, sql: &str) -> Result<Option<T>, mysql_async::Error>
+where
+    T: mysql_async::prelude::FromValue,
+{
+    // Some MySQL-compatible servers return extra columns for scalar queries.
+    // Convert only column zero so mysql_async does not panic on the row width.
+    let row = conn.query_first::<mysql_async::Row, _>(sql).await?;
+    Ok(row.as_ref().and_then(first_column_value))
+}
+
 /// 字节转 String：合法 UTF-8（绝大多数场景）时直接复用入参缓冲零拷贝，
 /// 仅在非法序列时退化为 lossy 替换。from_utf8_lossy(&b).to_string() 即使
 /// 对合法输入也会多一次分配+拷贝。
@@ -147,9 +165,8 @@ fn nonblank(value: String) -> Option<String> {
 async fn query_first_nonblank_string(conn: &mut mysql_async::Conn, sql: &str) -> Option<String> {
     // MySQL reports nullable metadata such as TABLE_COLLATION as NULL for views.
     // Reading it as String makes mysql_async panic during row conversion.
-    match conn.query_first::<Option<String>, _>(sql).await {
-        Ok(Some(value)) => value.and_then(nonblank),
-        Ok(None) => None,
+    match query_first_column::<String>(conn, sql).await {
+        Ok(value) => value.and_then(nonblank),
         Err(error) => {
             log::debug!("Failed to read optional MySQL database information with `{sql}`: {error}");
             None
@@ -266,21 +283,6 @@ fn is_mysql_binary_string_column(column: &mysql_async::Column) -> bool {
         )
 }
 
-fn mysql_printable_binary_preview(bytes: &[u8]) -> Option<String> {
-    let trimmed = bytes.strip_suffix(&[0]).map_or(bytes, |mut value| {
-        while let Some(rest) = value.strip_suffix(&[0]) {
-            value = rest;
-        }
-        value
-    });
-    if trimmed.is_empty() {
-        return Some(String::new());
-    }
-
-    let text = std::str::from_utf8(trimmed).ok()?;
-    text.chars().all(|ch| !ch.is_control() || matches!(ch, '\t' | '\n' | '\r')).then(|| text.to_string())
-}
-
 fn mysql_blob_preview(bytes: &[u8], label: &str) -> serde_json::Value {
     if label == "BLOB" {
         return super::binary_value_to_json(bytes);
@@ -309,9 +311,7 @@ fn mysql_bytes_to_json(bytes: Vec<u8>, column: &mysql_async::Column) -> serde_js
         return mysql_blob_preview(&bytes, "BLOB");
     }
     if is_mysql_binary_string_column(column) {
-        return mysql_printable_binary_preview(&bytes)
-            .map(serde_json::Value::String)
-            .unwrap_or_else(|| super::binary_value_to_json(&bytes));
+        return super::binary_value_to_json(&bytes);
     }
     serde_json::Value::String(bytes_to_string_lossy(bytes))
 }
@@ -505,18 +505,59 @@ pub(crate) fn mysql_value_to_json(row: &mysql_async::Row, idx: usize) -> serde_j
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn decode_mysql_geometry(bytes: &[u8]) -> Option<super::wkb::DecodedGeometry> {
+fn bytes_to_upper_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    output
+}
+
+// Native MySQL geometry values normally begin with a four-byte little-endian
+// SRID prefix. A bare WKB value can have 0 or 1 at byte four as well, so only
+// treat that prefix as present when the remaining bytes parse as WKB.
+fn mysql_geometry_wkb_parts(bytes: &[u8]) -> Option<(&[u8], u32)> {
     if bytes.len() >= 5 && matches!(bytes[4], 0 | 1) {
         let prefix: [u8; 4] = bytes[..4].try_into().ok()?;
-        if let Some(mut geometry) = super::wkb::decode_wkb_geometry(&bytes[4..]) {
-            if geometry.srid.is_none() {
-                let srid = u32::from_le_bytes(prefix);
-                geometry.srid = (srid != 0).then_some(srid);
-            }
-            return Some(geometry);
+        if super::wkb::decode_wkb_geometry(&bytes[4..]).is_some() {
+            return Some((&bytes[4..], u32::from_le_bytes(prefix)));
         }
     }
-    super::wkb::decode_wkb_geometry(bytes)
+    super::wkb::decode_wkb_geometry(bytes).map(|_| (bytes, 0))
+}
+
+fn mysql_geometry_to_export_marker(bytes: &[u8]) -> Option<String> {
+    let (wkb, srid) = mysql_geometry_wkb_parts(bytes)?;
+    Some(format!("DBX_WKB:{srid}:{}", bytes_to_upper_hex(wkb)))
+}
+
+fn mysql_value_to_json_for_export(
+    row: &mysql_async::Row,
+    idx: usize,
+    spatial_as_wkb: bool,
+) -> Result<serde_json::Value, String> {
+    if !spatial_as_wkb
+        || !row.columns_ref().get(idx).is_some_and(|column| column.column_type() == ColumnType::MYSQL_TYPE_GEOMETRY)
+    {
+        return Ok(mysql_value_to_json(row, idx));
+    }
+    let Some(bytes) = row_get::<Vec<u8>, _>(row, idx) else {
+        return Ok(mysql_value_to_json(row, idx));
+    };
+    mysql_geometry_to_export_marker(&bytes)
+        .map(serde_json::Value::String)
+        .ok_or_else(|| "Cannot export MySQL geometry value as WKB".to_string())
+}
+
+fn decode_mysql_geometry(bytes: &[u8]) -> Option<super::wkb::DecodedGeometry> {
+    let (wkb, srid) = mysql_geometry_wkb_parts(bytes)?;
+    let mut geometry = super::wkb::decode_wkb_geometry(wkb)?;
+    if geometry.srid.is_none() {
+        geometry.srid = (srid != 0).then_some(srid);
+    }
+    Some(geometry)
 }
 
 fn mysql_spatial_column_builder(columns: &[mysql_async::Column]) -> SpatialColumnBuilder {
@@ -1244,7 +1285,7 @@ async fn enable_explicit_timestamp_defaults_for_query(conn: &mut mysql_async::Co
         return None;
     }
 
-    let previous = match conn.query_first::<u8, _>("SELECT @@SESSION.explicit_defaults_for_timestamp").await {
+    let previous = match query_first_column::<u8>(conn, "SELECT @@SESSION.explicit_defaults_for_timestamp").await {
         Ok(Some(value)) => value != 0,
         Ok(None) => {
             log::debug!("Skipping MySQL explicit timestamp defaults compatibility setting: variable was empty");
@@ -1931,6 +1972,14 @@ pub async fn connect_bare_with_pool_limit_and_setup_database(
 const SHOW_DATABASES_SQL: &str = "SHOW DATABASES";
 const INFORMATION_SCHEMA_DATABASES_SQL: &str =
     "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME";
+const DATABASE_METADATA_SQL: &str = "SELECT s.SCHEMA_NAME, \
+            s.DEFAULT_CHARACTER_SET_NAME, \
+            s.DEFAULT_COLLATION_NAME, \
+            SUM(COALESCE(t.DATA_LENGTH, 0) + COALESCE(t.INDEX_LENGTH, 0)) AS SIZE_BYTES \
+     FROM information_schema.SCHEMATA s \
+     LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME \
+     GROUP BY s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME, s.DEFAULT_COLLATION_NAME \
+     ORDER BY s.SCHEMA_NAME";
 const DATABASE_LIST_QUERY_PLAN: [(&str, bool); 2] =
     [(SHOW_DATABASES_SQL, true), (INFORMATION_SCHEMA_DATABASES_SQL, false)];
 
@@ -1943,6 +1992,40 @@ pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, Strin
             list_databases_with_query(pool, fallback_sql, fallback_catalogless).await
         }
     }
+}
+
+pub async fn list_database_metadata(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = match conn.query_iter(DATABASE_METADATA_SQL).await {
+        Ok(result) => result,
+        Err(error) => {
+            log::debug!("Falling back to database names after metadata query failed: {error}");
+            drop(conn);
+            return list_databases(pool).await;
+        }
+    };
+    let rows: Vec<mysql_async::Row> = match result.collect_and_drop().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::debug!("Falling back to database names after metadata query failed: {error}");
+            drop(conn);
+            return list_databases(pool).await;
+        }
+    };
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str(row, 0).trim().to_string();
+            (!name.is_empty()).then_some(DatabaseInfo {
+                name,
+                size_bytes: get_opt_i64(row, "SIZE_BYTES"),
+                default_charset: get_opt_str(row, "DEFAULT_CHARACTER_SET_NAME")
+                    .filter(|value| !value.trim().is_empty()),
+                default_collation: get_opt_str(row, "DEFAULT_COLLATION_NAME").filter(|value| !value.trim().is_empty()),
+                ..Default::default()
+            })
+        })
+        .collect())
 }
 
 async fn list_databases_with_query(
@@ -1970,18 +2053,29 @@ pub(super) fn database_infos_from_names(
         .filter_map(|name| {
             saw_row = true;
             let name = name.trim().to_string();
-            (!name.is_empty()).then_some(DatabaseInfo { name })
+            (!name.is_empty()).then_some(DatabaseInfo { name, ..Default::default() })
         })
         .collect();
     databases.sort_by(|a, b| a.name.cmp(&b.name));
     if databases.is_empty() && saw_row && include_catalogless_when_blank {
-        return vec![DatabaseInfo { name: String::new() }];
+        return vec![DatabaseInfo { name: String::new(), ..Default::default() }];
     }
     databases
 }
 
 pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
     list_tables_filtered(pool, database, None, None, None, None, None).await
+}
+
+fn normalize_mysql_table_type(table_type: &str) -> String {
+    let trimmed = table_type.trim();
+    if trimmed.is_empty() {
+        return "TABLE".to_string();
+    }
+    if trimmed.eq_ignore_ascii_case("VIEW") || trimmed.eq_ignore_ascii_case("SYSTEM VIEW") {
+        return "VIEW".to_string();
+    }
+    trimmed.to_string()
 }
 
 pub async fn list_tables_filtered(
@@ -2014,7 +2108,7 @@ pub async fn list_tables_filtered(
             let name = get_str_by_name(row, "TABLE_NAME").trim().to_string();
             (!name.is_empty()).then_some(TableInfo {
                 name,
-                table_type: get_str_by_name(row, "TABLE_TYPE"),
+                table_type: normalize_mysql_table_type(&get_str_by_name(row, "TABLE_TYPE")),
                 comment: get_opt_str(row, "TABLE_COMMENT")
                     .map(|s| fix_potential_double_encoding(&s))
                     .filter(|s| !s.is_empty()),
@@ -2088,8 +2182,8 @@ fn list_tables_sql(
             .map(|object_type| object_type.to_ascii_uppercase().replace(' ', "_"))
             .any(|object_type| object_type == "VIEW");
         match (wants_table, wants_view) {
-            (true, false) => sql.push_str(" AND TABLE_TYPE <> 'VIEW'"),
-            (false, true) => sql.push_str(" AND TABLE_TYPE = 'VIEW'"),
+            (true, false) => sql.push_str(" AND TABLE_TYPE NOT IN ('VIEW', 'SYSTEM VIEW')"),
+            (false, true) => sql.push_str(" AND TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW')"),
             (false, false) => sql.push_str(" AND 1 = 0"),
             (true, true) => {}
         }
@@ -2478,6 +2572,40 @@ async fn list_table_names_show(pool: &MySqlPool, database: &str) -> Result<Vec<T
     list_table_names_show_filtered(pool, database, None, &[]).await
 }
 
+fn shardingsphere_show_full_tables_sql(database: &str) -> String {
+    if database.trim().is_empty() {
+        "SHOW FULL TABLES".to_string()
+    } else {
+        format!("SHOW FULL TABLES FROM {}", quote_identifier(database))
+    }
+}
+
+fn table_infos_from_show_rows(rows: &[mysql_async::Row]) -> Vec<TableInfo> {
+    let mut tables = rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str(row, 0).trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let table_type = normalize_mysql_table_type(&get_str(row, 1));
+            Some(TableInfo { name, table_type, comment: None, parent_schema: None, parent_name: None })
+        })
+        .collect::<Vec<_>>();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    tables
+}
+
+pub async fn list_shardingsphere_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
+    // ShardingSphere's logical names are authoritative here. Do not add SHOW TABLE STATUS:
+    // this hot path must replace the information_schema lookup with one metadata request.
+    let sql = shardingsphere_show_full_tables_sql(database);
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = conn.query_iter(&sql).await.map_err(|error| error.to_string())?;
+    let rows = result.collect_and_drop::<mysql_async::Row>().await.map_err(|error| error.to_string())?;
+    Ok(table_infos_from_show_rows(&rows))
+}
+
 async fn list_table_names_show_filtered(
     pool: &MySqlPool,
     database: &str,
@@ -2507,25 +2635,7 @@ async fn list_table_names_show_filtered(
         }
     }
     let rows = rows.ok_or_else(|| last_error.unwrap_or_else(|| "SHOW TABLES returned no result".to_string()))?;
-    let mut tables: Vec<TableInfo> = rows
-        .iter()
-        .filter_map(|row| {
-            let name = get_str(row, 0).trim().to_string();
-            if name.is_empty() {
-                return None;
-            }
-            let table_type = get_str(row, 1);
-            Some(TableInfo {
-                name,
-                table_type: if table_type.is_empty() { "TABLE".to_string() } else { table_type },
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            })
-        })
-        .collect();
-    tables.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(tables)
+    Ok(table_infos_from_show_rows(&rows))
 }
 
 struct ShowTablesQueryAttempt {
@@ -2822,18 +2932,18 @@ fn list_tables_objects_sql(
     let wants_tables = requested_object_type(object_types, "TABLE");
     let wants_views = requested_object_type(object_types, "VIEW");
     let type_filter = match (wants_tables, wants_views) {
-        (true, false) => " AND TABLE_TYPE <> 'VIEW'",
-        (false, true) => " AND TABLE_TYPE = 'VIEW'",
+        (true, false) => " AND TABLE_TYPE NOT IN ('VIEW', 'SYSTEM VIEW')",
+        (false, true) => " AND TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW')",
         _ => "",
     };
     format!(
         "SELECT TABLE_NAME AS object_name, \
-           CASE WHEN TABLE_TYPE = 'VIEW' THEN 'VIEW' ELSE 'TABLE' END AS object_type, \
+           CASE WHEN TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW') THEN 'VIEW' ELSE 'TABLE' END AS object_type, \
            TABLE_COMMENT AS object_comment, \
            CREATE_TIME AS created_at, \
            UPDATE_TIME AS updated_at, \
            NULL AS parent_schema, NULL AS parent_name, \
-           CASE WHEN TABLE_TYPE = 'VIEW' THEN 1 ELSE 0 END AS sort_order \
+           CASE WHEN TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW') THEN 1 ELSE 0 END AS sort_order \
          FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = {db}{type_filter} \
          ORDER BY sort_order, object_name{pagination}",
@@ -2889,6 +2999,8 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         schema: Some(database.to_string()),
         valid: None,
         signature: None,
+        custom_type_kind: None,
+        has_members: None,
         comment: get_opt_str(row, "object_comment")
             .map(|s| fix_potential_double_encoding(&s))
             .filter(|s| !s.is_empty()),
@@ -2896,6 +3008,8 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         updated_at: get_opt_str(row, "updated_at"),
         parent_schema: get_opt_str(row, "parent_schema"),
         parent_name: get_opt_str(row, "parent_name"),
+        trigger: None,
+        xugu_type_members_expandable: None,
     }
 }
 
@@ -3161,11 +3275,15 @@ fn table_infos_to_objects(
                 schema: Some(database.to_string()),
                 valid: None,
                 signature: None,
+                custom_type_kind: None,
+                has_members: None,
                 comment: table.comment,
                 created_at: meta.and_then(|meta| meta.created_at.clone()),
                 updated_at: meta.and_then(|meta| meta.updated_at.clone()),
                 parent_schema: table.parent_schema,
                 parent_name: table.parent_name,
+                trigger: None,
+                xugu_type_members_expandable: None,
             }
         })
         .collect()
@@ -3726,6 +3844,80 @@ async fn ping_conn_with_timeout_and_cancel(
     }
 }
 
+/// Maps `SHOW WARNINGS` rows (`Level`, `Code`, `Message`) to query messages.
+fn mysql_warning_rows_to_messages(rows: Vec<(String, u16, String)>) -> Vec<QueryMessage> {
+    rows.into_iter()
+        .map(|(level, code, message)| QueryMessage {
+            severity: level,
+            code: Some(code.to_string()),
+            message,
+            detail: None,
+            hint: None,
+        })
+        .collect()
+}
+
+/// Maps a non-empty OK-packet info string (e.g. `Records: 3 Duplicates: 0
+/// Warnings: 1`) to an INFO query message.
+fn mysql_info_message(info: &str) -> Option<QueryMessage> {
+    let info = info.trim();
+    if info.is_empty() {
+        return None;
+    }
+    Some(QueryMessage { severity: "INFO".to_string(), code: None, message: info.to_string(), detail: None, hint: None })
+}
+
+fn mysql_warnings_fallback_message(warnings: u16) -> QueryMessage {
+    QueryMessage {
+        severity: "Warning".to_string(),
+        code: None,
+        message: format!("{warnings} warning(s)"),
+        detail: None,
+        hint: None,
+    }
+}
+
+/// Builds the message list from an OK-packet info string plus the outcome of a
+/// `SHOW WARNINGS` query: `None` when the query failed (MySQL-compatible
+/// proxies such as Doris/StarRocks may not support it), `Some(rows)` with its
+/// rows otherwise. An empty successful result still falls back to the
+/// count-only message so a nonzero warning count is never silently dropped.
+fn mysql_server_messages_from_warnings(
+    info: &str,
+    warnings: u16,
+    warning_rows: Option<Vec<(String, u16, String)>>,
+) -> Vec<QueryMessage> {
+    let mut messages: Vec<QueryMessage> = mysql_info_message(info).into_iter().collect();
+    if warnings == 0 {
+        return messages;
+    }
+    match warning_rows {
+        Some(rows) if !rows.is_empty() => messages.extend(mysql_warning_rows_to_messages(rows)),
+        _ => messages.push(mysql_warnings_fallback_message(warnings)),
+    }
+    messages
+}
+
+/// Best-effort collection of server messages for a finished statement: the
+/// OK-packet info string plus `SHOW WARNINGS` output when the server reported
+/// warnings. `SHOW WARNINGS` runs on the same connection; all errors are
+/// swallowed (MySQL-compatible proxies such as Doris/StarRocks may not support
+/// it) and fall back to a count-only message.
+async fn collect_mysql_server_messages(conn: &mut mysql_async::Conn, warnings: u16, info: &str) -> Vec<QueryMessage> {
+    let warning_rows = if warnings == 0 {
+        None
+    } else {
+        match conn.query_iter("SHOW WARNINGS").await {
+            Ok(result) => match result.try_collect_and_drop::<(String, u16, String)>().await {
+                Ok(rows) => rows.into_iter().collect::<Result<Vec<_>, _>>().ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
+    mysql_server_messages_from_warnings(info, warnings, warning_rows)
+}
+
 async fn execute_result_set_with_text_protocol_on_conn(
     conn: &mut mysql_async::Conn,
     sql: &str,
@@ -3735,6 +3927,11 @@ async fn execute_result_set_with_text_protocol_on_conn(
 ) -> Result<QueryResult, String> {
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
     if !advance_to_result_set_with_columns(&mut result).await? {
+        let affected_rows = result.affected_rows();
+        let warnings = result.warnings();
+        let info = result.info().into_owned();
+        drop(result);
+        let messages = collect_mysql_server_messages(conn, warnings, &info).await;
         return Ok(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
@@ -3742,12 +3939,13 @@ async fn execute_result_set_with_text_protocol_on_conn(
             spatial_columns: vec![],
             spatial_values: vec![],
             rows: vec![],
-            affected_rows: result.affected_rows(),
+            affected_rows,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages,
         });
     }
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
@@ -3756,6 +3954,11 @@ async fn execute_result_set_with_text_protocol_on_conn(
 
     if should_collect_text_result_set(sql, row_limit, max_rows) {
         let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+        // collect_and_drop consumed the result; warnings/info now reflect the
+        // trailing EOF/OK packet of the finished result set.
+        let warnings = conn.get_warnings();
+        let info = conn.info().into_owned();
+        let messages = collect_mysql_server_messages(conn, warnings, &info).await;
         let truncated = rows.len() > row_limit;
         let mut spatial_values = Vec::new();
         let result_rows = rows
@@ -3781,6 +3984,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages,
         });
     }
 
@@ -3803,6 +4007,21 @@ async fn execute_result_set_with_text_protocol_on_conn(
         result_rows.push(values);
         spatial_values.push(srids);
     }
+    drop(stream);
+
+    // A truncated stream broke out of the row loop before this result set's
+    // terminator packet arrived, so `result.warnings()`/`result.info()` still
+    // hold the previous statement's values; skip capture instead of reporting
+    // stale messages.
+    let messages = if truncated {
+        drop(result);
+        Vec::new()
+    } else {
+        let warnings = result.warnings();
+        let info = result.info().into_owned();
+        drop(result);
+        collect_mysql_server_messages(conn, warnings, &info).await
+    };
 
     Ok(QueryResult {
         columns,
@@ -3817,6 +4036,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages,
     })
 }
 
@@ -3827,8 +4047,20 @@ async fn execute_result_sets_with_text_protocol_on_conn(
     max_rows: Option<usize>,
     start: Instant,
 ) -> Result<Vec<QueryResult>, String> {
+    // Per-set warnings/info read after each `collect()` are only accurate when
+    // the connection negotiated CLIENT_DEPRECATE_EOF: with legacy EOF packets
+    // the next result set's column-definition EOF clobbers the previous OK
+    // state, and a following column-less statement's OK packet would be
+    // misattributed to the wrong set. mysql_async does not expose the
+    // negotiated capability publicly, so gate on the client-side
+    // `deprecate_eof` option requested when the pool was built (DBX disables
+    // it automatically when a proxy only speaks legacy EOF). When disabled,
+    // per-set messages stay empty and only the final SHOW WARNINGS attachment
+    // on the last result set reports warnings.
+    let capture_per_set_messages = conn.opts().deprecate_eof();
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
+    let mut results: Vec<QueryResult> = Vec::new();
+    let mut result_set_warnings: Vec<u16> = Vec::new();
 
     while advance_to_result_set_with_columns(&mut result).await? {
         let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
@@ -3869,6 +4101,13 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             rows
         };
 
+        let warnings = if capture_per_set_messages { result.warnings() } else { 0 };
+        let messages: Vec<QueryMessage> = if capture_per_set_messages {
+            mysql_info_message(&result.info()).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        result_set_warnings.push(warnings);
         results.push(QueryResult {
             columns,
             column_types,
@@ -3882,10 +4121,16 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages,
         });
     }
 
     if results.is_empty() {
+        let affected_rows = result.affected_rows();
+        let warnings = result.warnings();
+        let info = result.info().into_owned();
+        drop(result);
+        let messages = collect_mysql_server_messages(conn, warnings, &info).await;
         results.push(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
@@ -3893,13 +4138,40 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             spatial_columns: vec![],
             spatial_values: vec![],
             rows: vec![],
-            affected_rows: result.affected_rows(),
+            affected_rows,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages,
         });
+        return Ok(results);
+    }
+    // Without per-set capture (no CLIENT_DEPRECATE_EOF) the per-iteration
+    // counts were skipped above; the connection state after the loop still
+    // reflects the last statement's terminator, so use its warnings count for
+    // the final SHOW WARNINGS attachment on the last result set.
+    if !capture_per_set_messages {
+        let last_index = result_set_warnings.len() - 1;
+        result_set_warnings[last_index] = result.warnings();
+    }
+    drop(result);
+
+    // SHOW WARNINGS only reports the last executed statement, so detailed
+    // warning rows can only be attached to the last result set; earlier sets
+    // with warnings get a count-only fallback message.
+    let last_index = results.len() - 1;
+    for (index, warnings) in result_set_warnings.iter().copied().enumerate() {
+        if warnings == 0 {
+            continue;
+        }
+        if index == last_index {
+            let mut messages = collect_mysql_server_messages(conn, warnings, "").await;
+            results[index].messages.append(&mut messages);
+        } else {
+            results[index].messages.push(mysql_warnings_fallback_message(warnings));
+        }
     }
 
     Ok(results)
@@ -3947,6 +4219,21 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
         result_rows.push(values);
         spatial_values.push(srids);
     }
+    drop(stream);
+
+    // A truncated stream broke out of the row loop before this result set's
+    // terminator packet arrived, so `result.warnings()`/`result.info()` still
+    // hold the previous statement's values; skip capture instead of reporting
+    // stale messages.
+    let messages = if truncated {
+        drop(result);
+        Vec::new()
+    } else {
+        let warnings = result.warnings();
+        let info = result.info().into_owned();
+        drop(result);
+        collect_mysql_server_messages(conn, warnings, &info).await
+    };
 
     Ok(QueryResult {
         columns,
@@ -3961,6 +4248,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages,
     })
 }
 
@@ -3970,7 +4258,11 @@ pub async fn execute_query(pool: &MySqlPool, sql: &str, bare: bool) -> Result<Qu
 
 pub async fn max_allowed_packet(pool: &MySqlPool) -> Result<u64, String> {
     let mut conn = get_conn_with_health_check(pool).await?;
-    conn.query_first::<u64, _>("SELECT @@max_allowed_packet")
+    max_allowed_packet_on_conn(&mut conn).await
+}
+
+pub(crate) async fn max_allowed_packet_on_conn(conn: &mut mysql_async::Conn) -> Result<u64, String> {
+    query_first_column::<u64>(conn, "SELECT @@max_allowed_packet")
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "MySQL did not return @@max_allowed_packet".to_string())
@@ -4006,7 +4298,7 @@ pub async fn stream_query_rows(
     mut on_row: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut conn = get_conn_with_health_check(pool).await?;
-    stream_query_result_on_conn(&mut conn, sql, bare, max_rows, dialect, cancelled, |item| {
+    stream_query_result_on_conn(&mut conn, sql, bare, max_rows, dialect, cancelled, false, |item| {
         if let MySqlQueryStreamItem::Row(row) = item {
             on_row(&row)?;
         }
@@ -4022,17 +4314,18 @@ pub async fn stream_query_result_on_conn(
     max_rows: Option<usize>,
     dialect: MySqlQueryDialect,
     cancelled: &AtomicBool,
+    spatial_as_wkb: bool,
     mut on_item: impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let row_limit = max_rows.unwrap_or(usize::MAX);
 
     if bare || prefers_text_protocol_query(sql, dialect) {
-        stream_query_result_text(conn, sql, row_limit, cancelled, &mut on_item).await
+        stream_query_result_text(conn, sql, row_limit, cancelled, spatial_as_wkb, &mut on_item).await
     } else {
-        match stream_query_result_prepared(conn, sql, row_limit, cancelled, &mut on_item).await {
+        match stream_query_result_prepared(conn, sql, row_limit, cancelled, spatial_as_wkb, &mut on_item).await {
             Ok(rows) => Ok(rows),
             Err(err) if mysql_error_should_retry_with_text_protocol(&err) => {
-                stream_query_result_text(conn, sql, row_limit, cancelled, &mut on_item).await
+                stream_query_result_text(conn, sql, row_limit, cancelled, spatial_as_wkb, &mut on_item).await
             }
             Err(err) => Err(err),
         }
@@ -4044,6 +4337,7 @@ async fn stream_query_result_text(
     sql: &str,
     row_limit: usize,
     cancelled: &AtomicBool,
+    spatial_as_wkb: bool,
     on_item: &mut impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
@@ -4069,7 +4363,9 @@ async fn stream_query_result_text(
             break;
         }
         let row = row.map_err(|e| e.to_string())?;
-        let values: Vec<serde_json::Value> = (0..row.len()).map(|i| mysql_value_to_json(&row, i)).collect();
+        let values: Vec<serde_json::Value> = (0..row.len())
+            .map(|i| mysql_value_to_json_for_export(&row, i, spatial_as_wkb))
+            .collect::<Result<_, _>>()?;
         on_item(MySqlQueryStreamItem::Row(values))?;
         rows_exported += 1;
     }
@@ -4082,6 +4378,7 @@ async fn stream_query_result_prepared(
     sql: &str,
     row_limit: usize,
     cancelled: &AtomicBool,
+    spatial_as_wkb: bool,
     on_item: &mut impl FnMut(MySqlQueryStreamItem) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut result = conn.exec_iter(sql, ()).await.map_err(|e| e.to_string())?;
@@ -4107,7 +4404,9 @@ async fn stream_query_result_prepared(
             break;
         }
         let row = row.map_err(|e| e.to_string())?;
-        let values: Vec<serde_json::Value> = (0..row.len()).map(|i| mysql_value_to_json(&row, i)).collect();
+        let values: Vec<serde_json::Value> = (0..row.len())
+            .map(|i| mysql_value_to_json_for_export(&row, i, spatial_as_wkb))
+            .collect::<Result<_, _>>()?;
         on_item(MySqlQueryStreamItem::Row(values))?;
         rows_exported += 1;
     }
@@ -4205,7 +4504,13 @@ pub async fn execute_query_on_conn_with_max_rows(
             }
         };
         let affected_rows = result.affected_rows();
+        let warnings = result.warnings();
+        let info = result.info().into_owned();
         let drop_result = result.drop_result().await;
+        // Collect server messages before restoring the timestamp defaults: the
+        // restore issues `SET SESSION explicit_defaults_for_timestamp`, which
+        // clears the diagnostics area and would leave SHOW WARNINGS empty.
+        let messages = collect_mysql_server_messages(conn, warnings, &info).await;
         restore_explicit_timestamp_defaults_for_query(conn, previous_explicit_timestamp_defaults).await;
         drop_result.map_err(|e| e.to_string())?;
 
@@ -4222,6 +4527,7 @@ pub async fn execute_query_on_conn_with_max_rows(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages,
         })
     }
 }
@@ -4242,6 +4548,103 @@ pub async fn execute_query_results_on_conn_with_max_rows(
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct MySqlNonResultBatchOutcome {
+    pub results: Vec<QueryResult>,
+    pub error: Option<String>,
+}
+
+/// Executes a chunk of statements that are known not to return rows using one
+/// COM_QUERY packet. MySQL still executes every statement in order and exposes
+/// one OK packet per statement, so affected-row counts and failure positions
+/// remain attributable to the original statements without one network round
+/// trip per statement.
+pub(crate) async fn execute_non_result_batch_on_conn(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    expected_results: usize,
+) -> Result<MySqlNonResultBatchOutcome, String> {
+    if expected_results == 0 {
+        return Ok(MySqlNonResultBatchOutcome { results: Vec::new(), error: None });
+    }
+
+    let start = Instant::now();
+    let capture_per_set_messages = conn.opts().deprecate_eof();
+    let previous_explicit_timestamp_defaults = enable_explicit_timestamp_defaults_for_query(conn, sql).await;
+    let mut result = match conn.query_iter(sql).await {
+        Ok(result) => result,
+        Err(error) => {
+            restore_explicit_timestamp_defaults_for_query(conn, previous_explicit_timestamp_defaults).await;
+            return Ok(MySqlNonResultBatchOutcome { results: Vec::new(), error: Some(error.to_string()) });
+        }
+    };
+    let mut results = Vec::with_capacity(expected_results);
+    let mut warning_counts = Vec::with_capacity(expected_results);
+    let mut error = None;
+
+    for statement_index in 0..expected_results {
+        if !result.columns_ref().is_empty() {
+            error = Some(format!(
+                "MySQL batch statement {} unexpectedly returned rows; retry the statement separately.",
+                statement_index + 1
+            ));
+            break;
+        }
+
+        let warnings = result.warnings();
+        let info = result.info().into_owned();
+        let messages =
+            if capture_per_set_messages { mysql_info_message(&info).into_iter().collect() } else { Vec::new() };
+        let current_result = QueryResult {
+            columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
+            rows: vec![],
+            affected_rows: result.affected_rows(),
+            execution_time_ms: start.elapsed().as_millis(),
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages,
+        };
+
+        // mysql_async can expose a failed next statement only when the current
+        // result set is consumed. Do not mark the current metadata slot as a
+        // successful statement until that consumption succeeds.
+        if let Err(next_error) = result.collect::<mysql_async::Row>().await {
+            error = Some(next_error.to_string());
+            break;
+        }
+        results.push(current_result);
+        warning_counts.push(warnings);
+    }
+
+    if let Err(drop_error) = result.drop_result().await {
+        if error.is_none() {
+            error = Some(drop_error.to_string());
+        }
+    }
+    if error.is_none() && !results.is_empty() {
+        let last_index = results.len() - 1;
+        for (index, warnings) in warning_counts.into_iter().enumerate() {
+            if warnings == 0 {
+                continue;
+            }
+            if index == last_index {
+                results[index].messages.extend(collect_mysql_server_messages(conn, warnings, "").await);
+            } else if results[index].messages.is_empty() {
+                results[index].messages.push(mysql_warnings_fallback_message(warnings));
+            }
+        }
+    }
+    restore_explicit_timestamp_defaults_for_query(conn, previous_explicit_timestamp_defaults).await;
+
+    Ok(MySqlNonResultBatchOutcome { results, error })
+}
+
 fn prefers_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
     // User-entered result-set queries are not parameterized in DBX. Text protocol
     // avoids binary result decoding bugs in MySQL-compatible servers and proxies.
@@ -4255,6 +4658,15 @@ pub(crate) fn is_result_set_query(sql: &str, dialect: MySqlQueryDialect) -> bool
         DatabaseType::Mysql,
     ) || mysql_statement_returns_rows(sql)
         || dialect.supports_admin_show_results && is_admin_show_query(sql)
+}
+
+pub(crate) fn is_batchable_non_result_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
+    !is_result_set_query(sql, dialect)
+        && starts_with_executable_sql_keyword_for_database(
+            sql,
+            &["INSERT", "REPLACE", "UPDATE", "DELETE"],
+            DatabaseType::Mysql,
+        )
 }
 
 /// MariaDB 10.5+ returns a result set for INSERT/DELETE/REPLACE ... RETURNING.
@@ -4949,6 +5361,13 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
             name: get_str_by_name(row, "TRIGGER_NAME"),
             event: get_str_by_name(row, "EVENT_MANIPULATION"),
             timing: get_str_by_name(row, "ACTION_TIMING"),
+            level: None,
+            condition: None,
+            language: None,
+            enabled: None,
+            valid: None,
+            comment: None,
+            created_at: None,
             statement: Some(get_str_by_name(row, "ACTION_STATEMENT")).filter(|value| !value.is_empty()),
         })
         .collect())
@@ -4957,6 +5376,125 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mysql_async::{consts::ColumnType, Column, Value};
+    use mysql_common::row::new_row;
+
+    fn mysql_test_row(values: Vec<Value>) -> mysql_async::Row {
+        let columns = values
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Column::new(ColumnType::MYSQL_TYPE_VAR_STRING).with_name(format!("column_{index}").as_bytes())
+            })
+            .collect::<Vec<_>>()
+            .into();
+        new_row(values, columns)
+    }
+
+    #[test]
+    fn mysql_first_column_value_ignores_extra_result_columns() {
+        let row = mysql_async::from_row::<mysql_async::Row>(mysql_test_row(vec![
+            Value::Bytes(Vec::new()),
+            Value::Bytes(Vec::new()),
+        ]));
+
+        assert_eq!(first_column_value::<String>(&row), Some(String::new()));
+    }
+
+    #[test]
+    fn mysql_first_column_value_handles_null_and_conversion_failures() {
+        let null_row = mysql_test_row(vec![Value::NULL, Value::Bytes(b"ignored".to_vec())]);
+        let invalid_number_row = mysql_test_row(vec![Value::Bytes(b"not-a-number".to_vec())]);
+
+        assert_eq!(first_column_value::<String>(&null_row), None);
+        assert_eq!(first_column_value::<u64>(&invalid_number_row), None);
+    }
+
+    #[test]
+    fn mysql_first_column_value_reads_integer_metadata() {
+        let enabled_row = mysql_test_row(vec![Value::Int(1), Value::Bytes(b"ignored".to_vec())]);
+        let packet_row = mysql_test_row(vec![Value::UInt(67_108_864), Value::Bytes(b"ignored".to_vec())]);
+
+        assert_eq!(first_column_value::<u8>(&enabled_row), Some(1));
+        assert_eq!(first_column_value::<u64>(&packet_row), Some(67_108_864));
+    }
+
+    #[test]
+    fn mysql_info_message_maps_non_empty_info_strings() {
+        let message = mysql_info_message("Records: 3  Duplicates: 0  Warnings: 1").unwrap();
+        assert_eq!(message.severity, "INFO");
+        assert_eq!(message.message, "Records: 3  Duplicates: 0  Warnings: 1");
+        assert_eq!(message.code, None);
+        assert_eq!(message.detail, None);
+        assert_eq!(message.hint, None);
+
+        assert!(mysql_info_message("").is_none());
+        assert!(mysql_info_message("   ").is_none());
+    }
+
+    #[test]
+    fn mysql_warning_rows_to_messages_maps_levels_and_codes() {
+        let messages = mysql_warning_rows_to_messages(vec![
+            ("Warning".to_string(), 1265, "Data truncated for column 'a' at row 1".to_string()),
+            ("Note".to_string(), 1051, "Unknown table 't'".to_string()),
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].severity, "Warning");
+        assert_eq!(messages[0].code.as_deref(), Some("1265"));
+        assert_eq!(messages[0].message, "Data truncated for column 'a' at row 1");
+        assert_eq!(messages[0].detail, None);
+        assert_eq!(messages[0].hint, None);
+        assert_eq!(messages[1].severity, "Note");
+        assert_eq!(messages[1].code.as_deref(), Some("1051"));
+
+        assert!(mysql_warning_rows_to_messages(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn mysql_warnings_fallback_message_reports_count() {
+        let message = mysql_warnings_fallback_message(3);
+        assert_eq!(message.severity, "Warning");
+        assert_eq!(message.message, "3 warning(s)");
+        assert_eq!(message.code, None);
+    }
+
+    #[test]
+    fn mysql_server_messages_from_warnings_maps_info_and_warning_rows() {
+        let rows = vec![("Warning".to_string(), 1265, "Data truncated for column 'a' at row 1".to_string())];
+        let messages = mysql_server_messages_from_warnings("Records: 1  Duplicates: 0  Warnings: 1", 1, Some(rows));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].severity, "INFO");
+        assert_eq!(messages[1].severity, "Warning");
+        assert_eq!(messages[1].code.as_deref(), Some("1265"));
+    }
+
+    #[test]
+    fn mysql_server_messages_from_warnings_falls_back_when_show_warnings_returns_no_rows() {
+        let messages = mysql_server_messages_from_warnings("", 2, Some(Vec::new()));
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].severity, "Warning");
+        assert_eq!(messages[0].message, "2 warning(s)");
+    }
+
+    #[test]
+    fn mysql_server_messages_from_warnings_falls_back_when_show_warnings_fails() {
+        let messages = mysql_server_messages_from_warnings("", 2, None);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, "2 warning(s)");
+    }
+
+    #[test]
+    fn mysql_server_messages_from_warnings_skips_warnings_when_count_is_zero() {
+        let messages = mysql_server_messages_from_warnings("Query OK", 0, None);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].severity, "INFO");
+        assert_eq!(messages[0].message, "Query OK");
+    }
 
     #[test]
     fn mysql_sql_statement_limit_reserves_packet_headroom() {
@@ -5004,11 +5542,15 @@ mod tests {
             schema: Some("app".to_string()),
             valid: None,
             signature: None,
+            custom_type_kind: None,
+            has_members: None,
             comment: None,
             created_at: None,
             updated_at: None,
             parent_schema: None,
             parent_name: None,
+            trigger: None,
+            xugu_type_members_expandable: None,
         }
     }
 
@@ -5033,6 +5575,23 @@ mod tests {
         let decoded = decode_mysql_geometry(&raw).unwrap();
         assert_eq!(decoded.wkt, "POINT(1 2)");
         assert_eq!(decoded.srid, None);
+        assert_eq!(
+            mysql_geometry_to_export_marker(&raw).as_deref(),
+            Some("DBX_WKB:0:0101000000000000000000F03F0000000000000040")
+        );
+    }
+
+    #[test]
+    fn mysql_geometry_export_marker_strips_internal_srid_prefix() {
+        let mut raw = 4326_u32.to_le_bytes().to_vec();
+        raw.extend_from_slice(&[
+            0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x40,
+        ]);
+        assert_eq!(
+            mysql_geometry_to_export_marker(&raw).as_deref(),
+            Some("DBX_WKB:4326:0101000000000000000000F03F0000000000000040")
+        );
     }
 
     #[test]
@@ -5140,6 +5699,17 @@ mod tests {
         assert!(is_result_set_query("INSERT INTO users (id) VALUES (1) RETURNING id", dialect));
         assert!(is_result_set_query("DELETE FROM users WHERE id = 1 RETURNING id", dialect));
         assert!(!is_result_set_query("UPDATE users SET name = 'Ada'", dialect));
+    }
+
+    #[test]
+    fn mysql_multi_statement_pipeline_only_accepts_known_dml() {
+        let dialect = MySqlQueryDialect::default();
+
+        assert!(is_batchable_non_result_query("INSERT INTO users(id) VALUES (1)", dialect));
+        assert!(is_batchable_non_result_query("UPDATE users SET active = 1", dialect));
+        assert!(!is_batchable_non_result_query("SELECT * FROM users", dialect));
+        assert!(!is_batchable_non_result_query("ANALYZE TABLE users", dialect));
+        assert!(!is_batchable_non_result_query("CREATE TABLE users(id INT)", dialect));
     }
 
     #[test]
@@ -5278,13 +5848,45 @@ mod tests {
     fn mysql_list_tables_sql_filters_table_type_before_pagination() {
         let tables = vec!["TABLE".to_string()];
         let table_sql = list_tables_sql("app", None, Some(1000), None, Some(&tables), None);
-        assert!(table_sql.contains("TABLE_TYPE <> 'VIEW'"));
-        assert!(table_sql.find("TABLE_TYPE <> 'VIEW'") < table_sql.find("ORDER BY TABLE_NAME"));
+        assert!(table_sql.contains("TABLE_TYPE NOT IN ('VIEW', 'SYSTEM VIEW')"));
+        assert!(table_sql.find("TABLE_TYPE NOT IN ('VIEW', 'SYSTEM VIEW')") < table_sql.find("ORDER BY TABLE_NAME"));
         assert!(table_sql.find("ORDER BY TABLE_NAME") < table_sql.find("LIMIT 1000"));
 
         let views = vec!["VIEW".to_string()];
         let view_sql = list_tables_sql("app", None, Some(1000), None, Some(&views), None);
-        assert!(view_sql.contains("TABLE_TYPE = 'VIEW'"));
+        assert!(view_sql.contains("TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW')"));
+    }
+
+    #[test]
+    fn mysql_system_views_are_normalized_as_views() {
+        assert_eq!(normalize_mysql_table_type("SYSTEM VIEW"), "VIEW");
+        assert_eq!(normalize_mysql_table_type("view"), "VIEW");
+        assert_eq!(normalize_mysql_table_type("BASE TABLE"), "BASE TABLE");
+        assert_eq!(normalize_mysql_table_type("MATERIALIZED VIEW"), "MATERIALIZED VIEW");
+        assert_eq!(normalize_mysql_table_type(""), "TABLE");
+    }
+
+    #[test]
+    fn shardingsphere_show_full_tables_is_one_exact_statement() {
+        assert_eq!(shardingsphere_show_full_tables_sql("app"), "SHOW FULL TABLES FROM `app`");
+        assert_eq!(shardingsphere_show_full_tables_sql(""), "SHOW FULL TABLES");
+    }
+
+    #[test]
+    fn shardingsphere_show_rows_keep_logical_names_and_types_without_comments() {
+        let rows = vec![
+            mysql_test_row(vec![Value::Bytes(b"normal_table".to_vec()), Value::Bytes(b"BASE TABLE".to_vec())]),
+            mysql_test_row(vec![Value::Bytes(b"t_order".to_vec()), Value::Bytes(b"BASE TABLE".to_vec())]),
+            mysql_test_row(vec![Value::Bytes(b"active_users".to_vec()), Value::Bytes(b"VIEW".to_vec())]),
+        ];
+
+        let tables = table_infos_from_show_rows(&rows);
+
+        assert_eq!(
+            tables.iter().map(|table| (table.name.as_str(), table.table_type.as_str())).collect::<Vec<_>>(),
+            vec![("active_users", "VIEW"), ("normal_table", "BASE TABLE"), ("t_order", "BASE TABLE")]
+        );
+        assert!(tables.iter().all(|table| table.comment.is_none()));
     }
 
     #[test]
@@ -5690,7 +6292,8 @@ mod tests {
         let object_types = vec!["VIEW".to_string()];
         let sql = list_tables_objects_sql("app", Some(&object_types), Some(51), Some(100));
 
-        assert!(sql.contains("TABLE_TYPE = 'VIEW'"));
+        assert!(sql.contains("TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW')"));
+        assert!(sql.contains("CASE WHEN TABLE_TYPE IN ('VIEW', 'SYSTEM VIEW') THEN 'VIEW' ELSE 'TABLE' END"));
         assert!(sql.ends_with("LIMIT 51 OFFSET 100"));
     }
 
@@ -5863,16 +6466,23 @@ mod tests {
     }
 
     #[test]
-    fn mysql_binary_preview_renders_binary_and_varbinary_like_navicat_text_preview() {
+    fn mysql_binary_values_preserve_all_bytes_as_hex() {
         let binary_column = mysql_test_column(ColumnType::MYSQL_TYPE_STRING, 63, ColumnFlags::BINARY_FLAG, 8);
         let varbinary_column = mysql_test_column(ColumnType::MYSQL_TYPE_VAR_STRING, 63, ColumnFlags::BINARY_FLAG, 8);
 
-        assert_eq!(mysql_bytes_to_json(b"150010\0\0".to_vec(), &binary_column), serde_json::json!("150010"));
-        assert_eq!(mysql_bytes_to_json(b"150010".to_vec(), &varbinary_column), serde_json::json!("150010"));
+        assert_eq!(
+            mysql_bytes_to_json(b"150010\0\0".to_vec(), &binary_column),
+            serde_json::json!("0x3135303031300000")
+        );
+        assert_eq!(mysql_bytes_to_json(b"150010".to_vec(), &varbinary_column), serde_json::json!("0x313530303130"));
+        assert_eq!(
+            mysql_bytes_to_json(b"SN-A0001".to_vec(), &varbinary_column),
+            serde_json::json!("0x534e2d4130303031")
+        );
     }
 
     #[test]
-    fn mysql_binary_preview_falls_back_to_hex_for_unprintable_bytes() {
+    fn mysql_binary_values_preserve_unprintable_bytes_as_hex() {
         let binary_column = mysql_test_column(ColumnType::MYSQL_TYPE_STRING, 63, ColumnFlags::BINARY_FLAG, 8);
         let varbinary_column = mysql_test_column(ColumnType::MYSQL_TYPE_VAR_STRING, 63, ColumnFlags::BINARY_FLAG, 8);
 

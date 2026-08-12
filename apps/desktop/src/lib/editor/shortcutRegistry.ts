@@ -4,11 +4,13 @@ export type ShortcutActionId =
   | "executeSql"
   | "executeSqlInNewResultTab"
   | "formatSql"
+  | "expandSelectStar"
   | "toggleLineComment"
   | "saveSql"
   | "acceptCompletion"
   | "indentMore"
   | "indentLess"
+  | "insertLineBelow"
   | "duplicateLine"
   | "deleteLine"
   | "moveLineUp"
@@ -56,7 +58,8 @@ export type ShortcutActionId =
   | "editSidebarConnection"
   | "openDataInNewTab"
   | "viewTableDdl"
-  | "sendSelectionToAi";
+  | "sendSelectionToAi"
+  | "sqlIntentionActions";
 
 export type ShortcutScope = "global" | "editor" | "grid" | "search" | "sidebar";
 
@@ -104,6 +107,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Shift+Mod+F",
   },
   {
+    id: "expandSelectStar",
+    labelKey: "settings.shortcutExpandSelectStar",
+    scope: "editor",
+    defaultShortcut: "Mod+Shift+X",
+  },
+  {
     id: "toggleLineComment",
     labelKey: "settings.shortcutToggleLineComment",
     scope: "editor",
@@ -132,6 +141,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutIndentLess",
     scope: "editor",
     defaultShortcut: "Shift+Tab",
+  },
+  {
+    id: "insertLineBelow",
+    labelKey: "settings.shortcutInsertLineBelow",
+    scope: "editor",
+    defaultShortcut: "Shift+Enter",
   },
   {
     id: "duplicateLine",
@@ -421,6 +436,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutSendSelectionToAi",
     scope: "editor",
     defaultShortcut: "Mod+Shift+A",
+  },
+  {
+    id: "sqlIntentionActions",
+    labelKey: "settings.shortcutSqlIntentionActions",
+    scope: "editor",
+    defaultShortcut: "Shift+Mod+Enter",
   },
 ];
 

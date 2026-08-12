@@ -252,6 +252,8 @@ pub struct BuildSingleColumnAlterSqlRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PrepareDataGridSaveRequest {
     pub options: dbx_core::data_grid_sql::DataGridSaveStatementOptions,
+    #[serde(default)]
+    pub driver_profile: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -802,7 +804,7 @@ pub async fn analyze_editable_query_editability(
 pub async fn prepare_data_grid_save(
     Json(req): Json<PrepareDataGridSaveRequest>,
 ) -> Json<dbx_core::data_grid_sql::DataGridSavePreparation> {
-    Json(dbx_core::data_grid_sql::prepare_data_grid_save(req.options))
+    Json(dbx_core::data_grid_sql::prepare_data_grid_save_for_driver_profile(req.options, req.driver_profile.as_deref()))
 }
 
 #[utoipa::path(
@@ -1012,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_multi_response_preserves_nested_filtered_error_detail() {
+    fn execute_multi_response_preserves_nested_original_error_detail() {
         let result = dbx_core::query::ExecuteMultiResult {
             result: dbx_core::db::QueryResult {
                 columns: vec!["Error".to_string()],
@@ -1027,12 +1029,14 @@ mod tests {
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             execution_error: true,
             statement_index: Some(1),
             error: Some(dbx_core::backend_error::BackendError::from_sql_detail(
                 "relation customer_orders does not exist",
             )),
+            server_message: false,
         };
 
         let payload = serde_json::to_value(execute_multi_response(vec![result]).0).unwrap();

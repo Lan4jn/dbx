@@ -69,6 +69,7 @@ const extraAliases = {
 const supplementalDrivers = [
   { dbType: "turso", label: "Turso", aliases: ["libsql", "lib sql"] },
   { dbType: "nacos", label: "Nacos", aliases: ["r-nacos", "rnacos"] },
+  { dbType: "consul", label: "Consul", aliases: ["hashicorp consul"] },
   { dbType: "cloudberry", label: "Apache Cloudberry" },
   { dbType: "mariadb", label: "MariaDB" },
   { dbType: "tidb", label: "TiDB" },
@@ -84,6 +85,7 @@ const supplementalDrivers = [
   { dbType: "kafka", label: "Apache Kafka" },
   { dbType: "rocketmq", label: "Apache RocketMQ" },
   { dbType: "rabbitmq", label: "RabbitMQ" },
+  { dbType: "mqtt", label: "MQTT", aliases: ["emqx", "hivemq", "mosquitto"] },
 ];
 
 const manifestUrl = new URL("../../crates/dbx-core/assets/database-drivers.manifest.json", import.meta.url);

@@ -20,6 +20,7 @@ src-tauri/target-win-x64/
 src-tauri/target-win7-x64/
 src-tauri-legacy/
 third-party/webview2-fixed-runtime/
+src-tauri/webview2-fixed-runtime/
 plugins/jdbc/target/
 plugins/jdbc/dependency-reduced-pom.xml
 plugins/jdbc/lib/*.jar
@@ -79,3 +80,6 @@ DBX_*_x64-portable.zip
 # Local devtest connections (contains credentials; do not commit)
 dbx-devtest-connections.json
 .npmrc
+
+# Real database integration credentials (see docs/TEST_ENVIRONMENTS.md)
+/docs/TEST_ENVIRONMENTS.md

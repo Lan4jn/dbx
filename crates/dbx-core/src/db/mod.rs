@@ -4,6 +4,7 @@ pub mod cloudberry;
 pub mod cloudflare_d1;
 pub use cloudflare_d1 as cloudflare_d1_driver;
 pub mod document_result;
+pub mod dolt;
 pub mod doris;
 pub mod duckdb_sql;
 #[cfg(feature = "duckdb-sidecar")]
@@ -36,6 +37,7 @@ pub mod starrocks;
 pub mod transport_layer_tunnel;
 pub mod turso_driver;
 pub mod vector_driver;
+pub mod victoriametrics_driver;
 pub mod wkb;
 
 use reqwest::ClientBuilder;

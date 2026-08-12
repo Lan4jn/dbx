@@ -15,7 +15,9 @@ import { revealPathInFileManager } from "@/lib/backend/tauri";
 import { canConfigureVisibleSchemasForTreeNode } from "@/lib/database/databaseFeatureSupport";
 import { canCloseSidebarDatabaseConnection } from "@/lib/sidebar/sidebarDatabaseOpenState";
 import { selectedConnectionDeleteTargets, selectedConnectionDuplicateTargets } from "@/lib/sidebar/sidebarConnectionSelection";
+import { releaseConnectionFromMultiSelection } from "@/lib/sidebar/sidebarConnectionMultiSelect";
 import { connectionDeleteTargetSnapshot, showDeleteConfirm, showDeleteGroupConfirm, sidebarFormTarget } from "@/components/sidebar/sidebarTreeDialogState";
+import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 
 interface SidebarConnectionMutationRuntimeOptions {
   activeNode: ShallowRef<TreeNode>;
@@ -49,6 +51,26 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     if (!node.connectionId) return;
     try {
       await connectionStore.clearDefaultDatabase(node.connectionId);
+    } catch (error: any) {
+      toast(t("connection.saveFailed", { message: error?.message || String(error) }), 5000);
+    }
+  }
+
+  async function setNodeAsDefaultSchema() {
+    const node = activeNode.value;
+    if (!node.connectionId || !node.schema) return;
+    try {
+      await connectionStore.setDefaultSchema(node.connectionId, node.schema);
+    } catch (error: any) {
+      toast(t("connection.saveFailed", { message: error?.message || String(error) }), 5000);
+    }
+  }
+
+  async function clearNodeDefaultSchema() {
+    const node = activeNode.value;
+    if (!node.connectionId) return;
+    try {
+      await connectionStore.clearDefaultSchema(node.connectionId);
     } catch (error: any) {
       toast(t("connection.saveFailed", { message: error?.message || String(error) }), 5000);
     }
@@ -114,7 +136,7 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
       await copyToClipboard(String(port));
       toast(t("contextMenu.finalProxyPortCopied", { port }), 2000);
     } catch (error: any) {
-      toast(t("grid.copyFailed", { message: translateBackendError(t, error?.message || String(error)) }), 5000);
+      toast(t("grid.copyFailed", { message: translateBackendError(t, error) }), 5000);
     }
   }
 
@@ -150,7 +172,7 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     try {
       await revealPathInFileManager(path);
     } catch (error: any) {
-      toast(translateBackendError(t, typeof error === "string" ? error : error?.message || String(error)), 5000);
+      toast(translateBackendError(t, error), 5000);
     }
   }
 
@@ -228,13 +250,14 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
   const isNodeDefaultDatabase = computed(
     () => (activeNode.value.type === "database" || activeNode.value.type === "redis-db" || activeNode.value.type === "mongo-db") && !!activeNode.value.connectionId && !!activeNode.value.database && connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database),
   );
+  const isNodeDefaultSchema = computed(() => activeNode.value.type === "schema" && !!activeNode.value.connectionId && !!activeNode.value.schema && connectionStore.isDefaultSchema(activeNode.value.connectionId, activeNode.value.schema));
   const isConnected = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && connectionStore.connectedIds.has(activeNode.value.connectionId));
   const isConnecting = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && connectionStore.connectingIds.has(activeNode.value.connectionId));
   const canCloseDatabaseConnection = computed(() => canCloseSidebarDatabaseConnection(activeNode.value, connectionStore.isTreeNodeChildrenLoaded, (connectionId, database) => queryStore.openDatabaseKeys.has(`${connectionId}\x00${database}`)));
   const canConfigureVisibleDatabases = computed(() => {
     if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
     const databaseType = connectionStore.getConfig(activeNode.value.connectionId)?.db_type;
-    return databaseType !== "elasticsearch" && databaseType !== "easysearch" && databaseType !== "qdrant" && databaseType !== "milvus" && databaseType !== "weaviate" && databaseType !== "chromadb" && databaseType !== "etcd" && databaseType !== "mq" && databaseType !== "nacos";
+    return connectionCanConfigureSidebarVisibleDatabases(databaseType);
   });
   const canConfigureVisibleSchemas = computed(() => {
     if (!activeNode.value.connectionId) return false;
@@ -283,12 +306,26 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
 
   function moveToGroup(groupId: string | null) {
     const connectionId = activeNode.value.connectionId;
-    if (connectionId) connectionStore.moveConnectionToGroup(connectionId, groupId);
+    if (!connectionId) return;
+    connectionStore.moveConnectionToGroup(connectionId, groupId);
+    releaseConnectionFromMultiSelection(connectionStore, connectionId);
+  }
+
+  function createGroupAndMoveConnection(name: string): boolean {
+    const node = sidebarFormTarget.value ?? activeNode.value;
+    const normalizedName = name.trim();
+    if (!normalizedName || !node.connectionId) return false;
+    const groupId = connectionStore.createConnectionGroup(normalizedName);
+    connectionStore.moveConnectionToGroup(node.connectionId, groupId);
+    releaseConnectionFromMultiSelection(connectionStore, node.connectionId);
+    return true;
   }
 
   return {
     setNodeAsDefaultDatabase,
     clearNodeDefaultDatabase,
+    setNodeAsDefaultSchema,
+    clearNodeDefaultSchema,
     connectionDeleteTargets,
     connectionDeleteMenuLabel,
     connectionDuplicateTargets,
@@ -309,6 +346,7 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     closeDatabaseConnection,
     isPinned,
     isNodeDefaultDatabase,
+    isNodeDefaultSchema,
     isConnected,
     isConnecting,
     canCloseDatabaseConnection,
@@ -324,5 +362,6 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     newSubgroup,
     confirmDeleteGroup,
     moveToGroup,
+    createGroupAndMoveConnection,
   };
 }

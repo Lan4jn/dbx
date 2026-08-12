@@ -178,6 +178,7 @@ mod tests {
 
     fn mongodb_config() -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "mongo".to_string(),
             name: "MongoDB".to_string(),
             note: String::new(),
@@ -191,6 +192,7 @@ mod tests {
             username: "mongouser".to_string(),
             password: "secret".to_string(),
             database: Some("RestCloud_V45PUB_Gateway".to_string()),
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -1077,11 +1079,39 @@ async fn test_connection_with_info_inner(
                     .await
                     .map(|_| "Connection successful".to_string())
             }
+            DatabaseType::VictoriaMetrics => {
+                let client =
+                    db::victoriametrics_driver::VictoriaMetricsClient::new_for_config(&url, &config, connect_timeout)?;
+                db::victoriametrics_driver::test_connection(&client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
             DatabaseType::Nacos => {
                 let admin_config = state.nacos_admin_config_for_connection(connection_id, &config).await?;
                 let adapter = state.nacos_registry.build_transient_config(admin_config).await?;
                 adapter.test_connection().await?;
                 Ok("Connection successful".to_string())
+            }
+            DatabaseType::Consul => {
+                let mut consul_config = dbx_core::consul::ConsulConfig::from_connection(&config)?;
+                let validate_agent_target = consul_config.agent_target.is_some();
+                let original_host = consul_config.base_url.host_str().unwrap_or_default();
+                let original_port = consul_config.base_url.port_or_known_default().unwrap_or(config.port);
+                if host != original_host || port != original_port {
+                    consul_config = consul_config.with_connect_override(&host, port);
+                }
+                let client = dbx_core::consul::ConsulClient::new(consul_config).await?;
+                client.probe().await?;
+                let identity = if validate_agent_target {
+                    Some(client.validate_configured_agent_target().await?)
+                } else {
+                    client.agent_self().await.ok()
+                };
+                Ok(identity
+                    .map(|identity| format!("Connection successful (Agent: {} at {})", identity.node, identity.address))
+                    .unwrap_or_else(|| {
+                        "Connection successful (Agent identity unavailable; Agent writes disabled)".to_string()
+                    }))
             }
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
@@ -1097,6 +1127,17 @@ async fn test_connection_with_info_inner(
             DatabaseType::MessageQueue => {
                 Err("Message queue admin support is not compiled in this build. Rebuild with the 'mq-admin' feature."
                     .to_string())
+            }
+            #[cfg(feature = "mq-admin")]
+            DatabaseType::Mqtt => {
+                let mqtt_config = dbx_core::mqtt::types::MqttConnectionConfig::from_connection(&config)?;
+                let client = dbx_core::mqtt::client::MqttClient::connect(mqtt_config).await?;
+                client.disconnect().await;
+                Ok("Connection successful".to_string())
+            }
+            #[cfg(not(feature = "mq-admin"))]
+            DatabaseType::Mqtt => {
+                Err("MQTT support is not compiled in this build. Rebuild with the 'mq-admin' feature.".to_string())
             }
             db_type if database_capabilities::is_agent_type(&db_type) => {
                 match test_agent_connection(state, &config, &host, port).await {
@@ -1403,11 +1444,28 @@ pub async fn connect_db(
             db::influxdb_driver::test_connection(&client, connect_timeout).await?;
             PoolKind::InfluxDb(client)
         }
+        DatabaseType::VictoriaMetrics => {
+            let client =
+                db::victoriametrics_driver::VictoriaMetricsClient::new_for_config(&url, &db_config, connect_timeout)?;
+            db::victoriametrics_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::VictoriaMetrics(client)
+        }
         DatabaseType::Nacos => {
             let admin_config = state.nacos_admin_config_for_connection(&id, &config).await?;
             let adapter = state.nacos_registry.build_transient_config(admin_config).await?;
             adapter.test_connection().await?;
             PoolKind::Nacos
+        }
+        DatabaseType::Consul => {
+            let mut consul_config = dbx_core::consul::ConsulConfig::from_connection(&db_config)?;
+            let original_host = consul_config.base_url.host_str().unwrap_or_default();
+            let original_port = consul_config.base_url.port_or_known_default().unwrap_or(db_config.port);
+            if host != original_host || port != original_port {
+                consul_config = consul_config.with_connect_override(&host, port);
+            }
+            let client = dbx_core::consul::ConsulClient::new(consul_config).await?;
+            client.probe().await?;
+            PoolKind::Consul(client)
         }
         #[cfg(feature = "mq-admin")]
         DatabaseType::MessageQueue => {
@@ -1449,6 +1507,16 @@ pub async fn connect_db(
             state.external_driver_pool("jdbc", &jdbc_config).await?
         }
         DatabaseType::Jdbc => state.external_driver_pool("jdbc", &db_config).await?,
+        #[cfg(feature = "mq-admin")]
+        DatabaseType::Mqtt => {
+            let mqtt_config = dbx_core::mqtt::types::MqttConnectionConfig::from_connection(&db_config)?;
+            let client = dbx_core::mqtt::client::MqttClient::connect(mqtt_config).await?;
+            PoolKind::Mqtt(client)
+        }
+        #[cfg(not(feature = "mq-admin"))]
+        DatabaseType::Mqtt => {
+            return Err("MQTT support is not compiled in this build. Rebuild with the 'mq-admin' feature.".to_string());
+        }
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 

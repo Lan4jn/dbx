@@ -60,6 +60,60 @@ test("rejects an incomplete reusable native platform set", () => {
   );
 });
 
+test("requires all TDengine native platforms when reusing a release", () => {
+  const native = Object.fromEntries(
+    platforms.slice(0, -1).map((platform, index) => [platform, artifact(`dbx-agent-tdengine-0.1.40-${platform}.tar.zst`, String(index + 1))]),
+  );
+  const registry = { drivers: { tdengine: { version: "0.1.40", native } }, jres: {} };
+
+  assert.throws(
+    () => collectReusableAssetPlan({
+      registry,
+      release: releaseFor(Object.values(native)),
+      versions: { tdengine: "0.1.40" },
+      modules: ["tdengine"],
+      reuseJre: false,
+    }),
+    /missing=windows-x64/,
+  );
+});
+
+test("requires all Neo4j native platforms when reusing a release", () => {
+  const native = Object.fromEntries(
+    platforms.slice(0, -1).map((platform, index) => [platform, artifact(`dbx-agent-neo4j-0.1.40-${platform}.tar.zst`, String(index + 1))]),
+  );
+  const registry = { drivers: { neo4j: { version: "0.1.40", native } }, jres: {} };
+
+  assert.throws(
+    () => collectReusableAssetPlan({
+      registry,
+      release: releaseFor(Object.values(native)),
+      versions: { neo4j: "0.1.40" },
+      modules: ["neo4j"],
+      reuseJre: false,
+    }),
+    /missing=windows-x64/,
+  );
+});
+
+test("requires all IoTDB native platforms when reusing a release", () => {
+  const native = Object.fromEntries(
+    platforms.slice(0, -1).map((platform, index) => [platform, artifact(`dbx-agent-iotdb-0.1.30-${platform}.tar.zst`, String(index + 1))]),
+  );
+  const registry = { drivers: { iotdb: { version: "0.1.30", native } }, jres: {} };
+
+  assert.throws(
+    () => collectReusableAssetPlan({
+      registry,
+      release: releaseFor(Object.values(native)),
+      versions: { iotdb: "0.1.30" },
+      modules: ["iotdb"],
+      reuseJre: false,
+    }),
+    /missing=windows-x64/,
+  );
+});
+
 test("ignores zero-size legacy JAR placeholders for native-only modules", () => {
   const native = Object.fromEntries(
     platforms.map((platform, index) => [platform, artifact(`dbx-agent-duckdb-0.1.2-${platform}.tar.zst`, String(index + 1))]),

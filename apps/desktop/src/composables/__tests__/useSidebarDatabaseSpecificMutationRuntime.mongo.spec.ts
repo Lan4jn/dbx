@@ -2,7 +2,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { shallowRef } from "vue";
 import type { TreeNode } from "@/types/database";
-import { mongoCreateIndexError, mongoCreateIndexForm, resetMongoCreateIndexForm, sidebarDangerTarget, sidebarFormTarget, showCreateMongoIndexDialog, showDropAllMongoIndexesConfirm, showDropMongoCollectionConfirm } from "@/components/sidebar/sidebarTreeDialogState";
+import {
+  cloneMongoCollectionError,
+  cloneMongoCollectionLoading,
+  cloneMongoCollectionName,
+  mongoCreateIndexError,
+  mongoCreateIndexForm,
+  resetMongoCreateIndexForm,
+  sidebarDangerTarget,
+  sidebarFormTarget,
+  showCloneMongoCollectionDialog,
+  showCreateMongoIndexDialog,
+  showDropAllMongoIndexesConfirm,
+  showDropMongoCollectionConfirm,
+} from "@/components/sidebar/sidebarTreeDialogState";
 
 const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
@@ -13,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   loadMongoDatabases: vi.fn().mockResolvedValue(undefined),
   removeTreeNode: vi.fn(),
   mongoCreateIndex: vi.fn().mockResolvedValue({ name: "email_1" }),
+  mongoCloneCollection: vi.fn().mockResolvedValue({ documents_copied: 2, indexes_copied: 1 }),
   mongoDropCollection: vi.fn().mockResolvedValue(undefined),
   mongoDropDatabase: vi.fn().mockResolvedValue(undefined),
   mongoDropIndexes: vi.fn().mockResolvedValue({ dropped_names: ["email_1"], affected_rows: 1 }),
@@ -35,6 +49,7 @@ vi.mock("@/stores/connectionStore", () => ({
 
 vi.mock("@/lib/backend/api", () => ({
   mongoCreateIndex: (...args: unknown[]) => mocks.mongoCreateIndex(...args),
+  mongoCloneCollection: (...args: unknown[]) => mocks.mongoCloneCollection(...args),
   mongoDropCollection: (...args: unknown[]) => mocks.mongoDropCollection(...args),
   mongoDropDatabase: (...args: unknown[]) => mocks.mongoDropDatabase(...args),
   mongoDropIndexes: (...args: unknown[]) => mocks.mongoDropIndexes(...args),
@@ -142,18 +157,23 @@ describe("MongoDB sidebar mutation runtime", () => {
     mocks.loadMongoCollections.mockResolvedValue(undefined);
     mocks.loadMongoDatabases.mockResolvedValue(undefined);
     mocks.mongoCreateIndex.mockResolvedValue({ name: "email_1" });
+    mocks.mongoCloneCollection.mockResolvedValue({ documents_copied: 2, indexes_copied: 1 });
     mocks.mongoDropCollection.mockResolvedValue(undefined);
     mocks.mongoDropDatabase.mockResolvedValue(undefined);
     mocks.mongoDropIndexes.mockResolvedValue({ dropped_names: ["email_1"], affected_rows: 1 });
     sidebarDangerTarget.value = null;
     sidebarFormTarget.value = null;
     showCreateMongoIndexDialog.value = false;
+    showCloneMongoCollectionDialog.value = false;
     showDropAllMongoIndexesConfirm.value = false;
     showDropMongoCollectionConfirm.value = false;
     resetMongoCreateIndexForm();
+    cloneMongoCollectionName.value = "";
+    cloneMongoCollectionError.value = "";
+    cloneMongoCollectionLoading.value = false;
   });
 
-  it("allows Legacy connections to create and delete MongoDB tree objects while keeping rename native-only", () => {
+  it("keeps Legacy MongoDB mutations available while limiting index actions to the Indexes group", () => {
     mocks.getConfig.mockReturnValue(mongoConfig("mongodb-legacy"));
     const activeNode = shallowRef(mongoDatabaseNode());
     const feature = useSidebarDatabaseSpecificMutationRuntime({
@@ -172,10 +192,15 @@ describe("MongoDB sidebar mutation runtime", () => {
     expect(feature.canDropMongoDatabase.value).toBe(true);
     activeNode.value = mongoCollectionNode();
     expect(feature.canDropMongoCollection.value).toBe(true);
-    expect(feature.canDropAllMongoIndexes.value).toBe(true);
+    expect(feature.canDropAllMongoIndexes.value).toBe(false);
     expect(feature.canRenameMongoCollection.value).toBe(false);
-    expect(feature.canCreateMongoIndex.value).toBe(true);
+    expect(feature.canCloneMongoCollection.value).toBe(true);
+    expect(feature.canCreateMongoIndex.value).toBe(false);
     activeNode.value = mongoIndexesGroupNode();
+    expect(feature.canDropAllMongoIndexes.value).toBe(true);
+    expect(feature.canCreateMongoIndex.value).toBe(true);
+    activeNode.value = mongoIndexesGroupNode("timeseries");
+    expect(feature.canDropAllMongoIndexes.value).toBe(true);
     expect(feature.canCreateMongoIndex.value).toBe(true);
     activeNode.value = mongoIndexNode("email_1");
     expect(feature.canDropMongoIndex.value).toBe(true);
@@ -199,11 +224,54 @@ describe("MongoDB sidebar mutation runtime", () => {
     });
 
     expect(feature.canDropMongoCollection.value).toBe(true);
+    expect(feature.canCloneMongoCollection.value).toBe(false);
     expect(feature.canDropAllMongoIndexes.value).toBe(false);
     activeNode.value = mongoIndexesGroupNode("view");
+    expect(feature.canDropAllMongoIndexes.value).toBe(false);
     expect(feature.canCreateMongoIndex.value).toBe(false);
     activeNode.value = mongoIndexNode("email_1", "view");
     expect(feature.canDropMongoIndex.value).toBe(false);
+  });
+
+  it("does not expose Indexes group mutations for read-only MongoDB connections", () => {
+    mocks.getConfig.mockReturnValue({ ...mongoConfig(), read_only: true });
+    const feature = runtime(mongoIndexesGroupNode());
+
+    expect(feature.canCreateMongoIndex.value).toBe(false);
+    expect(feature.canDropAllMongoIndexes.value).toBe(false);
+  });
+
+  it("clones a regular MongoDB collection through the Legacy Agent and refreshes the sidebar", async () => {
+    mocks.getConfig.mockReturnValue(mongoConfig("mongodb-legacy"));
+    const node = mongoCollectionNode();
+    const feature = runtime(node);
+    sidebarFormTarget.value = node;
+
+    expect(feature.canCloneMongoCollection.value).toBe(true);
+    feature.prepareCloneMongoCollectionDialog();
+    expect(cloneMongoCollectionName.value).toBe("users_copy");
+
+    await feature.confirmCloneMongoCollection();
+
+    expect(mocks.ensureConnected).toHaveBeenCalledWith("conn-1");
+    expect(mocks.mongoCloneCollection).toHaveBeenCalledWith("conn-1", "app", "users", "users_copy");
+    expect(mocks.loadMongoCollections).toHaveBeenCalledWith("conn-1", "app");
+    expect(showCloneMongoCollectionDialog.value).toBe(false);
+    expect(mocks.toast).toHaveBeenCalledWith('contextMenu.cloneCollectionSuccess:{"name":"users_copy","documents":2,"indexes":1}', 3000);
+  });
+
+  it("refreshes the collection list when cloning fails after a target may have been created", async () => {
+    const node = mongoCollectionNode();
+    const feature = runtime(node);
+    sidebarFormTarget.value = node;
+    mocks.mongoCloneCollection.mockRejectedValue(new Error("index build failed"));
+
+    feature.prepareCloneMongoCollectionDialog();
+    await feature.confirmCloneMongoCollection();
+
+    expect(mocks.loadMongoCollections).toHaveBeenCalledWith("conn-1", "app");
+    expect(showCloneMongoCollectionDialog.value).toBe(true);
+    expect(cloneMongoCollectionError.value).toContain("index build failed");
   });
 
   it("creates an index from the shared sidebar dialog state", async () => {
@@ -253,16 +321,26 @@ describe("MongoDB sidebar mutation runtime", () => {
     expect(showCreateMongoIndexDialog.value).toBe(true);
   });
 
-  it("allows a collection menu to create an index before its Indexes group is expanded", async () => {
+  it("does not expose index creation through a collection node", async () => {
     const node = mongoCollectionNode();
     const feature = runtime(node);
     sidebarFormTarget.value = node;
 
     feature.prepareCreateMongoIndexDialog();
-    mongoCreateIndexForm.value.fields[0]!.path = "email";
+    expect(showCreateMongoIndexDialog.value).toBe(false);
     await feature.confirmCreateMongoIndex();
 
-    expect(mocks.mongoCreateIndex).toHaveBeenCalledWith("conn-1", "app", "users", '{"email":1}', undefined);
+    expect(mocks.mongoCreateIndex).not.toHaveBeenCalled();
+  });
+
+  it("does not clear indexes through a collection node", async () => {
+    const node = mongoCollectionNode();
+    const feature = runtime(node);
+    sidebarDangerTarget.value = node;
+
+    await feature.confirmDropAllMongoIndexes();
+
+    expect(mocks.mongoDropIndexes).not.toHaveBeenCalled();
   });
 
   it("keeps the sidebar form target when the active node changes", async () => {
@@ -296,12 +374,13 @@ describe("MongoDB sidebar mutation runtime", () => {
   });
 
   it("drops every removable index through the shared mutation and refreshes metadata", async () => {
-    const node = mongoCollectionNode();
+    const node = mongoIndexesGroupNode();
     const feature = runtime(node);
     sidebarDangerTarget.value = node;
     showDropAllMongoIndexesConfirm.value = true;
     mocks.mongoDropIndexes.mockResolvedValueOnce({ dropped_names: ["email_1", "created_at_-1"], affected_rows: 2 });
 
+    expect(feature.mongoDropAllIndexesPreview(node)).toBe('db.getSiblingDB("app").getCollection("users").dropIndexes()');
     await feature.confirmDropAllMongoIndexes();
 
     expect(mocks.mongoDropIndexes).toHaveBeenCalledWith("conn-1", "app", "users", undefined, false);
@@ -323,7 +402,7 @@ describe("MongoDB sidebar mutation runtime", () => {
   });
 
   it("reports partial index deletion after forcing a metadata refresh", async () => {
-    const node = mongoCollectionNode();
+    const node = mongoIndexesGroupNode();
     const feature = runtime(node);
     sidebarDangerTarget.value = node;
     mocks.mongoDropIndexes.mockResolvedValueOnce({
@@ -431,5 +510,23 @@ describe("MongoDB sidebar mutation runtime", () => {
     expect(mocks.ensureConnected).not.toHaveBeenCalled();
     expect(mocks.mongoCreateIndex).not.toHaveBeenCalled();
     expect(showCreateMongoIndexDialog.value).toBe(true);
+  });
+
+  it("does not clear indexes when production confirmation is cancelled", async () => {
+    mocks.getConfig.mockReturnValue(mongoConfig(undefined, true));
+    const node = mongoIndexesGroupNode();
+    const feature = runtime(node);
+    sidebarDangerTarget.value = node;
+    showDropAllMongoIndexesConfirm.value = true;
+    const pending = feature.confirmDropAllMongoIndexes();
+    await Promise.resolve();
+
+    const { useProductionSafetyStore } = await import("@/stores/productionSafetyStore");
+    useProductionSafetyStore().cancel();
+    await pending;
+
+    expect(mocks.ensureConnected).not.toHaveBeenCalled();
+    expect(mocks.mongoDropIndexes).not.toHaveBeenCalled();
+    expect(showDropAllMongoIndexesConfirm.value).toBe(true);
   });
 });

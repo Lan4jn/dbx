@@ -101,6 +101,32 @@ describe("QueryEditor completion Tab keymap", () => {
     expect(result).not.toHaveProperty("filter");
   });
 
+  it("keeps ASCII single-character filtering while allowing Han pinyin matches", () => {
+    const source = [extractFunction("completionItemsForBypassedFilter"), extractFunction("shouldBypassCompletionFilter"), extractFunction("buildCompletionResult")].join("\n");
+    const javascript = ts.transpileModule(source, {
+      compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const buildCompletionResult = new Function("completionOptionForItem", "completionMatchRanges", `${javascript}\nreturn buildCompletionResult;`)(
+      (item: { label: string }) => item,
+      () => [],
+    ) as (items: Array<{ label: string }>, from: number, validFor?: RegExp, prefix?: string) => { filter?: boolean; options: Array<{ label: string }> } | null;
+
+    const result = buildCompletionResult([{ label: "amount" }, { label: "memo" }, { label: "明细" }], 0, undefined, "m");
+
+    expect(result?.filter).toBe(false);
+    expect(result?.options.map((item) => item.label)).toEqual(["memo", "明细"]);
+  });
+
+  it("bypasses CodeMirror filtering for Han substring matches", () => {
+    const javascript = ts.transpileModule(extractFunction("shouldBypassCompletionFilter"), {
+      compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const shouldBypassCompletionFilter = new Function(`${javascript}\nreturn shouldBypassCompletionFilter;`)() as (prefix: string, items: Array<{ label: string }>) => boolean;
+
+    expect(shouldBypassCompletionFilter("金", [{ label: "总租金" }])).toBe(true);
+    expect(shouldBypassCompletionFilter("m", [{ label: "amount" }, { label: "memo" }])).toBe(false);
+  });
+
   it("keeps normal Tab indentation when completion is inactive", () => {
     const harness = createHarness({ completionStatus: () => null });
     const view = createView();
@@ -115,21 +141,29 @@ describe("QueryEditor completion Tab keymap", () => {
     const harness = createHarness({ completionStatus: () => null, nextSnippetField });
     const view = createView();
 
-    expect(harness.acceptCompletionOrNextSnippetField(view)).toBe(true);
+    expect(harness.handleTab(view)).toBe(true);
     expect(nextSnippetField).toHaveBeenCalledWith(view);
     expect(view.dispatch).not.toHaveBeenCalled();
   });
 
-  it("advances an available snippet field immediately while completion is pending", () => {
+  it("waits for pending completion before advancing a snippet field", async () => {
     vi.useFakeTimers();
+    let status: "active" | "pending" | null = "pending";
+    const acceptCompletion = vi.fn(() => true);
     const nextSnippetField = vi.fn(() => true);
     const indentMore = vi.fn(() => true);
-    const harness = createHarness({ completionStatus: () => "pending", nextSnippetField, indentMore });
+    const harness = createHarness({ completionStatus: () => status, acceptCompletion, nextSnippetField, indentMore });
     const view = createView();
 
     expect(harness.acceptCompletionOrNextSnippetField(view)).toBe(true);
-    expect(nextSnippetField).toHaveBeenCalledWith(view);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(nextSnippetField).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+
+    status = "active";
+    await vi.advanceTimersByTimeAsync(16);
+
+    expect(acceptCompletion).toHaveBeenCalledWith(view);
+    expect(nextSnippetField).not.toHaveBeenCalled();
     expect(indentMore).not.toHaveBeenCalled();
     expect(view.dispatch).not.toHaveBeenCalled();
   });

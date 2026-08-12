@@ -840,6 +840,7 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+#[allow(clippy::needless_return)]
 pub(crate) fn locate_command(command: &str) -> Option<String> {
     #[cfg(windows)]
     {
@@ -910,6 +911,7 @@ struct CommandOutput {
     stderr: String,
 }
 
+#[allow(clippy::needless_return)]
 fn command_output(command: &str, args: &[&str]) -> Result<CommandOutput, String> {
     let direct = run_command(command, args);
     if direct.as_ref().is_ok_and(|output| output.success) {

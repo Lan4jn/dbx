@@ -110,16 +110,22 @@ try {
 
   if ($buildLegacy) {
     $env:CARGO_TARGET_DIR = Join-Path $repoRoot "src-tauri\target-win7-x64"
+    & (Join-Path $repoRoot ".github\scripts\prepare-webview2-win7-loader.ps1")
+    Assert-LastExitCode "Preparing Windows 7 WebView2 loader"
     & (Join-Path $repoRoot ".github\scripts\prepare-webview2-win7-runtime.ps1")
     Assert-LastExitCode "Preparing Windows 7 WebView2 runtime"
+    & (Join-Path $repoRoot ".github\scripts\assert-webview2-win7-runtime.ps1")
+    Assert-LastExitCode "Validating Windows 7 WebView2 runtime"
 
-    pnpm tauri bundle --bundles nsis --target $LegacyTarget --config src-tauri/tauri.webview2-win7-offline.conf.json
+    pnpm tauri bundle --bundles nsis --target $LegacyTarget --config src-tauri/tauri.webview2-win7-fixed.conf.json
     Assert-LastExitCode "Legacy NSIS build"
 
     $legacyBundleDir = Join-Path $env:CARGO_TARGET_DIR "$LegacyTarget\release\bundle\nsis"
     $generatedLegacyInstaller = Join-Path $legacyBundleDir "DBX_${version}_x64-setup.exe"
     $legacyInstaller = Join-Path $legacyBundleDir "DBX_${version}_x64-win7-win8-webview2-109-offline-setup.exe"
     Copy-Item -LiteralPath $generatedLegacyInstaller -Destination $legacyInstaller -Force
+    & (Join-Path $repoRoot ".github\scripts\assert-win7-installer-content.ps1") -InstallerPath $legacyInstaller
+    Assert-LastExitCode "Validating Windows 7 installer content"
     Remove-Item -LiteralPath "$legacyInstaller.sig" -Force -ErrorAction SilentlyContinue
     $legacySignature = Ensure-Signature -InstallerPath $legacyInstaller
     Write-LatestJson -InstallerPath $legacyInstaller -SignaturePath $legacySignature -BaseUrl $LegacyBaseUrl -Notes "DBX $version Windows 7/8 x64 offline release" | Out-Null
