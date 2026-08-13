@@ -33,6 +33,7 @@ const sshConfigHosts = ref<SshConfigHostEntry[]>([]);
 const gatewayIdentities = ref<GatewayIdentityMetadata[]>([]);
 const gatewayIdentityName = ref("");
 const gatewayIdentityPassword = ref("");
+const gatewayIdentityPath = ref("");
 const isImportingGatewayIdentity = ref(false);
 const isLoadingGatewayIdentities = ref(false);
 
@@ -69,6 +70,8 @@ const selectedProxy = computed(() => (selected.value?.type === "proxy" ? selecte
 const selectedHttp = computed(() => (selected.value?.type === "http_tunnel" ? selected.value : null));
 const selectedGateway = computed(() => (selected.value?.type === "dbx_gateway" ? selected.value : null));
 const sshConfigHostAliases = computed(() => sshConfigHosts.value.map((entry) => entry.alias));
+const canImportGatewayIdentity = computed(() => isDesktop && !!gatewayIdentityPath.value && !!gatewayIdentityPassword.value && !isImportingGatewayIdentity.value);
+const gatewayIdentityFileName = computed(() => gatewayIdentityPath.value.split(/[\\/]/).pop() || "");
 
 async function loadSshConfigHosts() {
   try {
@@ -161,21 +164,41 @@ function gatewayIdentityReferenceCount(identityId: string): number {
   return draft.value.filter((profile) => profile.type === "dbx_gateway" && profile.identity_id === identityId).length;
 }
 
-async function importGatewayIdentity() {
+async function selectGatewayIdentityFile() {
   if (!isDesktop || isImportingGatewayIdentity.value) return;
   const { open } = await import("@tauri-apps/plugin-dialog");
   const path = await open({
-    title: t("settings.tunnelsGatewayImportIdentity"),
+    title: t("settings.tunnelsGatewaySelectIdentity"),
     multiple: false,
     filters: [{ name: "PKCS#12", extensions: ["p12", "pfx"] }],
   });
-  if (typeof path !== "string") return;
+  if (typeof path === "string") gatewayIdentityPath.value = path;
+}
 
+async function selectGatewayIdentityPasswordFile() {
+  if (!isDesktop || isImportingGatewayIdentity.value) return;
+  try {
+    const [{ open }, { readTextFile }] = await Promise.all([import("@tauri-apps/plugin-dialog"), import("@tauri-apps/plugin-fs")]);
+    const path = await open({
+      title: t("settings.tunnelsGatewaySelectPasswordFile"),
+      multiple: false,
+    });
+    if (typeof path === "string") {
+      gatewayIdentityPassword.value = (await readTextFile(path)).replace(/\r?\n$/, "");
+    }
+  } catch (error) {
+    toast(t("settings.tunnelsGatewayPasswordFileFailed", { message: translateBackendError(t, String(error)) }), 5000);
+  }
+}
+
+async function importGatewayIdentity() {
+  if (!canImportGatewayIdentity.value) return;
   isImportingGatewayIdentity.value = true;
   try {
-    const identity = await api.importGatewayIdentity(path, gatewayIdentityPassword.value, gatewayIdentityName.value.trim());
+    const identity = await api.importGatewayIdentity(gatewayIdentityPath.value, gatewayIdentityPassword.value, gatewayIdentityName.value.trim());
     gatewayIdentityPassword.value = "";
     gatewayIdentityName.value = "";
+    gatewayIdentityPath.value = "";
     await loadGatewayIdentities();
     if (selectedGateway.value) selectedGateway.value.identity_id = identity.id;
     toast(t("settings.tunnelsGatewayIdentityImported"));
@@ -454,16 +477,31 @@ async function testSelected() {
           <div class="col-span-3 grid min-w-0 gap-2">
             <div class="grid min-w-0 gap-2 sm:grid-cols-2">
               <Input v-model="gatewayIdentityName" :placeholder="t('settings.tunnelsGatewayIdentityNamePlaceholder')" :disabled="!isDesktop || isImportingGatewayIdentity" />
-              <PasswordInput v-model="gatewayIdentityPassword" :placeholder="t('settings.tunnelsGatewayIdentityPasswordPlaceholder')" :disabled="!isDesktop || isImportingGatewayIdentity" />
+              <div class="flex min-w-0 items-center gap-1">
+                <PasswordInput v-model="gatewayIdentityPassword" class="min-w-0 flex-1" :placeholder="t('settings.tunnelsGatewayIdentityPasswordPlaceholder')" :disabled="!isDesktop || isImportingGatewayIdentity" />
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="!isDesktop || isImportingGatewayIdentity" @click="selectGatewayIdentityPasswordFile">
+                      <FolderOpen class="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{{ t("settings.tunnelsGatewaySelectPasswordFile") }}</TooltipContent>
+                </Tooltip>
+              </div>
             </div>
-            <div class="flex min-w-0 flex-wrap items-center gap-2">
-              <Button type="button" variant="outline" size="sm" :disabled="!isDesktop || isImportingGatewayIdentity" @click="importGatewayIdentity">
+            <div class="flex min-w-0 items-center gap-2">
+              <Button type="button" variant="outline" size="sm" class="shrink-0" :disabled="!isDesktop || isImportingGatewayIdentity" @click="selectGatewayIdentityFile">
+                <FolderOpen class="mr-1.5 h-3.5 w-3.5" />
+                {{ t("settings.tunnelsGatewaySelectIdentity") }}
+              </Button>
+              <span class="min-w-0 flex-1 truncate text-xs text-muted-foreground" :title="gatewayIdentityPath">{{ gatewayIdentityFileName || t("settings.tunnelsGatewayNoIdentitySelected") }}</span>
+              <Button type="button" size="sm" class="shrink-0" :disabled="!canImportGatewayIdentity" @click="importGatewayIdentity">
                 <Loader2 v-if="isImportingGatewayIdentity" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
                 <Upload v-else class="mr-1.5 h-3.5 w-3.5" />
                 {{ t("settings.tunnelsGatewayImportIdentity") }}
               </Button>
-              <span v-if="!isDesktop" class="text-xs text-muted-foreground">{{ t("settings.tunnelsGatewayDesktopOnly") }}</span>
             </div>
+            <span v-if="!isDesktop" class="text-xs text-muted-foreground">{{ t("settings.tunnelsGatewayDesktopOnly") }}</span>
             <div v-for="identity in gatewayIdentities" :key="identity.id" class="flex min-w-0 items-center gap-2 border-t py-2 text-xs">
               <ShieldCheck class="h-4 w-4 shrink-0 text-emerald-600" />
               <span class="min-w-0 flex-1 truncate" :title="`${identity.subject} · ${identity.fingerprint_sha256}`">{{ identity.name }} · {{ identity.subject }}</span>

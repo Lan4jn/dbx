@@ -2,6 +2,8 @@
 
 Main 是公网入口、客户端与 Edge 的身份验证点及透明字节中继。Main 会看到数据库协议明文，因此主机应使用最小管理员范围、磁盘加密、审计和严格出站规则。
 
+DBX 用户身份的单独签发与交付步骤见 [DBX Client 证书生成与交付](client-certificate.md)，Edge 身份见 [Edge 节点证书生成与领取](edge-certificate.md)。
+
 ## 安装
 
 在 Main Linux 主机以 `root` 执行，预期创建不可登录服务账号和目录：
@@ -17,29 +19,55 @@ install -m 0644 examples/main.toml /etc/dbx-gateway/main.toml
 
 若用户或目录已存在，命令会提示冲突；核对其 UID、GID、home 和 shell 后跳过对应创建命令，不要删除已有数据目录。
 
-在 PKI 主机以 `dbx-gateway-pki` 用户签发 Server 证书：
+在保存**完整离线 PKI**的主机签发 Server 证书。在线 Edge-only PKI 只有 `edge` CA，不能执行这一步：
+
+有域名时：
 
 ```bash
 dbx-gateway-pki server issue \
-  --data-dir /var/lib/dbx-gateway-pki \
-  --password-file /etc/dbx-gateway-pki/password \
+  --data-dir /secure/dbx-gateway-pki-offline \
+  --password-file /secure/dbx-pki-password \
   --identity gateway.example.com \
   --dns-san gateway.example.com \
-  --output-dir /var/lib/dbx-gateway-pki/export/main-server
+  --output-dir /secure/export/main-server
 ```
+
+没有域名、客户端和 Edge 直接连接固定 IP 时：
+
+```bash
+dbx-gateway-pki server issue \
+  --data-dir /secure/dbx-gateway-pki-offline \
+  --password-file /secure/dbx-pki-password \
+  --identity main-gateway \
+  --dns-san localhost \
+  --ip-san 10.235.10.53 \
+  --output-dir /secure/export/main-server-ip
+```
+
+纯 IP 场景必须使用 `--ip-san`。当前 CLI 要求至少有一个 DNS SAN，因此示例保留 `--dns-san localhost` 作为占位。`--dns-san 10.235.10.53` 会生成 `DNS:10.235.10.53`，不能通过 IP 地址校验。
+
+安装前检查：
+
+```bash
+openssl x509 -in /secure/export/main-server-ip/certificate.pem \
+  -noout -text | grep -A2 "Subject Alternative Name"
+```
+
+应包含 `IP Address:10.235.10.53`。
 
 预期输出 `issued server certificate <serial>`。将 `certificate.pem`、`chain.pem`、`private-key.pem` 通过受控通道送到 Main；Server 私钥只能在 PKI 签发主机与 Main 间短暂传递，导入后删除导出副本。若输出目录已存在，工具会拒绝覆盖，改用新的空目录。
 
 在 Main 主机以 `root` 安装证书：
 
 ```bash
-install -m 0644 certificate.pem /etc/dbx-gateway/certs/main.pem
+install -o root -g dbx-gateway -m 0644 certificate.pem /etc/dbx-gateway/certs/main.pem
 cat chain.pem >> /etc/dbx-gateway/certs/main.pem
-install -m 0600 private-key.pem /etc/dbx-gateway/certs/main.key
-install -m 0644 edge/ca.crt.pem /etc/dbx-gateway/certs/edge-ca.pem
-install -m 0644 client/ca.crt.pem /etc/dbx-gateway/certs/client-ca.pem
-chown root:dbx-gateway /etc/dbx-gateway/certs/*
+install -o dbx-gateway -g dbx-gateway -m 0600 private-key.pem /etc/dbx-gateway/certs/main.key
+install -o root -g dbx-gateway -m 0644 edge-ca.crt.pem /etc/dbx-gateway/certs/edge-ca.pem
+install -o root -g dbx-gateway -m 0644 client-ca.crt.pem /etc/dbx-gateway/certs/client-ca.pem
 ```
+
+其中 `edge-ca.crt.pem` 来自离线 PKI 的 `edge/ca.crt.pem`，`client-ca.crt.pem` 来自 `client/ca.crt.pem`。DBX 客户端和 Edge 主机信任 Main 时使用签发输出中的 `chain.pem`。
 
 预期私钥为 `0600`，PEM 链首张是 `gateway.example.com` 叶证书。失败时用 `openssl x509 -in ... -noout -subject -issuer -dates` 检查证书，不要临时放宽私钥权限。
 

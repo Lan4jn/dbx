@@ -28,6 +28,17 @@ describe("DBX Gateway tunnel profile UI", () => {
     expect(managerSource).toContain(':disabled="!isDesktop');
   });
 
+  it("selects PKCS#12 and password files before enabling identity import", () => {
+    expect(managerSource).toContain('const gatewayIdentityPath = ref("")');
+    expect(managerSource).toContain("async function selectGatewayIdentityFile()");
+    expect(managerSource).toContain("async function selectGatewayIdentityPasswordFile()");
+    expect(managerSource).toContain('(await readTextFile(path)).replace(/\\r?\\n$/, "")');
+    expect(managerSource).toContain("api.importGatewayIdentity(gatewayIdentityPath.value");
+    expect(managerSource).toContain('t("settings.tunnelsGatewaySelectIdentity")');
+    expect(managerSource).toContain('t("settings.tunnelsGatewaySelectPasswordFile")');
+    expect(managerSource).toContain(':disabled="!canImportGatewayIdentity"');
+  });
+
   it("uses the prescribed Gateway icons", () => {
     expect(managerSource).toContain("Network");
     expect(managerSource).toContain("ShieldCheck");

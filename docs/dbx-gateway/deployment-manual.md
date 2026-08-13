@@ -14,6 +14,8 @@
 | 在线 PKI 配置目录 | `/etc/dbx-gateway-pki` |
 | 在线 PKI 数据目录 | `/var/lib/dbx-gateway-pki` |
 
+没有域名时可以直接使用固定 IP，例如 `10.235.10.53`。证书 SAN 类型必须与 URL 一致：域名使用 `--dns-san`，IP 地址使用 `--ip-san`。不能把 IP 字符串写入 `--dns-san`。
+
 ## 1. 架构与安全边界
 
 ```mermaid
@@ -88,7 +90,14 @@ cargo build --release -p dbx-gateway
 
 ## 3. 初始化离线 PKI
 
-在离线、磁盘加密且已有备份方案的主机执行：
+本节所有命令都在**离线 PKI 主机**执行。下面两个路径含义不同：
+
+| 路径 | 谁创建 | 用途 | 是否交付给其他主机 |
+|---|---|---|---|
+| `/secure/dbx-pki-password` | 管理员先创建 | 解密 CA 私钥的密码文件 | 只向在线 PKI 交付一份受控副本 |
+| `/secure/dbx-gateway-pki-offline` | `init` 命令创建 | 完整 PKI 数据库 | 绝不能整体复制到在线主机 |
+
+先创建密码文件，再初始化 PKI：
 
 ```bash
 umask 077
@@ -101,13 +110,29 @@ dbx-gateway-pki init \
   --password-file /secure/dbx-pki-password
 ```
 
-预期输出 `initialized DBX Gateway PKI`，并生成 `root`、`server`、`client` 和 `edge` 目录。初始化命令不会覆盖已有 PKI。
+预期输出 `initialized DBX Gateway PKI`。命令生成以下文件；这些是 CA，不是 Main、Edge 或 DBX 用户的叶证书：
+
+```text
+/secure/dbx-gateway-pki-offline/
+├── root/                 # Root CA，只留在离线主机
+├── server/               # Server CA，用于签发 Main Server 证书
+│   └── ca.crt.pem
+├── edge/                 # Edge CA，用于签发 Edge 身份
+│   ├── ca.crt.pem
+│   └── ca.key.encrypted.pem
+└── client/               # Client CA，用于签发 DBX Client 身份
+    └── ca.crt.pem
+```
+
+初始化命令不会输出 `/secure/dbx-pki-password`，也不会覆盖已有 PKI。
 
 立即制作至少两份加密离线备份。完整 PKI、CA 密码和备份恢复说明应分开保管，不要将 Root、Server 或 Client CA 私钥复制到 Main 或 Edge。
 
 ## 4. 签发 Main Server 证书
 
-在离线 PKI 主机执行：
+本节命令仍在**离线 PKI 主机**执行。它从完整 PKI 的 `server` CA 签发 Main 的 HTTPS 服务端证书。
+
+**有域名时**，使用 DNS SAN：
 
 ```bash
 dbx-gateway-pki server issue \
@@ -118,19 +143,52 @@ dbx-gateway-pki server issue \
   --output-dir /secure/export/main-server
 ```
 
-通过受控通道将以下文件送到 Main：
+此证书对应 `wss://gateway.example.com/...` 和 `https://gateway.example.com/...`。
 
-```text
-certificate.pem
-chain.pem
-private-key.pem
+**没有域名、直接使用 IP 时**，必须使用 IP SAN：
+
+```bash
+dbx-gateway-pki server issue \
+  --data-dir /secure/dbx-gateway-pki-offline \
+  --password-file /secure/dbx-pki-password \
+  --identity main-gateway \
+  --dns-san localhost \
+  --ip-san 10.235.10.53 \
+  --output-dir /secure/export/main-server-ip
 ```
 
-同时向 Main 提供 Edge CA 和 Client CA 的公开证书，不提供这些 CA 的私钥。
+当前 CLI 要求至少填写一个 `--dns-san`，所以纯 IP 场景用 `localhost` 占位；真正让 `wss://10.235.10.53/...` 通过校验的是 `--ip-san 10.235.10.53`。不要写成 `--dns-san 10.235.10.53`。
+
+签发后必须检查 SAN：
+
+```bash
+openssl x509 \
+  -in /secure/export/main-server-ip/certificate.pem \
+  -noout -text | grep -A2 "Subject Alternative Name"
+```
+
+纯 IP 场景应看到 `IP Address:10.235.10.53`。如果只看到 `DNS:10.235.10.53`，该证书不能用于 IP URL，必须重新签发。
+
+域名命令创建 `/secure/export/main-server`；纯 IP 命令创建 `/secure/export/main-server-ip`。下表用 `<MAIN_SERVER_OUTPUT>` 表示你实际选择的那个目录：
+
+| 生成文件 | 用途 | 最终位置 |
+|---|---|---|
+| `<MAIN_SERVER_OUTPUT>/certificate.pem` | Main 的叶证书 | Main 的 `/etc/dbx-gateway/certs/main.pem` 首段 |
+| `<MAIN_SERVER_OUTPUT>/chain.pem` | Main Server CA 证书链 | 追加到 Main 的 `main.pem`；同时作为 DBX 和 Edge 信任 Main 的 CA PEM |
+| `<MAIN_SERVER_OUTPUT>/private-key.pem` | Main 服务端私钥 | Main 的 `/etc/dbx-gateway/certs/main.key`，权限必须为 `0600` |
+
+另外从完整 PKI 取出两个**公开 CA 证书**交给 Main：
+
+| 源文件 | Main 最终位置 | Main 用它验证谁 |
+|---|---|---|
+| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem` | `/etc/dbx-gateway/certs/edge-ca.pem` | Edge Gateway |
+| `/secure/dbx-gateway-pki-offline/client/ca.crt.pem` | `/etc/dbx-gateway/certs/client-ca.pem` | DBX Client |
+
+不要把 `edge/ca.key.encrypted.pem`、`client/ca.key.encrypted.pem` 或 Root 私钥交给 Main。
 
 ## 5. 部署在线 Edge PKI
 
-在线 PKI 只复制离线 PKI 的 `edge` 子目录和对应密码，不复制 `root`、`server`、`client` 私钥目录。
+在线 PKI 只负责 Edge 自动领证。它需要离线 PKI 的 `edge` CA 证书、加密私钥和同一个 CA 密码，不需要 Root、Server 或 Client CA 私钥。
 
 在在线 PKI/Main 主机以 `root` 执行：
 
@@ -143,11 +201,35 @@ install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway-pki
 install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 /var/lib/dbx-gateway-pki
 install -m 0755 bin/dbx-gateway-pki /usr/bin/dbx-gateway-pki
 install -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
-install -m 0600 /secure-transfer/password /etc/dbx-gateway-pki/password
-chown dbx-gateway-pki:dbx-gateway /etc/dbx-gateway-pki/password
 ```
 
-把离线 `edge` 目录复制到 `/var/lib/dbx-gateway-pki/edge`，所有者设为 `dbx-gateway-pki:dbx-gateway`。查询 Main 服务账号的 UID/GID：
+通过加密介质把下面三个源文件送到在线 PKI 主机，然后执行明确的安装命令：
+
+| 离线 PKI 主机上的源文件 | 在线 PKI 主机上的目标文件 |
+|---|---|
+| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem` | `/var/lib/dbx-gateway-pki/edge/ca.crt.pem` |
+| `/secure/dbx-gateway-pki-offline/edge/ca.key.encrypted.pem` | `/var/lib/dbx-gateway-pki/edge/ca.key.encrypted.pem` |
+| `/secure/dbx-pki-password` | `/etc/dbx-gateway-pki/password` |
+
+假设加密介质挂载在 `/mnt/secure-transfer`：
+
+```bash
+install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 \
+  /var/lib/dbx-gateway-pki/edge
+install -o dbx-gateway-pki -g dbx-gateway -m 0644 \
+  /mnt/secure-transfer/edge/ca.crt.pem \
+  /var/lib/dbx-gateway-pki/edge/ca.crt.pem
+install -o dbx-gateway-pki -g dbx-gateway -m 0600 \
+  /mnt/secure-transfer/edge/ca.key.encrypted.pem \
+  /var/lib/dbx-gateway-pki/edge/ca.key.encrypted.pem
+install -o dbx-gateway-pki -g dbx-gateway -m 0600 \
+  /mnt/secure-transfer/dbx-pki-password \
+  /etc/dbx-gateway-pki/password
+```
+
+`/mnt/secure-transfer` 只是示例挂载点，不是程序固定目录。安装完成后卸载并妥善清理传输介质。
+
+查询 Main 服务账号的 UID/GID：
 
 ```bash
 id -u dbx-gateway
@@ -184,19 +266,31 @@ systemctl status dbx-gateway-pki.service --no-pager
 
 在 Main 主机以 `root` 执行：
 
+先确保传输目录中放的是与你连接方式匹配的签发结果：域名使用 `/secure/export/main-server`，纯 IP 使用 `/secure/export/main-server-ip`。以下命令统一假设它已复制为 `/mnt/secure-transfer/main-server`。
+
 ```bash
 install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway /etc/dbx-gateway/certs
 install -d -o dbx-gateway -g dbx-gateway -m 0750 /var/lib/dbx-gateway /run/dbx-gateway
 install -m 0755 bin/dbx-gateway /usr/bin/dbx-gateway
 install -m 0640 examples/main.toml /etc/dbx-gateway/main.toml
 
-install -m 0644 certificate.pem /etc/dbx-gateway/certs/main.pem
-cat chain.pem >> /etc/dbx-gateway/certs/main.pem
-install -m 0600 private-key.pem /etc/dbx-gateway/certs/main.key
-install -m 0644 edge-ca.pem /etc/dbx-gateway/certs/edge-ca.pem
-install -m 0644 client-ca.pem /etc/dbx-gateway/certs/client-ca.pem
-chown root:dbx-gateway /etc/dbx-gateway/certs/*
+install -o root -g dbx-gateway -m 0644 \
+  /mnt/secure-transfer/main-server/certificate.pem \
+  /etc/dbx-gateway/certs/main.pem
+cat /mnt/secure-transfer/main-server/chain.pem >> \
+  /etc/dbx-gateway/certs/main.pem
+install -o dbx-gateway -g dbx-gateway -m 0600 \
+  /mnt/secure-transfer/main-server/private-key.pem \
+  /etc/dbx-gateway/certs/main.key
+install -o root -g dbx-gateway -m 0644 \
+  /mnt/secure-transfer/edge-ca.crt.pem \
+  /etc/dbx-gateway/certs/edge-ca.pem
+install -o root -g dbx-gateway -m 0644 \
+  /mnt/secure-transfer/client-ca.crt.pem \
+  /etc/dbx-gateway/certs/client-ca.pem
 ```
+
+这里的 `chain.pem` 是 Main Server CA 链。DBX 客户端和 Edge 主机导入的 “Main Server CA PEM” 也是这个文件，不是 `edge-ca.pem` 或 `client-ca.pem`。
 
 ### 6.2 配置 Main
 
@@ -267,11 +361,14 @@ stream {
 
 ## 7. 签发并导入 DBX Client 身份
 
-在离线 PKI 主机执行：
+完整步骤见 [DBX Client 证书生成与交付](client-certificate.md)。本节只保留部署主线。
+
+在**离线 PKI 主机**先创建本次 `client.p12` 专用的 bundle 密码文件，再签发：
 
 ```bash
 umask 077
-printf '%s\n' 'REPLACE_WITH_BUNDLE_PASSWORD' > /secure/client-bundle-password
+openssl rand -base64 32 > /secure/client-bundle-password
+chmod 0600 /secure/client-bundle-password
 
 dbx-gateway-pki client issue \
   --data-dir /secure/dbx-gateway-pki-offline \
@@ -281,18 +378,34 @@ dbx-gateway-pki client issue \
   --output-dir /secure/export/desktop-prod
 ```
 
-将 `client.p12` 和 bundle 密码分渠道交付给用户。DBX 桌面端操作：
+命令输出目录中的文件用途：
+
+| 文件 | 用途 | 是否交付给 DBX 用户 |
+|---|---|---|
+| `/secure/export/desktop-prod/client.p12` | 包含 Client 证书、私钥和证书链的导入包 | 是 |
+| `/secure/client-bundle-password` | 解锁这个 `client.p12` 的导入密码 | 是，与 `.p12` 分渠道 |
+| `certificate.pem`、`chain.pem`、`private-key.pem` | PEM 形式的同一 Client 身份，主要用于管理员检查或非 DBX 集成 | DBX 桌面端不需要 |
+| `/secure/dbx-pki-password` | CA 私钥密码 | 绝不交付 |
+
+还要把 Main 签发目录中的 `/secure/export/main-server/chain.pem` 交付给用户，作为 DBX 中的 **Main Server CA PEM**。它与 `client.p12` 的 bundle 密码无关。
+
+DBX 桌面端操作：
 
 1. 打开 `设置 > 隧道`，新增 Gateway。
-2. 在“导入身份”中选择 `client.p12`，输入 bundle 密码并导入。
-3. Main URL 填写 `wss://gateway.example.com/_dbx/client`。
-4. 选择导入的 Client 身份，并导入 Main Server CA PEM。
-5. 可选填写 Main Server SPKI SHA-256 Pin。
-6. 点击“测试 Main”，成功后保存 Gateway 档案。
+2. 在“导入身份”中点击“选择 PKCS#12”并选择 `client.p12`；点击密码框右侧的文件按钮选择 bundle 密码文件，DBX 会自动填入密码，也可手工输入。
+3. 文件和密码准备完成后，点击同一行最右侧的“导入”。
+4. Main URL 填写 `wss://gateway.example.com/_dbx/client`。
+5. 选择导入的 Client 身份，并把 Main 签发目录中的 `chain.pem` 导入为 Main Server CA PEM。
+6. 可选填写 Main Server SPKI SHA-256 Pin。
+7. 点击“测试 Main”，成功后保存 Gateway 档案。
+
+纯 IP 部署时第 4 步改为 `wss://10.235.10.53/_dbx/client`，并确保 Main 证书包含 `IP Address:10.235.10.53` SAN。
 
 私钥进入系统钥匙串，不会写入普通 SQLite 字段或连接导出文件。浏览器版不支持 Gateway 客户端身份。
 
 ## 8. 部署 Edge Gateway
+
+Edge 身份不会由管理员生成一个 `client.p12` 再复制过去。标准流程是创建一次性注册令牌，由 Edge 在本机生成私钥和 CSR，再通过 Main 向在线 PKI 领取证书。完整步骤见 [Edge 节点证书生成与领取](edge-certificate.md)。
 
 ### 8.1 安装
 
@@ -305,7 +418,17 @@ install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway /etc/dbx-gateway/cert
 install -d -o dbx-gateway -g dbx-gateway -m 0700 /var/lib/dbx-gateway
 install -m 0755 bin/dbx-gateway /usr/bin/dbx-gateway
 install -m 0640 examples/edge.toml /etc/dbx-gateway/edge.toml
-install -m 0644 main-server-ca.pem /etc/dbx-gateway/certs/main-server-ca.pem
+install -m 0644 /mnt/secure-transfer/main-server/chain.pem \
+  /etc/dbx-gateway/certs/main-server-ca.pem
+```
+
+纯 IP 部署时，这两个 URL 必须同时改为证书 `--ip-san` 中的同一个 IP：
+
+```toml
+main_url = "wss://10.235.10.53/_dbx/edge"
+
+[bootstrap]
+enrollment_url = "https://10.235.10.53/_dbx/enroll"
 ```
 
 计算并通过另一可信渠道核对 Main 证书 SPKI Pin：
@@ -390,6 +513,13 @@ journalctl -u dbx-gateway-edge.service -f
 ```
 
 首次启动时 Edge 在本地生成私钥，使用令牌提交 CSR，写入 `/var/lib/dbx-gateway/edge.pem` 和 `edge.key`，删除令牌文件，然后以 mTLS 重连 Main。Main 和 PKI 不会收到 Edge 私钥。
+
+首次启动后的两个产物用途如下：
+
+| Edge 本机文件 | 谁生成 | 用途 |
+|---|---|---|
+| `/var/lib/dbx-gateway/edge.pem` | Edge 自动写入 | Edge 叶证书和证书链，对应 `certificate` |
+| `/var/lib/dbx-gateway/edge.key` | Edge 本机生成 | Edge 私钥，对应 `private_key`，不得离开 Edge 主机 |
 
 ## 9. 在 DBX 中使用 Gateway 路由
 
@@ -532,7 +662,8 @@ systemctl restart dbx-gateway-main.service
 - [部署总览](../dbx-gateway.md)
 - [Main Gateway 部署](main-gateway.md)
 - [Edge Gateway 部署](edge-gateway.md)
+- [Edge 节点证书生成与领取](edge-certificate.md)
+- [DBX Client 证书生成与交付](client-certificate.md)
 - [PKI 与证书运维](pki.md)
 - [配置字段参考](configuration.md)
 - [运维、监控与排障](operations.md)
-

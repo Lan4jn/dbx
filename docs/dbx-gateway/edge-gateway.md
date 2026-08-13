@@ -2,6 +2,8 @@
 
 Edge 部署在数据库附近，主动连接 Main，不需要从 Main 向数据库网段开放入站端口。数据库看到的新连接由 Edge 主机上的 `dbx-gateway` 进程发起，源 IP 是 Edge 主机 IP。
 
+证书首次领取、每个产物的来源和用途见 [Edge 节点证书生成与领取](edge-certificate.md)。
+
 ## 安装
 
 在 Edge Linux 主机以 `root` 执行：

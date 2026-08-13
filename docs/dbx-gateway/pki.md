@@ -29,6 +29,8 @@ Root CA 有效期长于三个中间 CA。叶证书有效期不能超过签发中
 
 ## 在线 Edge CA
 
+本节只部署用于 Edge 自动领证的在线 CA。Edge 节点实际领证步骤见 [Edge 节点证书生成与领取](edge-certificate.md)，DBX 用户身份签发见 [DBX Client 证书生成与交付](client-certificate.md)。
+
 先在在线 PKI 主机以 `root` 创建用户和目录：
 
 ```bash
@@ -41,14 +43,30 @@ install -m 0755 bin/dbx-gateway-pki /usr/bin/dbx-gateway-pki
 install -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
 ```
 
-从离线主机通过加密介质只导出 `edge/ca.crt.pem` 和 `edge/ca.key.encrypted.pem`。在在线主机执行：
+从离线主机通过加密介质只导出以下三个文件：
+
+| 离线主机源文件                                              | 在线主机目标文件                                     |
+| ----------------------------------------------------------- | ---------------------------------------------------- |
+| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem`           | `/var/lib/dbx-gateway-pki/edge/ca.crt.pem`           |
+| `/secure/dbx-gateway-pki-offline/edge/ca.key.encrypted.pem` | `/var/lib/dbx-gateway-pki/edge/ca.key.encrypted.pem` |
+| `/secure/dbx-pki-password`                                  | `/etc/dbx-gateway-pki/password`                      |
+
+假设加密介质在在线主机挂载为 `/mnt/secure-transfer`，执行：
 
 ```bash
 install -d -o dbx-gateway-pki -g dbx-gateway-pki -m 0700 /var/lib/dbx-gateway-pki/edge
-install -o dbx-gateway-pki -g dbx-gateway-pki -m 0644 ca.crt.pem /var/lib/dbx-gateway-pki/edge/
-install -o dbx-gateway-pki -g dbx-gateway-pki -m 0600 ca.key.encrypted.pem /var/lib/dbx-gateway-pki/edge/
-install -o dbx-gateway-pki -g dbx-gateway-pki -m 0600 /secure-transfer/password /etc/dbx-gateway-pki/password
+install -o dbx-gateway-pki -g dbx-gateway-pki -m 0644 \
+  /mnt/secure-transfer/edge/ca.crt.pem \
+  /var/lib/dbx-gateway-pki/edge/ca.crt.pem
+install -o dbx-gateway-pki -g dbx-gateway-pki -m 0600 \
+  /mnt/secure-transfer/edge/ca.key.encrypted.pem \
+  /var/lib/dbx-gateway-pki/edge/ca.key.encrypted.pem
+install -o dbx-gateway-pki -g dbx-gateway-pki -m 0600 \
+  /mnt/secure-transfer/dbx-pki-password \
+  /etc/dbx-gateway-pki/password
 ```
+
+`/mnt/secure-transfer` 只是示例挂载点。密码目标文件必须与初始化完整 PKI 时使用的 `/secure/dbx-pki-password` 内容相同。
 
 在线 `serve` 使用专门的 Edge-only 打开模式；缺少 Root/Server/Client 目录是正常状态。若在线目录出现这些私钥，立即停止服务、按密钥暴露事件处理并轮换相应 CA。
 
@@ -72,6 +90,8 @@ systemctl status dbx-gateway-pki.service --no-pager
 
 ## DBX Client PKCS#12
 
+以下是命令摘要；完整的文件用途、交付和 DBX 导入步骤见 [DBX Client 证书生成与交付](client-certificate.md)。
+
 在离线 PKI 主机以 PKI 管理员执行：
 
 ```bash
@@ -91,11 +111,13 @@ dbx-gateway-pki client issue \
 
 在 DBX 中打开 `设置 > 隧道 > 新增 Gateway`：
 
-1. 在“导入身份”区域填写身份显示名称和 bundle 密码。
-2. 点击“导入 PKCS#12”，选择签发目录中的 `client.p12`。文件选择器只接受 `.p12` 和 `.pfx`。
-3. 导入成功后，从“客户端身份”下拉框选择该身份。DBX 会立即清空导入密码；PKCS#12 私钥和密码不会写入连接 JSON、SQLite 普通字段、导出文件或云同步快照。
-4. 导入专用 Server CA PEM；需要双重固定时再填写 Main Server 公钥的 SPKI SHA-256 Pin。Pin 格式为 64 位小写十六进制，不是证书指纹的 Base64 文本。
-5. 点击“测试 Main”。成功只表示 Main URL、客户端证书和服务端 CA/SPKI 校验通过；数据库路由在具体连接的“传输”选项卡中选择。
+1. 在“导入身份”区域填写身份显示名称。
+2. 点击“选择 PKCS#12”，选择签发目录中的 `client.p12`。文件选择器只接受 `.p12` 和 `.pfx`。
+3. 点击密码框右侧的文件按钮选择 bundle 密码文件，DBX 会自动填入密码，也可手工输入。
+4. 确认证书文件已选择且密码框非空，点击该行最右侧的“导入”。
+5. 导入成功后，从“客户端身份”下拉框选择该身份。DBX 会立即清空导入密码；PKCS#12 私钥和密码不会写入连接 JSON、SQLite 普通字段、导出文件或云同步快照。
+6. 导入专用 Server CA PEM；需要双重固定时再填写 Main Server 公钥的 SPKI SHA-256 Pin。Pin 格式为 64 位小写十六进制，不是证书指纹的 Base64 文本。
+7. 点击“测试 Main”。成功只表示 Main URL、客户端证书和服务端 CA/SPKI 校验通过；数据库路由在具体连接的“传输”选项卡中选择。
 
 若提示密码错误或 PKCS#12 无法解析，重新核对 bundle 密码和文件完整性，不要尝试把私钥 PEM 粘贴进 Gateway 档案。若提示身份过期、吊销或不存在，应由 PKI 管理员重新签发，导入新 identity，并把引用该身份的 Gateway 档案迁移后再删除旧 identity。
 
