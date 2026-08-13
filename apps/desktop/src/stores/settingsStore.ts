@@ -9,6 +9,7 @@ import { type ColumnFormatterConfig, type CustomColumnFormatterConfig, normalize
 import { type DataGridCopyPreference, type DataGridExtractorOptions, DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, normalizeDataGridCopyPreference, normalizeDataGridExtractorOptions } from "@/lib/dataGrid/dataGridCopyExtractor";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { DEFAULT_QUERY_RESULT_MAX_ROWS, normalizeQueryResultMaxRows } from "@/lib/dataGrid/queryResultRowLimit";
+import { normalizeConnectTimeoutSecs, normalizeQueryTimeoutSecs } from "@/lib/connection/timeoutLimits";
 import { normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
 import type { SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
@@ -532,11 +533,13 @@ export interface EditorSettings {
   infiniteScroll: boolean;
   /** Preserved for downgrade compatibility; current clients use queryResultMaxRows. */
   infiniteScrollMaxRows: number;
+  flatteningMultiLineText: boolean;
   regexMaxMatchCount: number;
   autoCalculateTotalRows: boolean;
   mongoViewMode: "document" | "table";
   showColumnCommentsInHeader: boolean;
   showColumnTypesInHeader: boolean;
+  colorizeDataGridCellTypes: boolean;
   showIndexIndicatorsInHeader: boolean;
   compactColumnHeaderActions: boolean;
   columnWidthDensity: ColumnWidthDensity;
@@ -723,11 +726,13 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   queryResultMaxRows: DEFAULT_QUERY_RESULT_MAX_ROWS,
   infiniteScroll: false,
   infiniteScrollMaxRows: 5000,
+  flatteningMultiLineText: false,
   regexMaxMatchCount: 1000,
   autoCalculateTotalRows: false,
   mongoViewMode: "document",
   showColumnCommentsInHeader: true,
   showColumnTypesInHeader: true,
+  colorizeDataGridCellTypes: false,
   showIndexIndicatorsInHeader: true,
   compactColumnHeaderActions: true,
   columnWidthDensity: "standard",
@@ -800,13 +805,11 @@ const MIN_UI_SCALE = 0.75;
 const MAX_UI_SCALE = 2;
 
 export function normalizeGlobalQueryTimeoutSecs(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_EDITOR_SETTINGS.globalQueryTimeoutSecs;
-  return Math.min(300, Math.max(0, Math.round(value)));
+  return normalizeQueryTimeoutSecs(value);
 }
 
 export function normalizeGlobalConnectTimeoutSecs(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_EDITOR_SETTINGS.globalConnectTimeoutSecs;
-  return Math.min(300, Math.max(1, Math.round(value)));
+  return normalizeConnectTimeoutSecs(value);
 }
 
 function normalizeUiScale(value: unknown): number {
@@ -1061,11 +1064,13 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     queryResultMaxRows: normalizeQueryResultMaxRows(settings.queryResultMaxRows),
     infiniteScroll: settings.infiniteScroll ?? DEFAULT_EDITOR_SETTINGS.infiniteScroll,
     infiniteScrollMaxRows: typeof settings.infiniteScrollMaxRows === "number" && settings.infiniteScrollMaxRows >= 1000 && settings.infiniteScrollMaxRows <= 50000 ? Math.round(settings.infiniteScrollMaxRows) : DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows,
+    flatteningMultiLineText: settings.flatteningMultiLineText ?? DEFAULT_EDITOR_SETTINGS.flatteningMultiLineText,
     regexMaxMatchCount: typeof settings.regexMaxMatchCount === "number" && Number.isFinite(settings.regexMaxMatchCount) && settings.regexMaxMatchCount >= 100 && settings.regexMaxMatchCount <= 10000 ? Math.round(settings.regexMaxMatchCount) : DEFAULT_EDITOR_SETTINGS.regexMaxMatchCount,
     autoCalculateTotalRows: settings.autoCalculateTotalRows ?? DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows,
     mongoViewMode: settings.mongoViewMode === "table" ? "table" : DEFAULT_EDITOR_SETTINGS.mongoViewMode,
     showColumnCommentsInHeader: settings.showColumnCommentsInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader,
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
+    colorizeDataGridCellTypes: settings.colorizeDataGridCellTypes ?? DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes,
     showIndexIndicatorsInHeader: settings.showIndexIndicatorsInHeader ?? DEFAULT_EDITOR_SETTINGS.showIndexIndicatorsInHeader,
     compactColumnHeaderActions: settings.compactColumnHeaderActions ?? DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions,
     columnWidthDensity: normalizeColumnWidthDensity(settings.columnWidthDensity),
@@ -1641,6 +1646,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.mongoViewMode !== undefined) editorSettings.value.mongoViewMode = partial.mongoViewMode;
     if (partial.showColumnCommentsInHeader !== undefined) editorSettings.value.showColumnCommentsInHeader = partial.showColumnCommentsInHeader;
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
+    if (partial.colorizeDataGridCellTypes !== undefined) editorSettings.value.colorizeDataGridCellTypes = partial.colorizeDataGridCellTypes === true;
     if (partial.showIndexIndicatorsInHeader !== undefined) editorSettings.value.showIndexIndicatorsInHeader = partial.showIndexIndicatorsInHeader;
     if (partial.compactColumnHeaderActions !== undefined) editorSettings.value.compactColumnHeaderActions = partial.compactColumnHeaderActions;
     if (partial.columnWidthDensity !== undefined) editorSettings.value.columnWidthDensity = normalizeColumnWidthDensity(partial.columnWidthDensity);
@@ -1703,6 +1709,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;
     if (partial.clickTableNavigationTarget !== undefined) editorSettings.value.clickTableNavigationTarget = normalizeClickTableNavigationTarget(partial.clickTableNavigationTarget);
     if (partial.completionTriggerMode !== undefined) editorSettings.value.completionTriggerMode = normalizeCompletionTriggerMode(partial.completionTriggerMode);
+    if (partial.flatteningMultiLineText !== undefined) editorSettings.value.flatteningMultiLineText = partial.flatteningMultiLineText;
   }
 
   function updateEditorSettings(partial: Partial<EditorSettings>) {

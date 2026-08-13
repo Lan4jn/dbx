@@ -30,6 +30,7 @@ import {
   SquareDashed,
   Check,
   CopyPlus,
+  Hash,
   KeyRound,
   Link2,
   ListTree,
@@ -82,7 +83,8 @@ import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/table
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
 import { generateCellValues, type CellValueGenerationKind } from "@/lib/dataGrid/cellValueGeneration";
-import { compactHeaderColumnType, isNumericColumnType, resolveHeaderColumnType, resolveResultColumnType } from "@/lib/dataGrid/dataGridColumnType";
+import { compactHeaderColumnType, isNumericColumnType, resolveDataGridTypeVisualKind, resolveHeaderColumnType, resolveResultColumnType } from "@/lib/dataGrid/dataGridColumnType";
+import { dataGridCellTextClass, dataGridTypeVisualClass } from "@/lib/dataGrid/dataGridCellTextVisual";
 import {
   canDeleteExistingTdengineRows,
   canEditExistingTableRows,
@@ -149,6 +151,7 @@ import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowSho
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
 import { canFetchNextDataGridSegment, canGoNextDataGridPage, dataGridTotalRowCountLabelKey, dataGridTruncationHintKey, hasCompleteLocalDataGridResult, resolveDataGridPaginationTotal, type DataGridInexactTotalRowCountMode } from "@/lib/dataGrid/dataGridPagination";
 import { dataGridCountQueryOptions } from "@/lib/dataGrid/dataGridQueryOptions";
+import { largeValueCellKey, largeValueCellMap } from "@/lib/dataGrid/dataGridLargeValues";
 import { dataGridBottomScrollTop, dataGridScrollPosition, isDataGridAtScrollBottom, isDataGridNearScrollBottom, isDataGridPrefixAppend, shouldCheckInfiniteScrollAfterScroll, type DataGridScrollPosition } from "@/lib/dataGrid/dataGridInfiniteScroll";
 import { CANVAS_DATA_GRID_ROW_HEIGHT, MAX_CANVAS_DATA_GRID_PIXEL_RATIO, canvasDataGridActionOverlayWidth, canvasDataGridActionReservedWidth, dataGridSearchMatchKey, drawCanvasDataGrid, type CanvasDevicePixelSize } from "@/lib/dataGrid/canvasDataGridRenderer";
 import { DATA_GRID_DARK_STRIPED_ROW_BG, DATA_GRID_LIGHT_STRIPED_ROW_BG, dataGridActiveRowBackground } from "@/lib/dataGrid/dataGridPaintTheme";
@@ -195,6 +198,7 @@ import {
 import { buildColumnForeignKeyMap, combineForeignKeyConditions, foreignKeyAssociationCells, foreignKeyMetadataRequestCurrent, foreignKeyNavigationTarget, foreignKeySourceColumnName, foreignKeyTableIdentity, type ForeignKeyAssociation } from "@/lib/dataGrid/dataGridForeignKeyNavigation";
 
 import { useToast } from "@/composables/useToast";
+import { translateBackendError } from "@/i18n/backend-errors";
 import { useNavigationTargets } from "@/composables/useNavigationTargets";
 import { useDataGridExport, type MongoCopyUpdateTarget } from "@/composables/useDataGridExport";
 import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/common/clipboard";
@@ -243,7 +247,7 @@ import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabil
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
 import { gaussdbMTypeDisplayName } from "@/lib/table/postgresDataTypeHelp";
 import { reserveDataGridHeaderLine } from "@/lib/dataGrid/dataGridHeaderLayout";
-import { buildColumnIndexMap, columnIndexMetadataRequestCurrent, columnIndexNameKey, columnIndexTableIdentity } from "@/lib/dataGrid/dataGridColumnIndexIcon";
+import { buildColumnIndexMap, columnIndexColorClass, columnIndexMetadataRequestCurrent, columnIndexNameKey, columnIndexTableIdentity, type ColumnIndexKind } from "@/lib/dataGrid/dataGridColumnIndexIcon";
 import { supportsTableStructureEditing } from "@/lib/database/databaseCapabilities";
 import { rememberDataGridConditionHistory } from "@/lib/dataGrid/dataGridConditionHistory";
 import { restoreDataGridLocalColumnFilters, serializeDataGridLocalColumnFilters } from "@/lib/dataGrid/dataGridLocalColumnFilterState";
@@ -256,6 +260,7 @@ import { dataGridConditionColumnOptions, dataGridConditionIdentifierQuote } from
 import { isMacOS } from "@/lib/backend/platform";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
+import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import timezone from "dayjs/plugin/timezone";
 import utc from "dayjs/plugin/utc";
@@ -283,10 +288,12 @@ const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const tableFontSize = computed(() => settingsStore.editorSettings.tableFontSize);
 const rowNumberWidth = ref(DATA_GRID_ROW_NUM_WIDTH);
+const largeValueResolutionVersion = ref(0);
 const multiRowTranspose = computed(() => settingsStore.editorSettings.dataGridMultiRowTranspose);
 const hideNullColumns = computed(() => settingsStore.editorSettings.dataGridHideNullColumns);
 const booleanCellsUseCheckbox = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode === "checkbox");
 const booleanDisplayMode = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode);
+const colorizeDataGridCellTypes = computed(() => settingsStore.editorSettings.colorizeDataGridCellTypes);
 const { isDark, themePalette } = useTheme();
 const { toast } = useToast();
 // 外键单元格跳转复用导航入口；对话框引用传 stub（同 AiAssistant 模式）
@@ -354,6 +361,7 @@ interface DataGridProps {
   countTotalRows?: () => Promise<number | undefined>;
   loading?: boolean;
   cacheKey?: string;
+  pendingStateKey?: string;
   exportSql?: string;
   onExecuteSql?: (sql: string) => Promise<void>;
   fullExportResult?: (onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => Promise<QueryResult | undefined>;
@@ -549,6 +557,7 @@ const dataGridSearchMode = computed(() => settingsStore.editorSettings.dataGridS
 const compactDataGridToolbar = computed(() => isDataGridToolbarCompact(dataGridTopbarWidth.value, dataGridViewportWidth.value, DATA_GRID_CONDITION_TOOLBAR_MIN_WIDTH));
 const infiniteScrollEnabled = computed(() => props.paginationEnabled && settingsStore.editorSettings.infiniteScroll);
 const infiniteScrollMaxRows = computed(() => continuousQueryResultMaxRows(settingsStore.editorSettings.queryResultMaxRowsEnabled, settingsStore.editorSettings.queryResultMaxRows));
+const flatteningMultiLineEnabled = computed(() => settingsStore.editorSettings.flatteningMultiLineText);
 const expandedCellEditor = ref<{ rowId: number; col: number } | null>(null);
 
 function headerColumnComment(column: string): string {
@@ -651,23 +660,7 @@ function selectedSortMenuValue(column: string, columnIndex: number): SortMenuVal
 }
 
 function typeColorClass(t: string): string {
-  // Strip precision/scale suffix like (20,6)
-  const base = t.replace(/\(.*\)$/, "").toLowerCase();
-  if (["int", "int2", "int4", "int8", "smallint", "bigint", "integer", "serial", "bigserial", "tinyint", "mediumint"].includes(base)) return "text-blue-500";
-  // number: Oracle/Dameng NUMBER；binary_float/binary_double: Oracle IEEE 浮点
-  if (["float4", "float8", "double", "decimal", "numeric", "real", "float", "money", "number", "binary_float", "binary_double", "dec"].includes(base)) return "text-cyan-500";
-  // varchar2/nvarchar2/long: Oracle/Dameng 字符类型（LONG 在 Oracle 中是变长字符）
-  if (["varchar", "varchar2", "nvarchar2", "text", "char", "character varying", "character", "string", "nvarchar", "nchar", "ntext", "longtext", "mediumtext", "tinytext", "clob", "long"].includes(base)) return "text-green-500";
-  if (["bool", "boolean", "bit"].includes(base)) return "text-orange-500";
-  if (["timestamp", "timestamptz", "datetime", "date", "time", "timetz", "datetime2", "smalldatetime"].includes(base)) return "text-purple-500";
-  // xmltype: Oracle XMLType
-  if (["json", "jsonb", "xml", "xmltype", "array"].includes(base)) return "text-pink-500";
-  if (["uuid", "uniqueidentifier"].includes(base)) return "text-amber-500";
-  // raw/long raw/bfile: Oracle 二进制
-  if (["bytea", "blob", "binary", "varbinary", "image", "raw", "long raw", "bfile"].includes(base)) return "text-red-400";
-  // sdo_geometry: Oracle Spatial
-  if (["geometry", "geography", "sdo_geometry"].includes(base)) return "text-emerald-500";
-  return "text-muted-foreground";
+  return dataGridTypeVisualClass(resolveDataGridTypeVisualKind(t, resolvedDatabaseType.value));
 }
 const contextCell = ref<{
   rowId: number;
@@ -1970,6 +1963,8 @@ const allColumnTypes = computed(() =>
   ),
 );
 const visibleColumnTypes = computed(() => visibleColumnIndexes.value.map((index) => allColumnTypes.value[index]));
+const allColumnTypeVisualKinds = computed(() => allColumnTypes.value.map((type) => resolveDataGridTypeVisualKind(type, resolvedDatabaseType.value)));
+const visibleColumnTypeVisualKinds = computed(() => visibleColumnIndexes.value.map((index) => allColumnTypeVisualKinds.value[index] ?? "unknown"));
 const visibleColumnComments = computed(() => visibleColumnIndexes.value.map((index) => dataGridColumnCommentFor(columnCommentMap.value, props.result.columns[index] ?? "", props.sourceColumns?.[index])));
 const visibleColumnCount = computed(() => visibleColumnIndexes.value.length);
 
@@ -1978,6 +1973,45 @@ const columnAligns = computed<("left" | "right")[]>(() => {
   if (!numericColumnRightAlign.value) return [];
   return visibleColumnTypes.value.map((type) => (isNumericColumnType(type) ? "right" : "left"));
 });
+
+function gridCellTextColorClass(item: RowItem, actualColIdx: number, visibleColIdx: number): string {
+  if (!colorizeDataGridCellTypes.value) return "text-foreground";
+  const value = item.data[actualColIdx];
+  const checkbox = booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && value !== null;
+  return dataGridCellTextClass({
+    colorizeTypes: colorizeDataGridCellTypes.value,
+    typeKind: allColumnTypeVisualKinds.value[actualColIdx] ?? "unknown",
+    isNull: value === null,
+    isDraft: item.isDraft && value === null,
+    isEditing: editingCell.value?.rowId === item.id && editingCell.value.col === actualColIdx,
+    isControl: checkbox,
+    isSelected: rowCellsUseSelectionVisual(item.id) || cellIsSelected(item.displayIndex, visibleColIdx),
+    isCurrentSearchMatch: cellIsCurrentMatch(item.displayIndex, actualColIdx),
+    isSearchMatch: cellIsSearchMatch(item.displayIndex, actualColIdx),
+    isDirty: item.isDirtyCol[actualColIdx],
+    isDeleted: item.isDeleted,
+  });
+}
+
+function transposeCellTextColorClass(recordIndex: number, actualColIdx: number): string {
+  if (!colorizeDataGridCellTypes.value) return "text-foreground";
+  const item = displayItems.value[recordIndex];
+  if (!item) return "text-foreground";
+  const value = item.data[actualColIdx];
+  return dataGridCellTextClass({
+    colorizeTypes: colorizeDataGridCellTypes.value,
+    typeKind: allColumnTypeVisualKinds.value[actualColIdx] ?? "unknown",
+    isNull: value === null,
+    isDraft: item.isDraft && value === null,
+    isEditing: editingCell.value?.rowId === item.id && editingCell.value.col === actualColIdx,
+    isControl: booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && value !== null,
+    isSelected: transposeRecordUsesSelectionVisual(recordIndex) || transposeCellIsSelected(recordIndex, actualColIdx),
+    isCurrentSearchMatch: cellIsCurrentMatch(recordIndex, actualColIdx),
+    isSearchMatch: cellIsSearchMatch(recordIndex, actualColIdx),
+    isDirty: item.isDirtyCol[actualColIdx],
+    isDeleted: item.isDeleted,
+  });
+}
 
 /** Preview actions from the result preview registry for the current result. */
 const previewActions = computed(() => {
@@ -3111,7 +3145,7 @@ const editor = useDataGridEditor({
   getRowItem,
   pageSize,
   currentPage,
-  cacheKey: computed(() => props.cacheKey),
+  cacheKey: computed(() => props.pendingStateKey ?? props.cacheKey),
   onResultPayloadMutated: () => queryStore.invalidateResultEstimateForPayload(props.result),
   emit,
 });
@@ -3146,7 +3180,7 @@ const {
   onEditKeydown,
   addRows: addEditorRows,
   appendPastedRowsToNewRow,
-  cloneRow,
+  cloneRow: cloneEditorRow,
   showDeleteRowConfirm,
   requestDeleteRow,
   confirmDeleteRow,
@@ -3154,7 +3188,7 @@ const {
   restoreRows,
   pendingDeleteRowIds,
   requestDeleteRows,
-  cloneRows,
+  cloneRows: cloneEditorRows,
   saveChanges,
   discardChanges,
   canUndoPendingChange,
@@ -3301,15 +3335,17 @@ function cellUsesExpandedEditor(rowId: number | undefined, columnIndex: number):
   return !!expandedCellEditor.value && expandedCellEditor.value.rowId === rowId && expandedCellEditor.value.col === columnIndex;
 }
 
-function startCellEdit(rowId: number, columnIndex: number, expanded: boolean) {
+async function startCellEdit(rowId: number, columnIndex: number, expanded: boolean) {
+  if (!(await hydrateLargeValueCell(rowId, columnIndex))) return;
   expandedCellEditor.value = expanded ? { rowId, col: columnIndex } : null;
   startEdit(rowId, columnIndex);
 }
 
-function startDomCellEdit(rowId: number, columnIndex: number, displayText: string, event: MouseEvent) {
+async function startDomCellEdit(rowId: number, columnIndex: number, displayText: string, event: MouseEvent) {
+  if (!(await hydrateLargeValueCell(rowId, columnIndex))) return;
   const item = getRowItem(rowId);
   const editText = item ? cellEditorTextForValue(item.data[columnIndex], columnIndex) : displayText;
-  startCellEdit(
+  await startCellEdit(
     rowId,
     columnIndex,
     cellEditContentNeedsExpandedEditor({
@@ -3326,10 +3362,10 @@ function showReadonlyCellDetailsOnDblClick(item: RowItem, rowIndex: number, visi
   return true;
 }
 
-function onDomCellDblClick(item: RowItem, rowIndex: number, visibleColIdx: number, actualColIdx: number, event: MouseEvent) {
+async function onDomCellDblClick(item: RowItem, rowIndex: number, visibleColIdx: number, actualColIdx: number, event: MouseEvent) {
   if (booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && canEditCellItem(item, actualColIdx)) return;
   if (showReadonlyCellDetailsOnDblClick(item, rowIndex, visibleColIdx, actualColIdx)) return;
-  startDomCellEdit(item.id, actualColIdx, formatCellCached(item.data[actualColIdx], actualColIdx), event);
+  await startDomCellEdit(item.id, actualColIdx, formatCellCached(item.data[actualColIdx], actualColIdx), event);
 }
 
 function cellEditContentNeedsExpandedEditor(options: { displayText: string; editText: string; target: EventTarget | null }): boolean {
@@ -3779,6 +3815,7 @@ const displayRowIndexByIdLookup = computed(() => {
 });
 
 function rowItemFromDisplayRef(ref: DisplayRowRef): RowItem {
+  largeValueResolutionVersion.value;
   if (ref.isNew) {
     return {
       ...ref,
@@ -3958,6 +3995,215 @@ const visibleDisplayItems = computed<RowItem[]>(() =>
     isDirtyCol: visibleDirtyColumns(item.isDirtyCol),
   })),
 );
+
+type ResolvedLargeValueCells = Map<number, Map<number, CellValue>>;
+type LargeValueCellRequest = {
+  item: RowItem;
+  sourceIndex: number;
+  columnIndex: number;
+  originalBytes: number;
+};
+
+const LARGE_VALUE_FETCH_MAX_ROWS = 200;
+const LARGE_VALUE_FETCH_TARGET_BYTES = 64 * 1024 * 1024;
+const pendingLargeValueHydrations = new Map<string, Promise<boolean>>();
+const largeValueCellsByKey = computed(() => largeValueCellMap(props.result));
+
+function isLargeValuePreview(item: RowItem | undefined, columnIndex: number): boolean {
+  if (!item || item.isNew || item.isDraft || item.sourceIndex === undefined || item.isDirtyCol[columnIndex]) return false;
+  return largeValueCellsByKey.value.has(largeValueCellKey(item.sourceIndex, columnIndex));
+}
+
+function normalizedLargeValueIdentityPart(value: CellValue): string {
+  if (value === null) return "null";
+  return `${typeof value}:${JSON.stringify(value)}`;
+}
+
+function largeValueIdentityKey(row: readonly CellValue[], indexes: readonly number[]): string {
+  return indexes.map((index) => normalizedLargeValueIdentityPart(row[index] ?? null)).join("\u001f");
+}
+
+function largeValueSourceColumnIndex(columnName: string): number {
+  const normalized = columnName.toLocaleLowerCase();
+  return resultSourceColumns.value.findIndex((column) => column.toLocaleLowerCase() === normalized);
+}
+
+function chunkLargeValueRequests(requests: LargeValueCellRequest[]): LargeValueCellRequest[][] {
+  const chunks: LargeValueCellRequest[][] = [];
+  let chunk: LargeValueCellRequest[] = [];
+  let bytes = 0;
+  for (const request of requests) {
+    if (chunk.length > 0 && (chunk.length >= LARGE_VALUE_FETCH_MAX_ROWS || bytes + request.originalBytes > LARGE_VALUE_FETCH_TARGET_BYTES)) {
+      chunks.push(chunk);
+      chunk = [];
+      bytes = 0;
+    }
+    chunk.push(request);
+    bytes += request.originalBytes;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+
+async function largeValueRowPredicate(item: RowItem, primaryKeyIndexes: number[]): Promise<string> {
+  const originalRow = item.sourceIndex === undefined ? undefined : props.result.rows[item.sourceIndex];
+  if (!originalRow) throw new Error(t("grid.largeValueRowUnavailable"));
+  const tableMeta = props.tableMeta!;
+  const conditions = await Promise.all(
+    tableMeta.primaryKeys.map((columnName, index) =>
+      buildDataGridContextFilterCondition({
+        databaseType: resolvedDatabaseType.value,
+        identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
+        columnName,
+        columnInfo: tableMeta.columns.find((column) => column.name.toLocaleLowerCase() === columnName.toLocaleLowerCase()),
+        mode: "equals",
+        value: originalRow[primaryKeyIndexes[index]!] ?? null,
+      }),
+    ),
+  );
+  if (conditions.some((condition) => !condition)) throw new Error(t("grid.largeValueRowUnavailable"));
+  return conditions.map((condition) => `(${condition})`).join(" AND ");
+}
+
+async function fetchLargeValueRequestChunk(columnIndex: number, requests: LargeValueCellRequest[], primaryKeyIndexes: number[], resolved: ResolvedLargeValueCells) {
+  const tableMeta = props.tableMeta!;
+  const sourceColumn = resultSourceColumns.value[columnIndex];
+  if (!sourceColumn) throw new Error(t("grid.largeValueColumnUnavailable"));
+  const predicates = await Promise.all(requests.map((request) => largeValueRowPredicate(request.item, primaryKeyIndexes)));
+  const selectedColumns = [...new Set([...tableMeta.primaryKeys, sourceColumn])];
+  const sql = await buildTableSelectSql({
+    databaseType: resolvedDatabaseType.value,
+    identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
+    database: tableMeta.database,
+    schema: tableMeta.schema,
+    tableName: tableMeta.tableName,
+    tableType: tableMeta.tableType,
+    catalog: tableMeta.catalog,
+    columns: selectedColumns,
+    primaryKeys: tableMeta.primaryKeys,
+    whereInput: predicates.map((predicate) => `(${predicate})`).join(" OR "),
+    limit: requests.length,
+    offset: 0,
+  });
+  const connection = props.connectionId ? connectionStore.getConfig(props.connectionId) : undefined;
+  const results = await api.executeMulti(props.connectionId!, props.executionDatabase ?? props.database ?? "", sql, undefined, uuid(), {
+    maxRows: requests.length,
+    fetchSize: requests.length,
+    timeoutSecs: queryTimeoutSecsForConnection(connection, settingsStore.editorSettings.globalQueryTimeoutSecs),
+  });
+  const result = results[0];
+  if (!result || result.execution_error) {
+    throw new Error(result?.error ? translateBackendError(t, result.error) : String(result?.rows?.[0]?.[0] ?? t("grid.largeValueLoadFailed")));
+  }
+  const resultColumnIndexes = selectedColumns.map((column) => {
+    const normalized = column.toLocaleLowerCase();
+    return result.columns.findIndex((resultColumn) => resultColumn.toLocaleLowerCase() === normalized);
+  });
+  if (resultColumnIndexes.some((index) => index < 0)) throw new Error(t("grid.largeValueColumnUnavailable"));
+  const resultPrimaryKeyIndexes = resultColumnIndexes.slice(0, tableMeta.primaryKeys.length);
+  const resultValueIndex = resultColumnIndexes[selectedColumns.indexOf(sourceColumn)];
+  const valuesByIdentity = new Map(result.rows.map((row) => [largeValueIdentityKey(row, resultPrimaryKeyIndexes), row[resultValueIndex!] ?? null]));
+  for (const request of requests) {
+    const originalRow = props.result.rows[request.sourceIndex];
+    const identity = originalRow ? largeValueIdentityKey(originalRow, primaryKeyIndexes) : "";
+    if (!valuesByIdentity.has(identity)) throw new Error(t("grid.largeValueRowUnavailable"));
+    const rowValues = resolved.get(request.item.id) ?? new Map<number, CellValue>();
+    rowValues.set(columnIndex, valuesByIdentity.get(identity) ?? null);
+    resolved.set(request.item.id, rowValues);
+  }
+}
+
+async function resolveLargeValueCells(rowIds: number[], columnIndexes: number[]): Promise<ResolvedLargeValueCells> {
+  const resolved: ResolvedLargeValueCells = new Map();
+  const requestedColumns = new Set(columnIndexes);
+  const requestsByColumn = new Map<number, LargeValueCellRequest[]>();
+  for (const rowId of new Set(rowIds)) {
+    const item = getRowItem(rowId);
+    if (!item || item.sourceIndex === undefined) continue;
+    for (const columnIndex of requestedColumns) {
+      if (!isLargeValuePreview(item, columnIndex)) continue;
+      const metadata = largeValueCellsByKey.value.get(largeValueCellKey(item.sourceIndex, columnIndex));
+      if (!metadata) continue;
+      const requests = requestsByColumn.get(columnIndex) ?? [];
+      requests.push({ item, sourceIndex: item.sourceIndex, columnIndex, originalBytes: metadata.original_bytes });
+      requestsByColumn.set(columnIndex, requests);
+    }
+  }
+  if (requestsByColumn.size === 0) return resolved;
+  if (resolvedDatabaseType.value !== "mysql" || !props.connectionId || !props.tableMeta?.tableName || props.tableMeta.primaryKeys.length === 0) {
+    throw new Error(t("grid.largeValueNeedsStableKey"));
+  }
+  const primaryKeyIndexes = props.tableMeta.primaryKeys.map(largeValueSourceColumnIndex);
+  if (primaryKeyIndexes.some((index) => index < 0)) throw new Error(t("grid.largeValueNeedsStableKey"));
+
+  for (const [columnIndex, requests] of requestsByColumn) {
+    for (const chunk of chunkLargeValueRequests(requests)) {
+      await fetchLargeValueRequestChunk(columnIndex, chunk, primaryKeyIndexes, resolved);
+    }
+  }
+  return resolved;
+}
+
+function reportLargeValueLoadError(error: unknown) {
+  toast(t("grid.largeValueLoadFailedWithMessage", { message: translateBackendError(t, error) }), 5000);
+}
+
+async function cloneRow(rowId: number) {
+  try {
+    const resolved = await resolveLargeValueCells(
+      [rowId],
+      props.result.columns.map((_, index) => index),
+    );
+    cloneEditorRow(rowId, resolved.get(rowId));
+  } catch (error) {
+    reportLargeValueLoadError(error);
+  }
+}
+
+async function cloneRows(rowIds: number[]) {
+  try {
+    const resolved = await resolveLargeValueCells(
+      rowIds,
+      props.result.columns.map((_, index) => index),
+    );
+    cloneEditorRows(rowIds, resolved);
+  } catch (error) {
+    reportLargeValueLoadError(error);
+  }
+}
+
+async function hydrateLargeValueCell(rowId: number, columnIndex: number): Promise<boolean> {
+  const item = getRowItem(rowId);
+  if (!isLargeValuePreview(item, columnIndex) || item?.sourceIndex === undefined) return true;
+  const hydrationKey = largeValueCellKey(item.sourceIndex, columnIndex);
+  const pending = pendingLargeValueHydrations.get(hydrationKey);
+  if (pending) return pending;
+  const hydration = (async () => {
+    try {
+      const resolved = await resolveLargeValueCells([rowId], [columnIndex]);
+      const value = resolved.get(rowId)?.get(columnIndex);
+      if (value === undefined && !resolved.get(rowId)?.has(columnIndex)) return false;
+      const row = [...(props.result.rows[item.sourceIndex!] ?? [])];
+      row[columnIndex] = value ?? null;
+      const rows = props.result.rows.slice();
+      rows[item.sourceIndex!] = row;
+      props.result.rows = rows;
+      props.result.large_value_cells = props.result.large_value_cells?.filter((cell) => cell.row_index !== item.sourceIndex || cell.column_index !== columnIndex);
+      largeValueResolutionVersion.value += 1;
+      clearCellFormatCache();
+      queryStore.invalidateResultEstimateForPayload(props.result);
+      return true;
+    } catch (error) {
+      reportLargeValueLoadError(error);
+      return false;
+    } finally {
+      pendingLargeValueHydrations.delete(hydrationKey);
+    }
+  })();
+  pendingLargeValueHydrations.set(hydrationKey, hydration);
+  return hydration;
+}
+
 const exportContextCell = computed(() => {
   if (!contextCell.value) return null;
   const visibleCol = visibleColumnIndexes.value.indexOf(contextCell.value.col);
@@ -4334,6 +4580,7 @@ function cellDetailFor(rowIndex: number, columnIndex: number): DataGridCellDetai
       canEditCell: canEditCellItem(item, columnIndex),
       isDraft: !!item.isDraft,
     }),
+    isValuePreviewTruncated: isLargeValuePreview(item, columnIndex),
   });
 }
 
@@ -4406,6 +4653,7 @@ const rowDetail = computed(() => {
         canEditCell: canEditCellItem(item, columnIndex),
         isDraft: !!item.isDraft,
       }),
+    isValuePreviewTruncated: (columnIndex) => isLargeValuePreview(item, columnIndex),
   });
 });
 
@@ -4423,6 +4671,7 @@ const columnDetail = computed(() => {
           canEditCell: canEditCellItem(item, columnIndex),
           isDraft: !!item.isDraft,
         }),
+        isValuePreviewTruncated: isLargeValuePreview(item, columnIndex),
       })),
     columns: props.result.columns,
     columnIndex,
@@ -4481,7 +4730,7 @@ watch(activeCellDetailTabs, (tabs) => {
 
 watch(activeCellDetailTab, (tab) => {
   if (tab === "valueEditor") {
-    startDetailEdit();
+    void startDetailEdit();
   } else {
     resetDetailEdit();
   }
@@ -4545,6 +4794,8 @@ const detailSqlConditionKey = computed(() => {
 });
 
 function canCopyPreparedDetailSqlCondition(): boolean {
+  const detail = activeCellDetail.value;
+  if (detail && isLargeValuePreview(getRowItem(detail.rowId), detail.colIndex)) return false;
   return detailSqlConditionCopy.value.ready && detailSqlConditionCopy.value.key === detailSqlConditionKey.value;
 }
 
@@ -4730,7 +4981,10 @@ function toggleCellDetailMetadataCollapsed() {
   });
 }
 
-function startDetailEdit() {
+async function startDetailEdit() {
+  const initialDetail = activeCellDetail.value;
+  if (!initialDetail || !initialDetail.isEditable) return;
+  if (!(await hydrateLargeValueCell(initialDetail.rowId, initialDetail.colIndex))) return;
   const detail = activeCellDetail.value;
   if (!detail || !detail.isEditable) return;
   warnFormattedJsonEditIfNeeded(detail);
@@ -4847,6 +5101,10 @@ function setDetailNull() {
 
 function applyColumnSort(column: string, columnIndex: number, direction: "asc" | "desc" | null, mode: DataGridSortMode = "database") {
   if (getIsResizing()) return;
+  if (mode === "local" && direction && props.result.large_value_cells?.some((cell) => cell.column_index === columnIndex)) {
+    toast(t("grid.largeValueLocalSortUnavailable"), 5000);
+    return;
+  }
   if (mode === "database" && infiniteScrollEnabled.value) {
     resetInfiniteScrollState();
   } else {
@@ -4883,6 +5141,9 @@ function applyContextSort(direction: "asc" | "desc" | null, mode: DataGridSortMo
 
 async function contextFilterCondition(mode: FilterMode): Promise<string | null> {
   if (!contextColumn.value) return null;
+  if (mode !== "is-null" && mode !== "is-not-null" && contextCell.value) {
+    if (!(await hydrateLargeValueCell(contextCell.value.rowId, contextCell.value.col))) return null;
+  }
   return (
     (await buildDataGridContextFilterCondition({
       databaseType: resolvedDatabaseType.value,
@@ -5002,6 +5263,7 @@ async function applyWhereFilter() {
 
 const CELL_FORMAT_CACHE_LIMIT = 20_000;
 const CELL_FORMAT_CACHE_PRUNE_COUNT = 5_000;
+const CELL_FORMAT_CACHE_STRING_KEY_MAX_LENGTH = 512;
 
 const resolvedColumnFormatters = computed(() => props.result.columns.map((_, columnIndex) => columnFormatter(columnIndex)));
 const columnFormatterSignatures = computed(() => resolvedColumnFormatters.value.map(formatterSignature));
@@ -5073,6 +5335,13 @@ function formatCellCached(value: CellValue, columnIndex?: number): string {
     return display;
   }
 
+  // Avoid retaining a second copy of large text values in Map keys. Long
+  // values are truncated for display anyway, so formatting them on demand is
+  // cheaper than keeping the full source string in the primitive cache.
+  if (typeof value === "string" && value.length > CELL_FORMAT_CACHE_STRING_KEY_MAX_LENGTH) {
+    return formatCell(value, columnIndex);
+  }
+
   const key = primitiveCellFormatKey(value, columnIndex);
   const cached = primitiveCellFormatCache.get(key);
   if (cached !== undefined) return cached;
@@ -5110,10 +5379,6 @@ function quoteIdent(name: string): string {
 function queryColumnRef(name: string): string {
   const quoted = quoteIdent(name);
   return props.databaseType === "neo4j" ? `n.${quoted}` : quoted;
-}
-
-function isNull(value: unknown): boolean {
-  return value === null;
 }
 
 function rowNumberStatusClass(item: RowItem): string {
@@ -5580,7 +5845,7 @@ function booleanNullTextHitFromCanvasEvent(item: RowItem, hit: { rowIndex: numbe
   const canvasRect = canvas?.getBoundingClientRect();
   const cellRect = canvasCellViewportRect(hit.rowIndex, hit.visibleColIdx);
   if (!canvasRect || !cellRect) return false;
-  const text = firstLineCellDisplayValue(formatCellCached(item.data[actualColIdx], actualColIdx));
+  const text = firstLineCellDisplayValue(formatCellCached(item.data[actualColIdx], actualColIdx), flatteningMultiLineEnabled.value);
   if (!text) return false;
   const textWidth = measureCellTextWidthCached(text, `italic 400 ${tableFontSize.value}px ${tableFontFamily.value}`);
   if (textWidth <= 0) return false;
@@ -5639,7 +5904,7 @@ function onCanvasContext(event: MouseEvent) {
   onCellContext(item.id, item.displayIndex, actualColIdx, hit.visibleColIdx, event);
 }
 
-function onCanvasDblClick(event: MouseEvent) {
+async function onCanvasDblClick(event: MouseEvent) {
   const hit = canvasHitTest(event);
   if (!hit) return;
   if (hit.rowNumber) {
@@ -5652,7 +5917,7 @@ function onCanvasDblClick(event: MouseEvent) {
   if (!item || actualColIdx === undefined) return;
   if (showReadonlyCellDetailsOnDblClick(item, item.displayIndex, hit.visibleColIdx, actualColIdx)) return;
   if (booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && canEditCellItem(item, actualColIdx)) return;
-  startCellEdit(item.id, actualColIdx, canvasCellContentOverflows(item, actualColIdx, hit.visibleColIdx));
+  await startCellEdit(item.id, actualColIdx, canvasCellContentOverflows(item, actualColIdx, hit.visibleColIdx));
 }
 
 function canvasCellContentOverflows(item: RowItem, actualColIdx: number, visibleColIdx: number): boolean {
@@ -5840,9 +6105,12 @@ function drawCanvasGrid() {
     pageOffset: rowNumberPageOffset(),
     frozenColumnCount: frozenColumnCount.value,
     columnAligns: columnAligns.value,
+    columnTypeVisualKinds: visibleColumnTypeVisualKinds.value,
+    colorizeDataTypes: colorizeDataGridCellTypes.value,
     rightAlignedActionCell: canvasRightAlignedActionCell.value,
     columnIsBoolean: isBooleanGridColumn,
     booleanDisplayMode: booleanDisplayMode.value,
+    flatteningMultiLineEnabled: flatteningMultiLineEnabled.value,
   });
 }
 
@@ -5860,6 +6128,8 @@ watch(showDataGridTopbar, () => nextTick(observeDataGridTopbarWidth), {
 });
 watch(columnAligns, () => scheduleCanvasDraw());
 watch(booleanDisplayMode, () => scheduleCanvasDraw());
+watch(flatteningMultiLineEnabled, () => scheduleCanvasDraw());
+watch(colorizeDataGridCellTypes, () => scheduleCanvasDraw());
 watch(
   [
     displayRowRefs,
@@ -5965,6 +6235,7 @@ onMounted(() => {
 onDeactivated(pauseCanvasGridWork);
 onUnmounted(() => {
   dataGridRuntimeScope.dispose();
+  clearCellFormatCache();
   pauseCanvasGridWork();
   canvasRuntime.dispose();
   gridScrollbarsRuntime.dispose();
@@ -6074,6 +6345,7 @@ const {
   getRowItem: (rowId: number) => visibleDisplayItems.value.find((item) => item.id === rowId),
   selectedRowIds,
   hasRowSelection,
+  resolveSourceValues: resolveLargeValueCells,
   fullExportResult: props.fullExportResult,
   queryResultExportRequest: props.queryResultExportRequest,
   hasCompleteLocalResult,
@@ -6304,6 +6576,8 @@ function showCellDetails(rowIndex: number, colIndex: number) {
   detailCell.value = { rowIndex, col: colIndex };
   activeCellDetailTab.value = defaultCellDetailTab();
   showCellDetail.value = true;
+  const item = displayItemAt(rowIndex);
+  if (item && isLargeValuePreview(item, colIndex)) void hydrateLargeValueCell(item.id, colIndex);
 }
 
 function showCellDetailsForVisibleCell(rowIndex: number, visibleColIdx: number, actualColIdx: number) {
@@ -6316,6 +6590,8 @@ function showCellDetailsForVisibleCell(rowIndex: number, visibleColIdx: number, 
 function openCellDetailDialog(rowIndex: number, columnIndex: number) {
   cellDetailDialogTarget.value = { rowIndex, col: columnIndex };
   cellDetailDialogOpen.value = true;
+  const item = displayItemAt(rowIndex);
+  if (item && isLargeValuePreview(item, columnIndex)) void hydrateLargeValueCell(item.id, columnIndex);
 }
 
 function openColumnDetailDialog(columnIndex: number) {
@@ -6420,14 +6696,14 @@ function showTransposeCellDetails(rowIndex: number, actualColIdx: number) {
   gridRef.value?.focus({ preventScroll: true });
 }
 
-function onTransposeCellDblClick(rowIndex: number, actualColIdx: number, displayText: string, event: MouseEvent) {
+async function onTransposeCellDblClick(rowIndex: number, actualColIdx: number, displayText: string, event: MouseEvent) {
   const item = displayItemAt(rowIndex);
   if (!item) return;
   if (!canEditCellItem(item, actualColIdx)) {
     showTransposeCellDetails(rowIndex, actualColIdx);
     return;
   }
-  startDomCellEdit(item.id, actualColIdx, displayText, event);
+  await startDomCellEdit(item.id, actualColIdx, displayText, event);
 }
 
 function onTransposeCellContext(rowIndex: number, actualColIdx: number, event: MouseEvent) {
@@ -6787,10 +7063,10 @@ function generateSelectionMenuItems(disabled: boolean): ContextMenuItem[] {
   ];
 }
 
-function cutSelection() {
+async function cutSelection() {
   if (!props.editable || !selectedRange.value) return;
-  void copyWithExtractor("tsv");
   const range = selectedRange.value;
+  if (!(await copyWithExtractor("tsv"))) return;
   const allowDraftSelectionValue = selectedRangeTargetsOnlyDraftRow();
   beginBatch();
   try {
@@ -7042,7 +7318,7 @@ function editSelectedCell(): boolean {
   const item = displayItemAt(position.rowIndex);
   const actualColIndex = actualColumnIndex(position.colIndex);
   if (!item || !canEditCellItem(item, actualColIndex)) return false;
-  startEdit(item.id, actualColIndex);
+  void startCellEdit(item.id, actualColIndex, false);
   return true;
 }
 
@@ -7060,10 +7336,10 @@ function copyCurrentRow(): boolean {
   const rowIds = selectedOrCurrentRowIds().filter((rowId) => !getRowItem(rowId)?.isDraft);
   if (rowIds.length === 0) return false;
   if (rowIds.length === 1) {
-    cloneRow(rowIds[0]);
+    void cloneRow(rowIds[0]);
     return true;
   }
-  cloneRows(rowIds);
+  void cloneRows(rowIds);
   return true;
 }
 
@@ -7105,7 +7381,7 @@ async function commitEditFromCellBlur() {
     await commitEditFromBlur({ promoteDraft: false });
     nextTick(() => {
       const item = getRowItem(target.rowId);
-      if (item && canEditCellItem(item, target.col)) startEdit(target.rowId, target.col);
+      if (item && canEditCellItem(item, target.col)) void startCellEdit(target.rowId, target.col, false);
     });
     return;
   }
@@ -7307,7 +7583,7 @@ async function onGridKeydown(event: KeyboardEvent) {
   if (clipboardShortcut(event, "x")) {
     if (!props.editable || !selectedRange.value) return;
     event.preventDefault();
-    cutSelection();
+    await cutSelection();
     return;
   }
   if (clipboardShortcut(event, "v")) {
@@ -7320,24 +7596,28 @@ async function onGridKeydown(event: KeyboardEvent) {
   }
 }
 
-function copyDetailValue() {
+async function copyDetailValue() {
+  const initialDetail = activeCellDetail.value;
+  if (!initialDetail || !(await hydrateLargeValueCell(initialDetail.rowId, initialDetail.colIndex))) return;
   const detail = activeCellDetail.value;
   if (!detail) return;
   const text = detail.value === null ? "" : displayCellValue(detail.value);
   copyText(text);
 }
 
-function copyDetailFormattedJson() {
+async function copyDetailFormattedJson() {
+  const initialDetail = activeCellDetail.value;
+  if (!initialDetail || !(await hydrateLargeValueCell(initialDetail.rowId, initialDetail.colIndex))) return;
   const detail = activeCellDetail.value;
   if (!detail?.formattedJson) return;
   copyText(detail.formattedJson);
 }
 
-function copyDetailCurrentValue() {
+async function copyDetailCurrentValue() {
   if (sideDetailJsonView.value && activeCellDetail.value?.formattedJson) {
-    copyDetailFormattedJson();
+    await copyDetailFormattedJson();
   } else {
-    copyDetailValue();
+    await copyDetailValue();
   }
 }
 
@@ -7347,7 +7627,9 @@ function copyDetailColumnName() {
 }
 
 function canDownloadDetailBinaryValue(detail: DataGridCellDetail | null): boolean {
-  return !!detail && canDownloadBinaryCellValue(detail.value, detail.type);
+  if (!detail) return false;
+  const item = getRowItem(detail.rowId);
+  return (isLargeValuePreview(item, detail.colIndex) && isBinaryCellColumnType(detail.type)) || canDownloadBinaryCellValue(detail.value, detail.type);
 }
 
 function canImportDetailBinaryValue(detail: DataGridCellDetail | null): boolean {
@@ -7394,10 +7676,13 @@ function downloadCellBinaryValue(rowIndex: number, columnIndex: number, mode: Bi
 async function downloadDetailBinaryValue(detail: DataGridCellDetail | null, mode: BinaryCellDownloadMode) {
   if (!detail || !canDownloadDetailBinaryValue(detail)) return;
   try {
-    const payload = binaryCellDownloadPayload(detail.value, mode, detail.type);
+    if (!(await hydrateLargeValueCell(detail.rowId, detail.colIndex))) return;
+    const resolvedDetail = cellDetailFor(detail.rowNumber - 1, detail.colIndex);
+    if (!resolvedDetail) return;
+    const payload = binaryCellDownloadPayload(resolvedDetail.value, mode, resolvedDetail.type);
     const fileName = binaryCellDownloadFileName({
-      column: detail.column,
-      rowNumber: detail.rowNumber,
+      column: resolvedDetail.column,
+      rowNumber: resolvedDetail.rowNumber,
       mode,
       extension: payload.extension,
     });
@@ -7448,35 +7733,102 @@ async function openDialogCellInSidePanel() {
   showCellDetails(detail.rowNumber - 1, detail.colIndex);
   cellDetailDialogOpen.value = false;
   await nextTick();
-  if (detail.isEditable) startDetailEdit();
+  if (detail.isEditable) await startDetailEdit();
 }
 
-function copyRowDetailJson() {
-  const detail = rowDetail.value;
-  if (!detail) return;
-  copyText(dataGridRowDetailJson(detail));
+async function resolvedRowDetailForCopy() {
+  if (rowDetailDialogRowId.value === null) return null;
+  const item = getRowItem(rowDetailDialogRowId.value);
+  if (!item) return null;
+  const resolved = await resolveLargeValueCells([item.id], visibleColumnIndexes.value);
+  const data = [...item.data];
+  for (const [columnIndex, value] of resolved.get(item.id) ?? []) data[columnIndex] = value;
+  return buildDataGridRowDetail({
+    rowIndex: item.displayIndex,
+    rowId: item.id,
+    row: data,
+    columns: props.result.columns,
+    columnIndexes: visibleColumnIndexes.value,
+    typeByColumn: columnTypeMap.value,
+    resultColumnTypes: props.result.column_types,
+    commentByColumn: columnCommentMap.value,
+    displayValue: (value, index) => formatCellCached(value, index),
+    isEditableColumn: (columnIndex) => canEditGridCellDetail({ canEditCell: canEditCellItem(item, columnIndex), isDraft: !!item.isDraft }),
+  });
 }
 
-function copyRowDetailTsv() {
-  const detail = rowDetail.value;
-  if (!detail) return;
-  copyText(dataGridRowDetailTsv(detail));
+async function resolvedColumnDetailForCopy() {
+  if (columnDetailDialogColumnIndex.value === null) return null;
+  const columnIndex = columnDetailDialogColumnIndex.value;
+  const items = displayItems.value.filter((item) => !item.isDraft);
+  const resolved = await resolveLargeValueCells(
+    items.map((item) => item.id),
+    [columnIndex],
+  );
+  return buildDataGridColumnDetail({
+    rows: items.map((item) => {
+      const row = [...item.data];
+      if (resolved.get(item.id)?.has(columnIndex)) row[columnIndex] = resolved.get(item.id)!.get(columnIndex) ?? null;
+      return {
+        rowIndex: item.displayIndex,
+        rowId: item.id,
+        row,
+        isEditable: canEditGridCellDetail({ canEditCell: canEditCellItem(item, columnIndex), isDraft: !!item.isDraft }),
+      };
+    }),
+    columns: props.result.columns,
+    columnIndex,
+    typeByColumn: columnTypeMap.value,
+    resultColumnTypes: props.result.column_types,
+    commentByColumn: columnCommentMap.value,
+    displayValue: (value, index) => formatCellCached(value, index),
+  });
 }
 
-function copyRowDetailFieldValue(field: DataGridCellDetail) {
-  copyText(field.value === null ? "" : displayCellValue(field.value));
+async function copyRowDetailJson() {
+  try {
+    const detail = await resolvedRowDetailForCopy();
+    if (!detail) return;
+    copyText(dataGridRowDetailJson(detail));
+  } catch (error) {
+    reportLargeValueLoadError(error);
+  }
 }
 
-function copyColumnDetailJson() {
-  const detail = columnDetail.value;
-  if (!detail) return;
-  copyText(dataGridColumnDetailJson(detail));
+async function copyRowDetailTsv() {
+  try {
+    const detail = await resolvedRowDetailForCopy();
+    if (!detail) return;
+    copyText(dataGridRowDetailTsv(detail));
+  } catch (error) {
+    reportLargeValueLoadError(error);
+  }
 }
 
-function copyColumnDetailTsv() {
-  const detail = columnDetail.value;
-  if (!detail) return;
-  copyText(dataGridColumnDetailTsv(detail));
+async function copyRowDetailFieldValue(field: DataGridCellDetail) {
+  if (!(await hydrateLargeValueCell(field.rowId, field.colIndex))) return;
+  const resolved = cellDetailFor(field.rowNumber - 1, field.colIndex);
+  if (resolved) copyText(resolved.value === null ? "" : displayCellValue(resolved.value));
+}
+
+async function copyColumnDetailJson() {
+  try {
+    const detail = await resolvedColumnDetailForCopy();
+    if (!detail) return;
+    copyText(dataGridColumnDetailJson(detail));
+  } catch (error) {
+    reportLargeValueLoadError(error);
+  }
+}
+
+async function copyColumnDetailTsv() {
+  try {
+    const detail = await resolvedColumnDetailForCopy();
+    if (!detail) return;
+    copyText(dataGridColumnDetailTsv(detail));
+  } catch (error) {
+    reportLargeValueLoadError(error);
+  }
 }
 
 function copyColumnDetailColumnName() {
@@ -7485,8 +7837,10 @@ function copyColumnDetailColumnName() {
   copyText(detail.column);
 }
 
-function copyColumnDetailFieldValue(field: DataGridCellDetail) {
-  copyText(field.value === null ? "" : displayCellValue(field.value));
+async function copyColumnDetailFieldValue(field: DataGridCellDetail) {
+  if (!(await hydrateLargeValueCell(field.rowId, field.colIndex))) return;
+  const resolved = cellDetailFor(field.rowNumber - 1, field.colIndex);
+  if (resolved) copyText(resolved.value === null ? "" : displayCellValue(resolved.value));
 }
 
 const transposeRecordWidths = ref<number[]>([]);
@@ -7591,6 +7945,9 @@ const transposeRows = computed(() => {
     displayValue: (value, _column, index) => formatCellCached(value, visibleColumnIndexes.value[index]),
   });
 });
+const transposeReserveTypeLine = computed(() => showColumnTypesInHeader.value && transposeRows.value.some((row) => row.type));
+const transposeReserveCommentLine = computed(() => showColumnCommentsInHeader.value && transposeRows.value.some((row) => row.comment));
+const transposeRowHeight = computed(() => 30 + (transposeReserveTypeLine.value ? 14 : 0) + (transposeReserveCommentLine.value ? 14 : 0));
 const isTransposeMode = computed(() => showTranspose.value && transposeRows.value.length > 0);
 const transposeTotalWidth = computed(() => {
   const recordIndexes = multiRowTranspose.value ? Array.from({ length: displayRowCount.value }, (_, i) => i) : activeTransposeRecordIndexes.value;
@@ -7608,6 +7965,19 @@ function transposeFieldTitle(item: { column: string; type: string; comment?: str
   if (showColumnTypesInHeader.value && item.type) details.push(`${t("grid.columnType")}: ${item.type}`);
   if (showColumnCommentsInHeader.value && item.comment) details.push(`${t("grid.columnComment")}: ${item.comment}`);
   return details.join("\n");
+}
+
+function transposeColumnIndexKind(column: string): ColumnIndexKind | undefined {
+  if (!showIndexIndicatorsInHeader.value) return undefined;
+  const kind = columnIndexMap.value.get(columnIndexNameKey(column));
+  return kind && kind !== "none" ? kind : undefined;
+}
+
+function transposeColumnIndexText(kind: ColumnIndexKind): string {
+  if (kind === "primary") return t("grid.columnPrimaryIndex");
+  if (kind === "unique") return t("grid.columnUniqueIndex");
+  if (kind === "index") return t("grid.columnRegularIndex");
+  return "";
 }
 
 function updateTransposeViewport() {
@@ -8709,7 +9079,7 @@ async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) 
   const association = cellForeignKeyAssociation(actualColIdx);
   const item = displayItems.value[rowIndex];
   if (!association || !item || !props.connectionId) return;
-  const cells = foreignKeyAssociationCells({
+  let cells = foreignKeyAssociationCells({
     association,
     context: props.context,
     resultColumns: props.result.columns,
@@ -8718,6 +9088,15 @@ async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) 
   });
   if (!cells) return;
   try {
+    const resolved = await resolveLargeValueCells(
+      [item.id],
+      cells.map((cell) => cell.columnIndex),
+    );
+    const resolvedRow = resolved.get(item.id);
+    if (resolvedRow) {
+      cells = cells.map((cell) => (resolvedRow.has(cell.columnIndex) ? { ...cell, value: resolvedRow.get(cell.columnIndex) ?? null } : cell));
+      if (cells.some((cell) => cell.value === null)) throw new Error(t("grid.largeValueRowUnavailable"));
+    }
     const conditions = await Promise.all(
       cells.map(({ foreignKey, value }) =>
         buildColumnValueFilterCondition({
@@ -9465,7 +9844,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
       labels: rowLabels,
       icons: { clone: CopyPlus, restore: Undo2, delete: Trash2 },
       actions: {
-        clone: () => (isMultiRow.value ? cloneRows(affectedRowIds()) : row && cloneRow(row.id)),
+        clone: () => void (isMultiRow.value ? cloneRows(affectedRowIds()) : row && cloneRow(row.id)),
         restore: () => (isMultiRow.value ? restoreRows(affectedRowIds()) : row && restoreRow(row.id)),
         delete: () => (isMultiRow.value ? requestDeleteRows(deletableRowIds(affectedRowIds())) : row && requestDeleteRow(row.id)),
       },
@@ -9729,7 +10108,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   '--transpose-field-w': `${transposePinnedWidth}px`,
                 }"
                 :items="transposeRows"
-                :item-size="30"
+                :item-size="transposeRowHeight"
                 :buffer="400"
                 key-field="id"
                 @scroll="onTransposeScroll"
@@ -9767,21 +10146,35 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   <div
                     class="data-grid-transpose-row flex border-b border-border/60"
                     :style="{
-                      height: '30px',
+                      height: `${transposeRowHeight}px`,
                       width: `${transposeTotalWidth}px`,
                     }"
                   >
                     <LightTooltip :text="transposeFieldTitle(item)" side="right" :side-offset="6" :delay="250" :open-on-focus="false" surface="popover">
                       <div
                         data-native-clipboard
-                        class="sticky left-0 z-10 flex shrink-0 items-center gap-1.5 overflow-hidden border-r border-border bg-background px-3 py-0"
+                        class="sticky left-0 z-10 flex shrink-0 flex-col items-start justify-center overflow-hidden border-r border-border bg-background px-3 py-0"
                         :class="{
                           'bg-yellow-200/60 dark:bg-yellow-500/20': transposeHeaderIsSearchMatch(visibleColumnIndexes[index]),
                           'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': transposeHeaderIsCurrentMatch(visibleColumnIndexes[index]),
                         }"
                         :style="{ width: `${transposePinnedWidth}px` }"
                       >
-                        <span class="min-w-0 flex-1 truncate font-medium">{{ item.column }}</span>
+                        <span class="flex min-w-0 items-center gap-1 overflow-hidden">
+                          <KeyRound v-if="transposeColumnIndexKind(item.column) === 'primary'" data-grid-transpose-index-indicator class="h-3 w-3 shrink-0" :class="columnIndexColorClass('primary')" :title="transposeColumnIndexText('primary')" />
+                          <Hash v-else-if="transposeColumnIndexKind(item.column)" data-grid-transpose-index-indicator class="h-3 w-3 shrink-0" :class="columnIndexColorClass(transposeColumnIndexKind(item.column)!)" :title="transposeColumnIndexText(transposeColumnIndexKind(item.column)!)" />
+                          <span class="min-w-0 flex-1 truncate font-medium leading-4">{{ item.column }}</span>
+                        </span>
+                        <template v-if="showColumnTypesInHeader && item.type">
+                          <span data-grid-transpose-type-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 select-none" :class="typeColorClass(item.type)" :title="item.type">
+                            {{ item.type }}
+                          </span>
+                        </template>
+                        <template v-if="showColumnCommentsInHeader && item.comment">
+                          <span data-grid-transpose-comment-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 text-muted-foreground select-none" :title="item.comment">
+                            {{ item.comment }}
+                          </span>
+                        </template>
                       </div>
                       <template #content>
                         <div
@@ -9806,22 +10199,24 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       v-for="cell in item.values"
                       :key="`${item.id}:${cell.recordIndex}`"
                       class="relative flex shrink-0 items-center border-r border-border/70 px-2 py-0 truncate"
-                      :class="{
-                        'text-muted-foreground italic': cell.isNull,
-                        'cell-selected': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'cell-selected-dirty': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'cell-selected--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'cell-selected-dirty--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'row-cell-selected': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'row-cell-selected-dirty': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'bg-primary/15': transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
-                        'bg-yellow-500/10 cell-dirty': displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                        'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(cell.recordIndex, cell.valueIndex),
-                        'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(cell.recordIndex, cell.valueIndex),
-                        'cursor-text': !isScrolling && canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex),
-                        'hover:bg-gray-200 dark:hover:bg-gray-800':
-                          !isScrolling && canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
-                      }"
+                      :class="[
+                        transposeCellTextColorClass(cell.recordIndex, cell.valueIndex),
+                        {
+                          'cell-selected': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'cell-selected-dirty': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'cell-selected--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'cell-selected-dirty--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'row-cell-selected': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'row-cell-selected-dirty': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'bg-primary/15': transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
+                          'bg-yellow-500/10 cell-dirty': displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(cell.recordIndex, cell.valueIndex),
+                          'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(cell.recordIndex, cell.valueIndex),
+                          'cursor-text': !isScrolling && canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex),
+                          'hover:bg-gray-200 hover:text-foreground dark:hover:bg-gray-800':
+                            !isScrolling && canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
+                        },
+                      ]"
                       :style="{
                         width: `${getTransposeRecordWidth(cell.recordIndex)}px`,
                       }"
@@ -9899,7 +10294,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         <template v-if="draftCellPlaceholder(displayItems[cell.recordIndex], cell.valueIndex)">
                           <span class="text-muted-foreground/70 italic">{{ draftCellPlaceholder(displayItems[cell.recordIndex], cell.valueIndex) }}</span>
                         </template>
-                        <template v-else>{{ firstLineCellDisplayValue(cell.display) }}</template>
+                        <template v-else>{{ firstLineCellDisplayValue(cell.display, flatteningMultiLineEnabled) }}</template>
                         <div v-if="cellDetailButtonVisible(cell.recordIndex, cell.valueIndex)" class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
                           <LightDropdownMenu
                             v-if="canQuickDownloadCellValue(cell.recordIndex, cell.valueIndex)"
@@ -10558,12 +10953,12 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         class="data-grid-cell group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none inline-block items-center tabular-nums"
                         :style="renderedColumnStyle(col.visibleColIdx)"
                         :class="[
+                          gridCellTextColorClass(item, col.actualColIdx, col.visibleColIdx),
                           selectionFrameEdgeClass(item.displayIndex, col.visibleColIdx),
                           {
                             'data-grid-cell--frozen': col.visibleColIdx < frozenColumnCount,
                             'data-grid-cell--frozen-separator': frozenColumnCount > 0 && col.visibleColIdx === frozenColumnCount - 1,
                             'text-right': columnAligns[col.visibleColIdx] === 'right',
-                            'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
                             'bg-yellow-500/10 cell-dirty': item.isDirtyCol[col.actualColIdx],
                             'cell-selected': cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
                             'cell-selected-dirty': cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
@@ -10577,7 +10972,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                             'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
                             'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
                             'tabular-nums': typeof item.data[col.actualColIdx] === 'number',
-                            'cursor-text hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && canEditCellItem(item, col.actualColIdx) && !(booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null),
+                            'cursor-text hover:bg-gray-200 hover:text-foreground dark:hover:bg-gray-800': !isScrolling && canEditCellItem(item, col.actualColIdx) && !(booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null),
                             'cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx),
                             'line-through': item.isDeleted,
                             'overflow-visible z-20 border-r-transparent': editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx,
@@ -10666,13 +11061,13 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           </div>
                         </template>
                         <template v-else-if="booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] === null && canEditCellItem(item, col.actualColIdx)">
-                          <span class="italic text-muted-foreground cursor-pointer select-none" @click.stop="cycleBooleanGridCell(item, col.actualColIdx, $event)">{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx)) }}</span>
+                          <span class="italic text-muted-foreground cursor-pointer select-none" @click.stop="cycleBooleanGridCell(item, col.actualColIdx, $event)">{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx), flatteningMultiLineEnabled) }}</span>
                         </template>
                         <template v-else>
                           <template v-if="draftCellPlaceholder(item, col.actualColIdx)">
                             <span class="text-muted-foreground/70 italic">{{ draftCellPlaceholder(item, col.actualColIdx) }}</span>
                           </template>
-                          <template v-else>{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx)) }}</template>
+                          <template v-else>{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx), flatteningMultiLineEnabled) }}</template>
                           <div v-if="cellDetailButtonVisible(item.displayIndex, col.actualColIdx)" class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
                             <LightDropdownMenu
                               v-if="canQuickDownloadCellValue(item.displayIndex, col.actualColIdx)"

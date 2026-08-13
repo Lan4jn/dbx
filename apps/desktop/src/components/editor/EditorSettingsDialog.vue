@@ -313,6 +313,7 @@ const debugLogCopied = ref(false);
 const debugLogDownloaded = ref(false);
 const editShowColumnCommentsInHeader = ref(settingsStore.editorSettings.showColumnCommentsInHeader);
 const editShowColumnTypesInHeader = ref(settingsStore.editorSettings.showColumnTypesInHeader);
+const editColorizeDataGridCellTypes = ref(settingsStore.editorSettings.colorizeDataGridCellTypes);
 const editShowIndexIndicatorsInHeader = ref(settingsStore.editorSettings.showIndexIndicatorsInHeader);
 const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactColumnHeaderActions);
 const editDataGridQuickEntry = ref(settingsStore.editorSettings.dataGridQuickEntry);
@@ -324,6 +325,7 @@ const editQueryResultMaxRows = ref(settingsStore.editorSettings.queryResultMaxRo
 const editInfiniteScroll = ref(settingsStore.editorSettings.infiniteScroll);
 const editRegexMaxMatchCount = ref(settingsStore.editorSettings.regexMaxMatchCount);
 const editAutoCalculateTotalRows = ref(settingsStore.editorSettings.autoCalculateTotalRows);
+const editFlatteningMultiLineText = ref(settingsStore.editorSettings.flatteningMultiLineText);
 const editTableColumnTemplateRows = ref<TableColumnTemplateGridRow[]>(tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields));
 const editTableColumnTemplateDatabaseType = ref<DatabaseType>(TABLE_COLUMN_TEMPLATE_DATABASE_TYPES[0] ?? "mysql");
 const editSqlVariableSyntaxOverrides = ref<SqlVariableSyntaxOverrides>(normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides));
@@ -486,10 +488,12 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     tabLayout: editTabLayout.value,
     showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
     showColumnTypesInHeader: editShowColumnTypesInHeader.value,
+    colorizeDataGridCellTypes: editColorizeDataGridCellTypes.value,
     showIndexIndicatorsInHeader: editShowIndexIndicatorsInHeader.value,
     compactColumnHeaderActions: editCompactColumnHeaderActions.value,
     dataGridQuickEntry: editDataGridQuickEntry.value,
     dataGridAutoTransposeSingleRow: editDataGridAutoTransposeSingleRow.value,
+    flatteningMultiLineText: editFlatteningMultiLineText.value,
     pageSize: editPageSize.value,
     tableOpenPageSize: editTableOpenPageSize.value,
     queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled.value,
@@ -758,10 +762,12 @@ function syncEditorSettingsDraftFromStore() {
   editTabLayout.value = settingsStore.editorSettings.tabLayout;
   editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
   editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
+  editColorizeDataGridCellTypes.value = settingsStore.editorSettings.colorizeDataGridCellTypes;
   editShowIndexIndicatorsInHeader.value = settingsStore.editorSettings.showIndexIndicatorsInHeader;
   editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
   editDataGridQuickEntry.value = settingsStore.editorSettings.dataGridQuickEntry;
   editDataGridAutoTransposeSingleRow.value = settingsStore.editorSettings.dataGridAutoTransposeSingleRow;
+  editFlatteningMultiLineText.value = settingsStore.editorSettings.flatteningMultiLineText;
   editPageSize.value = settingsStore.editorSettings.pageSize;
   editTableOpenPageSize.value = settingsStore.editorSettings.tableOpenPageSize;
   editQueryResultMaxRowsEnabled.value = settingsStore.editorSettings.queryResultMaxRowsEnabled;
@@ -1002,10 +1008,12 @@ function resetDefaultsForTab(tab: SettingsCategory) {
   } else if (tab === "data") {
     editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
     editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
+    editColorizeDataGridCellTypes.value = DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes;
     editShowIndexIndicatorsInHeader.value = DEFAULT_EDITOR_SETTINGS.showIndexIndicatorsInHeader;
     editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
     editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
     editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
+    editFlatteningMultiLineText.value = DEFAULT_EDITOR_SETTINGS.flatteningMultiLineText;
     editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
     editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
     editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
@@ -1069,10 +1077,12 @@ function resetAllDefaults() {
   editSidebarTablePageSize.value = DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
   editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
   editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
+  editColorizeDataGridCellTypes.value = DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes;
   editShowIndexIndicatorsInHeader.value = DEFAULT_EDITOR_SETTINGS.showIndexIndicatorsInHeader;
   editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
   editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
   editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
+  editFlatteningMultiLineText.value = DEFAULT_EDITOR_SETTINGS.flatteningMultiLineText;
   editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
   editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
   editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
@@ -4910,6 +4920,17 @@ onUnmounted(() => {
                 </div>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="colorize-data-grid-cell-types">
+                      {{ t("settings.colorizeDataGridCellTypes") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.colorizeDataGridCellTypesDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="colorize-data-grid-cell-types" v-model="editColorizeDataGridCellTypes" />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="show-index-indicators-in-header">
                       {{ t("settings.showIndexIndicatorsInHeader") }}
                     </Label>
@@ -4951,6 +4972,17 @@ onUnmounted(() => {
                     </p>
                   </div>
                   <Switch id="data-grid-auto-transpose-single-row" v-model="editDataGridAutoTransposeSingleRow" />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="flattening-multi-line">
+                      {{ t("settings.flatteningMultiLineText") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.flatteningMultiLineTextDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="flattening-multi-line" v-model="editFlatteningMultiLineText" />
                 </div>
               </div>
 
@@ -6334,15 +6366,15 @@ onUnmounted(() => {
               <div class="space-y-2">
                 <Label>{{ t("settings.mcpConfig") }}</Label>
                 <Tabs v-model="mcpConfigTab" class="space-y-3">
-                  <TabsList class="h-auto min-h-8 w-full min-w-0 max-w-full justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain group-data-horizontal/tabs:h-auto">
-                    <TabsTrigger value="claude" class="h-7 flex-none shrink-0 px-2.5">Claude Code</TabsTrigger>
-                    <TabsTrigger value="cursor" class="h-7 flex-none shrink-0 px-2.5">Cursor</TabsTrigger>
-                    <TabsTrigger value="trae" class="h-7 flex-none shrink-0 px-2.5">TRAE</TabsTrigger>
-                    <TabsTrigger value="vscode" class="h-7 flex-none shrink-0 px-2.5">VS Code</TabsTrigger>
-                    <TabsTrigger value="windsurf" class="h-7 flex-none shrink-0 px-2.5">Windsurf</TabsTrigger>
-                    <TabsTrigger value="codex" class="h-7 flex-none shrink-0 px-2.5">Codex</TabsTrigger>
-                    <TabsTrigger value="opencode" class="h-7 flex-none shrink-0 px-2.5">OpenCode</TabsTrigger>
-                    <TabsTrigger value="cherry-studio" class="h-7 flex-none shrink-0 px-2.5">Cherry Studio</TabsTrigger>
+                  <TabsList class="settings-mcp-config-tabs h-auto min-h-8 w-full min-w-0 max-w-full justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain group-data-horizontal/tabs:h-auto">
+                    <TabsTrigger value="claude" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Claude Code</TabsTrigger>
+                    <TabsTrigger value="cursor" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cursor</TabsTrigger>
+                    <TabsTrigger value="trae" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">TRAE</TabsTrigger>
+                    <TabsTrigger value="vscode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">VS Code</TabsTrigger>
+                    <TabsTrigger value="windsurf" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Windsurf</TabsTrigger>
+                    <TabsTrigger value="codex" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Codex</TabsTrigger>
+                    <TabsTrigger value="opencode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">OpenCode</TabsTrigger>
+                    <TabsTrigger value="cherry-studio" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cherry Studio</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value="claude" class="m-0">
@@ -6910,6 +6942,28 @@ html.dbx-legacy-webview .settings-layout .settings-export-number-input::-webkit-
   appearance: auto !important;
   min-height: 1.5rem !important;
   opacity: 1 !important;
+}
+
+html.dbx-legacy-webview .settings-layout .settings-mcp-config-tabs {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  gap: 0.25rem !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  white-space: nowrap !important;
+}
+
+html.dbx-legacy-webview .settings-layout .settings-mcp-config-tab {
+  display: inline-flex !important;
+  flex: 0 0 auto !important;
+  width: max-content !important;
+  min-width: max-content !important;
+  max-width: none !important;
+  padding-left: 0.625rem !important;
+  padding-right: 0.625rem !important;
+  white-space: nowrap !important;
 }
 
 html.dbx-legacy-webview .settings-ai-back-button {

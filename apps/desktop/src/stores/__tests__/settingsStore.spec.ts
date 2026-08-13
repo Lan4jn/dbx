@@ -5,6 +5,12 @@ import { DEFAULT_EDITOR_SETTINGS, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, enforceR
 import type { AiConfigItem } from "@/types/ai";
 
 describe("normalizeEditorSettings", () => {
+  it("keeps data type colors disabled by default and preserves an explicit opt-in", () => {
+    expect(normalizeEditorSettings({}).colorizeDataGridCellTypes).toBe(false);
+    expect(normalizeEditorSettings({ colorizeDataGridCellTypes: true }).colorizeDataGridCellTypes).toBe(true);
+    expect(normalizeEditorSettings({ colorizeDataGridCellTypes: false }).colorizeDataGridCellTypes).toBe(false);
+  });
+
   it("defaults and migrates the data-tab reuse mode", () => {
     expect(normalizeEditorSettings({}).dataTabReuseMode).toBe("same-table");
     expect(normalizeEditorSettings({ dataTabReuseMode: "always-new" }).dataTabReuseMode).toBe("always-new");
@@ -238,7 +244,9 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).globalQueryTimeoutSecs).toBe(30);
     expect(normalizeEditorSettings({ queryTimeoutSecs: 45 } as any).globalQueryTimeoutSecs).toBe(45);
     expect(normalizeEditorSettings({ globalQueryTimeoutSecs: -1 }).globalQueryTimeoutSecs).toBe(0);
-    expect(normalizeEditorSettings({ globalQueryTimeoutSecs: 301 }).globalQueryTimeoutSecs).toBe(300);
+    expect(normalizeEditorSettings({ globalQueryTimeoutSecs: 301 }).globalQueryTimeoutSecs).toBe(301);
+    expect(normalizeEditorSettings({ globalQueryTimeoutSecs: 3600 }).globalQueryTimeoutSecs).toBe(3600);
+    expect(normalizeEditorSettings({ globalQueryTimeoutSecs: 3601 }).globalQueryTimeoutSecs).toBe(3600);
     expect(normalizeEditorSettings({ connectTimeoutInheritConnectionIds: ["one", "one", " ", "two"] }).connectTimeoutInheritConnectionIds).toEqual(["one", "two"]);
     expect(normalizeEditorSettings({ queryTimeoutInheritConnectionIds: ["one", "one", " ", "two"] }).queryTimeoutInheritConnectionIds).toEqual(["one", "two"]);
     expect(normalizeEditorSettings({}).timeoutInheritanceMigrationVersion).toBe(0);

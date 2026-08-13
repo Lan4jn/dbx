@@ -39,6 +39,7 @@ import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosMetri
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
+import { applySshAuthMethod, inferSshAuthMethod } from "@/lib/connection/sshAuthMethod";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
 import { canPersistConnectionTestResult, connectionEditDraftSyncAction } from "./connectionEditDraftSync";
 import { createConnectionNoteVisibilityDraft, persistConnectionNoteVisibilityDraft as persistConnectionNoteVisibilityDraftState, resetConnectionNoteVisibilityDraft, setConnectionNoteVisibilityDraft, syncConnectionNoteVisibilityDraft } from "./connectionNoteVisibilityDraft";
@@ -49,6 +50,7 @@ import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connection/connectionUrl";
+import { MAX_CONNECT_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
 import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseServiceConnectionUrl, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
@@ -337,6 +339,7 @@ const defaultForm = (): ConnectionForm => ({
   is_production: false,
   production_databases: [],
   visible_databases: undefined,
+  save_password: true,
 });
 
 const elasticsearchConnectionMode = ref<ElasticsearchConnectionMode>("direct");
@@ -386,20 +389,6 @@ function defaultSshTunnel(): SshTunnelConfig {
     auth_method: "password",
     allow_exec_channel_proxy: false,
   };
-}
-
-/**
- * Infers a login method for connections saved before `auth_method` existed
- * (or imported from a source that never set it), so the dropdown shows a
- * sensible current state instead of defaulting blindly to "password".
- * Mirrors the priority `connect_and_authenticate` actually uses at connect
- * time (key > password > agent > none) — see `db/ssh_tunnel.rs`.
- */
-function inferSshAuthMethod(hop: Partial<SshTunnelConfig>): "password" | "key" | "agent" | "none" {
-  if (hop.key_path?.trim()) return "key";
-  if (hop.password) return "password";
-  if (hop.use_ssh_agent) return "agent";
-  return "none";
 }
 
 function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
@@ -1091,6 +1080,13 @@ const driverProfiles: Record<
     user: "",
     label: "Easysearch",
     icon: "easysearch",
+  },
+  meilisearch: {
+    type: "meilisearch",
+    port: 7700,
+    user: "",
+    label: "Meilisearch",
+    icon: "meilisearch",
   },
   hbase: { type: "hbase", port: 8080, user: "", label: "Apache HBase", icon: "hbase" },
   qdrant: { type: "qdrant", port: 6333, user: "", label: "Qdrant", icon: "qdrant" },
@@ -2518,6 +2514,7 @@ watch(
         production_databases: config.production_databases || [],
         visible_databases: config.visible_databases,
         visible_schemas: config.visible_schemas,
+        save_password: config.save_password !== false,
       };
       oracleTnsAdminPath.value = parseOracleTnsConnectionString(config.connection_string)?.tnsAdmin || "";
       productionProtectionEnabled.value = !!config.is_production || (config.production_databases?.length ?? 0) > 0;
@@ -2854,6 +2851,7 @@ const iconTypeMap: Record<string, string> = {
   oracle: "oracle",
   elasticsearch: "elasticsearch",
   easysearch: "easysearch",
+  meilisearch: "meilisearch",
   hbase: "hbase",
   qdrant: "qdrant",
   milvus: "milvus",
@@ -2940,6 +2938,7 @@ const dbOptions: DbOption[] = [
   { value: "sqlserver", label: "SQL Server" },
   { value: "elasticsearch", label: "Elasticsearch" },
   { value: "easysearch", label: "Easysearch" },
+  { value: "meilisearch", label: "Meilisearch" },
   { value: "hbase", label: "Apache HBase" },
   { value: "qdrant", label: "Qdrant" },
   { value: "milvus", label: "Milvus" },
@@ -3047,7 +3046,7 @@ const dbCategoryDefinitions: Array<{
   {
     key: "document",
     titleKey: "connection.databaseCategoryDocument",
-    optionValues: ["mongodb", "redis", "elasticsearch", "easysearch", "hbase", "manticoresearch", "cassandra"],
+    optionValues: ["mongodb", "redis", "elasticsearch", "easysearch", "meilisearch", "hbase", "manticoresearch", "cassandra"],
   },
   {
     key: "graph_ai",
@@ -3187,6 +3186,7 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "clickhouse",
   "elasticsearch",
   "easysearch",
+  "meilisearch",
   "hbase",
   "qdrant",
   "milvus",
@@ -3853,10 +3853,9 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     // service, SID, and descriptor JDBC strings exactly as before.
     config.connection_string = undefined;
   }
-  const connectTimeout = Number(config.connect_timeout_secs);
-  config.connect_timeout_secs = config.connect_timeout_inherit === true ? normalizeGlobalConnectTimeoutSecs(editGlobalConnectTimeoutSecs.value) : Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 10;
+  config.connect_timeout_secs = config.connect_timeout_inherit === true ? normalizeGlobalConnectTimeoutSecs(editGlobalConnectTimeoutSecs.value) : normalizeGlobalConnectTimeoutSecs(config.connect_timeout_secs);
   const queryTimeout = Number(config.query_timeout_secs);
-  config.query_timeout_secs = config.query_timeout_inherit === true ? normalizeGlobalQueryTimeoutSecs(editGlobalQueryTimeoutSecs.value) : Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
+  config.query_timeout_secs = config.query_timeout_inherit === true ? normalizeGlobalQueryTimeoutSecs(editGlobalQueryTimeoutSecs.value) : normalizeGlobalQueryTimeoutSecs(queryTimeout);
   const idleTimeout = Number(config.idle_timeout_secs);
   config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
   const keepaliveInterval = Number(config.keepalive_interval_secs);
@@ -3905,6 +3904,9 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   }
   if (!config.one_time) config.one_time = undefined;
   if (!config.read_only) config.read_only = undefined;
+  // Save-password is a positive default: only an explicit unchecked state (false)
+  // is persisted; anything else keeps the current behavior.
+  config.save_password = config.save_password !== false;
   if ((isSingleDatabase(config.db_type) || config.db_type === "mq" || config.db_type === "mqtt") && config.production_databases?.length) {
     // Single-database / MQ drivers expose no independently selectable database list for PROD scope.
     config.is_production = true;
@@ -3986,6 +3988,11 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.username = config.username.trim();
   } else if (config.db_type === "elasticsearch") {
     config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value, elasticsearchConnectivityCheckPath.value, elasticsearchIndexGroupingPattern.value);
+  } else if (config.db_type === "meilisearch") {
+    config.username = "";
+    config.password = config.password.trim();
+    config.database = undefined;
+    config.external_config = undefined;
   } else if (config.db_type === "sqlserver") {
     config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else if (supportsGaussdbIdentifierQuoteStyle(config)) {
@@ -5117,31 +5124,10 @@ function updateSelectedProxyType(value: unknown) {
   resetTestState();
 }
 
-/**
- * "agent" is legacy-only: it's never chosen from this dropdown, only ever
- * inherited from a connection saved before this selector existed. Once the
- * user picks something else, the option (and its underlying checkbox) is
- * gone from the form for good.
- */
-function isLegacySshAgentMethod(hop: Partial<SshTunnelConfig> | null | undefined) {
-  return hop?.auth_method === "agent";
-}
-
 function updateSelectedSshAuthMethod(value: unknown) {
   const layer = selectedSshLayer.value;
   if (!layer) return;
-  layer.auth_method = value === "key" ? "key" : value === "key+password" ? "key+password" : value === "none" ? "none" : "password";
-  // Scrub credential fields that do not apply to the selected method so
-  // they are not accidentally submitted or used by the backend fallback.
-  // "key+password" keeps both key and password fields.
-  if (layer.auth_method !== "password" && layer.auth_method !== "key+password") layer.password = "";
-  if (layer.auth_method !== "key" && layer.auth_method !== "key+password") {
-    layer.key_path = "";
-    layer.key_passphrase = "";
-  }
-  if (layer.auth_method !== "key" && layer.auth_method !== "key+password") {
-    layer.use_ssh_agent = false;
-  }
+  applySshAuthMethod(layer, value);
   resetTestState();
 }
 
@@ -5195,6 +5181,26 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
       }
     }
   });
+}
+
+function clampQueryTimeoutInput(event: Event, target: "global" | "connection") {
+  const input = event.target as HTMLInputElement;
+  if (input.value === "") return;
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value <= MAX_QUERY_TIMEOUT_SECS) return;
+  input.value = String(MAX_QUERY_TIMEOUT_SECS);
+  if (target === "global") editGlobalQueryTimeoutSecs.value = MAX_QUERY_TIMEOUT_SECS;
+  else form.value.query_timeout_secs = MAX_QUERY_TIMEOUT_SECS;
+}
+
+function clampConnectTimeoutInput(event: Event, target: "global" | "connection") {
+  const input = event.target as HTMLInputElement;
+  if (input.value === "") return;
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value <= MAX_CONNECT_TIMEOUT_SECS) return;
+  input.value = String(MAX_CONNECT_TIMEOUT_SECS);
+  if (target === "global") editGlobalConnectTimeoutSecs.value = MAX_CONNECT_TIMEOUT_SECS;
+  else form.value.connect_timeout_secs = MAX_CONNECT_TIMEOUT_SECS;
 }
 
 async function persistGlobalTimeoutDrafts() {
@@ -5735,7 +5741,7 @@ function openExternalUrl(url: string) {
                     @dblclick="goToConnectionStep(opt.value)"
                   >
                     <span class="flex h-10 w-10 items-center justify-center rounded-xl bg-muted/60 transition group-hover:bg-background">
-                      <DatabaseIcon :db-type="iconTypeMap[opt.value]" class="h-6 w-6" />
+                      <DatabaseIcon :db-type="iconTypeMap[opt.value] || opt.value" class="h-6 w-6" />
                     </span>
                     <span class="flex min-h-8 max-w-full items-center justify-center">
                       <span class="line-clamp-2 text-sm leading-4 font-medium">{{ opt.label }}</span>
@@ -5754,7 +5760,7 @@ function openExternalUrl(url: string) {
                     @click="onDbTypeChange(opt.value)"
                     @dblclick="goToConnectionStep(opt.value)"
                   >
-                    <DatabaseIcon :db-type="iconTypeMap[opt.value]" class="h-5 w-5 shrink-0" />
+                    <DatabaseIcon :db-type="iconTypeMap[opt.value] || opt.value" class="h-5 w-5 shrink-0" />
                     <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ opt.label }}</span>
                     <span v-if="isDbSearchActive" class="text-xs text-muted-foreground">{{ category.title }}</span>
                   </button>
@@ -5984,6 +5990,14 @@ function openExternalUrl(url: string) {
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <label class="col-span-3 flex items-center gap-2 text-sm">
+                      <input v-model="form.save_password" type="checkbox" class="h-4 w-4 rounded border-border accent-primary" :aria-label="t('connection.savePassword')" />
+                      <span>{{ t("connection.savePassword") }}</span>
+                      <span class="text-xs text-muted-foreground">{{ t("connection.savePasswordHint") }}</span>
+                    </label>
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
                     <Label :class="connectionLabelTopClass">{{ t("connection.jdbcDriverPaths") }}</Label>
@@ -7114,17 +7128,26 @@ function openExternalUrl(url: string) {
                     <Input v-model="form.informix_server" class="col-span-3" placeholder="ol_informix1170" />
                   </div>
 
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="form.db_type !== 'meilisearch'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
+                    <Label :class="connectionLabelClass">{{ form.db_type === "meilisearch" ? t("connection.mqAuthApiKey") : t("connection.password") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
 
-                  <div v-if="form.db_type !== 'hbase'" class="grid grid-cols-4 items-center gap-4">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <label class="col-span-3 flex items-center gap-2 text-sm">
+                      <input v-model="form.save_password" type="checkbox" class="h-4 w-4 rounded border-border accent-primary" :aria-label="t('connection.savePassword')" />
+                      <span>{{ t("connection.savePassword") }}</span>
+                      <span class="text-xs text-muted-foreground">{{ t("connection.savePasswordHint") }}</span>
+                    </label>
+                  </div>
+
+                  <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ databaseLabel }}</Label>
                     <Input v-model="form.database" class="col-span-3" :placeholder="databasePlaceholder" />
                   </div>
@@ -7919,13 +7942,41 @@ function openExternalUrl(url: string) {
                   <div class="col-span-3 grid grid-cols-2 gap-2">
                     <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.connect_timeout_inherit === true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
                       <input id="connect-timeout-global" v-model="form.connect_timeout_inherit" type="radio" name="connect-timeout-scope" :value="true" class="h-3.5 w-3.5 shrink-0 accent-primary" />
-                      <label for="connect-timeout-global" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useGlobalQueryTimeout')">{{ t("connection.useGlobalQueryTimeout") }}</label>
-                      <Input v-model.number="editGlobalConnectTimeoutSecs" type="number" min="1" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.connect_timeout_inherit !== true" />
+                      <div class="flex min-w-0 flex-1 items-center gap-1">
+                        <label for="connect-timeout-global" class="min-w-0 cursor-pointer truncate text-xs" :title="t('connection.useGlobalQueryTimeout')">{{ t("connection.useGlobalQueryTimeout") }}</label>
+                        <Tooltip>
+                          <TooltipTrigger as-child>
+                            <CircleHelp class="h-3.5 w-3.5 shrink-0 cursor-help text-muted-foreground hover:text-foreground" />
+                          </TooltipTrigger>
+                          <TooltipContent side="top" align="center" class="max-w-[280px] text-xs leading-relaxed">
+                            {{ t("connection.globalConnectTimeoutHint") }}
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <Input
+                        v-model.number="editGlobalConnectTimeoutSecs"
+                        type="number"
+                        min="1"
+                        :max="MAX_CONNECT_TIMEOUT_SECS"
+                        step="1"
+                        class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20"
+                        :disabled="form.connect_timeout_inherit !== true"
+                        @input="clampConnectTimeoutInput($event, 'global')"
+                      />
                     </div>
                     <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.connect_timeout_inherit !== true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
                       <input id="connect-timeout-connection" v-model="form.connect_timeout_inherit" type="radio" name="connect-timeout-scope" :value="false" class="h-3.5 w-3.5 shrink-0 accent-primary" />
                       <label for="connect-timeout-connection" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useConnectionQueryTimeout')">{{ t("connection.useConnectionQueryTimeout") }}</label>
-                      <Input v-model.number="form.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.connect_timeout_inherit === true" />
+                      <Input
+                        v-model.number="form.connect_timeout_secs"
+                        type="number"
+                        min="1"
+                        :max="MAX_CONNECT_TIMEOUT_SECS"
+                        step="1"
+                        class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20"
+                        :disabled="form.connect_timeout_inherit === true"
+                        @input="clampConnectTimeoutInput($event, 'connection')"
+                      />
                     </div>
                   </div>
                 </div>
@@ -7941,13 +7992,23 @@ function openExternalUrl(url: string) {
                   <div class="col-span-3 grid grid-cols-2 gap-2">
                     <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.query_timeout_inherit === true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
                       <input id="query-timeout-global" v-model="form.query_timeout_inherit" type="radio" name="query-timeout-scope" :value="true" class="h-3.5 w-3.5 shrink-0 accent-primary" />
-                      <label for="query-timeout-global" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useGlobalQueryTimeout')">{{ t("connection.useGlobalQueryTimeout") }}</label>
-                      <Input v-model.number="editGlobalQueryTimeoutSecs" type="number" min="0" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.query_timeout_inherit !== true" />
+                      <div class="flex min-w-0 flex-1 items-center gap-1">
+                        <label for="query-timeout-global" class="min-w-0 cursor-pointer truncate text-xs" :title="t('connection.useGlobalQueryTimeout')">{{ t("connection.useGlobalQueryTimeout") }}</label>
+                        <Tooltip>
+                          <TooltipTrigger as-child>
+                            <CircleHelp class="h-3.5 w-3.5 shrink-0 cursor-help text-muted-foreground hover:text-foreground" />
+                          </TooltipTrigger>
+                          <TooltipContent side="top" align="center" class="max-w-[280px] text-xs leading-relaxed">
+                            {{ t("connection.globalQueryTimeoutHint") }}
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <Input v-model.number="editGlobalQueryTimeoutSecs" type="number" min="0" :max="MAX_QUERY_TIMEOUT_SECS" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.query_timeout_inherit !== true" @input="clampQueryTimeoutInput($event, 'global')" />
                     </div>
                     <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.query_timeout_inherit !== true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
                       <input id="query-timeout-connection" v-model="form.query_timeout_inherit" type="radio" name="query-timeout-scope" :value="false" class="h-3.5 w-3.5 shrink-0 accent-primary" />
                       <label for="query-timeout-connection" class="min-w-0 flex-1 cursor-pointer truncate text-xs" :title="t('connection.useConnectionQueryTimeout')">{{ t("connection.useConnectionQueryTimeout") }}</label>
-                      <Input v-model.number="form.query_timeout_secs" type="number" min="0" max="300" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.query_timeout_inherit === true" />
+                      <Input v-model.number="form.query_timeout_secs" type="number" min="0" :max="MAX_QUERY_TIMEOUT_SECS" step="1" class="col-span-2 h-7 w-full shrink-0 sm:col-span-1 sm:w-20" :disabled="form.query_timeout_inherit === true" @input="clampQueryTimeoutInput($event, 'connection')" />
                     </div>
                   </div>
                 </div>
@@ -8237,8 +8298,8 @@ function openExternalUrl(url: string) {
                           <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
                           <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
                           <SelectItem value="key+password">{{ t("connection.sshAuthMethodKeyPassword") }}</SelectItem>
+                          <SelectItem value="agent">{{ t("connection.sshUseAgent") }}</SelectItem>
                           <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
-                          <SelectItem v-if="isLegacySshAgentMethod(selectedSshLayer)" value="agent" disabled>{{ t("connection.sshAuthMethodAgentLegacy") }}</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
@@ -8268,19 +8329,10 @@ function openExternalUrl(url: string) {
                       <span />
                       <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.sshAuthMethodNoneHint") }}</p>
                     </div>
-                    <template v-if="isLegacySshAgentMethod(selectedSshLayer)">
-                      <div class="grid grid-cols-4 items-center gap-4">
-                        <span />
-                        <label class="col-span-3 flex items-center gap-2 cursor-pointer">
-                          <input type="checkbox" v-model="selectedSshLayer.use_ssh_agent" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
-                          <span class="text-xs text-muted-foreground">{{ t("connection.sshUseAgent") }}</span>
-                        </label>
-                      </div>
-                      <div v-if="selectedSshLayer.use_ssh_agent" class="grid grid-cols-4 items-center gap-4">
-                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
-                        <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
-                      </div>
-                    </template>
+                    <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
+                      <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                    </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />
                       <label class="col-span-3 flex items-center gap-2 cursor-pointer">
@@ -8347,8 +8399,8 @@ function openExternalUrl(url: string) {
           </Tabs>
         </div>
 
-        <DialogFooter class="flex min-w-0 shrink-0 items-center gap-2 sm:flex-nowrap">
-          <div class="mr-auto flex min-w-0 flex-1 basis-0 items-center gap-2 overflow-hidden">
+        <DialogFooter class="connection-dialog-footer flex min-w-0 shrink-0 items-center gap-2 sm:flex-nowrap">
+          <div class="connection-dialog-test-status mr-auto flex min-w-0 flex-1 basis-0 items-center gap-2 overflow-hidden">
             <Button v-if="!editingId" variant="outline" class="shrink-0" :disabled="isSaving" @click="backToDatabasePicker">
               <ArrowLeft class="h-4 w-4" />
               {{ t("connection.back") }}

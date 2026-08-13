@@ -16,6 +16,7 @@ export type DatabaseType =
   | "oracle"
   | "elasticsearch"
   | "easysearch"
+  | "meilisearch"
   | "hbase"
   | "qdrant"
   | "milvus"
@@ -78,6 +79,10 @@ export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): bo
   return dbType === "elasticsearch" || dbType === "easysearch";
 }
 
+export function isMeilisearchDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "meilisearch";
+}
+
 export interface SqlSnippet {
   id: string;
   label: string;
@@ -86,9 +91,9 @@ export interface SqlSnippet {
   enabled?: boolean;
 }
 
-export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column";
+export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column" | "sequence";
 
-export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "object";
+export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "sequence" | "object";
 
 export type CompletionAssistantMatchMode = "prefix" | "contains";
 
@@ -185,6 +190,12 @@ export interface ConnectionConfig {
   informix_server?: string;
   external_config?: unknown;
   one_time?: boolean;
+  /**
+   * Whether the database password may be persisted locally. When false, the
+   * password is never written to local storage and the user is prompted on
+   * every connect. Absent/true keeps current behavior (password saved).
+   */
+  save_password?: boolean;
   read_only?: boolean;
   /** Explicit production marker for every database reachable through this connection. */
   is_production?: boolean;
@@ -248,9 +259,7 @@ export interface SshTunnelConfig {
    * `"key+password"` tries private key auth first and falls back to
    * password auth if the key is rejected.
    *
-   * `"agent"` is a legacy value: it's no longer offered as a dropdown
-   * choice for new connections, but is preserved and displayed read-only
-   * for connections that already have `use_ssh_agent` configured.
+   * `"agent"` uses identities from the configured SSH agent socket.
    */
   auth_method?: "password" | "key" | "key+password" | "agent" | "none";
   /** Allow `nc` through an SSH exec channel when direct-tcpip is prohibited. */
@@ -746,6 +755,8 @@ export interface QueryResult {
   /** Whether a backend-reported result total is exact. */
   total_is_exact?: boolean;
   truncated?: boolean;
+  /** Variable-length cells represented by bounded previews in `rows`. */
+  large_value_cells?: Array<{ row_index: number; column_index: number; original_bytes: number }>;
   session_id?: string | null;
   has_more?: boolean;
   /** For Elasticsearch REST search results parsed into a _source table,
@@ -798,6 +809,8 @@ export interface QueryResultRun {
   sequence: number;
   sql: string;
   createdAt: number;
+  /** Distinguishes successive result payloads that reuse the same run slot. */
+  resultGridRevision?: string;
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
@@ -811,6 +824,7 @@ export interface QueryResultRun {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalLargeValueCells?: QueryResult["large_value_cells"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
@@ -932,6 +946,8 @@ export type TreeNodeType =
   | "extension"
   | "object-browser"
   | "user-admin"
+  | "dameng-users"
+  | "dameng-roles"
   | "dameng-job-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
@@ -1116,6 +1132,7 @@ export interface QueryTab {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalLargeValueCells?: QueryResult["large_value_cells"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
@@ -1135,6 +1152,8 @@ export interface QueryTab {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  /** Distinguishes successive result payloads that reuse the current result slot. */
+  resultGridRevision?: string;
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
   resultAutoSave?: boolean;
@@ -1190,8 +1209,11 @@ export interface QueryTab {
     | "objects"
     | "structure"
     | "users"
+    | "dameng-users"
+    | "dameng-roles"
     | "dameng-jobs"
     | "processlist"
+    | "sqlserver-trace"
     | "mysql-dashboard"
     | "postgres-dashboard";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
@@ -1311,6 +1333,7 @@ export interface SavedSqlFile {
   folderId?: string;
   name: string;
   database: string;
+  catalog?: string;
   schema?: string;
   sql: string;
   sqlLoaded?: boolean;

@@ -59,8 +59,8 @@ import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentat
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
-import { treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebar/sidebarTreeSelection";
-import { applyConnectionMultiSelection, connectionMultiSelectionAfterToggle } from "@/lib/sidebar/sidebarConnectionMultiSelect";
+import { filterSidebarModifierSelectionIds, supportsSidebarModifierSelection, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebar/sidebarTreeSelection";
+import { applyConnectionMultiSelection, applyTreeNodeSelection, connectionMultiSelectionAfterToggle } from "@/lib/sidebar/sidebarConnectionMultiSelect";
 import { isSidebarDatabaseOpenForVisual } from "@/lib/sidebar/sidebarDatabaseOpenState";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
 import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
@@ -255,6 +255,10 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: TableProperties, colorClass: "text-primary" };
     case "user-admin":
       return { icon: UsersRound, colorClass: "text-primary" };
+    case "dameng-users":
+      return { icon: UsersRound, colorClass: "text-primary" };
+    case "dameng-roles":
+      return { icon: ShieldCheck, colorClass: "text-primary" };
     case "dameng-job-admin":
       return { icon: CalendarClock, colorClass: "text-primary" };
     case "index":
@@ -349,7 +353,7 @@ function isGroupLabel(node: TreeNode): boolean {
 function displayLabel(node: TreeNode): string {
   if (node.type === "load-more") return t(node.label);
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
-  if (node.type === "user-admin" || node.type === "dameng-job-admin") return t(node.label);
+  if (node.type === "user-admin" || node.type === "dameng-users" || node.type === "dameng-roles" || node.type === "dameng-job-admin") return t(node.label);
   if (node.type === "linked-server-root") return t(node.label);
   if (node.type === "mqtt-topic" && node.id.endsWith(":mqtt-topic:__console__")) return t(node.label);
   if (node.label === "tree.defaultDatabase") return t(node.label);
@@ -520,25 +524,45 @@ function selectSingleTreeNode(node: TreeNode) {
 }
 
 function toggleTreeNodeSelection(node: TreeNode) {
-  connectionStore.connectionMultiSelectActive = false;
+  if (!supportsSidebarModifierSelection(node)) {
+    selectSingleTreeNode(node);
+    return;
+  }
   const ids = new Set(connectionStore.selectedTreeNodeIds);
   if (ids.has(node.id)) ids.delete(node.id);
   else ids.add(node.id);
-  connectionStore.selectedTreeNodeIds = ids.size ? [...ids] : [node.id];
-  connectionStore.selectedTreeNodeId = node.id;
-  connectionStore.treeSelectionAnchorId = node.id;
+  const filteredIds = filterSidebarModifierSelectionIds(visibleTreeNodes(), [...ids]);
+  applyTreeNodeSelection(
+    connectionStore,
+    {
+      nodeIds: filteredIds.length ? filteredIds : [node.id],
+      activeNodeId: node.id,
+      anchorNodeId: node.id,
+    },
+    new Set(connectionStore.connections.map((connection) => connection.id)),
+  );
 }
 
 function selectTreeNodeRange(node: TreeNode) {
-  connectionStore.connectionMultiSelectActive = false;
+  if (!supportsSidebarModifierSelection(node)) {
+    selectSingleTreeNode(node);
+    return;
+  }
   const visible = visibleTreeNodes();
   const anchorId = connectionStore.treeSelectionAnchorId || connectionStore.selectedTreeNodeId || node.id;
   const currentIndex = sidebarTreeContext ? sidebarTreeContext.getVisibleNodeIndex(node.id) : -1;
   const anchorIndex = sidebarTreeContext ? sidebarTreeContext.getVisibleNodeIndex(anchorId) : -1;
 
   if (sidebarTreeContext && currentIndex >= 0 && anchorIndex >= 0) {
-    connectionStore.selectedTreeNodeIds = treeSelectionRangeIdsByIndex(visible, currentIndex, anchorIndex, node.id);
-    connectionStore.selectedTreeNodeId = node.id;
+    applyTreeNodeSelection(
+      connectionStore,
+      {
+        nodeIds: filterSidebarModifierSelectionIds(visible, treeSelectionRangeIdsByIndex(visible, currentIndex, anchorIndex, node.id)),
+        activeNodeId: node.id,
+        anchorNodeId: anchorId,
+      },
+      new Set(connectionStore.connections.map((connection) => connection.id)),
+    );
     return;
   }
 
@@ -547,9 +571,16 @@ function selectTreeNodeRange(node: TreeNode) {
     return;
   }
 
-  const rangeIds = treeSelectionRangeIds(visible, node.id, anchorId, connectionStore.selectedTreeNodeId);
-  connectionStore.selectedTreeNodeIds = rangeIds;
-  connectionStore.selectedTreeNodeId = node.id;
+  const rangeIds = filterSidebarModifierSelectionIds(visible, treeSelectionRangeIds(visible, node.id, anchorId, connectionStore.selectedTreeNodeId));
+  applyTreeNodeSelection(
+    connectionStore,
+    {
+      nodeIds: rangeIds,
+      activeNodeId: node.id,
+      anchorNodeId: anchorId,
+    },
+    new Set(connectionStore.connections.map((connection) => connection.id)),
+  );
 }
 
 function selectedConnectionIdsForAction(): string[] {
