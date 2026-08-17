@@ -9,8 +9,10 @@ use tauri::{AppHandle, Manager};
 
 const MCP_PACKAGE_NAME: &str = "@dbx-app/mcp-server";
 const MCP_LATEST_URL: &str = "https://registry.npmjs.org/@dbx-app%2fmcp-server/latest";
-const MCP_INSTALL_COMMAND: &str = "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org";
-const MCP_PNPM_UPDATE_COMMAND: &str = "pnpm update -g @dbx-app/mcp-server --registry=https://registry.npmjs.org";
+const MCP_INSTALL_COMMAND: &str = "npm install -g @dbx-app/mcp-server@latest";
+const MCP_PNPM_UPDATE_COMMAND: &str = "pnpm update -g @dbx-app/mcp-server";
+const MCP_UNINSTALL_COMMAND: &str = "npm uninstall -g @dbx-app/mcp-server";
+const MCP_PNPM_UNINSTALL_COMMAND: &str = "pnpm remove -g @dbx-app/mcp-server";
 const MCP_MIN_NODE_VERSION: NodeVersion = NodeVersion { major: 18, minor: 18, patch: 0 };
 const MCP_MIN_NODE_VERSION_REQUIREMENT: &str = ">=18.18.0";
 const SHELL_COMMAND_MARKER: &str = "__DBX_MCP_COMMAND_OUTPUT_START__";
@@ -30,6 +32,7 @@ pub struct McpServerStatus {
     pub data_dir: Option<String>,
     pub install_command: String,
     pub update_command: String,
+    pub uninstall_command: String,
     pub error: Option<String>,
 }
 
@@ -155,19 +158,28 @@ impl NodeRuntime {
         }
     }
 
+    fn uninstall_command(&self) -> &'static str {
+        match &self.package_manager {
+            McpPackageManager::Npm => MCP_UNINSTALL_COMMAND,
+            McpPackageManager::Pnpm { .. } => MCP_PNPM_UNINSTALL_COMMAND,
+        }
+    }
+
     fn install_or_update(&self) -> Result<CommandOutput, String> {
         match &self.package_manager {
-            McpPackageManager::Pnpm { command_path } if self.has_mcp_package() => run_package_manager_command(
-                command_path,
-                &["update", "-g", MCP_PACKAGE_NAME, "--registry=https://registry.npmjs.org"],
-                &self.node_launcher_path,
-            ),
-            _ => self.npm_output(&[
-                "install",
-                "-g",
-                "@dbx-app/mcp-server@latest",
-                "--registry=https://registry.npmjs.org",
-            ]),
+            McpPackageManager::Pnpm { command_path } if self.has_mcp_package() => {
+                run_package_manager_command(command_path, &["update", "-g", MCP_PACKAGE_NAME], &self.node_launcher_path)
+            }
+            _ => self.npm_output(&["install", "-g", "@dbx-app/mcp-server@latest"]),
+        }
+    }
+
+    fn uninstall(&self) -> Result<CommandOutput, String> {
+        match &self.package_manager {
+            McpPackageManager::Pnpm { command_path } => {
+                run_package_manager_command(command_path, &["remove", "-g", MCP_PACKAGE_NAME], &self.node_launcher_path)
+            }
+            McpPackageManager::Npm => self.npm_output(&["uninstall", "-g", MCP_PACKAGE_NAME]),
         }
     }
 }
@@ -231,6 +243,11 @@ pub async fn check_mcp_server_status(app: AppHandle) -> Result<McpServerStatus, 
         data_dir,
         install_command: MCP_INSTALL_COMMAND.to_string(),
         update_command: runtime.as_ref().map(NodeRuntime::update_command).unwrap_or(MCP_INSTALL_COMMAND).to_string(),
+        uninstall_command: runtime
+            .as_ref()
+            .map(NodeRuntime::uninstall_command)
+            .unwrap_or(MCP_UNINSTALL_COMMAND)
+            .to_string(),
         error,
     })
 }
@@ -266,6 +283,31 @@ pub async fn install_mcp_server() -> Result<String, String> {
         })?;
         let version = installed.mcp_version.unwrap_or_else(|| "unknown".to_string());
         Ok(format!("Successfully installed @dbx-app/mcp-server@{}", version))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn uninstall_mcp_server() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let runtime = resolve_node_runtime().ok_or_else(|| {
+            format!("Unable to resolve a compatible Node.js ({}) and npm runtime.", MCP_MIN_NODE_VERSION_REQUIREMENT)
+        })?;
+        if !runtime.has_mcp_package() {
+            return Err(format!("{} is not installed in the detected Node.js runtime.", MCP_PACKAGE_NAME));
+        }
+
+        let output = runtime.uninstall()?;
+        if !output.success {
+            let error_msg = if !output.stderr.is_empty() { output.stderr } else { output.stdout };
+            return Err(format!("Uninstallation failed: {}", error_msg));
+        }
+
+        if runtime.refresh().is_some_and(|refreshed| refreshed.has_mcp_package()) {
+            return Err(format!("Uninstallation completed, but {} is still installed.", MCP_PACKAGE_NAME));
+        }
+        Ok(format!("Successfully uninstalled {}", MCP_PACKAGE_NAME))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1413,6 +1455,7 @@ mod tests {
              elif [ \"$2\" = '--version' ]; then printf '10.9.2\\n'; \
              elif [ \"$2\" = 'root' ]; then printf '%s\\n' {}; \
              elif [ \"$2\" = 'prefix' ]; then printf '%s\\n' {}; \
+             elif [ \"$2\" = 'install' ]; then exit 0; \
              else exit 1; fi\n",
             shell_quote(log_path.to_string_lossy().as_ref()),
             shell_quote(log_path.to_string_lossy().as_ref()),
@@ -1431,9 +1474,15 @@ mod tests {
         assert_eq!(probed.npm_root, canonical_runtime_path(&npm_root).unwrap());
         assert_eq!(probed.node_version, "v24.16.0");
         assert_eq!(probed.mcp_script_path, canonical_runtime_path(&script_path));
+        let install_output = probed.install_or_update().unwrap();
+        assert!(install_output.success);
         let calls = std::fs::read_to_string(log_path).unwrap();
         assert!(calls.contains("npm root -g"));
         assert!(calls.contains("npm prefix -g"));
+        assert!(calls
+            .lines()
+            .any(|line| line == format!("{} install -g @dbx-app/mcp-server@latest", npm_cli_path.display())));
+        assert!(!calls.contains("--registry"));
         assert!(calls.contains(&format!("PATH={}", canonical_runtime_path(&dir).unwrap().display())));
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1512,14 +1561,23 @@ mod tests {
         assert_eq!(probed.mcp_script_path, canonical_runtime_path(&script_path));
         assert_eq!(probed.mcp_version.as_deref(), Some("0.4.44"));
         assert_eq!(probed.update_command(), super::MCP_PNPM_UPDATE_COMMAND);
+        assert_eq!(probed.uninstall_command(), super::MCP_PNPM_UNINSTALL_COMMAND);
         assert!(matches!(
             probed.package_manager,
             super::McpPackageManager::Pnpm { ref command_path } if command_path == &pnpm_path
         ));
         let update_output = probed.install_or_update().unwrap();
         assert!(update_output.success);
-        let pnpm_log = std::fs::read_to_string(pnpm_log_path).unwrap();
-        assert!(pnpm_log.contains("ARGS=update -g @dbx-app/mcp-server --registry=https://registry.npmjs.org"));
+        let pnpm_log = std::fs::read_to_string(&pnpm_log_path).unwrap();
+        assert!(pnpm_log.contains("ARGS=update -g @dbx-app/mcp-server\n"));
+        assert!(!pnpm_log.contains("--registry"));
+        assert!(pnpm_log.contains(&format!("PNPM_HOME={}", dir.display())));
+        assert!(pnpm_log.contains(&format!("PATH={}", bin_dir.display())));
+
+        let uninstall_output = probed.uninstall().unwrap();
+        assert!(uninstall_output.success);
+        let pnpm_log = std::fs::read_to_string(&pnpm_log_path).unwrap();
+        assert!(pnpm_log.contains("ARGS=remove -g @dbx-app/mcp-server"));
         assert!(pnpm_log.contains(&format!("PNPM_HOME={}", dir.display())));
         assert!(pnpm_log.contains(&format!("PATH={}", bin_dir.display())));
 

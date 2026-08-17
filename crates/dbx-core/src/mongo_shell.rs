@@ -8,6 +8,13 @@ pub enum MongoCommand {
     Version,
     #[serde(rename = "use")]
     Use { database: String },
+    #[serde(rename = "showDatabases")]
+    ShowDatabases,
+    #[serde(rename = "runCommand")]
+    RunCommand {
+        #[serde(rename = "commandJson")]
+        command_json: String,
+    },
     #[serde(rename = "createUser")]
     CreateUser {
         #[serde(rename = "userJson")]
@@ -84,7 +91,8 @@ impl MongoCommand {
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::CreateUser { .. }
+            Self::RunCommand { .. }
+                | Self::CreateUser { .. }
                 | Self::Insert { .. }
                 | Self::Update { .. }
                 | Self::Delete { .. }
@@ -98,7 +106,7 @@ impl MongoCommand {
     }
 
     pub fn is_dangerous(&self) -> bool {
-        matches!(self, Self::CreateUser { .. } | Self::DropCollection { .. })
+        matches!(self, Self::RunCommand { .. } | Self::CreateUser { .. } | Self::DropCollection { .. })
             || matches!(self, Self::DropIndexes { indexes: None, single: false, .. })
             || matches!(self, Self::Aggregate { pipeline, .. } if aggregate_writes(pipeline))
     }
@@ -349,12 +357,29 @@ fn mongo_field_predicate_is_exists_true(value: &serde_json::Value) -> bool {
 }
 
 pub fn parse(input: &str) -> Result<MongoCommand, String> {
+    let show_source = trim_mongo_outer_comments(input).trim_end_matches(';').trim();
+    if parse_show_databases(show_source) {
+        return Ok(MongoCommand::ShowDatabases);
+    }
     let source = input.trim().trim_end_matches(';').trim();
     if source.eq_ignore_ascii_case("db.version()") {
         return Ok(MongoCommand::Version);
     }
     if let Some(database) = parse_use_database(source) {
         return Ok(MongoCommand::Use { database });
+    }
+    if let Some((args, tail)) = database_method_call(source, "runCommand") {
+        if !tail.is_empty() || args.len() != 1 {
+            return Err("MongoDB runCommand() requires exactly one command document.".to_string());
+        }
+        let command_json = normalized_json(&args[0])?;
+        let command = parse_json_value(&command_json)
+            .and_then(|value| value.as_object().cloned())
+            .ok_or("MongoDB runCommand() requires a command document.")?;
+        if command.is_empty() {
+            return Err("MongoDB runCommand() requires a non-empty command document.".to_string());
+        }
+        return Ok(MongoCommand::RunCommand { command_json });
     }
     if let Some((args, tail)) = database_method_call(source, "createUser") {
         if !tail.is_empty() || !(1..=2).contains(&args.len()) {
@@ -624,6 +649,86 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
     }
 
     Err("Unsupported MongoDB shell command.".to_string())
+}
+
+fn parse_show_databases(source: &str) -> bool {
+    let mut words = source.split_whitespace();
+    words.next().is_some_and(|word| word.eq_ignore_ascii_case("show"))
+        && words.next().is_some_and(|word| word.eq_ignore_ascii_case("dbs") || word.eq_ignore_ascii_case("databases"))
+        && words.next().is_none()
+}
+
+fn trim_mongo_outer_comments(mut source: &str) -> &str {
+    loop {
+        source = source.trim_start();
+        if source.starts_with("//") || source.starts_with("--") {
+            source = source
+                .char_indices()
+                .find_map(|(index, character)| (character == '\n' || character == '\r').then_some(&source[index + 1..]))
+                .unwrap_or("");
+            continue;
+        }
+        if source.starts_with("/*") {
+            let Some(end) = source.find("*/") else {
+                return source;
+            };
+            source = &source[end + 2..];
+            continue;
+        }
+        break;
+    }
+
+    let source = source.trim_end();
+    let mut body_end = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut characters = source.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let next = characters.peek().map(|(_, character)| *character);
+        if line_comment {
+            if character == '\n' || character == '\r' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if block_comment {
+            if character == '*' && next == Some('/') {
+                block_comment = false;
+                characters.next();
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            body_end = index + character.len_utf8();
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if (character == '/' && next == Some('/')) || (character == '-' && next == Some('-')) {
+            line_comment = true;
+            characters.next();
+            continue;
+        }
+        if character == '/' && next == Some('*') {
+            block_comment = true;
+            characters.next();
+            continue;
+        }
+        if matches!(character, '"' | '\'' | '`') {
+            quote = Some(character);
+        }
+        if !character.is_whitespace() {
+            body_end = index + character.len_utf8();
+        }
+    }
+    source[..body_end].trim_end()
 }
 
 fn parse_collection_prefix(source: &str) -> Result<(String, usize), String> {
@@ -1023,6 +1128,64 @@ mod tests {
     }
 
     #[test]
+    fn parses_run_command_as_a_dangerous_write() {
+        let command = parse(
+            r#"db.runCommand({
+                find: "orders",
+                filter: {_id: ObjectId("507f1f77bcf86cd799439011")},
+                createdAt: ISODate("2025-01-01T00:00:00Z")
+            })"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            MongoCommand::RunCommand {
+                command_json: r#"{"find":"orders","filter":{"_id":{"$oid":"507f1f77bcf86cd799439011"}},"createdAt":{"$date":"2025-01-01T00:00:00Z"}}"#.to_string(),
+            }
+        );
+        assert!(command.is_mutating());
+        assert!(command.is_dangerous());
+        assert_eq!(validate_safety(&command, false, false, false), Err(MongoSafetyError::WritesDisabled));
+        assert_eq!(validate_safety(&command, true, false, false), Err(MongoSafetyError::Dangerous));
+        assert_eq!(validate_safety(&command, true, true, false), Ok(()));
+    }
+
+    #[test]
+    fn parses_show_databases_aliases_as_read_only() {
+        for source in [
+            "show dbs",
+            "SHOW DATABASES;",
+            "ShOw DbS ;",
+            "/* databases */ show dbs -- list",
+            "// databases\nshow databases; /* list */",
+        ] {
+            let command = parse(source).unwrap();
+            assert_eq!(command, MongoCommand::ShowDatabases, "{source}");
+            assert!(!command.is_mutating(), "{source}");
+            assert!(!command.is_dangerous(), "{source}");
+            assert_eq!(validate_safety(&command, false, false, true), Ok(()), "{source}");
+        }
+
+        for source in ["show dbs extra", "show database", "show collections", "show"] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_run_command_shapes() {
+        for source in [
+            "db.runCommand()",
+            "db.runCommand({})",
+            "db.runCommand('ping')",
+            "db.runCommand({ping: 1}, {readPreference: 'primary'})",
+            "db.runCommand({ping: 1}).valueOf()",
+            "db.runCommand([1, 2, 3])",
+        ] {
+            assert!(parse(source).unwrap_err().contains("runCommand"), "{source}");
+        }
+    }
+
+    #[test]
     fn treats_effectively_unbounded_write_filters_as_dangerous() {
         for command in [
             r#"db.items.deleteMany({_id: {$exists: true}})"#,
@@ -1171,6 +1334,11 @@ mod tests {
             serde_json::to_value(parse(r#"db.createUser({user: "app", pwd: "secret", roles: []})"#).unwrap()).unwrap();
         assert_eq!(create_user["kind"], "createUser");
         assert_eq!(create_user["userJson"], r#"{"user":"app","pwd":"secret","roles":[]}"#);
+        let run_command = serde_json::to_value(parse("db.runCommand({ping: 1})").unwrap()).unwrap();
+        assert_eq!(run_command["kind"], "runCommand");
+        assert_eq!(run_command["commandJson"], r#"{"ping":1}"#);
+        let show_databases = serde_json::to_value(parse("show dbs").unwrap()).unwrap();
+        assert_eq!(show_databases["kind"], "showDatabases");
     }
 
     #[test]

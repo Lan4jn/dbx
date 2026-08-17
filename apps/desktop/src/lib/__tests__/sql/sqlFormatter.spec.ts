@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { formatSqlForDisplay, formatSqlForEditing, formatSqlText, MAX_SQL_FORMAT_CHARS, sqlFormatDialectForDbType, UnsupportedStructuredInputError } from "@/lib/sql/sqlFormatter";
+import { canFormatSqlForDatabaseType, formatSqlForDisplay, formatSqlForEditing, formatSqlText, MAX_SQL_FORMAT_CHARS, sqlFormatDialectForDbType, UnsupportedStructuredInputError } from "@/lib/sql/sqlFormatter";
 
 describe("sqlFormatter", () => {
+  it("disables SQL formatting for VictoriaMetrics queries", () => {
+    expect(canFormatSqlForDatabaseType("victoriametrics")).toBe(false);
+    expect(canFormatSqlForDatabaseType("mysql")).toBe(true);
+  });
+
   it("maps PostgreSQL-compatible database types to the postgres formatter dialect", () => {
     for (const dbType of ["postgres", "kwdb", "gaussdb", "opengauss", "questdb", "kingbase", "highgo", "vastbase", "redshift"]) {
       expect(sqlFormatDialectForDbType(dbType)).toBe("postgres");
@@ -12,6 +17,10 @@ describe("sqlFormatter", () => {
     for (const dbType of ["sqlite", "rqlite", "turso", "cloudflare-d1"]) {
       expect(sqlFormatDialectForDbType(dbType)).toBe("sqlite");
     }
+  });
+
+  it("maps Dameng to its scoped formatter dialect", () => {
+    expect(sqlFormatDialectForDbType("dameng")).toBe("dameng");
   });
 
   it("preserves ClickHouse lambda arrows when formatting issue #3573 SQL", async () => {
@@ -43,6 +52,53 @@ describe("sqlFormatter", () => {
     }
   });
 
+  it.each(["mysql", "sqlite"] as const)("applies keyword case to LIKE operators in the %s dialect", async (dialect) => {
+    const sql = "select * from users where name like '%like%' and note not like 'LIKE'";
+
+    const upper = await formatSqlText(sql, dialect, { keywordCase: "upper", functionCase: "preserve" });
+    const lower = await formatSqlText(sql.toUpperCase(), dialect, { keywordCase: "lower", functionCase: "preserve", identifierCase: "lower" });
+
+    expect(upper).toContain("name LIKE '%like%'");
+    expect(upper).toContain("note NOT LIKE 'LIKE'");
+    expect(lower).toContain("name like '%LIKE%'");
+    expect(lower).toContain("note not like 'LIKE'");
+  });
+
+  it("keeps SQLite LIKE functions and qualified identifiers under their own case settings", async () => {
+    const formatted = await formatSqlText("select like('%a%', name), filters.like from users", "sqlite", {
+      keywordCase: "upper",
+      functionCase: "preserve",
+      identifierCase: "preserve",
+    });
+
+    expect(formatted).toContain("like(");
+    expect(formatted).toContain("filters.like");
+  });
+
+  it.each(["mysql", "sqlite"] as const)("does not rewrite LIKE inside DBX placeholders in the %s dialect", async (dialect) => {
+    for (const [lowerPlaceholder, upperPlaceholder] of [
+      ["${like}", "${LIKE}"],
+      ["#{like}", "#{LIKE}"],
+      [":like", ":LIKE"],
+      ["@like", "@LIKE"],
+    ]) {
+      const upper = await formatSqlText(`select * from users where name like 'a';\nselect ${lowerPlaceholder} as marker`, dialect, {
+        keywordCase: "upper",
+        functionCase: "preserve",
+      });
+      const lower = await formatSqlText(`SELECT * FROM users WHERE name LIKE 'a';\nSELECT ${upperPlaceholder} AS marker`, dialect, {
+        keywordCase: "lower",
+        functionCase: "preserve",
+        identifierCase: "lower",
+      });
+
+      expect(upper).toContain(lowerPlaceholder);
+      expect(upper).toContain("name LIKE 'a'");
+      expect(lower).toContain(upperPlaceholder);
+      expect(lower).toContain("name like 'a'");
+    }
+  });
+
   it("falls back to the postgres formatter when the generic dialect cannot parse SQL", async () => {
     const formatted = await formatSqlText("SELECT 1::int AS id;", "generic");
 
@@ -50,10 +106,46 @@ describe("sqlFormatter", () => {
     expect(formatted).toContain("AS id");
   });
 
+  it("formats Dameng SQL with a standalone trailing dot without changing the invalid token", async () => {
+    const sql = `SELECT JS1.REC_CREATOR as "recCreator", JS1.REC_CREATOR_JOB_ID as "recCreatorJobId" FROM APSSC.TMPJS01 JS1 WHERE 1=1 AND JS1.SUBSTR(REC_CREATE_TIME,1,8) = ? ORDER BY DECODE(JS1.STATUS,'DRAFT',1,'PENDING_APPROVAL',2,'APPROVED',3,'POSTED',4,'REJECTED',5,'DELETED',6), JS1.REC_CREATE_TIME DESC .`;
+
+    const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("dameng"));
+
+    expect(formatted).toContain('JS1.REC_CREATOR AS "recCreator"');
+    expect(formatted).toContain("DECODE (");
+    expect(formatted.endsWith("JS1.REC_CREATE_TIME DESC .")).toBe(true);
+  });
+
+  it("only recovers a whitespace-separated final dot", async () => {
+    await expect(formatSqlText("SELECT schema.", "dameng")).rejects.toThrow();
+    await expect(formatSqlText("SELECT 1..", "dameng")).rejects.toThrow();
+    await expect(formatSqlText("SELECT 'value .'", "dameng")).resolves.toContain("'value .'");
+  });
+
+  it("preserves whitespace after a recovered trailing dot", async () => {
+    await expect(formatSqlForEditing("SELECT 1 .\n", "dameng")).resolves.toBe("SELECT\n  1 .\n");
+  });
+
+  it("preserves the newline before a trailing dot after a line comment", async () => {
+    await expect(formatSqlForEditing("DELETE FROM accounts -- comment\n .", "dameng")).resolves.toBe("DELETE FROM accounts -- comment\n .");
+  });
+
+  it("does not change trailing-dot formatting for other databases", async () => {
+    await expect(formatSqlText("SELECT 1 .", "generic")).rejects.toThrow();
+    await expect(formatSqlForEditing("SELECT 1 .", "generic")).resolves.toBe("SELECT 1 .");
+  });
+
   it("keeps incomplete editor SQL unchanged when the formatter cannot parse it", async () => {
     const sql = "select *\nfrom dbname.\n;";
 
     await expect(formatSqlText(sql, "mysql")).rejects.toThrow("Parse error at token:");
+    await expect(formatSqlForEditing(sql, "mysql")).resolves.toBe(sql);
+  });
+
+  it("keeps editor SQL unchanged when it contains full-width characters the tokenizer can't parse", async () => {
+    const sql = "update t set a=concat(t.入池时间（审核通过时间）,' 00:00:00') where t.入池时间（审核通过时间） ≠ '';";
+
+    await expect(formatSqlText(sql, "mysql")).rejects.toThrow("Parse error: Unexpected");
     await expect(formatSqlForEditing(sql, "mysql")).resolves.toBe(sql);
   });
 

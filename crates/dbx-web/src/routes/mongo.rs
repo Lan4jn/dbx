@@ -211,6 +211,15 @@ pub struct MongoCreateUserRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MongoRunCommandRequest {
+    pub connection_id: String,
+    pub database: String,
+    pub command_json: String,
+    pub execution_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MongoDropIndexesRequest {
     pub connection_id: String,
     pub database: String,
@@ -457,6 +466,7 @@ pub async fn find_documents(
             req.projection.as_deref(),
             req.sort.as_deref(),
             req.collation.as_deref(),
+            None,
         ),
     )
     .await?;
@@ -633,6 +643,23 @@ pub async fn distinct(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
+pub async fn list_index_specs(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<MongoCollectionNameRequest>,
+) -> Result<Json<Vec<dbx_core::db::mongo_driver::MongoIndexSpec>>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mongo_ops::mongo_list_index_specs_core(
+        &state.app,
+        &req.connection_id,
+        &req.database,
+        &req.collection,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn create_index(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -672,6 +699,29 @@ pub async fn create_user(
     .await
     .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "affected_rows": affected_rows })))
+}
+
+pub async fn run_command(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<MongoRunCommandRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    super::mcp_policy::ensure_dangerous_write(
+        &state,
+        &headers,
+        &req.connection_id,
+        &req.database,
+        "Run MongoDB command",
+    )
+    .await?;
+    ensure_writable(&state.app, &req.connection_id, "Run MongoDB command").await?;
+    let result = run_cancellable(
+        &state,
+        req.execution_id.clone(),
+        dbx_core::mongo_ops::mongo_run_command_core(&state.app, &req.connection_id, &req.database, &req.command_json),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn drop_indexes(

@@ -137,6 +137,7 @@ type server struct {
 	usePgViewDefinition        bool
 	usePgFunctionDefinition    bool
 	catalogIdentityUnsupported bool
+	catalogOIDUnsupported      bool
 	infoColumnTypeUnsupported  bool
 	infoUdtNameUnsupported     bool
 	currentSchema              string
@@ -464,6 +465,7 @@ func (s *server) connect(cp connectParams) error {
 	s.usePgViewDefinition = false
 	s.usePgFunctionDefinition = false
 	s.catalogIdentityUnsupported = false
+	s.catalogOIDUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
 	return nil
@@ -530,6 +532,7 @@ func (s *server) disconnect() error {
 	s.usePgViewDefinition = false
 	s.usePgFunctionDefinition = false
 	s.catalogIdentityUnsupported = false
+	s.catalogOIDUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
 	s.currentSchema = ""
@@ -884,6 +887,11 @@ func (s *server) schemaConn(ctx context.Context, schema string) (*sql.Conn, erro
 
 func (s *server) setSchema(ctx context.Context, conn *sql.Conn, schema string) error {
 	schema = strings.TrimSpace(schema)
+	// An omitted schema leaves the session search_path under user control.
+	// Reset it only after DBX applied an explicit schema.
+	if schema == "" && !s.schemaSet {
+		return nil
+	}
 	statement := "RESET search_path"
 	if schema != "" {
 		// Kingbase implicitly prioritizes its system catalog when it is not

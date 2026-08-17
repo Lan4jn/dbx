@@ -115,7 +115,7 @@ function resetPerFileState() {
   currentFileName.value = "";
 }
 
-const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
+const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
 
@@ -198,6 +198,7 @@ function resolveInitialConnectionId() {
   if (props.prefillConnectionId && sqlConnections.value.some((c) => c.id === props.prefillConnectionId)) {
     return props.prefillConnectionId;
   }
+  if (props.prefillFilePath) return "";
   return sqlConnections.value[0]?.id ?? "";
 }
 
@@ -704,7 +705,7 @@ watch(
 
           <div v-if="running && previews.length > 1 && currentFileIndex >= 0" class="flex items-center gap-1.5 text-xs text-muted-foreground">
             <FileCode class="w-3.5 h-3.5 shrink-0" />
-            <span class="truncate">{{ t("sqlFile.fileProgress", { current: currentFileIndex + 1, total: previews.length }) }} — {{ currentFileName }}</span>
+            <span class="truncate tabular-nums">{{ t("sqlFile.fileProgress", { current: currentFileIndex + 1, total: previews.length }) }} — {{ currentFileName }}</span>
           </div>
 
           <template v-if="!running && previews.length > 1 && perFileResults.length > 0">
@@ -753,23 +754,23 @@ watch(
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
               <div class="border rounded-md px-2 py-1.5 min-w-0">
                 <div class="text-muted-foreground truncate">{{ t("sqlFile.statement") }}</div>
-                <div class="font-medium truncate">{{ progress?.statementIndex ?? 0 }}</div>
+                <div class="font-medium truncate tabular-nums">{{ progress?.statementIndex ?? 0 }}</div>
               </div>
               <div class="border rounded-md px-2 py-1.5 min-w-0">
                 <div class="text-muted-foreground truncate">{{ t("sqlFile.succeeded") }}</div>
-                <div class="font-medium text-green-600 truncate">
+                <div class="font-medium text-green-600 truncate tabular-nums">
                   {{ progress?.successCount ?? 0 }}
                 </div>
               </div>
               <div class="border rounded-md px-2 py-1.5 min-w-0">
                 <div class="text-muted-foreground truncate">{{ t("sqlFile.failed") }}</div>
-                <div class="font-medium text-destructive truncate">
+                <div class="font-medium text-destructive truncate tabular-nums">
                   {{ progress?.failureCount ?? 0 }}
                 </div>
               </div>
               <div class="border rounded-md px-2 py-1.5 min-w-0">
                 <div class="text-muted-foreground truncate">{{ t("sqlFile.affectedRows") }}</div>
-                <div class="font-medium truncate">
+                <div class="font-medium truncate tabular-nums">
                   {{ (progress?.affectedRows ?? 0).toLocaleString() }}
                 </div>
               </div>

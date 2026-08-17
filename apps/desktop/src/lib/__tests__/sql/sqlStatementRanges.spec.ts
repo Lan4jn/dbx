@@ -230,6 +230,39 @@ BEGIN
 END;
 SELECT 2;`;
 
+const mysqlRoutineWithCaseExpressionFixture = `CREATE PROCEDURE p_case()
+BEGIN
+  INSERT INTO audit_log (status_text)
+  SELECT CASE
+    WHEN active = 1 THEN 'active'
+    ELSE 'inactive'
+  END;
+
+  CASE
+    WHEN active = 1 THEN SET @status_code = 1;
+    ELSE SET @status_code = 0;
+  END CASE;
+
+  DELETE FROM stale_rows
+  WHERE expires_at < NOW();
+END;
+SELECT 2;`;
+
+const mysqlRoutineWithNestedCaseBlockFixture = `CREATE PROCEDURE p_nested_case()
+BEGIN
+  CASE
+    WHEN active = 1 THEN
+      BEGIN
+        SET @status_code = 1;
+      END;
+    ELSE SET @status_code = 0;
+  END CASE;
+
+  DELETE FROM stale_rows
+  WHERE expires_at < NOW();
+END;
+SELECT 2;`;
+
 const mysqlDelimitedRoutineFixture = `DELIMITER //
 CREATE PROCEDURE sp_insert_random_users(IN p_count INT)
 BEGIN
@@ -309,6 +342,11 @@ describe("splitSqlStatementRanges", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "kingbase"))).toEqual(["SELECT * FROM yd_org_decla_detail WHERE clr_ym = #{ym}", "SELECT 2"]);
   });
 
+  it("keeps dotted MyBatis placeholders instead of treating them as hash comments", () => {
+    const sql = "SELECT * FROM users WHERE id = #{params.user.id};\nSELECT 2";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["SELECT * FROM users WHERE id = #{params.user.id}", "SELECT 2"]);
+  });
+
   it("treats malformed or disabled MyBatis prefixes as hash comments", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges("SELECT 1; #{1ym};\nSELECT 2", "kingbase"))).toEqual(["SELECT 1", "SELECT 2"]);
     expect(rangeSqlTexts(splitSqlStatementRanges("SELECT 1; #{ym};\nSELECT 2", "kingbase", { enabledSyntaxes: ["shell"] }))).toEqual(["SELECT 1", "SELECT 2"]);
@@ -335,6 +373,10 @@ describe("splitSqlStatementRanges", () => {
     expect(ranges[0].sql).toContain("SELECT 1;");
     expect(ranges[0].sql).toContain("END IF;");
     expect(ranges[0].sql).not.toMatch(/END;$/);
+  });
+
+  it("closes nested MySQL CASE and BEGIN blocks in their opening order", () => {
+    expect(rangeSqlTexts(splitSqlStatementRanges(mysqlRoutineWithNestedCaseBlockFixture, "mysql"))).toEqual([mysqlRoutineWithNestedCaseBlockFixture.slice(0, mysqlRoutineWithNestedCaseBlockFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
   });
 
   it("does not merge regular MySQL transaction statements as routine blocks", () => {
@@ -469,7 +511,7 @@ POST /orders/_search
 
 HEAD /orders`;
 
-    for (const databaseType of ["elasticsearch", "easysearch"] as const) {
+    for (const databaseType of ["elasticsearch", "easysearch", "meilisearch"] as const) {
       expect(rangeSqlTexts(splitSqlStatementRanges(sql, databaseType))).toEqual(["GET /_nodes/stats/jvm?pretty", 'POST /orders/_search\n{\n  "query": { "match_all": {} }\n}', "HEAD /orders"]);
       expect(hasMultipleExecutionTargets(sql, databaseType)).toBe(true);
     }
@@ -1100,6 +1142,14 @@ describe("executableStatementRanges", () => {
     expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineWithLoopsFixture, "mysql"))).toEqual([mysqlRoutineWithLoopsFixture.slice(0, mysqlRoutineWithLoopsFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
   });
 
+  it("does not treat a CASE expression ending as the end of a MySQL routine", () => {
+    expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineWithCaseExpressionFixture, "mysql"))).toEqual([mysqlRoutineWithCaseExpressionFixture.slice(0, mysqlRoutineWithCaseExpressionFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
+  });
+
+  it("does not split MySQL routine ranges when a CASE branch contains a BEGIN block", () => {
+    expect(rangeSqlTexts(executableStatementRanges(mysqlRoutineWithNestedCaseBlockFixture, "mysql"))).toEqual([mysqlRoutineWithNestedCaseBlockFixture.slice(0, mysqlRoutineWithNestedCaseBlockFixture.indexOf("\nSELECT 2;")).replace(/;$/, "").trim(), "SELECT 2"]);
+  });
+
   it("does not expose run targets for statements inside a delimited MySQL routine", () => {
     expect(rangeSqlTexts(executableStatementRanges(mysqlDelimitedRoutineFixture, "mysql"))).toEqual([mysqlDelimitedRoutineFixture.slice(mysqlDelimitedRoutineFixture.indexOf("CREATE PROCEDURE"), mysqlDelimitedRoutineFixture.indexOf(" //\nDELIMITER")), "CALL sp_insert_random_users(100)"]);
   });
@@ -1110,6 +1160,12 @@ describe("executableStatementRanges", () => {
 
   it("returns executable SQL Server batches without GO delimiter lines", () => {
     expect(rangeSqlTexts(executableStatementRanges("SELECT 1\nGO\nSELECT 2;", "sqlserver"))).toEqual(["SELECT 1", "SELECT 2"]);
+  });
+
+  it("keeps SQL Server KILL commands independent without semicolons", () => {
+    const sql = "EXEC sp_who_lock\nDBCC INPUTBUFFER(580)\nKILL 580";
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "sqlserver"))).toEqual(["EXEC sp_who_lock", "DBCC INPUTBUFFER(580)", "KILL 580"]);
   });
 });
 
@@ -1192,6 +1248,74 @@ describe("buildExecutionCandidates", () => {
 
     expect(candidates[0].sql).toBe(hintedSql);
     expect(splitSqlStatementRanges("/*&tenant:mctest*/", "mysql")).toEqual([]);
+  });
+
+  it("preserves only the exact TDSQL proxy directive for the current statement", () => {
+    const directedSql = "/*proxy*/ \n\tSHOW PROXY STATUS";
+    const sql = `SELECT 1;\n${directedSql};\nSELECT 2;`;
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "STATUS"), "mysql");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe(directedSql);
+    expect(executionCandidateForMode(candidates, "all")?.sql).toBe(sql);
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual(["SELECT 1", directedSql, "SELECT 2"]);
+    expect(splitSqlStatementRanges("/*proxy*/SHOW PROXY STATUS", "mysql")[0]?.sql).toBe("/*proxy*/SHOW PROXY STATUS");
+    expect(splitSqlStatementRanges("/* ordinary */\n/*proxy*/SHOW PROXY STATUS", "mysql")[0]?.sql).toBe("/*proxy*/SHOW PROXY STATUS");
+    expect(splitSqlStatementRanges("/*proxy*/", "mysql")).toEqual([]);
+  });
+
+  it.each(["/*sets:allsets */", "/*master*/", "/*slave:set_1781591902_7*/", "/*future-route:anywhere*/"])("preserves a same-line TDSQL directive without relying on a keyword allowlist: %s", (directive) => {
+    const directedSql = `${directive} SELECT count(*) FROM tenant_table`;
+    const sql = `SELECT 1;\n${directedSql};\nSELECT 2;`;
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "tenant_table"), "mysql");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe(directedSql);
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual(["SELECT 1", directedSql, "SELECT 2"]);
+  });
+
+  it("handles long same-line directive chains without rescanning growing prefixes", () => {
+    const prefix = "/**/".repeat(80_000);
+    const sql = `${prefix} SELECT 1`;
+
+    expect(splitSqlStatementRanges(sql, "mysql")[0]?.sql).toBe(sql);
+  });
+
+  it("does not preserve a generic TDSQL-style directive on a separate line", () => {
+    const sql = "/*sets:allsets */\nSELECT count(*) FROM tenant_table";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "tenant_table"), "mysql");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe("SELECT count(*) FROM tenant_table");
+  });
+
+  it("does not preserve a same-line TDSQL-style directive for other database types", () => {
+    const sql = "/*sets:allsets */ SELECT count(*) FROM tenant_table";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "tenant_table"), "postgres");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe("SELECT count(*) FROM tenant_table");
+  });
+
+  it.each(["/* ordinary */", "/*unknown*/", "/* proxy */", "/*PROXY*/"])("keeps %s as a non-executable leading comment", (comment) => {
+    const sql = `${comment}\nSHOW PROXY STATUS`;
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "STATUS"), "mysql");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe("SHOW PROXY STATUS");
+  });
+
+  it.each(["/*proxy*/\n/* audit */\nSHOW PROXY STATUS", "/*proxy*/\n-- audit\nSHOW PROXY STATUS"])("does not preserve a proxy directive separated from SQL by another comment", (sql) => {
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "STATUS"), "mysql");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe("SHOW PROXY STATUS");
+  });
+
+  it("does not preserve the proxy directive for other database types", () => {
+    const sql = "/*proxy*/\nSHOW PROXY STATUS";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "STATUS"), "postgres");
+
+    expect(executionCandidateForMode(candidates, "current")?.sql).toBe("SHOW PROXY STATUS");
+  });
+
+  it("keeps existing hints without allowing them between the proxy directive and SQL", () => {
+    expect(splitSqlStatementRanges("/*+ route */\n/*proxy*/SHOW PROXY STATUS", "mysql")[0]?.sql).toBe("/*proxy*/SHOW PROXY STATUS");
+    expect(splitSqlStatementRanges("/*proxy*/\n/*+ route */\nSHOW PROXY STATUS", "mysql")[0]?.sql).toBe("/*+ route */\nSHOW PROXY STATUS");
   });
 
   it("uses the cursor statement for the first candidate when there is no selection", () => {
@@ -1354,6 +1478,13 @@ WHERE t2.product_name = '12345'
     const candidates = buildExecutionCandidates(sql, indexOf(sql, "2"), "sqlserver");
     expect(candidateSummaries(candidates)).toEqual(["cursor:SELECT 2", "all:SELECT 1\nGO\nSELECT 2;"]);
   });
+
+  it("uses a trailing SQL Server KILL command as the current statement", () => {
+    const sql = "EXEC sp_who_lock\nDBCC INPUTBUFFER(580)\nKILL 580";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "KILL"), "sqlserver");
+
+    expect(candidateSummaries(candidates)).toEqual(["cursor:KILL 580", `all:${sql}`]);
+  });
 });
 
 describe("hasMultipleExecutionTargets", () => {
@@ -1404,6 +1535,7 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker("mongodb")).toBe(false);
     expect(supportsExecutionTargetPicker("elasticsearch")).toBe(true);
     expect(supportsExecutionTargetPicker("easysearch")).toBe(true);
+    expect(supportsExecutionTargetPicker("meilisearch")).toBe(true);
     expect(supportsExecutionTargetPicker("qdrant")).toBe(false);
     expect(supportsExecutionTargetPicker("milvus")).toBe(false);
     expect(supportsExecutionTargetPicker("weaviate")).toBe(false);

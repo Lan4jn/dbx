@@ -60,19 +60,28 @@ export function stripSqlComments(sql: string): string {
 const ELASTICSEARCH_TRANSIENT_DELETE_PATHS = [/^\/_search\/scroll\/?$/i, /^\/_pit\/?$/i, /^\/_async_search\/[^/?]+\/?$/i];
 const ELASTICSEARCH_DESTRUCTIVE_POST_PATHS = [/(?:^|\/)_(?:delete_by_query|update_by_query|bulk)(?:\/|$)/i, /^\/_reindex(?:\/|$)/i, /^\/_aliases(?:\/|$)/i, /\/_restore(?:\/|$)/i];
 
-function isDangerousElasticsearchRequest(method: "GET" | "POST" | "PUT" | "DELETE" | "HEAD", path: string): boolean {
+function isDangerousElasticsearchRequest(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD", path: string): boolean {
   const pathname = path.split("?", 1)[0].replace(/\/+$/, "") || "/";
   if (method === "DELETE") return !ELASTICSEARCH_TRANSIENT_DELETE_PATHS.some((pattern) => pattern.test(pathname));
-  if (method === "PUT") return true;
+  if (method === "PUT" || method === "PATCH") return true;
   return method === "POST" && ELASTICSEARCH_DESTRUCTIVE_POST_PATHS.some((pattern) => pattern.test(pathname));
 }
 
+function isDangerousMeilisearchRequest(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD", path: string): boolean {
+  if (method === "GET" || method === "HEAD") return false;
+  if (method === "DELETE" || method === "PUT" || method === "PATCH") return true;
+  const pathname = path.split("?", 1)[0].replace(/\/+$/, "") || "/";
+  return !(pathname === "/multi-search" || /\/search$/i.test(pathname) || /\/facet-search$/i.test(pathname) || /\/similar$/i.test(pathname) || /\/documents\/fetch$/i.test(pathname));
+}
+
 export function isDangerousSql(sql: string, databaseType?: DatabaseType): boolean {
-  if (databaseType === "elasticsearch" || databaseType === "easysearch") {
+  if (databaseType === "elasticsearch" || databaseType === "easysearch" || databaseType === "meilisearch") {
     const requests = splitSqlStatementRanges(sql, databaseType)
       .map((statement) => parseElasticsearchRestRequestTarget(statement.sql))
       .filter((request): request is NonNullable<typeof request> => request !== null);
-    if (requests.length > 0) return requests.some((request) => isDangerousElasticsearchRequest(request.method, request.path));
+    if (requests.length > 0) {
+      return requests.some((request) => (databaseType === "meilisearch" ? isDangerousMeilisearchRequest(request.method, request.path) : isDangerousElasticsearchRequest(request.method, request.path)));
+    }
   }
   const cleaned = stripSqlComments(sql);
   return cleaned.split(";").some((stmt) => DANGER_RE.test(stmt));
@@ -130,7 +139,7 @@ export function useSqlExecution(deps: {
   let pendingSqlParameterContinuation: ((sql: string, sourceOffset?: number) => Promise<void> | void) | undefined;
 
   async function resolvedExecutableSql(source?: SqlExecutionOverride): Promise<{ sql: string; sourceOffset?: number }> {
-    const atSetEnabled = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, deps.activeConnection.value?.db_type).atSet;
+    const atSetEnabled = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, deps.activeConnection.value?.db_type, settingsStore.editorSettings.sqlVariableSubstitutionEnabled).atSet;
     const expand = (sql: string) => (atSetEnabled ? expandSqlVariables(sql).sql : sql);
     if (typeof source === "string") return { sql: expand(source) };
 
@@ -219,7 +228,7 @@ export function useSqlExecution(deps: {
 
   function prepareSqlParameterDialog(sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}, continuation?: (sql: string, sourceOffset?: number) => Promise<void> | void): boolean {
     const databaseType = deps.activeConnection.value?.db_type;
-    const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, databaseType);
+    const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, databaseType, settingsStore.editorSettings.sqlVariableSubstitutionEnabled);
     const enabledSyntaxes = enabledSqlParameterSyntaxes(toggles);
     const parameters = extractSqlParameterDescriptors(sql, { databaseType, enabledSyntaxes });
     if (!parameters.length) return false;
@@ -241,6 +250,22 @@ export function useSqlExecution(deps: {
     if (supportsSqlTemplateParameters(deps.activeConnection.value, sql) && prepareSqlParameterDialog(sql, sourceOffset, {}, onReady)) return true;
     await onReady(sql, sourceOffset);
     return false;
+  }
+
+  // SQL Server batches that end in PRINT/DBCC-style messages with no rows of their own get
+  // synthesized into a "Message" pseudo-result (server_message: true). The store's generic
+  // "first result with columns" pick can land on that pseudo-result instead of real data, so
+  // whenever it does, redirect focus to the first real data result (falling back to the
+  // message itself only if there is no data result to show). Shared by every SQL execution
+  // entry point so none of them can regress independently (see #6189).
+  function focusSqlServerDataResult(executionTabId: string, executionDatabaseType: DatabaseType | undefined, tab: Pick<QueryTab, "results" | "result" | "activeResultIndex">) {
+    if (executionDatabaseType !== "sqlserver") return;
+    const sqlServerMessageResultIndex = tab.results?.findIndex((result) => result.server_message === true);
+    if (sqlServerMessageResultIndex === undefined || sqlServerMessageResultIndex < 0) return;
+    const activeSqlServerResult = tab.results && tab.activeResultIndex !== undefined ? tab.results[tab.activeResultIndex] : tab.result;
+    if (activeSqlServerResult?.server_message !== true) return;
+    const sqlServerDataResultIndex = tab.results?.findIndex((result) => result.server_message !== true && !isQueryExecutionErrorResult(result) && result.columns.length > 0);
+    queryStore.setActiveResultIndex(executionTabId, sqlServerDataResultIndex !== undefined && sqlServerDataResultIndex >= 0 ? sqlServerDataResultIndex : sqlServerMessageResultIndex);
   }
 
   async function doExecute(sql?: string, sourceOffset?: number, options: SqlExecutionOptions = {}) {
@@ -266,7 +291,7 @@ export function useSqlExecution(deps: {
     if (producedResult === false) return;
     const sqlServerMessageResultIndex = executionDatabaseType === "sqlserver" ? tab.results?.findIndex((result) => result.server_message === true) : undefined;
     if (sqlServerMessageResultIndex !== undefined && sqlServerMessageResultIndex >= 0) {
-      queryStore.setActiveResultIndex(tab.id, sqlServerMessageResultIndex);
+      focusSqlServerDataResult(tab.id, executionDatabaseType, tab);
       deps.activeOutputView.value = "result";
     } else if (executionDatabaseType === "sqlserver" && tab.result?.server_message === true) {
       deps.activeOutputView.value = "result";
@@ -411,6 +436,7 @@ export function useSqlExecution(deps: {
       if (cancelRequested() || tabCancelRequested(cancelRequestCount)) {
         return finish({ status: "cancelled" });
       }
+      focusSqlServerDataResult(executionTabId, connection.db_type, latest);
       const failure = firstQueryExecutionError(latest);
       const errorMessage = failure ? String(failure.rows?.[0]?.[0] ?? t("common.failed")) : undefined;
       const success = !failure;
@@ -475,7 +501,9 @@ export function useSqlExecution(deps: {
     }
 
     deps.activeOutputView.value = "explain";
-    const result = await queryStore.explainTabSql(tab.id, sql, deps.activeConnection.value?.db_type, explainMode.value);
+    const connection = deps.activeConnection.value;
+    const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection?.db_type;
+    const result = await queryStore.explainTabSql(tab.id, sql, databaseType, explainMode.value);
     if (!result.ok) {
       toast(explainReasonMessage(result.reason), 5000);
       return;
@@ -562,6 +590,7 @@ export function useSqlExecution(deps: {
 
 export function supportsSqlTemplateParameters(connection: Pick<ConnectionConfig, "db_type"> | undefined, sql = ""): boolean {
   if (!connection) return false;
+  if (connection.db_type === "meilisearch") return false;
   if (connection.db_type === "elasticsearch" || connection.db_type === "easysearch") return !isElasticsearchRestRequestText(sql);
   return connection.db_type !== "redis" && connection.db_type !== "mongodb" && connection.db_type !== "victoriametrics";
 }

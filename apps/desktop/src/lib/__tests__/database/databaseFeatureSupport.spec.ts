@@ -9,6 +9,7 @@ import {
   supportsDatabaseNameCompletion,
   supportsDatabaseSchemaQualifier,
   supportsQueryTargetDatabaseListing,
+  supportsQueryEditorBlockComments,
   supportsSqlInListPaste,
   supportsTableImport,
   supportsTransaction,
@@ -107,6 +108,7 @@ describe("supportsSqlInListPaste", () => {
     expect(supportsSqlInListPaste("mongodb")).toBe(false);
     expect(supportsSqlInListPaste("elasticsearch")).toBe(false);
     expect(supportsSqlInListPaste("easysearch")).toBe(false);
+    expect(supportsSqlInListPaste("meilisearch")).toBe(false);
     expect(supportsSqlInListPaste("qdrant")).toBe(false);
     expect(supportsSqlInListPaste("milvus")).toBe(false);
     expect(supportsSqlInListPaste("weaviate")).toBe(false);
@@ -119,6 +121,21 @@ describe("supportsSqlInListPaste", () => {
 
   it("excludes Neo4j because Cypher uses list syntax instead of SQL IN tuples", () => {
     expect(supportsSqlInListPaste("neo4j")).toBe(false);
+  });
+});
+
+describe("supportsQueryEditorBlockComments", () => {
+  it("allows block comments in generic and SQL editors", () => {
+    expect(supportsQueryEditorBlockComments(undefined)).toBe(true);
+    expect(supportsQueryEditorBlockComments("mysql")).toBe(true);
+    expect(supportsQueryEditorBlockComments("postgres")).toBe(true);
+    expect(supportsQueryEditorBlockComments("sqlserver")).toBe(true);
+  });
+
+  it("hides block comments in non-SQL editors", () => {
+    expect(supportsQueryEditorBlockComments("redis")).toBe(false);
+    expect(supportsQueryEditorBlockComments("mongodb")).toBe(false);
+    expect(supportsQueryEditorBlockComments("elasticsearch")).toBe(false);
   });
 });
 

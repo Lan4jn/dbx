@@ -1,4 +1,4 @@
-import type { ColumnInfo, DatabaseObjectType, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, DatabaseObjectType, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import { createColumnDrafts, createForeignKeyDrafts, createIndexDrafts, createTriggerDrafts } from "@/lib/table/tableStructureEditorState";
 import type { BuildTableStructureChangeSqlOptions } from "@/lib/table/tableStructureEditorSql";
@@ -16,6 +16,14 @@ export interface TableAdminSqlOptions {
   schema?: string | null;
   tableName: string;
   cascade?: boolean;
+}
+
+export interface MysqlAutoIncrementSqlOptions {
+  databaseType: DatabaseType;
+  driverProfile?: string | null;
+  schema?: string | null;
+  tableName: string;
+  value: string;
 }
 
 export type TableChildObjectType = "COLUMN" | "INDEX" | "FOREIGN_KEY" | "TRIGGER";
@@ -82,6 +90,7 @@ export function collectDuplicateTableColumnComments(columns: readonly Pick<Colum
 }
 
 const ORACLE_LEGACY_IDENTIFIER_LIMIT = 30;
+const DAMENG_IDENTIFIER_LIMIT = 128;
 
 function oracleCloneObjectName(targetName: string, kind: string, index: number): string {
   const normalized =
@@ -131,6 +140,58 @@ export function oracleDuplicateTableCreateOptions(options: { schema?: string | n
   };
 }
 
+function damengDuplicateTableName(targetName: string): string {
+  const hasLower = /[a-z]/.test(targetName);
+  const hasUpper = /[A-Z]/.test(targetName);
+  const hasSpecial = /[^a-zA-Z0-9_$#]/.test(targetName);
+  const hasInvalidStart = !/^[a-zA-Z_]/.test(targetName);
+  return (hasLower && hasUpper) || hasSpecial || hasInvalidStart ? targetName : targetName.toUpperCase();
+}
+
+function damengCloneIndexName(targetName: string, index: number): string {
+  const normalized =
+    targetName
+      .trim()
+      .replace(/[^\p{L}\p{N}_$#]+/gu, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .toUpperCase() || "TABLE";
+  const suffix = `_IDX${index + 1}`;
+  const prefixLength = Math.max(1, DAMENG_IDENTIFIER_LIMIT - Array.from(suffix).length);
+  return `${Array.from(normalized).slice(0, prefixLength).join("")}${suffix}`;
+}
+
+function isSupportedDamengCloneIndex(index: IndexInfo): boolean {
+  if (index.is_primary) return false;
+  const indexType = (index.index_type ?? "").trim().toUpperCase();
+  if (indexType.includes("INNER") || indexType.includes("INTERNAL")) return false;
+  return indexType === "" || indexType === "NORMAL" || indexType === "BITMAP";
+}
+
+export function damengDuplicateTableCreateOptions(options: { schema?: string | null; targetName: string; tableComment?: string | null; columns: ColumnInfo[]; indexes: IndexInfo[] }): BuildTableStructureChangeSqlOptions {
+  return {
+    databaseType: "dameng",
+    schema: options.schema || undefined,
+    tableName: damengDuplicateTableName(options.targetName),
+    tableComment: options.tableComment || undefined,
+    columns: createColumnDrafts(options.columns, "dameng").map((column, index) => ({
+      ...column,
+      id: `clone:column:${index}`,
+      original: undefined,
+      originalPosition: undefined,
+    })),
+    indexes: createIndexDrafts(options.indexes.filter(isSupportedDamengCloneIndex)).map((index, position) => ({
+      ...index,
+      id: `clone:index:${position}`,
+      name: damengCloneIndexName(options.targetName, position),
+      nameEdited: true,
+      original: undefined,
+    })),
+    foreignKeys: [],
+    triggers: [],
+  };
+}
+
 export async function buildDuplicateTableStructurePlan(options: DuplicateTableStructurePlanOptions): Promise<DuplicateTableStructurePlan> {
   if (options.databaseType === "oracle") {
     const columnsPromise = options.sourceColumns ? Promise.resolve(options.sourceColumns) : api.getColumns(options.connectionId, options.database, options.schema || "", options.sourceName, options.catalog);
@@ -165,23 +226,33 @@ export async function buildDuplicateTableStructurePlan(options: DuplicateTableSt
     return { sql: result.statements.join("\n"), sourceColumns: columns, executeAsScript: true };
   }
 
-  let columns = options.sourceColumns;
-  if (options.databaseType === "dameng" && !columns) {
-    try {
-      columns = await api.getColumns(options.connectionId, options.database, options.schema || "", options.sourceName, options.catalog);
-    } catch (error) {
-      console.warn(`Failed to load Dameng column comments for table clone: ${options.sourceName}`, error);
+  if (options.databaseType === "dameng") {
+    const columnsPromise = options.sourceColumns ? Promise.resolve(options.sourceColumns) : api.getColumns(options.connectionId, options.database, options.schema || "", options.sourceName, options.catalog);
+    const [columns, indexes] = await Promise.all([columnsPromise, api.listIndexes(options.connectionId, options.database, options.schema || "", options.sourceName, options.catalog)]);
+    const result = await api.buildCreateTableSql(
+      damengDuplicateTableCreateOptions({
+        schema: options.schema,
+        targetName: options.targetName,
+        tableComment: options.tableComment,
+        columns,
+        indexes,
+      }),
+    );
+    if (result.warnings.length > 0 || result.statements.length === 0) {
+      throw new Error(result.warnings.join("\n") || "Failed to generate Dameng clone DDL.");
     }
+    return { sql: result.statements.join("\n"), sourceColumns: columns, executeAsScript: true };
   }
+
   const sql = await buildDuplicateTableStructureSql({
     databaseType: options.databaseType,
     schema: options.schema,
     sourceName: options.sourceName,
     targetName: options.targetName,
     tableComment: options.tableComment,
-    columnComments: options.databaseType === "dameng" ? collectDuplicateTableColumnComments(columns ?? []) : [],
+    columnComments: [],
   });
-  return { sql, sourceColumns: columns, executeAsScript: duplicateTableStructureRequiresScript(sql) };
+  return { sql, sourceColumns: options.sourceColumns, executeAsScript: duplicateTableStructureRequiresScript(sql) };
 }
 
 export interface CopyTableDataSqlOptions {
@@ -213,6 +284,16 @@ export function buildEmptyTableSql(options: TableAdminSqlOptions): Promise<strin
 
 export function buildTruncateTableSql(options: TableAdminSqlOptions): Promise<string> {
   return api.buildTruncateTableSql(options);
+}
+
+export function buildMysqlAutoIncrementSql(options: MysqlAutoIncrementSqlOptions): Promise<string> {
+  return api.buildMysqlAutoIncrementSql(options);
+}
+
+export function supportsNativeMysqlAutoIncrement(connection: Pick<ConnectionConfig, "db_type" | "driver_profile"> | undefined): boolean {
+  if (connection?.db_type !== "mysql") return false;
+  const profile = connection.driver_profile?.trim().toLowerCase();
+  return !profile || profile === "mysql";
 }
 
 const DROP_TABLE_CASCADE_DATABASE_TYPES: readonly DatabaseType[] = ["postgres", "redshift", "gaussdb", "kwdb", "kingbase", "highgo", "uxdb", "vastbase", "opengauss"];

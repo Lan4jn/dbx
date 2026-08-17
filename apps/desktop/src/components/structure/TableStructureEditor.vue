@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Plus, RefreshCw, Save, Search, Settings, SlidersHorizontal, Trash2, X } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -40,14 +41,16 @@ import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTabl
 import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
 import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import type { TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
+import type { ColumnInfo, ConstraintInfo, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
 import {
   applyManticoreDdlColumnExtras,
   buildStructureTargetLabel,
   canEditStructuredTriggerDraft,
   canEditManticoreColumnProperties,
+  cloneColumnDraftAsNew,
   combineDataTypeForDatabase,
   combineDataTypeForDatabaseWithLengthUnit,
+  createCopiedColumnDrafts,
   createColumnDrafts,
   createForeignKeyDrafts,
   createIndexDrafts,
@@ -73,9 +76,10 @@ import {
   parseExtraToColumnExtra,
   rehydrateColumnDraftsFromMetadata,
   resolveInsertColumnIndex,
-  restoreDamengLengthUnitsAfterSave,
+  restoreCharacterLengthUnitsAfterSave,
   sameStructureIndexType,
   splitDataType,
+  tableStructureIdentifierComparisonKey,
   toColumnNames,
 } from "@/lib/table/tableStructureEditorState";
 import { CREATE_DATABASE_CHARSET_OPTIONS, createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, normalizeCreateDatabaseCharsetKey, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
@@ -95,11 +99,16 @@ type StructureScrollerRef = HTMLElement | { $el?: HTMLElement };
 const columnsScrollerRef = ref<StructureScrollerRef>();
 const indexesScrollerRef = ref<StructureScrollerRef>();
 const foreignKeysScrollerRef = ref<StructureScrollerRef>();
+const constraintsScrollerRef = ref<StructureScrollerRef>();
 const triggersScrollerRef = ref<StructureScrollerRef>();
 const ddlScrollerRef = ref<StructureScrollerRef>();
+const structureHorizontalScrollbarTrackRef = ref<HTMLDivElement>();
+const structureHorizontalScrollbarThumbRef = ref<HTMLDivElement>();
+const hasStructureHorizontalOverflow = ref(false);
 const dynamicDataTypeOptionsCache = new Map<string, string[]>();
 
 const sqlHighlighter = ref<SqlHighlighter>();
+const SQL_PREVIEW_DEBOUNCE_MS = 300;
 onMounted(async () => {
   sqlHighlighter.value = await createShikiSqlHighlighter({
     appearance: () => (isDark.value ? "dark" : "light"),
@@ -137,8 +146,10 @@ const loading = ref(false);
 const saving = ref(false);
 const postSaveRefreshing = ref(false);
 const sqlPreviewLoading = ref(false);
+const sqlPreviewPending = ref(false);
 const indexesLoading = ref(false);
 const foreignKeysLoading = ref(false);
+const constraintsLoading = ref(false);
 const triggersLoading = ref(false);
 const ddlContent = ref("");
 const ddlLoading = ref(false);
@@ -185,14 +196,26 @@ async function fetchDdl(force = false) {
 }
 const errorMessage = ref("");
 const columns = ref<EditableStructureColumn[]>([]);
+const copyColumnsDialogOpen = ref(false);
+const copySourceTables = ref<TableInfo[]>([]);
+const copySourceTableName = ref("");
+const copySourceColumns = ref<ColumnInfo[]>([]);
+const copySourceColumnSearch = ref("");
+const selectedCopySourceColumnNames = ref<string[]>([]);
+const copySourceTablesLoading = ref(false);
+const copySourceColumnsLoading = ref(false);
+const copySourceError = ref("");
+let copySourceColumnsRequestId = 0;
 const indexes = ref<EditableStructureIndex[]>([]);
 const pendingStatements = ref<string[]>([]);
 const warnings = ref<string[]>([]);
 const sqliteSchemaRevision = ref<string>();
 const foreignKeys = ref<EditableStructureForeignKey[]>([]);
+const constraints = ref<ConstraintInfo[]>([]);
+const constraintsLoaded = ref(false);
 const triggers = ref<EditableStructureTrigger[]>([]);
 const triggersLoaded = ref(false);
-const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || triggersLoading.value);
+const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value);
 
 function sameList(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
   const a = left ?? [];
@@ -260,6 +283,10 @@ function captureStructureRefreshScope(): TableStructureRefreshScope {
     columns: columns.value.some(columnChanged),
     indexes: indexes.value.some(indexChanged),
     foreignKeys: foreignKeys.value.some(foreignKeyChanged),
+    // Constraints have no editable draft of their own, but column/index/FK
+    // saves can change what constraints exist (e.g. toggling a primary key),
+    // so refresh the tab if it was ever loaded rather than leaving it stale.
+    constraints: constraintsLoaded.value,
     triggers: triggers.value.some(triggerChanged),
     tableComment: tableComment.value !== originalTableComment.value,
   };
@@ -466,7 +493,7 @@ const structureDensityStyle = computed(() => {
     "--structure-line-height": String(metric.lineHeight),
   };
 });
-const structureControlClass = "h-[var(--structure-control-height)] min-w-0 rounded-[6px] px-[var(--structure-control-px)] py-0 text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25";
+const structureControlClass = "structure-grid-control h-[var(--structure-control-height)] min-w-0 rounded-[6px] px-[var(--structure-control-px)] py-0 text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25";
 const structureMonoControlClass = `${structureControlClass} font-mono`;
 const structureToolbarButtonClass = "h-[var(--structure-control-height)] gap-1 px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]";
 const structureIconButtonClass = "h-[var(--structure-control-height)] w-[var(--structure-control-height)]";
@@ -581,7 +608,7 @@ watch(localStructureDensity, (density, previousDensity) => {
 function onColResize(e: MouseEvent, col: number) {
   e.preventDefault();
   const widthIndex = columnWidthIndex(col);
-  const minimumWidth = widthIndex === 3 && databaseType.value === "dameng" ? structureDensityMetric.value.minLengthColumnWidth : structureDensityMetric.value.minColumnWidth;
+  const minimumWidth = widthIndex === 3 && supportsCharacterLengthUnits.value ? structureDensityMetric.value.minLengthColumnWidth : structureDensityMetric.value.minColumnWidth;
   colResizing.value = { col: widthIndex, startX: e.clientX, startW: Math.max(colWidths.value[widthIndex] ?? minimumWidth, minimumWidth) };
   const onMove = (ev: MouseEvent) => {
     if (!colResizing.value) return;
@@ -620,6 +647,7 @@ function onIndexColResize(e: MouseEvent, col: number) {
 
 const connection = computed(() => (props.connectionId ? store.getConfig(props.connectionId) : undefined));
 const databaseType = computed(() => tableStructureDatabaseTypeForConnection(connection.value));
+const supportsCharacterLengthUnits = computed(() => databaseType.value === "dameng" || databaseType.value === "oracle");
 const usesMysql8SafeDefaults = computed(() => databaseType.value === "mysql" && connection.value?.db_type === "mysql" && connection.value.driver_profile === "mysql");
 const structureCapabilities = computed(() => getTableStructureCapabilities(databaseType.value, connection.value?.db_type, connection.value?.database_info?.productVersion));
 const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(databaseType.value));
@@ -770,7 +798,7 @@ const visibleColWidths = computed(() =>
   colLabels.value.map((column) => {
     if (column.key === "actions") return columnActionsWidth.value;
     const width = colWidths.value[column.widthIndex] ?? structureDensityMetric.value.minColumnWidth;
-    return column.key === "length" && databaseType.value === "dameng" ? Math.max(width, structureDensityMetric.value.minLengthColumnWidth) : width;
+    return column.key === "length" && supportsCharacterLengthUnits.value ? Math.max(width, structureDensityMetric.value.minLengthColumnWidth) : width;
   }),
 );
 
@@ -857,6 +885,17 @@ let syncingDraft = false;
 let draftHydrated = false;
 let hydratingRestoredDraft = false;
 let structureScrollFrame = 0;
+let structureHorizontalScrollbarThumbLeftPercent = 0;
+let structureHorizontalScrollbarThumbWidthPercent = 100;
+let structureHorizontalScrollbarResizeObserver: ResizeObserver | null = null;
+let structureHorizontalScrollbarObserverGeneration = 0;
+let structureHorizontalScrollbarPreviousUserSelect: string | null = null;
+let structureHorizontalScrollbarDragState: {
+  scroller: HTMLElement;
+  trackRect: DOMRect;
+  thumbOffsetPx: number;
+  maxScrollLeft: number;
+} | null = null;
 // A context-menu target may arrive before metadata rows render, so search text
 // and row scrolling are tracked separately for each request.
 let appliedInitialTargetSearchKey = "";
@@ -878,9 +917,107 @@ function structureScrollerForTab(tab: TableInfoTab): HTMLElement | undefined {
   if (tab === "columns") return structureScrollerElement(columnsScrollerRef.value);
   if (tab === "indexes") return structureScrollerElement(indexesScrollerRef.value);
   if (tab === "foreignKeys") return structureScrollerElement(foreignKeysScrollerRef.value);
+  if (tab === "constraints") return structureScrollerElement(constraintsScrollerRef.value);
   if (tab === "triggers") return structureScrollerElement(triggersScrollerRef.value);
   if (tab === "ddl") return structureScrollerElement(ddlScrollerRef.value);
   return undefined;
+}
+
+function activeStructureHorizontalScroller(): HTMLElement | undefined {
+  if (activeTab.value !== "columns" && activeTab.value !== "indexes") return undefined;
+  return structureScrollerForTab(activeTab.value);
+}
+
+function applyStructureHorizontalScrollbarThumbStyle(): boolean {
+  const thumb = structureHorizontalScrollbarThumbRef.value;
+  if (!thumb) return false;
+  thumb.style.width = `${structureHorizontalScrollbarThumbWidthPercent}%`;
+  thumb.style.left = `${structureHorizontalScrollbarThumbLeftPercent}%`;
+  return true;
+}
+
+function updateStructureHorizontalScrollbar(scroller = activeStructureHorizontalScroller()) {
+  if (!scroller) {
+    hasStructureHorizontalOverflow.value = false;
+    return;
+  }
+  const maxScrollLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+  const hasOverflow = maxScrollLeft > 1;
+  hasStructureHorizontalOverflow.value = hasOverflow;
+  const thumbWidth = scroller.scrollWidth > 0 ? Math.min(100, Math.max(6, (scroller.clientWidth / scroller.scrollWidth) * 100)) : 100;
+  structureHorizontalScrollbarThumbWidthPercent = thumbWidth;
+  structureHorizontalScrollbarThumbLeftPercent = maxScrollLeft > 0 ? (scroller.scrollLeft / maxScrollLeft) * Math.max(0, 100 - thumbWidth) : 0;
+  if (!applyStructureHorizontalScrollbarThumbStyle() && hasOverflow) void nextTick(applyStructureHorizontalScrollbarThumbStyle);
+}
+
+function observeStructureHorizontalScroller() {
+  const generation = ++structureHorizontalScrollbarObserverGeneration;
+  structureHorizontalScrollbarResizeObserver?.disconnect();
+  structureHorizontalScrollbarResizeObserver = null;
+  const tab = activeTab.value;
+  void nextTick(() => {
+    if (generation !== structureHorizontalScrollbarObserverGeneration || tab !== activeTab.value) return;
+    const scroller = activeStructureHorizontalScroller();
+    updateStructureHorizontalScrollbar(scroller);
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    structureHorizontalScrollbarResizeObserver = new ResizeObserver(() => updateStructureHorizontalScrollbar(scroller));
+    structureHorizontalScrollbarResizeObserver.observe(scroller);
+    for (const child of Array.from(scroller.children)) structureHorizontalScrollbarResizeObserver.observe(child);
+  });
+}
+
+function applyStructureHorizontalScrollbarDrag(clientX: number) {
+  const dragState = structureHorizontalScrollbarDragState;
+  if (!dragState) return;
+  const thumbWidthPx = dragState.trackRect.width * (structureHorizontalScrollbarThumbWidthPercent / 100);
+  const maxThumbLeftPx = Math.max(1, dragState.trackRect.width - thumbWidthPx);
+  const thumbLeftPx = Math.min(maxThumbLeftPx, Math.max(0, clientX - dragState.trackRect.left - dragState.thumbOffsetPx));
+  dragState.scroller.scrollLeft = (thumbLeftPx / maxThumbLeftPx) * dragState.maxScrollLeft;
+  updateStructureHorizontalScrollbar(dragState.scroller);
+}
+
+function onStructureHorizontalScrollbarPointerMove(event: PointerEvent) {
+  if (!structureHorizontalScrollbarDragState) return;
+  event.preventDefault();
+  applyStructureHorizontalScrollbarDrag(event.clientX);
+}
+
+function stopStructureHorizontalScrollbarDrag() {
+  if (!structureHorizontalScrollbarDragState) return;
+  structureHorizontalScrollbarDragState = null;
+  structureHorizontalScrollbarTrackRef.value?.classList.remove("structure-horizontal-scrollbar--dragging");
+  window.removeEventListener("pointermove", onStructureHorizontalScrollbarPointerMove, true);
+  window.removeEventListener("pointerup", stopStructureHorizontalScrollbarDrag, true);
+  window.removeEventListener("pointercancel", stopStructureHorizontalScrollbarDrag, true);
+  document.body.style.userSelect = structureHorizontalScrollbarPreviousUserSelect ?? "";
+  structureHorizontalScrollbarPreviousUserSelect = null;
+}
+
+function startStructureHorizontalScrollbarDrag(event: PointerEvent) {
+  if (event.button !== 0 || !event.isPrimary) return;
+  const scroller = activeStructureHorizontalScroller();
+  const track = structureHorizontalScrollbarTrackRef.value;
+  if (!scroller || !track || !hasStructureHorizontalOverflow.value) return;
+  const maxScrollLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+  if (maxScrollLeft <= 1) return;
+  const trackRect = track.getBoundingClientRect();
+  const thumbLeftPx = trackRect.width * (structureHorizontalScrollbarThumbLeftPercent / 100);
+  const thumbWidthPx = trackRect.width * (structureHorizontalScrollbarThumbWidthPercent / 100);
+  const pointerX = event.clientX - trackRect.left;
+  structureHorizontalScrollbarDragState = {
+    scroller,
+    trackRect,
+    thumbOffsetPx: pointerX >= thumbLeftPx && pointerX <= thumbLeftPx + thumbWidthPx ? pointerX - thumbLeftPx : thumbWidthPx / 2,
+    maxScrollLeft,
+  };
+  track.classList.add("structure-horizontal-scrollbar--dragging");
+  structureHorizontalScrollbarPreviousUserSelect = document.body.style.userSelect;
+  document.body.style.userSelect = "none";
+  window.addEventListener("pointermove", onStructureHorizontalScrollbarPointerMove, true);
+  window.addEventListener("pointerup", stopStructureHorizontalScrollbarDrag, true);
+  window.addEventListener("pointercancel", stopStructureHorizontalScrollbarDrag, true);
+  event.preventDefault();
+  applyStructureHorizontalScrollbarDrag(event.clientX);
 }
 
 function restoreStructureScrollPosition(tab = activeTab.value) {
@@ -891,12 +1028,14 @@ function restoreStructureScrollPosition(tab = activeTab.value) {
     if (!scroller) return;
     scroller.scrollTop = Math.max(0, position.scrollTop);
     scroller.scrollLeft = Math.max(0, position.scrollLeft);
+    if (tab === "columns" || tab === "indexes") updateStructureHorizontalScrollbar(scroller);
   });
 }
 
 function onStructureContentScroll(tab: TableInfoTab, event: Event) {
   const target = event.currentTarget;
   if (!(target instanceof HTMLElement)) return;
+  if (tab === "columns" || tab === "indexes") updateStructureHorizontalScrollbar(target);
   const position: TableStructureEditorViewport = {
     scrollTop: Math.max(0, Math.round(target.scrollTop)),
     scrollLeft: Math.max(0, Math.round(target.scrollLeft)),
@@ -924,6 +1063,8 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     columns: cloneDraftValue(columns.value),
     indexes: cloneDraftValue(indexes.value),
     foreignKeys: cloneDraftValue(foreignKeys.value),
+    constraints: cloneDraftValue(constraints.value),
+    constraintsLoaded: constraintsLoaded.value,
     triggers: cloneDraftValue(triggers.value),
     triggersLoaded: triggersLoaded.value,
     loadedMetadataFacets: [...loadedMetadataFacets],
@@ -950,6 +1091,9 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   columns.value = cloneDraftValue(draft.columns || []);
   indexes.value = cloneDraftValue(draft.indexes || []);
   foreignKeys.value = cloneDraftValue(draft.foreignKeys || []);
+  constraints.value = cloneDraftValue(draft.constraints || []);
+  // Drafts created before constraint loading existed have no saved facet.
+  constraintsLoaded.value = draft.constraintsLoaded ?? false;
   triggers.value = cloneDraftValue(draft.triggers || []);
   // Drafts created before lazy trigger loading always contained live trigger metadata.
   triggersLoaded.value = draft.triggersLoaded ?? true;
@@ -961,6 +1105,7 @@ function restoreDraft(draft: TableStructureEditorDraft) {
     if (activeScope.columns) loadedMetadataFacets.add("columns");
     if (activeScope.indexes || draft.indexes?.length) loadedMetadataFacets.add("indexes");
     if (activeScope.foreignKeys || draft.foreignKeys?.length) loadedMetadataFacets.add("foreign-keys");
+    if (activeScope.constraints || constraintsLoaded.value) loadedMetadataFacets.add("constraints");
     if (activeScope.triggers || triggersLoaded.value) loadedMetadataFacets.add("triggers");
     if (activeScope.tableComment) loadedMetadataFacets.add("comment");
   }
@@ -1030,6 +1175,7 @@ function clearSqlPreviewState() {
   sqlPreviewRequestId++;
   deferredSqlPreviewRefresh = false;
   sqlPreviewLoading.value = false;
+  sqlPreviewPending.value = false;
   pendingStatements.value = [];
   warnings.value = [];
   sqliteSchemaRevision.value = undefined;
@@ -1134,9 +1280,10 @@ function scheduleSqlPreviewRefresh() {
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
     sqlPreviewLoading.value = false;
+    sqlPreviewPending.value = false;
     return;
   }
-  sqlPreviewLoading.value = true;
+  sqlPreviewPending.value = true;
   if (hydratingRestoredDraft || needsColumnDraftMetadataHydration()) return;
   if (!isCreateMode.value && secondaryMetadataLoading.value) {
     deferredSqlPreviewRefresh = true;
@@ -1145,7 +1292,7 @@ function scheduleSqlPreviewRefresh() {
   sqlPreviewDebounceTimer = setTimeout(() => {
     sqlPreviewDebounceTimer = undefined;
     void refreshSqlPreview();
-  }, 80);
+  }, SQL_PREVIEW_DEBOUNCE_MS);
 }
 
 function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
@@ -1169,6 +1316,7 @@ async function refreshSqlPreview() {
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
     sqlPreviewLoading.value = false;
+    sqlPreviewPending.value = false;
     return;
   }
   sqlPreviewLoading.value = true;
@@ -1185,7 +1333,10 @@ async function refreshSqlPreview() {
     warnings.value = [e?.message || String(e)];
     sqliteSchemaRevision.value = undefined;
   } finally {
-    if (requestId === sqlPreviewRequestId) sqlPreviewLoading.value = false;
+    if (requestId === sqlPreviewRequestId) {
+      sqlPreviewLoading.value = false;
+      sqlPreviewPending.value = false;
+    }
   }
 }
 
@@ -1196,6 +1347,7 @@ const canApply = computed(
     !postSaveRefreshing.value &&
     !secondaryMetadataLoading.value &&
     !sqlPreviewLoading.value &&
+    !sqlPreviewPending.value &&
     pendingStatements.value.length > 0 &&
     warnings.value.length === 0 &&
     (!hasSqliteTypeChange.value || !!sqliteSchemaRevision.value) &&
@@ -1213,8 +1365,10 @@ function resetState() {
   saving.value = false;
   postSaveRefreshing.value = false;
   sqlPreviewLoading.value = false;
+  sqlPreviewPending.value = false;
   indexesLoading.value = false;
   foreignKeysLoading.value = false;
+  constraintsLoading.value = false;
   triggersLoading.value = false;
   errorMessage.value = "";
   columns.value = [];
@@ -1223,6 +1377,8 @@ function resetState() {
   warnings.value = [];
   sqliteSchemaRevision.value = undefined;
   foreignKeys.value = [];
+  constraints.value = [];
+  constraintsLoaded.value = false;
   triggers.value = [];
   triggersLoaded.value = false;
   selectedColumnId.value = null;
@@ -1248,6 +1404,10 @@ async function reloadStructureFromDatabase() {
     triggers.value = [];
     triggersLoaded.value = false;
   }
+  if (activeTab.value !== "constraints") {
+    constraints.value = [];
+    constraintsLoaded.value = false;
+  }
   const refreshDdl = activeTab.value === "ddl";
   const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
   invalidateTableMetadataCache(metadataMatch);
@@ -1264,6 +1424,7 @@ async function reloadStructureFromDatabase() {
 function setSecondaryMetadataLoading(scope: TableStructureRefreshScope, value: boolean) {
   if (scope.indexes && tableMetadataCapabilities.value.indexes) indexesLoading.value = value;
   if (scope.foreignKeys && tableMetadataCapabilities.value.foreignKeys) foreignKeysLoading.value = value;
+  if (scope.constraints && tableMetadataCapabilities.value.constraints) constraintsLoading.value = value;
   if (scope.triggers && tableMetadataCapabilities.value.triggers) triggersLoading.value = value;
 }
 
@@ -1289,7 +1450,7 @@ async function loadStructure(
   silent = false,
   scope: TableStructureRefreshScope = visibleTableStructureRefreshScope(activeTab.value),
   showErrors = true,
-  options: { blockSecondaryMetadata?: boolean; preserveDraft?: boolean; damengLengthUnitsAfterSave?: ReadonlyMap<string, string>; forceDdl?: boolean; forceMetadata?: boolean } = {},
+  options: { blockSecondaryMetadata?: boolean; preserveDraft?: boolean; characterLengthUnitsAfterSave?: ReadonlyMap<string, string>; forceDdl?: boolean; forceMetadata?: boolean } = {},
 ) {
   const connectionId = props.connectionId;
   const database = props.database;
@@ -1319,6 +1480,11 @@ async function loadStructure(
         ? loadObjectMetadataFacet(metadataRequest, "foreign-keys", () => api.listForeignKeys(connectionId, database, schema, tableName, catalog).catch(() => []), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
+    const constraintsPromise = scope.constraints
+      ? tableMetadataCapabilities.value.constraints
+        ? loadObjectMetadataFacet(metadataRequest, "constraints", () => api.listConstraints(connectionId, database, schema, tableName, catalog).catch(() => []), { force: forceMetadata }).then((result) => result.value)
+        : Promise.resolve([])
+      : Promise.resolve(undefined);
     const triggersPromise = scope.triggers
       ? tableMetadataCapabilities.value.triggers
         ? loadObjectMetadataFacet(metadataRequest, "triggers", () => api.listTriggers(connectionId, database, schema, tableName, catalog).catch(() => []), { force: forceMetadata }).then((result) => result.value)
@@ -1342,7 +1508,7 @@ async function loadStructure(
       // editor shows the correct options for the server version.
       void loadCharsetMetadata();
       const nextColumnDrafts = createColumnDrafts(nextColumns, databaseType.value);
-      const hydratedColumnDrafts = databaseType.value === "dameng" && options.damengLengthUnitsAfterSave ? restoreDamengLengthUnitsAfterSave(nextColumnDrafts, options.damengLengthUnitsAfterSave) : nextColumnDrafts;
+      const hydratedColumnDrafts = supportsCharacterLengthUnits.value && options.characterLengthUnitsAfterSave ? restoreCharacterLengthUnitsAfterSave(databaseType.value, nextColumnDrafts, options.characterLengthUnitsAfterSave) : nextColumnDrafts;
       columns.value = applyStoredLocalColumnOrder(hydratedColumnDrafts);
       loadedMetadataFacets.add("columns");
       if (!options.preserveDraft) selectedColumnId.value = null;
@@ -1355,7 +1521,7 @@ async function loadStructure(
       loadedMetadataFacets.add("comment");
     }
     const applySecondaryMetadata = async () => {
-      const [nextIndexes, nextForeignKeys, nextTriggers] = await Promise.all([indexesPromise, foreignKeysPromise, triggersPromise]);
+      const [nextIndexes, nextForeignKeys, nextConstraints, nextTriggers] = await Promise.all([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise]);
       if (requestId !== structureLoadRequestId) return;
       if (nextIndexes) {
         indexes.value = createIndexDrafts(nextIndexes);
@@ -1364,6 +1530,11 @@ async function loadStructure(
       if (nextForeignKeys) {
         foreignKeys.value = createForeignKeyDrafts(nextForeignKeys);
         loadedMetadataFacets.add("foreign-keys");
+      }
+      if (nextConstraints) {
+        constraints.value = nextConstraints;
+        constraintsLoaded.value = true;
+        loadedMetadataFacets.add("constraints");
       }
       if (nextTriggers) {
         triggers.value = createTriggerDrafts(nextTriggers);
@@ -1401,9 +1572,9 @@ async function loadStructure(
   }
 }
 
-async function refreshStructureAfterSave(scope: TableStructureRefreshScope, damengLengthUnitsAfterSave: ReadonlyMap<string, string>) {
+async function refreshStructureAfterSave(scope: TableStructureRefreshScope, characterLengthUnitsAfterSave: ReadonlyMap<string, string>) {
   try {
-    await loadStructure(true, scope, false, { blockSecondaryMetadata: true, damengLengthUnitsAfterSave });
+    await loadStructure(true, scope, false, { blockSecondaryMetadata: true, characterLengthUnitsAfterSave });
   } catch (e) {
     console.warn("[DBX][structure-editor:post-save-refresh-failed]", e);
   } finally {
@@ -1424,6 +1595,107 @@ async function focusColumnNameInput(columnId: string) {
 function onColumnRowActivate(column: EditableStructureColumn) {
   if (column.markedForDrop || !columns.value.some((item) => item.id === column.id)) return;
   selectedColumnId.value = column.id;
+}
+
+function normalizedColumnSearch(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+const copyableSourceColumns = computed(() => {
+  const databaseInfo = connection.value?.database_info;
+  const existingNames = new Set(columns.value.filter((column) => !column.markedForDrop).map((column) => tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)));
+  return copySourceColumns.value.map((column) => ({
+    column,
+    alreadyExists: existingNames.has(tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)),
+  }));
+});
+
+const filteredCopyableSourceColumns = computed(() => {
+  const search = normalizedColumnSearch(copySourceColumnSearch.value);
+  if (!search) return copyableSourceColumns.value;
+  return copyableSourceColumns.value.filter(({ column }) => [column.name, column.data_type, column.comment ?? ""].some((value) => normalizedColumnSearch(value).includes(search)));
+});
+
+const copyableSourceColumnNames = computed(() => copyableSourceColumns.value.filter(({ alreadyExists }) => !alreadyExists).map(({ column }) => column.name));
+const selectedCopySourceColumns = computed(() => {
+  const selected = new Set(selectedCopySourceColumnNames.value);
+  return copyableSourceColumns.value.filter(({ column, alreadyExists }) => !alreadyExists && selected.has(column.name)).map(({ column }) => column);
+});
+const allCopyableSourceColumnsSelected = computed(() => copyableSourceColumnNames.value.length > 0 && copyableSourceColumnNames.value.every((name) => selectedCopySourceColumnNames.value.includes(name)));
+
+async function openCopyColumnsDialog() {
+  if (!canAddColumn.value || !props.connectionId || !props.database) return;
+  copyColumnsDialogOpen.value = true;
+  copySourceTableName.value = "";
+  copySourceColumns.value = [];
+  copySourceColumnSearch.value = "";
+  selectedCopySourceColumnNames.value = [];
+  copySourceError.value = "";
+  copySourceColumnsRequestId++;
+  copySourceColumnsLoading.value = false;
+  copySourceTables.value = [];
+  copySourceTablesLoading.value = true;
+  try {
+    await store.ensureConnected(props.connectionId);
+    const databaseInfo = connection.value?.database_info;
+    const currentTableIdentifierKey = tableStructureIdentifierComparisonKey(props.tableName, databaseType.value, databaseInfo);
+    copySourceTables.value = (await api.listTables(props.connectionId, props.database, metadataSchema.value, undefined, undefined, undefined, undefined, props.catalog)).filter((table) => {
+      const tableType = table.table_type.toUpperCase();
+      return tableType !== "VIEW" && tableType !== "MATERIALIZED_VIEW" && (isCreateMode.value || tableStructureIdentifierComparisonKey(table.name, databaseType.value, databaseInfo) !== currentTableIdentifierKey);
+    });
+  } catch (error: any) {
+    copySourceTables.value = [];
+    copySourceError.value = error?.message || String(error);
+  } finally {
+    copySourceTablesLoading.value = false;
+  }
+}
+
+async function loadCopySourceColumns(tableName: string) {
+  copySourceTableName.value = tableName;
+  copySourceColumns.value = [];
+  copySourceColumnSearch.value = "";
+  selectedCopySourceColumnNames.value = [];
+  copySourceError.value = "";
+  if (!tableName || !props.connectionId || !props.database) return;
+  const requestId = ++copySourceColumnsRequestId;
+  copySourceColumnsLoading.value = true;
+  try {
+    const sourceColumns = await api.getColumns(props.connectionId, props.database, metadataSchema.value, tableName, props.catalog);
+    if (requestId !== copySourceColumnsRequestId) return;
+    copySourceColumns.value = sourceColumns;
+    selectedCopySourceColumnNames.value = copyableSourceColumns.value.filter(({ alreadyExists }) => !alreadyExists).map(({ column }) => column.name);
+  } catch (error: any) {
+    if (requestId !== copySourceColumnsRequestId) return;
+    copySourceError.value = error?.message || String(error);
+  } finally {
+    if (requestId === copySourceColumnsRequestId) copySourceColumnsLoading.value = false;
+  }
+}
+
+function toggleCopySourceColumns() {
+  selectedCopySourceColumnNames.value = allCopyableSourceColumnsSelected.value ? [] : [...copyableSourceColumnNames.value];
+}
+
+function applyCopiedColumns() {
+  const copiedColumns = createCopiedColumnDrafts(selectedCopySourceColumns.value, databaseType.value, uuid);
+  if (!copiedColumns.length) return;
+  const insertAt = resolveInsertColumnIndex(columns.value, selectedColumnId.value);
+  columns.value.splice(insertAt, 0, ...copiedColumns);
+  selectedColumnId.value = copiedColumns[copiedColumns.length - 1]?.id ?? selectedColumnId.value;
+  if (usesLocalTableColumnOrder.value) persistLocalColumnOrder(false);
+  copyColumnsDialogOpen.value = false;
+}
+
+async function copyColumn(column: EditableStructureColumn) {
+  if (!canAddColumn.value || column.markedForDrop) return;
+  const sourceIndex = columns.value.findIndex((item) => item.id === column.id);
+  if (sourceIndex < 0) return;
+  const copiedColumn = cloneColumnDraftAsNew(column, uuid);
+  columns.value.splice(sourceIndex + 1, 0, copiedColumn);
+  selectedColumnId.value = copiedColumn.id;
+  if (usesLocalTableColumnOrder.value) persistLocalColumnOrder(false);
+  await focusColumnNameInput(copiedColumn.id);
 }
 
 async function addColumn() {
@@ -2273,7 +2545,7 @@ async function recordStructureHistory(sql: string, start: number, success: boole
 }
 
 async function copyPreviewSql() {
-  if (!previewSqlText.value.trim()) return;
+  if (sqlPreviewPending.value || sqlPreviewLoading.value || !previewSqlText.value.trim()) return;
   try {
     await copyToClipboard(previewSqlText.value);
     toast(t("grid.copied"));
@@ -2315,11 +2587,11 @@ async function applyChanges() {
   saving.value = true;
   errorMessage.value = "";
   const refreshScope = captureStructureRefreshScope();
-  const damengLengthUnitsAfterSave = new Map<string, string>();
-  if (databaseType.value === "dameng") {
+  const characterLengthUnitsAfterSave = new Map<string, string>();
+  if (supportsCharacterLengthUnits.value) {
     for (const column of columns.value) {
-      if (!column.markedForDrop && dataTypeLengthUnitValue("dameng", column.dataType)) {
-        damengLengthUnitsAfterSave.set(column.name.trim().toLowerCase(), column.dataType);
+      if (!column.markedForDrop && dataTypeLengthUnitValue(databaseType.value, column.dataType)) {
+        characterLengthUnitsAfterSave.set(column.name.trim().toLowerCase(), column.dataType);
       }
     }
   }
@@ -2335,6 +2607,8 @@ async function applyChanges() {
       loadedMetadataFacets.clear();
     }
     toast(t("structureEditor.saved"), 2500);
+    sqlPreviewPending.value = false;
+    sqlPreviewLoading.value = false;
     pendingStatements.value = [];
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
@@ -2351,7 +2625,7 @@ async function applyChanges() {
       postSaveRefreshing.value = true;
       skipNextRefreshVersion = true;
       emit("saved", tableComment.value !== originalTableComment.value);
-      await refreshStructureAfterSave(refreshScope, damengLengthUnitsAfterSave);
+      await refreshStructureAfterSave(refreshScope, characterLengthUnitsAfterSave);
     }
     return true;
   } catch (e: any) {
@@ -2432,6 +2706,7 @@ onMounted(() => {
     applyInitialStructureTarget();
   }
   structureEditorReady = true;
+  observeStructureHorizontalScroller();
   if (props.draft?.initialized) {
     void hydrateRestoredDraftFromDatabase().then(() => {
       applyInitialStructureTarget();
@@ -2448,6 +2723,7 @@ onMounted(() => {
 
 onActivated(() => {
   registerStructureEditorShortcuts();
+  observeStructureHorizontalScroller();
   void loadDynamicDataTypeOptions();
   if (props.draft?.initialized && !draftHydrated) {
     restoreDraft(props.draft);
@@ -2459,9 +2735,18 @@ onActivated(() => {
   }
   restoreStructureScrollPosition();
 });
-onDeactivated(unregisterStructureEditorShortcuts);
+onDeactivated(() => {
+  unregisterStructureEditorShortcuts();
+  structureHorizontalScrollbarObserverGeneration += 1;
+  structureHorizontalScrollbarResizeObserver?.disconnect();
+  structureHorizontalScrollbarResizeObserver = null;
+  stopStructureHorizontalScrollbarDrag();
+});
 onBeforeUnmount(() => {
   stopColumnDragTracking();
+  stopStructureHorizontalScrollbarDrag();
+  structureHorizontalScrollbarObserverGeneration += 1;
+  structureHorizontalScrollbarResizeObserver?.disconnect();
   unregisterStructureEditorShortcuts();
   clearSqlPreviewState();
   if (columnHighlightTimer) window.clearTimeout(columnHighlightTimer);
@@ -2554,12 +2839,15 @@ watch(
 );
 
 watch(activeTab, () => {
+  stopStructureHorizontalScrollbarDrag();
   selectedColumnId.value = null;
   highlightedColumnId.value = null;
   highlightedIndexId.value = null;
   restoreStructureScrollPosition();
   syncDraftToParent();
 });
+
+watch([activeTab, loading, indexesLoading, visibleColWidths, indexColWidths], observeStructureHorizontalScroller, { deep: true, flush: "post", immediate: true });
 
 watch(
   columns,
@@ -2591,6 +2879,10 @@ watch(refreshVersion, (version, previous) => {
   if (activeTab.value !== "triggers") {
     triggers.value = [];
     triggersLoaded.value = false;
+  }
+  if (activeTab.value !== "constraints") {
+    constraints.value = [];
+    constraintsLoaded.value = false;
   }
   void loadStructure(true, visibleTableStructureRefreshScope(activeTab.value));
 });
@@ -2661,6 +2953,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
               <TabsTrigger v-if="tableMetadataCapabilities.columns" value="columns">{{ t("structureEditor.columns") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.indexes" value="indexes">{{ t("structureEditor.indexes") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.constraints" value="constraints">{{ t("structureEditor.constraints") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.triggers" value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
             </TabsList>
             <div class="flex shrink-0 items-center gap-1.5">
@@ -2720,6 +3013,10 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                 <Plus :class="structureIconClass" />
                 {{ t("structureEditor.addColumn") }}
               </Button>
+              <Button v-if="activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="openCopyColumnsDialog">
+                <Copy :class="structureIconClass" />
+                {{ t("structureEditor.copyColumns") }}
+              </Button>
               <Button v-if="isCreateMode && activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="applyColumnTemplate(PRESET_FIELDS_TEMPLATE_ID)">
                 <Copy :class="structureIconClass" />
                 {{ t("structureEditor.columnTemplates") }}
@@ -2760,8 +3057,8 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
             </div>
           </div>
 
-          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
-            <table class="border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
+            <table class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
@@ -2849,7 +3146,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                         <SelectTrigger
                           :aria-label="t('structureEditor.lengthUnit')"
                           :title="t('structureEditor.lengthUnit')"
-                          class="h-[var(--structure-control-height)] w-16 shrink-0 rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25"
+                          class="structure-grid-control h-[var(--structure-control-height)] w-16 shrink-0 rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25"
                         >
                           <SelectValue :placeholder="t('structureEditor.unitPlaceholder')" />
                         </SelectTrigger>
@@ -2933,7 +3230,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                       :empty-text="t('structureEditor.noMatchingType')"
                       :allow-custom="true"
                       :disabled="isColumnCharsetDisabled(column)"
-                      :trigger-class="[structureMonoControlClass, 'w-20']"
+                      :trigger-class="[structureMonoControlClass, 'w-full']"
                       @update:model-value="(v: string) => onCharsetChange(column, v)"
                     />
                   </td>
@@ -2946,7 +3243,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                       :empty-text="t('structureEditor.noMatchingType')"
                       :allow-custom="true"
                       :disabled="isColumnCharsetDisabled(column)"
-                      :trigger-class="[structureMonoControlClass, 'w-28']"
+                      :trigger-class="[structureMonoControlClass, 'w-full']"
                       @update:model-value="(v: string) => (column.collation = v)"
                     />
                   </td>
@@ -3029,7 +3326,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                             }
                           "
                         >
-                          <SelectTrigger class="h-[var(--structure-control-height)] w-28 rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
+                          <SelectTrigger class="structure-grid-control h-[var(--structure-control-height)] w-28 rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -3112,6 +3409,9 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                       >
                         <ListChevronsUpDown :class="structureIconClass" />
                       </Button>
+                      <Button variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canAddColumn || column.markedForDrop" :title="t('structureEditor.copyColumn')" :aria-label="t('structureEditor.copyColumn')" @click.stop="copyColumn(column)">
+                        <Copy :class="structureIconClass" />
+                      </Button>
                       <Button
                         v-if="column.original"
                         variant="ghost"
@@ -3135,12 +3435,12 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
             </table>
           </TabsContent>
 
-          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
+          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
             <div v-if="indexesLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
             </div>
-            <table v-else class="border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+            <table v-else class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
@@ -3189,7 +3489,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                   </td>
                   <td :class="structureCellClass">
                     <Select v-if="indexTypeOptions.length > 0" :model-value="index.indexType || 'BTREE'" :disabled="!canEditIndexDraft(index)" @update:model-value="(v: any) => (index.indexType = String(v ?? ''))">
-                      <SelectTrigger class="h-[var(--structure-control-height)] w-full rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
+                      <SelectTrigger class="structure-grid-control h-[var(--structure-control-height)] w-full rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -3239,6 +3539,10 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
             </table>
           </TabsContent>
 
+          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar" @pointerdown="startStructureHorizontalScrollbarDrag">
+            <div ref="structureHorizontalScrollbarThumbRef" class="structure-horizontal-scrollbar__thumb" />
+          </div>
+
           <TabsContent ref="foreignKeysScrollerRef" v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('foreignKeys', $event)">
             <div v-if="foreignKeysLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
@@ -3285,6 +3589,29 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                   </Select>
                   <div class="truncate font-mono text-muted-foreground">{{ fk.column }} -> {{ fk.refSchema ? `${fk.refSchema}.` : "" }}{{ fk.refTable }}.{{ fk.refColumn }}</div>
                 </div>
+              </div>
+            </div>
+          </TabsContent>
+
+          <TabsContent ref="constraintsScrollerRef" v-if="tableMetadataCapabilities.constraints" value="constraints" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('constraints', $event)">
+            <div v-if="constraintsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
+              <Loader2 class="h-4 w-4 animate-spin" />
+              {{ t("common.loading") }}
+            </div>
+            <div v-else-if="constraints.length === 0" class="py-10 text-center text-muted-foreground">
+              {{ t("structureEditor.emptyReadonly") }}
+            </div>
+            <div v-else class="space-y-1.5">
+              <div v-for="constraint in constraints" :key="constraint.name" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="constraint.enabled ? '' : 'opacity-60'">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <span class="font-mono font-medium">{{ constraint.name }}</span>
+                  <Badge variant="outline" class="shrink-0">{{ constraint.constraint_type }}</Badge>
+                  <Badge v-if="!constraint.enabled" variant="outline" class="shrink-0 text-muted-foreground">{{ t("structureEditor.constraintDisabled") }}</Badge>
+                  <Badge v-else-if="!constraint.valid" variant="outline" class="shrink-0 text-muted-foreground">{{ t("structureEditor.constraintNotValidated") }}</Badge>
+                </div>
+                <div v-if="constraint.columns.length" class="mt-1 truncate font-mono text-muted-foreground">{{ constraint.columns.join(", ") }}</div>
+                <div v-if="constraint.ref_table" class="mt-1 truncate font-mono text-muted-foreground">-> {{ constraint.ref_schema ? `${constraint.ref_schema}.` : "" }}{{ constraint.ref_table }}{{ constraint.ref_columns.length ? `(${constraint.ref_columns.join(", ")})` : "" }}</div>
+                <div v-if="constraint.definition" class="mt-1 whitespace-pre-wrap break-words font-mono text-muted-foreground">{{ constraint.definition }}</div>
               </div>
             </div>
           </TabsContent>
@@ -3360,7 +3687,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
         <div class="flex shrink-0 items-center justify-between border-b px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)] font-medium">
           <div class="flex items-center gap-1.5">
             <span>{{ t("structureEditor.sqlPreview") }}</span>
-            <Badge v-if="!saving && pendingStatements.length && warnings.length === 0" variant="outline" class="h-4 px-1 text-[10px]">
+            <Badge v-if="!saving && pendingStatements.length && warnings.length === 0" variant="outline" :class="['h-4 px-1 text-[10px]', sqlPreviewPending || sqlPreviewLoading ? 'invisible' : '']" :aria-hidden="sqlPreviewPending || sqlPreviewLoading">
               <Check class="h-3 w-3" />
               {{ t("structureEditor.ready") }}
             </Badge>
@@ -3376,17 +3703,17 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
               <ChevronUp v-if="sqlPreviewCollapsed" :class="structureIconClass" />
               <ChevronDown v-else :class="structureIconClass" />
             </Button>
-            <Button variant="ghost" :class="structureToolbarButtonClass" :disabled="!previewSqlText.trim()" @click="copyPreviewSql">
+            <Button variant="ghost" :class="structureToolbarButtonClass" :disabled="sqlPreviewPending || sqlPreviewLoading || !previewSqlText.trim()" @click="copyPreviewSql">
               <Copy :class="[structureIconClass, 'mr-1']" />
               {{ t("structureEditor.copySql") }}
             </Button>
-            <Badge variant="secondary">
-              <Loader2 v-if="sqlPreviewLoading" class="h-3 w-3 animate-spin" />
+            <Badge variant="secondary" class="min-w-6 justify-center tabular-nums">
+              <Loader2 v-if="(sqlPreviewPending || sqlPreviewLoading) && !pendingStatements.length" class="h-3 w-3 animate-spin" />
               <span v-else>{{ pendingStatements.length }}</span>
             </Badge>
           </div>
         </div>
-        <div v-if="!sqlPreviewCollapsed" class="min-h-0 flex-1 overflow-auto p-2.5">
+        <div v-if="!sqlPreviewCollapsed" class="min-h-0 flex-1 overflow-auto p-2.5" :aria-busy="sqlPreviewPending || sqlPreviewLoading">
           <div v-if="hasSqliteTypeChange" class="mb-2 flex gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-[var(--structure-cell-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] text-primary">
             <Info :class="[structureIconClass, 'mt-0.5 shrink-0']" />
             <span>{{ t("structureEditor.sqliteRebuildNotice") }}</span>
@@ -3398,6 +3725,9 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
             </div>
           </div>
           <pre v-if="pendingStatements.length" class="select-text whitespace-pre-wrap break-words rounded-md bg-muted/40 p-2.5 font-mono text-[calc(var(--structure-font-size)+1px)] leading-5" v-html="highlightedSql" />
+          <div v-else-if="sqlPreviewPending || sqlPreviewLoading" class="flex h-full items-center justify-center text-muted-foreground">
+            <Loader2 class="h-4 w-4 animate-spin" />
+          </div>
           <div v-else class="flex h-full items-center justify-center text-[length:var(--structure-font-size)] text-muted-foreground">
             {{ t("structureEditor.noChanges") }}
           </div>
@@ -3416,10 +3746,136 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
         {{ t("structureEditor.apply") }}
       </Button>
     </div>
+
+    <Dialog v-model:open="copyColumnsDialogOpen">
+      <DialogContent class="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{{ t("structureEditor.copyColumnsTitle") }}</DialogTitle>
+        </DialogHeader>
+
+        <div class="space-y-3 overflow-hidden">
+          <label class="grid gap-1.5 text-sm font-medium">
+            {{ t("structureEditor.copyColumnsSourceTable") }}
+            <select
+              :value="copySourceTableName"
+              class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="copySourceTablesLoading || copySourceTables.length === 0"
+              @change="loadCopySourceColumns(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="" disabled>{{ t("structureEditor.copyColumnsSelectSourceTable") }}</option>
+              <option v-for="table in copySourceTables" :key="table.name" :value="table.name">{{ table.name }}</option>
+            </select>
+          </label>
+
+          <div v-if="copySourceTablesLoading" class="flex items-center gap-2 py-5 text-sm text-muted-foreground">
+            <Loader2 class="h-4 w-4 animate-spin" />
+            {{ t("common.loading") }}
+          </div>
+          <div v-else-if="copySourceError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {{ copySourceError }}
+          </div>
+          <div v-else-if="copySourceTables.length === 0" class="rounded-md border border-dashed px-3 py-5 text-center text-sm text-muted-foreground">
+            {{ t("structureEditor.copyColumnsNoSourceTables") }}
+          </div>
+          <template v-else-if="copySourceTableName">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-sm font-medium">{{ t("structureEditor.copyColumnsSelectFields") }}</span>
+              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="copySourceColumnsLoading || copyableSourceColumnNames.length === 0" @click="toggleCopySourceColumns">
+                {{ allCopyableSourceColumnsSelected ? t("structureEditor.copyColumnsClearSelection") : t("structureEditor.copyColumnsSelectAll") }}
+              </Button>
+            </div>
+            <Input v-model="copySourceColumnSearch" :placeholder="t('structureEditor.copyColumnsSearchFields')" />
+            <div v-if="copySourceColumnsLoading" class="flex items-center gap-2 py-5 text-sm text-muted-foreground">
+              <Loader2 class="h-4 w-4 animate-spin" />
+              {{ t("common.loading") }}
+            </div>
+            <div v-else-if="copySourceColumns.length === 0" class="rounded-md border border-dashed px-3 py-5 text-center text-sm text-muted-foreground">
+              {{ t("structureEditor.copyColumnsNoFields") }}
+            </div>
+            <div v-else-if="filteredCopyableSourceColumns.length === 0" class="rounded-md border border-dashed px-3 py-5 text-center text-sm text-muted-foreground">
+              {{ t("structureEditor.copyColumnsNoMatchingFields") }}
+            </div>
+            <div v-else class="max-h-72 overflow-y-auto rounded-md border">
+              <label v-for="{ column, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-center gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
+                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="size-4 rounded border-input" />
+                <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
+                <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+                <Badge v-if="alreadyExists" variant="secondary" class="shrink-0 text-[10px]">{{ t("structureEditor.copyColumnsAlreadyExists") }}</Badge>
+              </label>
+            </div>
+          </template>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" @click="copyColumnsDialogOpen = false">{{ t("structureEditor.copyColumnsCancel") }}</Button>
+          <Button :disabled="copySourceColumnsLoading || selectedCopySourceColumns.length === 0" @click="applyCopiedColumns">
+            {{ t("structureEditor.copyColumnsApply", { count: selectedCopySourceColumns.length }) }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>
 
 <style scoped>
+.structure-table-scroller::-webkit-scrollbar {
+  width: 8px;
+  height: 0;
+}
+
+.structure-horizontal-scrollbar {
+  position: relative;
+  height: 10px;
+  flex-shrink: 0;
+  cursor: pointer;
+  touch-action: none;
+  background: var(--background);
+}
+
+.structure-horizontal-scrollbar__thumb {
+  position: absolute;
+  top: 3px;
+  height: 4px;
+  min-width: 24px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  transition:
+    top 120ms ease,
+    height 120ms ease,
+    background-color 120ms ease;
+}
+
+.structure-horizontal-scrollbar:hover .structure-horizontal-scrollbar__thumb,
+.structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb {
+  top: 2px;
+  height: 6px;
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+}
+
+/* Editable values behave like grid cells, not a row of independent pill controls. */
+.structure-edit-grid :deep(.structure-grid-control) {
+  border-color: transparent;
+  border-radius: 0;
+  background-color: transparent;
+  box-shadow: none;
+}
+
+.structure-edit-grid > tbody > tr > td:hover {
+  background-color: color-mix(in oklab, var(--muted) 36%, transparent);
+}
+
+.structure-edit-grid > tbody > tr > td:focus-within {
+  background-color: color-mix(in oklab, var(--primary) 7%, transparent);
+  outline: 1px solid color-mix(in oklab, var(--primary) 55%, transparent);
+  outline-offset: -1px;
+}
+
+.structure-edit-grid > tbody > tr > td:focus-within :deep(.structure-grid-control) {
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+}
+
 /* --primary is rgb/oklch; use color-mix like DataGrid, not channel-based hsl wrappers. */
 .structure-column-search-match > td:first-child {
   box-shadow: inset 3px 0 0 color-mix(in oklab, var(--primary) 55%, transparent);

@@ -67,12 +67,13 @@ fn web_compression_predicate() -> impl Predicate {
 }
 
 fn web_body_limit_bytes() -> usize {
+    let value = std::env::var("DBX_MAX_UPLOAD_MB").ok();
+    web_body_limit_bytes_from_value(value.as_deref())
+}
+
+fn web_body_limit_bytes_from_value(value: Option<&str>) -> usize {
     const DEFAULT_MB: usize = 1024;
-    let mb = std::env::var("DBX_MAX_UPLOAD_MB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MB);
+    let mb = value.and_then(|value| value.parse::<usize>().ok()).filter(|value| *value > 0).unwrap_or(DEFAULT_MB);
     mb.saturating_mul(1024 * 1024)
 }
 
@@ -332,11 +333,14 @@ async fn main() {
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
+        .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
         .route("/connection/identifier-quote", post(routes::connection::connection_identifier_quote))
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
         .route("/connection/mcp/add", post(routes::connection::mcp_add_connection))
+        .route("/connection/mcp/duplicate", post(routes::connection::mcp_duplicate_connection))
         .route("/connection/mcp/remove", post(routes::connection::mcp_remove_connection))
         .route("/plugins", get(routes::plugins::list_plugins))
         // JDBC
@@ -472,6 +476,7 @@ async fn main() {
         .route("/query/build-drop-table-child-object-sql", post(routes::query::build_drop_table_child_object_sql))
         .route("/query/build-empty-table-sql", post(routes::query::build_empty_table_sql))
         .route("/query/build-truncate-table-sql", post(routes::query::build_truncate_table_sql))
+        .route("/query/build-mysql-auto-increment-sql", post(routes::query::build_mysql_auto_increment_sql))
         .route("/query/build-drop-database-sql", post(routes::query::build_drop_database_sql))
         .route("/query/build-create-schema-sql", post(routes::query::build_create_schema_sql))
         .route("/query/build-update-database-properties-sql", post(routes::query::build_update_database_properties_sql))
@@ -718,6 +723,7 @@ async fn main() {
         // Nacos
         .route("/nacos/test-connection", post(routes::nacos::test_connection))
         .route("/nacos/namespaces/list", post(routes::nacos::list_namespaces))
+        .route("/nacos/sidebar/snapshot", post(routes::nacos::sidebar_snapshot))
         .route("/nacos/namespaces/create", post(routes::nacos::create_namespace))
         .route("/nacos/namespaces/update", post(routes::nacos::update_namespace))
         .route("/nacos/configs/list", post(routes::nacos::list_configs))
@@ -729,6 +735,18 @@ async fn main() {
         .route("/nacos/configs/history/rollback", post(routes::nacos::rollback_config))
         .route("/nacos/rnacos-console/captcha", post(routes::nacos::get_rnacos_console_captcha))
         .route("/nacos/rnacos-console/login", post(routes::nacos::login_rnacos_console))
+        .route("/nacos/users/list", post(routes::nacos::list_users))
+        .route("/nacos/users/create", post(routes::nacos::create_user))
+        .route("/nacos/users/update", post(routes::nacos::update_user))
+        .route("/nacos/users/delete", post(routes::nacos::delete_user))
+        .route("/nacos/roles/list", post(routes::nacos::list_role_bindings))
+        .route("/nacos/roles/assign", post(routes::nacos::assign_role))
+        .route("/nacos/roles/remove", post(routes::nacos::remove_role))
+        .route("/nacos/access/snapshot", post(routes::nacos::access_snapshot))
+        .route("/nacos/access/operations/start", post(routes::nacos::start_access_operation))
+        .route("/nacos/access/operations/get", post(routes::nacos::get_access_operation))
+        .route("/nacos/access/operations/retry", post(routes::nacos::retry_access_operation))
+        .route("/nacos/access/operations/undo", post(routes::nacos::undo_access_operation))
         .route("/nacos/services/list", post(routes::nacos::list_services))
         .route("/nacos/services/get", post(routes::nacos::get_service))
         .route("/nacos/services/create", post(routes::nacos::create_service))
@@ -759,6 +777,8 @@ async fn main() {
         .route("/document-store/list-databases", post(routes::document_store::list_databases))
         .route("/document-store/list-collections", post(routes::document_store::list_collections))
         .route("/document-store/find-documents", post(routes::document_store::find_documents))
+        .route("/document-store/count-documents", post(routes::document_store::count_documents))
+        .route("/document-store/dynamodb-describe-table", post(routes::document_store::describe_dynamodb_table))
         .route(
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
@@ -773,6 +793,7 @@ async fn main() {
         .route("/document-store/insert-document", post(routes::document_store::insert_document))
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
+        .route("/document-store/save-meilisearch-batch", post(routes::document_store::save_meilisearch_batch))
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
         .route("/mongo/parse-shell-command", post(routes::mongo::parse_shell_command))
         .route("/mongo/explain-find", post(routes::mongo::explain_find))
@@ -782,8 +803,10 @@ async fn main() {
         .route("/mongo/collection-stats", post(routes::mongo::collection_stats))
         .route("/mongo/aggregate-documents", post(routes::mongo::aggregate_documents))
         .route("/mongo/distinct", post(routes::mongo::distinct))
+        .route("/mongo/list-index-specs", post(routes::mongo::list_index_specs))
         .route("/mongo/create-index", post(routes::mongo::create_index))
         .route("/mongo/create-user", post(routes::mongo::create_user))
+        .route("/mongo/run-command", post(routes::mongo::run_command))
         .route("/mongo/drop-indexes", post(routes::mongo::drop_indexes))
         .route("/mongo/insert-document", post(routes::mongo::insert_document))
         .route("/mongo/insert-documents", post(routes::mongo::insert_documents))
@@ -877,7 +900,12 @@ async fn main() {
         .route("/sql-file/progress/{executionId}", get(routes::sql_file::sql_file_progress))
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
         // Table import
-        .route("/import/preview", post(routes::table_import::preview_import))
+        .route(
+            "/import/preview",
+            post(routes::table_import::preview_import).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
         .route("/import/preview-source", post(routes::table_import::preview_uploaded_import))
         .route("/import/source/release", post(routes::table_import::release_import_source))
         .route("/import/execute", post(routes::table_import::execute_import))
@@ -982,13 +1010,15 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        mount_public_base_path, normalize_public_base_path, web_agent_dir_from_env, web_compression_predicate,
-        XLSX_CONTENT_TYPE,
+        mount_public_base_path, normalize_public_base_path, web_agent_dir_from_env, web_body_limit_bytes_from_value,
+        web_compression_predicate, XLSX_CONTENT_TYPE,
     };
+    use crate::routes::table_import;
     use axum::body::Body;
+    use axum::extract::{DefaultBodyLimit, Multipart};
     use axum::http::header::CONTENT_TYPE;
-    use axum::http::Response;
-    use axum::routing::get;
+    use axum::http::{Response, StatusCode};
+    use axum::routing::{get, post};
     use axum::Router;
     use tower_http::compression::predicate::Predicate;
 
@@ -1038,6 +1068,70 @@ mod tests {
             web_agent_dir_from_env(&data_dir, Some("/custom/agents".to_string())),
             std::path::PathBuf::from("/custom/agents")
         );
+    }
+
+    #[test]
+    fn web_upload_limit_parses_valid_values_and_preserves_safe_fallbacks() {
+        const MIB: usize = 1024 * 1024;
+
+        assert_eq!(web_body_limit_bytes_from_value(None), 1024 * MIB);
+        assert_eq!(web_body_limit_bytes_from_value(Some("")), 1024 * MIB);
+        assert_eq!(web_body_limit_bytes_from_value(Some("0")), 1024 * MIB);
+        assert_eq!(web_body_limit_bytes_from_value(Some("invalid")), 1024 * MIB);
+        assert_eq!(web_body_limit_bytes_from_value(Some("4096")), 4096usize.saturating_mul(MIB));
+        assert_eq!(web_body_limit_bytes_from_value(Some(&usize::MAX.to_string())), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn import_route_reserves_multipart_framing_above_the_file_limit() {
+        const FILE_LIMIT: usize = 8;
+
+        async fn uploaded_file_size(mut multipart: Multipart) -> Result<String, StatusCode> {
+            let field =
+                multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)?.ok_or(StatusCode::BAD_REQUEST)?;
+            let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            Ok(bytes.len().to_string())
+        }
+
+        let router = Router::new()
+            .route("/general", post(uploaded_file_size))
+            .route(
+                "/import",
+                post(uploaded_file_size)
+                    .layer(DefaultBodyLimit::max(table_import::import_request_body_limit_for_upload(FILE_LIMIT))),
+            )
+            .layer(DefaultBodyLimit::max(FILE_LIMIT));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve test router");
+        });
+        let boundary = "dbx-import-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.csv\"\r\n\r\n12345678\r\n--{boundary}--\r\n"
+        );
+        let client = reqwest::Client::new();
+
+        let general_response = client
+            .post(format!("http://{address}/general"))
+            .header(CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+            .body(body.clone())
+            .send()
+            .await
+            .expect("send request through general limit");
+        assert_eq!(general_response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let import_response = client
+            .post(format!("http://{address}/import"))
+            .header(CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+            .body(body)
+            .send()
+            .await
+            .expect("send request through import limit");
+        assert_eq!(import_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(import_response.text().await.expect("read import response"), FILE_LIMIT.to_string());
+
+        server.abort();
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 import type { BackendError } from "@/lib/backend/errorUtils";
+import type { TransferContent, TransferMode, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/tauri";
 import type { MultiDbResultRunExecution } from "@/types/sqlExecution";
 
 export type DatabaseType =
@@ -13,9 +14,11 @@ export type DatabaseType =
   | "clickhouse"
   | "sqlserver"
   | "mongodb"
+  | "dynamodb"
   | "oracle"
   | "elasticsearch"
   | "easysearch"
+  | "meilisearch"
   | "hbase"
   | "qdrant"
   | "milvus"
@@ -51,6 +54,8 @@ export type DatabaseType =
   | "trino"
   | "prestosql"
   | "hive"
+  | "kyuubi"
+  | "impala"
   | "spark"
   | "db2"
   | "informix"
@@ -78,6 +83,10 @@ export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): bo
   return dbType === "elasticsearch" || dbType === "easysearch";
 }
 
+export function isMeilisearchDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "meilisearch";
+}
+
 export interface SqlSnippet {
   id: string;
   label: string;
@@ -86,9 +95,9 @@ export interface SqlSnippet {
   enabled?: boolean;
 }
 
-export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column";
+export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column" | "sequence";
 
-export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "object";
+export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "sequence" | "object";
 
 export type CompletionAssistantMatchMode = "prefix" | "contains";
 
@@ -185,6 +194,12 @@ export interface ConnectionConfig {
   informix_server?: string;
   external_config?: unknown;
   one_time?: boolean;
+  /**
+   * Whether the database password may be persisted locally. When false, the
+   * password is never written to local storage and the user is prompted on
+   * every connect. Absent/true keeps current behavior (password saved).
+   */
+  save_password?: boolean;
   read_only?: boolean;
   /** Explicit production marker for every database reachable through this connection. */
   is_production?: boolean;
@@ -248,9 +263,7 @@ export interface SshTunnelConfig {
    * `"key+password"` tries private key auth first and falls back to
    * password auth if the key is rejected.
    *
-   * `"agent"` is a legacy value: it's no longer offered as a dropdown
-   * choice for new connections, but is preserved and displayed read-only
-   * for connections that already have `use_ssh_agent` configured.
+   * `"agent"` uses identities from the configured SSH agent socket.
    */
   auth_method?: "password" | "key" | "key+password" | "agent" | "none";
   /** Allow `nc` through an SSH exec channel when direct-tcpip is prohibited. */
@@ -554,6 +567,8 @@ export interface IndexInfo {
   index_type?: string | null;
   included_columns?: string[] | null;
   comment?: string | null;
+  /** Parallel to `columns`: true at index i means columns[i] is a raw expression, not a plain column name. */
+  key_is_expression?: boolean[] | null;
 }
 
 export interface ForeignKeyInfo {
@@ -713,6 +728,8 @@ export interface QueryResult {
   /** Whether a backend-reported result total is exact. */
   total_is_exact?: boolean;
   truncated?: boolean;
+  /** Variable-length cells represented by bounded previews in `rows`. */
+  large_value_cells?: Array<{ row_index: number; column_index: number; original_bytes: number }>;
   session_id?: string | null;
   has_more?: boolean;
   /** For Elasticsearch REST search results parsed into a _source table,
@@ -759,12 +776,19 @@ export interface SpatialColumn {
   srid: number | null;
 }
 
+export interface QueryResultSourceColumnRef {
+  sourceKey: string;
+  sourceColumn: string;
+}
+
 export interface QueryResultRun {
   id: string;
   title: string;
   sequence: number;
   sql: string;
   createdAt: number;
+  /** Distinguishes successive result payloads that reuse the same run slot. */
+  resultGridRevision?: string;
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
@@ -778,6 +802,7 @@ export interface QueryResultRun {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalLargeValueCells?: QueryResult["large_value_cells"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
@@ -796,6 +821,8 @@ export interface QueryResultRun {
   resultEvicted?: boolean;
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
+  resultColumnComments?: QueryTab["resultColumnComments"];
+  queryDisplaySourceColumns?: QueryTab["queryDisplaySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
@@ -886,6 +913,7 @@ export type TreeNodeType =
   | "group-table-partitions"
   | "group-table-subpartitions"
   | "group-tables"
+  | "group-dolt-system-tables"
   | "group-views"
   | "group-materialized-views"
   | "group-procedures"
@@ -899,6 +927,8 @@ export type TreeNodeType =
   | "extension"
   | "object-browser"
   | "user-admin"
+  | "dameng-users"
+  | "dameng-roles"
   | "dameng-job-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
@@ -919,6 +949,7 @@ export type TreeNodeType =
   | "redis-db"
   | "mq-tenant"
   | "nacos-namespace"
+  | "nacos-access-control"
   | "etcd-root"
   | "etcd-dashboard"
   | "etcd-access-control"
@@ -930,6 +961,7 @@ export type TreeNodeType =
   | "mongo-buckets"
   | "mongo-bucket"
   | "mongo-collection"
+  | "dynamodb-table"
   | "vector-database"
   | "vector-collection"
   | "elasticsearch-index"
@@ -952,6 +984,8 @@ export interface TreeNode {
   id: string;
   label: string;
   type: TreeNodeType;
+  /** Additional values matched by sidebar search without rendering them. */
+  searchAliases?: string[];
   children?: TreeNode[];
   isLoading?: boolean;
   isExpanded?: boolean;
@@ -1015,7 +1049,7 @@ export interface TableNameFilter {
   excludePatterns: string[];
 }
 
-export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "constraints" | "triggers" | "ddl";
 
 export interface TableStructureEditorTarget {
   kind: "column" | "index";
@@ -1031,6 +1065,8 @@ export interface TableStructureEditorDraft {
   columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
+  constraints?: ConstraintInfo[];
+  constraintsLoaded?: boolean;
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
   triggersLoaded?: boolean;
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
@@ -1060,6 +1096,8 @@ export interface QueryTab {
   id: string;
   title: string;
   customTitle?: boolean;
+  /** Force the editor to word-wrap regardless of the global setting, e.g. for auto-generated single-line templates. */
+  forceWordWrap?: boolean;
   connectionId: string;
   database: string;
   schema?: string;
@@ -1083,6 +1121,7 @@ export interface QueryTab {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalLargeValueCells?: QueryResult["large_value_cells"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
@@ -1102,6 +1141,8 @@ export interface QueryTab {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  /** Distinguishes successive result payloads that reuse the current result slot. */
+  resultGridRevision?: string;
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
   resultAutoSave?: boolean;
@@ -1153,12 +1194,16 @@ export interface QueryTab {
     | "mqtt"
     | "nacos"
     | "nacos-dashboard"
+    | "nacos-access-control"
     | "databases"
     | "objects"
     | "structure"
     | "users"
+    | "dameng-users"
+    | "dameng-roles"
     | "dameng-jobs"
     | "processlist"
+    | "sqlserver-trace"
     | "mysql-dashboard"
     | "postgres-dashboard";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
@@ -1221,6 +1266,7 @@ export interface QueryTab {
     multiSource?: boolean;
     allowInsert?: boolean;
     allowInsertDelete?: boolean;
+    distinct?: boolean;
     sources?: {
       key: string;
       catalog?: string;
@@ -1242,6 +1288,25 @@ export interface QueryTab {
     }[];
   };
   querySourceColumns?: Array<string | undefined>;
+  /**
+   * Column comments for a multi-source query result (e.g. JOIN), indexed by
+   * result-column ordinal (projection order). Each entry is the comment of the
+   * single base column that result column resolves to; `undefined` when the
+   * column is ambiguous (e.g. an unqualified name present in several sources)
+   * or cannot be resolved back to a base column, so the grid shows no comment
+   * instead of a wrong one. Populated even when the result is not editable
+   * (e.g. multi-table JOIN), so joined results still show column comments.
+   */
+  resultColumnComments?: Array<string | undefined>;
+  /**
+   * Display-only result-column to source mapping for multi-source results,
+   * indexed by result-column ordinal. Each entry carries the source identity
+   * (sourceKey + canonical source column name), so comments resolve per source
+   * instead of first-source-wins on name clashes. Unlike querySourceColumns it
+   * is also populated for multi-source results that are not editable, and must
+   * never be used for row identity or editing.
+   */
+  queryDisplaySourceColumns?: Array<QueryResultSourceColumnRef | undefined>;
   queryEditabilityReason?: "not-select" | "cte" | "set-operation" | "aggregation" | "external-source" | "complex-source" | "computed-columns" | "no-table" | "no-primary-key" | "primary-key-not-returned" | "aliased-columns" | "metadata-unavailable";
   mongoEditTarget?: {
     collection: string;
@@ -1278,6 +1343,8 @@ export interface SavedSqlFile {
   folderId?: string;
   name: string;
   database: string;
+  /** Undefined means the connection's built-in/default catalog. */
+  catalog?: string;
   schema?: string;
   sql: string;
   sqlLoaded?: boolean;
@@ -1291,6 +1358,50 @@ export interface SavedSqlFile {
 export interface SavedSqlLibrary {
   folders: SavedSqlFolder[];
   files: SavedSqlFile[];
+}
+
+/** Serializable configuration of a saved data-transfer task. */
+export interface TransferTaskConfig {
+  sourceConnectionId: string;
+  /** Undefined means the connection's built-in/default catalog. */
+  sourceCatalog?: string;
+  sourceDatabase: string;
+  sourceSchema?: string;
+  targetConnectionId: string;
+  targetCatalog?: string;
+  targetDatabase: string;
+  targetSchema?: string;
+  /** Selected object names grouped by object kind (TABLE, VIEW, ...). */
+  objects: Partial<Record<TransferObjectKind, string[]>>;
+  content: TransferContent;
+  mode: TransferMode;
+  targetTableNameCase: TransferTableNameCase;
+  batchSize: number;
+}
+
+export interface TransferTask {
+  id: string;
+  folderId?: string;
+  name: string;
+  orderIndex?: number;
+  config: TransferTaskConfig;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TransferTaskFolder {
+  id: string;
+  parentFolderId?: string;
+  name: string;
+  orderIndex?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TransferTaskLibrary {
+  version: 1;
+  folders: TransferTaskFolder[];
+  tasks: TransferTask[];
 }
 
 export interface VectorCollectionMeta {

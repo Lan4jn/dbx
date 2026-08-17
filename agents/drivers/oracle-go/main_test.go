@@ -207,6 +207,15 @@ func TestEmptyResultSlicesMarshalAsArrays(t *testing.T) {
 	if strings.Contains(text, `"columns":null`) || strings.Contains(text, `"included_columns":null`) {
 		t.Fatalf("index info should marshal nil slices as arrays: %s", text)
 	}
+
+	data, err = json.Marshal(constraintInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = string(data)
+	if strings.Contains(text, `"columns":null`) || strings.Contains(text, `"ref_columns":null`) {
+		t.Fatalf("constraint info should marshal nil slices as arrays: %s", text)
+	}
 }
 
 func TestGetTableDDLResultMarshalsAsString(t *testing.T) {
@@ -536,9 +545,9 @@ func TestGetTableDDLFallbackPreservesQuotedColumnNames(t *testing.T) {
 			args:          []driver.Value{schema, table},
 			columns: []string{
 				"COLUMN_NAME", "DATA_TYPE", "NULLABLE", "DATA_DEFAULT", "IS_PRIMARY_KEY",
-				"COMMENTS", "DATA_PRECISION", "DATA_SCALE", "CHAR_LENGTH",
+				"COMMENTS", "DATA_PRECISION", "DATA_SCALE", "CHAR_LENGTH", "CHAR_USED",
 			},
-			rows: [][]driver.Value{{"FlowId", "VARCHAR2", "N", nil, int64(1), nil, nil, nil, int64(50)}},
+			rows: [][]driver.Value{{"FlowId", "VARCHAR2", "N", nil, int64(1), nil, nil, nil, int64(50), "C"}},
 		},
 	})
 	s := newServer()
@@ -549,7 +558,7 @@ func TestGetTableDDLFallbackPreservesQuotedColumnNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `CREATE TABLE "ZTZS_ERP2"."ZGJ_FlowSealTemplate" (
-  "FlowId" VARCHAR2(50) NOT NULL,
+  "FlowId" VARCHAR2(50 CHAR) NOT NULL,
   PRIMARY KEY ("FlowId")
 )`
 	if got != want {
@@ -740,6 +749,104 @@ func TestListForeignKeysIncludesReferencedSchemaAndDeleteRule(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("listForeignKeys() = %#v, want %#v", got, want)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestListConstraintsGroupsMultiColumnPrimaryKeyAndMapsTypes(t *testing.T) {
+	const schema = "HR"
+	const table = "ORDERS"
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "FROM ALL_CONSTRAINTS ac",
+			args:          []driver.Value{schema, table},
+			columns:       []string{"CONSTRAINT_NAME", "CONSTRAINT_TYPE", "SEARCH_CONDITION", "GENERATED", "STATUS", "DEFERRABLE", "DEFERRED", "VALIDATED", "COLUMN_NAME", "POSITION", "NULLABLE"},
+			rows: [][]driver.Value{
+				{"PK_ORDERS", "P", nil, "USER NAME", "ENABLED", "NOT DEFERRABLE", "IMMEDIATE", "VALIDATED", "TENANT_ID", int64(1), "N"},
+				{"PK_ORDERS", "P", nil, "USER NAME", "ENABLED", "NOT DEFERRABLE", "IMMEDIATE", "VALIDATED", "ORDER_ID", int64(2), "N"},
+				{"UQ_ORDERS_CODE", "U", nil, "USER NAME", "ENABLED", "DEFERRABLE", "DEFERRED", "VALIDATED", "ORDER_CODE", int64(1), "Y"},
+				{"CK_ORDERS_AMOUNT", "C", "AMOUNT > 0", "USER NAME", "DISABLED", "NOT DEFERRABLE", "IMMEDIATE", "NOT VALIDATED", nil, nil, nil},
+			},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	got, err := s.listConstraints(schema, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []constraintInfo{
+		{Name: "PK_ORDERS", ConstraintType: "PRIMARY KEY", Definition: "", Columns: []string{"TENANT_ID", "ORDER_ID"}, RefColumns: []string{}, Enabled: true, Valid: true},
+		{Name: "UQ_ORDERS_CODE", ConstraintType: "UNIQUE", Definition: "", Columns: []string{"ORDER_CODE"}, RefColumns: []string{}, Deferrable: true, InitiallyDeferred: true, Enabled: true, Valid: true},
+		{Name: "CK_ORDERS_AMOUNT", ConstraintType: "CHECK", Definition: "AMOUNT > 0", Columns: []string{}, RefColumns: []string{}, Enabled: false, Valid: false},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("listConstraints() = %#v, want %#v", got, want)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestListConstraintsExcludesGeneratedNotNullChecksButKeepsRealChecks(t *testing.T) {
+	const schema = "HR"
+	const table = "ORDERS"
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "FROM ALL_CONSTRAINTS ac",
+			args:          []driver.Value{schema, table},
+			columns:       []string{"CONSTRAINT_NAME", "CONSTRAINT_TYPE", "SEARCH_CONDITION", "GENERATED", "STATUS", "DEFERRABLE", "DEFERRED", "VALIDATED", "COLUMN_NAME", "POSITION", "NULLABLE"},
+			rows: [][]driver.Value{
+				{"SYS_C008648", "C", `"ORDER_CODE" IS NOT NULL`, "GENERATED NAME", "ENABLED", "NOT DEFERRABLE", "IMMEDIATE", "VALIDATED", "ORDER_CODE", int64(1), "N"},
+				{"SYS_C008649", "C", `"OPTIONAL_CODE" IS NOT NULL`, "GENERATED NAME", "ENABLED", "NOT DEFERRABLE", "IMMEDIATE", "VALIDATED", "OPTIONAL_CODE", int64(1), "Y"},
+				{"CK_REQUIRED_CODE", "C", `"REQUIRED_CODE" IS NOT NULL`, "USER NAME", "ENABLED", "NOT DEFERRABLE", "IMMEDIATE", "VALIDATED", "REQUIRED_CODE", int64(1), "N"},
+				{"CK_ORDERS_AMOUNT", "C", "AMOUNT > 0", "USER NAME", "ENABLED", "NOT DEFERRABLE", "IMMEDIATE", "VALIDATED", nil, nil, nil},
+			},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	got, err := s.listConstraints(schema, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []constraintInfo{
+		{Name: "SYS_C008649", ConstraintType: "CHECK", Definition: `"OPTIONAL_CODE" IS NOT NULL`, Columns: []string{"OPTIONAL_CODE"}, RefColumns: []string{}, Enabled: true, Valid: true},
+		{Name: "CK_REQUIRED_CODE", ConstraintType: "CHECK", Definition: `"REQUIRED_CODE" IS NOT NULL`, Columns: []string{"REQUIRED_CODE"}, RefColumns: []string{}, Enabled: true, Valid: true},
+		{Name: "CK_ORDERS_AMOUNT", ConstraintType: "CHECK", Definition: "AMOUNT > 0", Columns: []string{}, RefColumns: []string{}, Enabled: true, Valid: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("listConstraints() = %#v, want %#v (system-generated NOT NULL check must be excluded, real CHECK must survive)", got, want)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestListConstraintsPreservesQuotedMixedCaseSchema(t *testing.T) {
+	const schema = "AppOwner"
+	const table = "Orders"
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "FROM ALL_CONSTRAINTS ac",
+			args:          []driver.Value{schema, table},
+			columns:       []string{"CONSTRAINT_NAME", "CONSTRAINT_TYPE", "SEARCH_CONDITION", "GENERATED", "STATUS", "DEFERRABLE", "DEFERRED", "VALIDATED", "COLUMN_NAME", "POSITION", "NULLABLE"},
+			rows:          [][]driver.Value{},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	constraints, err := s.listConstraints(schema, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constraints) != 0 {
+		t.Fatalf("listConstraints(%q) = %#v, want empty result", schema, constraints)
 	}
 	if scripted.next != len(scripted.steps) {
 		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
@@ -961,6 +1068,8 @@ func TestOracleColumnTypeDDL(t *testing.T) {
 	precision := 10
 	scale := 2
 	zeroScale := 0
+	byteUnit := "B"
+	charUnit := "C"
 
 	tests := []struct {
 		name   string
@@ -968,6 +1077,9 @@ func TestOracleColumnTypeDDL(t *testing.T) {
 		want   string
 	}{
 		{name: "varchar", column: columnInfo{DataType: "VARCHAR2", CharacterMaximumLength: &charLen}, want: "VARCHAR2(64)"},
+		{name: "varchar byte semantics", column: columnInfo{DataType: "VARCHAR2", CharacterMaximumLength: &charLen, CharacterLengthUnit: &byteUnit}, want: "VARCHAR2(64 BYTE)"},
+		{name: "varchar char semantics", column: columnInfo{DataType: "VARCHAR2", CharacterMaximumLength: &charLen, CharacterLengthUnit: &charUnit}, want: "VARCHAR2(64 CHAR)"},
+		{name: "national character type ignores unit", column: columnInfo{DataType: "NVARCHAR2", CharacterMaximumLength: &charLen, CharacterLengthUnit: &charUnit}, want: "NVARCHAR2(64)"},
 		{name: "number scale", column: columnInfo{DataType: "NUMBER", NumericPrecision: &precision, NumericScale: &scale}, want: "NUMBER(10,2)"},
 		{name: "number zero scale", column: columnInfo{DataType: "NUMBER", NumericPrecision: &precision, NumericScale: &zeroScale}, want: "NUMBER(10)"},
 		{name: "timestamp preserves precision", column: columnInfo{DataType: "TIMESTAMP(6)"}, want: "TIMESTAMP(6)"},
@@ -984,8 +1096,58 @@ func TestOracleColumnTypeDDL(t *testing.T) {
 func TestBuildDSNUsesConnectionStringWhenProvided(t *testing.T) {
 	dsn := buildDSN(connectParams{ConnectionString: "oracle://scott:tiger@db.example.com:1521/ORCLPDB1"})
 
-	if dsn != "oracle://scott:tiger@db.example.com:1521/ORCLPDB1" {
-		t.Fatalf("unexpected dsn: %s", dsn)
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("PREFETCH_ROWS") != oracleDefaultPrefetchRows {
+		t.Fatalf("raw Oracle DSN should use the DBX prefetch default, got: %s", dsn)
+	}
+}
+
+func TestBuildDSNUsesStableDefaultPrefetchRows(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Host:     "db.example.com",
+		Port:     1521,
+		Database: "XE",
+		Username: "scott",
+		Password: "tiger",
+	})
+
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("PREFETCH_ROWS") != oracleDefaultPrefetchRows {
+		t.Fatalf("generated Oracle DSN should use the DBX prefetch default, got: %s", dsn)
+	}
+}
+
+func TestBuildDSNPreservesConfiguredPrefetchRows(t *testing.T) {
+	tests := []connectParams{
+		{
+			Host:      "db.example.com",
+			Port:      1521,
+			Database:  "XE",
+			Username:  "scott",
+			Password:  "tiger",
+			URLParams: "prefetch_rows=20",
+		},
+		{ConnectionString: "oracle://scott:tiger@db.example.com:1521/XE?prefetch_rows=50"},
+	}
+
+	for _, params := range tests {
+		dsn := buildDSN(params)
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.Query().Get("prefetch_rows") == "" {
+			t.Fatalf("configured prefetch rows should be preserved, got: %s", dsn)
+		}
+		if parsed.Query().Get("PREFETCH_ROWS") != "" {
+			t.Fatalf("default prefetch rows should not be added beside a configured value, got: %s", dsn)
+		}
 	}
 }
 
@@ -1600,6 +1762,9 @@ func TestListObjectsSQLUsesSplitDictionaryQuery(t *testing.T) {
 	if !strings.Contains(sqlText, "'PACKAGE BODY'") || !strings.Contains(sqlText, "PACKAGE_BODY") {
 		t.Fatalf("object listing should include package bodies with normalized type, got: %s", oracleListObjectsSQL)
 	}
+	if !strings.Contains(sqlText, "ALL_SYNONYMS") || !strings.Contains(sqlText, "'SYNONYM' AS OBJECT_TYPE") {
+		t.Fatalf("object listing should include schema synonyms, got: %s", oracleListObjectsSQL)
+	}
 }
 
 func TestListObjectsQueryAppliesMetadataConstraints(t *testing.T) {
@@ -1610,19 +1775,19 @@ func TestListObjectsQueryAppliesMetadataConstraints(t *testing.T) {
 	})
 	sqlText := strings.ToUpper(query.SQL)
 
-	if !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE :3 ESCAPE '\\'") {
+	if !strings.Contains(sqlText, "UPPER(OBJECT_NAME) LIKE :4 ESCAPE '\\'") {
 		t.Fatalf("object listing should push filter predicate, got: %s", query.SQL)
 	}
-	if !strings.Contains(sqlText, "OBJECT_TYPE IN (:4,:5)") {
+	if !strings.Contains(sqlText, "OBJECT_TYPE IN (:5,:6)") {
 		t.Fatalf("object listing should push object type predicate, got: %s", query.SQL)
 	}
-	if !strings.Contains(sqlText, "ROWNUM <= :6") || !strings.Contains(sqlText, "DBX_RN > :7") {
+	if !strings.Contains(sqlText, "ROWNUM <= :7") || !strings.Contains(sqlText, "DBX_RN > :8") {
 		t.Fatalf("object listing should use rownum pagination, got: %s", query.SQL)
 	}
-	if len(query.Args) != 7 {
+	if len(query.Args) != 8 {
 		t.Fatalf("unexpected args: %#v", query.Args)
 	}
-	if query.Args[2] != "%P%K%G%\\%%" || query.Args[3] != "FUNCTION" || query.Args[4] != "PACKAGE" || query.Args[5] != 25 || query.Args[6] != 0 {
+	if query.Args[0] != "APP" || query.Args[1] != "APP" || query.Args[2] != "APP" || query.Args[3] != "%P%K%G%\\%%" || query.Args[4] != "FUNCTION" || query.Args[5] != "PACKAGE" || query.Args[6] != 25 || query.Args[7] != 0 {
 		t.Fatalf("object constraints args were not normalized: %#v", query.Args)
 	}
 }
@@ -1641,6 +1806,9 @@ func TestListSessionUserObjectsQueryUsesUserDictionary(t *testing.T) {
 	if strings.Contains(sqlText, "ALL_TABLES") || strings.Contains(sqlText, "ALL_OBJECTS") {
 		t.Fatalf("session-user object listing should avoid ALL_* dictionaries, got: %s", query.SQL)
 	}
+	if !strings.Contains(sqlText, "USER_SYNONYMS") {
+		t.Fatalf("session-user object listing should include owned synonyms, got: %s", query.SQL)
+	}
 	if strings.Contains(sqlText, "OWNER =") {
 		t.Fatalf("session-user object listing should not add owner predicates, got: %s", query.SQL)
 	}
@@ -1658,6 +1826,26 @@ func TestListSessionUserObjectsQueryUsesUserDictionary(t *testing.T) {
 	}
 	if query.Args[0] != "%P%K%G%\\%%" || query.Args[1] != "FUNCTION" || query.Args[2] != "PACKAGE" || query.Args[3] != 25 || query.Args[4] != 0 {
 		t.Fatalf("object constraints args were not normalized: %#v", query.Args)
+	}
+}
+
+func TestListObjectsQuerySupportsSynonymOnlyFiltering(t *testing.T) {
+	query := oracleListObjectsQuery("AP", metadataListConstraints{
+		Filter:      "spec",
+		Limit:       10,
+		Offset:      20,
+		ObjectTypes: []string{"synonym"},
+	})
+	sqlText := strings.ToUpper(query.SQL)
+
+	if !strings.Contains(sqlText, "FROM ALL_SYNONYMS") || !strings.Contains(sqlText, "S.OWNER = :3") {
+		t.Fatalf("cross-schema synonym listing should use the selected owner, got: %s", query.SQL)
+	}
+	if !strings.Contains(sqlText, "OBJECT_TYPE IN (:5)") {
+		t.Fatalf("synonym filtering should be pushed into the constrained query, got: %s", query.SQL)
+	}
+	if len(query.Args) != 7 || query.Args[2] != "AP" || query.Args[3] != "%S%P%E%C%" || query.Args[4] != "SYNONYM" || query.Args[5] != 30 || query.Args[6] != 20 {
+		t.Fatalf("unexpected synonym query args: %#v", query.Args)
 	}
 }
 
@@ -1965,6 +2153,123 @@ func TestRewriteOracleXMLTypeSkipsJoins(t *testing.T) {
 	}
 }
 
+func TestRewriteOracleLOBSelectStarAsDeferredValues(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT t.* FROM TEST_LOBS t ORDER BY t.ID DESC`,
+		fakeOracleColumnLoader([]oracleColumnMeta{
+			{Name: "ID", DataType: "NUMBER"},
+			{Name: "PAYLOAD", DataType: "CLOB"},
+			{Name: "NATIONAL_TEXT", DataType: "NCLOB"},
+			{Name: "BINARY_DATA", DataType: "BLOB"},
+			{Name: "FILE_DATA", DataType: "BFILE"},
+		}),
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT t."ID", CASE WHEN t."PAYLOAD" IS NULL THEN NULL ELSE '<CLOB>' END AS "PAYLOAD", CASE WHEN t."PAYLOAD" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_C_1", CASE WHEN t."NATIONAL_TEXT" IS NULL THEN NULL ELSE '<NCLOB>' END AS "NATIONAL_TEXT", CASE WHEN t."NATIONAL_TEXT" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_N_2", CASE WHEN t."BINARY_DATA" IS NULL THEN NULL ELSE '<BLOB>' END AS "BINARY_DATA", CASE WHEN t."BINARY_DATA" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_L_3", CASE WHEN t."FILE_DATA" IS NULL THEN NULL ELSE '<BFILE>' END AS "FILE_DATA", CASE WHEN t."FILE_DATA" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_F_4" FROM TEST_LOBS t ORDER BY t.ID DESC`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestRewriteOracleLOBExplicitColumnUsesVisibleResultIndex(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT t.ID, t.PAYLOAD AS body, LENGTH(t.PAYLOAD) AS payload_length FROM TEST_LOBS t`,
+		fakeOracleColumnLoader([]oracleColumnMeta{
+			{Name: "ID", DataType: "NUMBER"},
+			{Name: "PAYLOAD", DataType: "CLOB"},
+		}),
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `SELECT t.ID, CASE WHEN t."PAYLOAD" IS NULL THEN NULL ELSE '<CLOB>' END AS body, CASE WHEN t."PAYLOAD" IS NULL THEN NULL ELSE 'D:1' END AS "__DBX_LARGE_VALUE_BYTES_C_1", LENGTH(t.PAYLOAD) AS payload_length FROM TEST_LOBS t`
+	if sqlText != want {
+		t.Fatalf("rewriteOracleSelectSQL() = %s, want %s", sqlText, want)
+	}
+}
+
+func TestRewriteOracleLOBNestedRownumQuery(t *testing.T) {
+	sqlText, err := rewriteOracleSelectSQL(
+		`SELECT * FROM (SELECT ID, PAYLOAD FROM TEST_LOBS ORDER BY ID DESC) WHERE ROWNUM <= 10`,
+		fakeOracleColumnLoader([]oracleColumnMeta{
+			{Name: "ID", DataType: "NUMBER"},
+			{Name: "PAYLOAD", DataType: "CLOB"},
+		}),
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sqlText, `CASE WHEN "PAYLOAD" IS NULL THEN NULL ELSE '<CLOB>' END AS "PAYLOAD"`) ||
+		!strings.Contains(sqlText, `"__DBX_LARGE_VALUE_BYTES_C_1"`) {
+		t.Fatalf("expected nested CLOB column to be deferred, got: %s", sqlText)
+	}
+}
+
+func TestRewriteOracleLOBSkipsDerivedProjectionThatDropsMarkers(t *testing.T) {
+	called := false
+	input := `SELECT PAYLOAD FROM (SELECT PAYLOAD FROM TEST_LOBS)`
+	sqlText, err := rewriteOracleSelectSQL(
+		input,
+		func(schema, table string) ([]oracleColumnMeta, error) {
+			called = true
+			return []oracleColumnMeta{{Name: "PAYLOAD", DataType: "CLOB"}}, nil
+		},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("derived projection should not load table metadata")
+	}
+	if sqlText != input {
+		t.Fatalf("derived projection should remain unchanged, got: %s", sqlText)
+	}
+}
+
+func TestRewriteOracleLOBPreservesUnsafeQueries(t *testing.T) {
+	columns := []oracleColumnMeta{{Name: "ID", DataType: "NUMBER"}, {Name: "PAYLOAD", DataType: "CLOB"}}
+	tests := []string{
+		`SELECT DISTINCT PAYLOAD FROM TEST_LOBS`,
+		`SELECT l.PAYLOAD FROM TEST_LOBS l JOIN OTHER_TABLE o ON o.ID = l.ID`,
+		`SELECT PAYLOAD FROM TEST_LOBS UNION ALL SELECT PAYLOAD FROM OTHER_TABLE`,
+	}
+	for _, input := range tests {
+		sqlText, err := rewriteOracleSelectSQL(input, fakeOracleColumnLoader(columns), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sqlText != input {
+			t.Fatalf("unsafe query should not be rewritten: %s", sqlText)
+		}
+	}
+}
+
+func TestRewriteOracleLOBRequiresDeferredModeAndSafeMarkerNames(t *testing.T) {
+	input := `SELECT * FROM TEST_LOBS`
+	tests := []struct {
+		deferLOBs bool
+		columns   []oracleColumnMeta
+	}{
+		{deferLOBs: false, columns: []oracleColumnMeta{{Name: "ID", DataType: "NUMBER"}, {Name: "PAYLOAD", DataType: "CLOB"}}},
+		{deferLOBs: true, columns: []oracleColumnMeta{{Name: "PAYLOAD", DataType: "CLOB"}, {Name: "__DBX_LARGE_VALUE_BYTES_C_0", DataType: "VARCHAR2"}}},
+	}
+	for _, test := range tests {
+		sqlText, err := rewriteOracleSelectSQL(input, fakeOracleColumnLoader(test.columns), test.deferLOBs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sqlText != input {
+			t.Fatalf("query should remain unchanged, got: %s", sqlText)
+		}
+	}
+}
+
 func TestOracleColumnTypeNamesContainXMLType(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -2019,6 +2324,55 @@ func TestGetObjectSourceUsesOriginalViewNameWithDBMSMetadata(t *testing.T) {
 				t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
 			}
 		})
+	}
+}
+
+func TestGetObjectSourceUsesDBMSMetadataForSynonym(t *testing.T) {
+	const ddl = `CREATE OR REPLACE EDITIONABLE SYNONYM "AP"."S_SPECS" FOR "ADM"."S_SPECS"`
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_METADATA.GET_DDL(:1, :2, :3)",
+			args:          []driver.Value{"SYNONYM", "S_SPECS", "AP"},
+			rows:          [][]driver.Value{{ddl}},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("AP", "S_SPECS", "SYNONYM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["source"] != ddl || result["object_type"] != "SYNONYM" {
+		t.Fatalf("unexpected synonym source: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestGetObjectSourcePreservesQuotedSynonymName(t *testing.T) {
+	const synonym = "MixedSynonym"
+	const ddl = `CREATE OR REPLACE EDITIONABLE SYNONYM "AP"."MixedSynonym" FOR "ADM"."S_SPECS"`
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "DBMS_METADATA.GET_DDL(:1, :2, :3)",
+			args:          []driver.Value{"SYNONYM", synonym, "AP"},
+			rows:          [][]driver.Value{{ddl}},
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	result, err := s.getObjectSource("AP", synonym, "SYNONYM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["name"] != synonym || result["source"] != ddl {
+		t.Fatalf("quoted synonym identity was not preserved: %#v", result)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
 	}
 }
 

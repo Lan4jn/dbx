@@ -7,8 +7,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.io.Reader;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.math.BigDecimal;
@@ -17,11 +19,13 @@ import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.Clob;
 import java.sql.DatabaseMetaData;
 import java.sql.Date;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
+import java.sql.ParameterMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -310,6 +314,7 @@ public final class DbxJdbcPlugin {
                 optionalText(params, "schema"),
                 positiveInt(params, "maxRows", MAX_ROWS),
                 nonNegativeInt(params, "fetchSize", 0),
+                nonNegativeInt(params, "rowOffset", 0),
                 nonNegativeInt(params, "timeoutSecs", -1)
             );
             case "executeQueryPage", "execute_query_page" -> executeQueryPage(
@@ -535,7 +540,6 @@ public final class DbxJdbcPlugin {
             properties.setProperty("password", password);
         }
         applyConnectTimeout(connection, properties);
-        applyPagedFetchProperties(connection, url, properties);
         applyJdbcxExtensionSecurity(connection, url, properties);
         if (isOracleUrl(url)) {
             applyOracleProperties(connection, properties);
@@ -626,25 +630,6 @@ public final class DbxJdbcPlugin {
             normalized.equals("org.mariadb.jdbc.driver");
     }
 
-    private static void applyPagedFetchProperties(JsonNode connection, String url, Properties properties) {
-        if (!isMysqlConnection(connection, url) || jdbcUrlHasParameter(url, "useCursorFetch")) {
-            return;
-        }
-        properties.putIfAbsent("useCursorFetch", "true");
-    }
-
-    private static boolean isMysqlConnection(JsonNode connection, String url) {
-        if (urlMatchesPrefix(url, "jdbc:mysql:")) {
-            return true;
-        }
-        String driverClass = optionalText(connection, "jdbc_driver_class");
-        if (driverClass == null) {
-            return false;
-        }
-        String normalized = driverClass.toLowerCase(Locale.ROOT);
-        return normalized.equals("com.mysql.cj.jdbc.driver") || normalized.equals("com.mysql.jdbc.driver");
-    }
-
     private static boolean isPostgresConnection(JsonNode connection) {
         if (urlMatchesPrefix(jdbcUrl(connection), "jdbc:postgresql:")) {
             return true;
@@ -685,12 +670,14 @@ public final class DbxJdbcPlugin {
         String schema,
         int maxRows,
         int fetchSize,
+        int rowOffset,
         int timeoutSecs
     ) throws Exception {
         long start = System.nanoTime();
         Connection conn = openConnection(connection);
         applyExecutionContext(connection, conn, database, schema);
         JdbcDriverQuirks quirks = driverQuirks(connection);
+        boolean preserveOracleDateTime = isOracleUrl(jdbcUrl(connection));
         try (Statement statement = conn.createStatement()) {
             applyStatementOptions(statement, maxRows, fetchSize, timeoutSecs, quirks);
             String trimmedSql = trimStatementSql(sql);
@@ -708,6 +695,10 @@ public final class DbxJdbcPlugin {
                         String label = meta.getColumnLabel(i);
                         columns.add(label == null || label.isBlank() ? meta.getColumnName(i) : label);
                     }
+                    for (int skipped = 0; skipped < rowOffset && rs.next(); skipped++) {
+                        // Caché/IRIS does not support SQL offset pagination; advance
+                        // the forward-only JDBC cursor before collecting this page.
+                    }
                     while (rs.next()) {
                         if (rows.size() >= maxRows) {
                             truncated = true;
@@ -715,7 +706,7 @@ public final class DbxJdbcPlugin {
                         }
                         ArrayNode row = MAPPER.createArrayNode();
                         for (int i = 1; i <= columnCount; i++) {
-                            row.add(MAPPER.valueToTree(readValue(rs, meta, i)));
+                            row.add(MAPPER.valueToTree(readValue(rs, meta, i, preserveOracleDateTime)));
                         }
                         rows.add(row);
                     }
@@ -744,6 +735,7 @@ public final class DbxJdbcPlugin {
         private final long startNanos;
         private final Connection connection;
         private final boolean restoreAutoCommit;
+        private final boolean preserveOracleDateTime;
         private int rowsReturned;
         private ArrayNode pendingRow;
 
@@ -756,7 +748,8 @@ public final class DbxJdbcPlugin {
             int maxRows,
             long startNanos,
             Connection connection,
-            boolean restoreAutoCommit
+            boolean restoreAutoCommit,
+            boolean preserveOracleDateTime
         ) {
             this.id = id;
             this.statement = statement;
@@ -767,6 +760,7 @@ public final class DbxJdbcPlugin {
             this.startNanos = startNanos;
             this.connection = connection;
             this.restoreAutoCommit = restoreAutoCommit;
+            this.preserveOracleDateTime = preserveOracleDateTime;
         }
     }
 
@@ -784,6 +778,7 @@ public final class DbxJdbcPlugin {
         Connection conn = openConnection(connection);
         applyExecutionContext(connection, conn, database, schema);
         JdbcDriverQuirks quirks = driverQuirks(connection);
+        boolean preserveOracleDateTime = isOracleUrl(jdbcUrl(connection));
         boolean restoreAutoCommit = beginPagedQueryTransaction(connection, conn);
         Statement statement;
         try {
@@ -828,7 +823,8 @@ public final class DbxJdbcPlugin {
                 maxRows,
                 start,
                 conn,
-                restoreAutoCommit
+                restoreAutoCommit,
+                preserveOracleDateTime
             );
             QUERY_SESSIONS.put(sessionId, session);
             try {
@@ -901,7 +897,7 @@ public final class DbxJdbcPlugin {
                     closeQuerySession(session.id);
                     return queryPageResult(session, rows, false, false);
                 }
-                row = readRow(session.resultSet, session.meta);
+                row = readRow(session.resultSet, session.meta, session.preserveOracleDateTime);
             }
             rows.add(row);
             session.rowsReturned++;
@@ -919,7 +915,7 @@ public final class DbxJdbcPlugin {
             return queryPageResult(session, rows, false, false);
         }
 
-        session.pendingRow = readRow(session.resultSet, session.meta);
+        session.pendingRow = readRow(session.resultSet, session.meta, session.preserveOracleDateTime);
         return queryPageResult(session, rows, false, true);
     }
 
@@ -969,10 +965,14 @@ public final class DbxJdbcPlugin {
         }
     }
 
-    private static ArrayNode readRow(ResultSet rs, ResultSetMetaData meta) throws SQLException {
+    private static ArrayNode readRow(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        boolean preserveOracleDateTime
+    ) throws SQLException {
         ArrayNode row = MAPPER.createArrayNode();
         for (int i = 1; i <= meta.getColumnCount(); i++) {
-            row.add(MAPPER.valueToTree(readValue(rs, meta, i)));
+            row.add(MAPPER.valueToTree(readValue(rs, meta, i, preserveOracleDateTime)));
         }
         return row;
     }
@@ -1066,6 +1066,11 @@ public final class DbxJdbcPlugin {
         String planText = null;
         String dmMethod = null;
 
+        if (!autotrace && isOracleConnection(connection)) {
+            planText = getOracleExplainInfo(conn, sql, timeoutSecs);
+            dmMethod = "oracle-plan-table";
+        }
+
         if (autotrace) {
             if (!isSafeAutotraceSql(sql)) {
                 throw new IllegalArgumentException("unsafe");
@@ -1108,7 +1113,7 @@ public final class DbxJdbcPlugin {
                     } catch (Exception ignored) {}
                 }
             }
-        } else {
+        } else if (planText == null) {
             // ── Explain mode: direct plan via getExplainInfo(sqlStr), no execution ──
             try {
                 Class<?> dmConnClass = Class.forName("dm.jdbc.driver.DmdbConnection");
@@ -1141,6 +1146,206 @@ public final class DbxJdbcPlugin {
         result.put("has_actual_stats", "getExplainInfo(stmt)".equals(dmMethod));
         result.put("mode", autotrace ? "autotrace" : "explain");
         return result;
+    }
+
+    private static boolean isOracleConnection(JsonNode connection) {
+        String url = optionalText(connection, "connection_string");
+        return url != null && url.regionMatches(true, 0, "jdbc:oracle:", 0, "jdbc:oracle:".length());
+    }
+
+    private static String getOracleExplainInfo(Connection connection, String sql, int timeoutSecs) throws SQLException {
+        String statementId = "DBX_" + UUID.randomUUID().toString().replace("-", "").substring(0, 26);
+        String statementSql = trimStatementSql(sql);
+        StringBuilder plan = new StringBuilder();
+        try {
+            try (PreparedStatement explain = connection.prepareStatement(
+                "EXPLAIN PLAN SET STATEMENT_ID = '" + statementId + "' FOR " + statementSql
+            )) {
+                applyExplainTimeout(explain, timeoutSecs);
+                nullBindExplainParameters(explain, statementSql);
+                explain.execute();
+            }
+            try (PreparedStatement read = connection.prepareStatement(
+                "SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', ?, 'TYPICAL +PREDICATE'))"
+            )) {
+                applyExplainTimeout(read, timeoutSecs);
+                read.setString(1, statementId);
+                try (ResultSet rows = read.executeQuery()) {
+                    while (rows.next()) {
+                        if (plan.length() > 0) plan.append('\n');
+                        plan.append(rows.getString(1));
+                    }
+                }
+            }
+            return plan.toString();
+        } finally {
+            try (PreparedStatement cleanup = connection.prepareStatement(
+                "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = ?"
+            )) {
+                applyExplainTimeout(cleanup, timeoutSecs);
+                cleanup.setString(1, statementId);
+                cleanup.executeUpdate();
+            } catch (SQLException ignored) {}
+        }
+    }
+
+    /**
+     * SQL passed to EXPLAIN PLAN may legitimately contain Oracle bind markers
+     * (":1", ":name", or "?") that aren't meant to be executed with real
+     * values — e.g. statements copied from V$SQL/AWR reports. A PreparedStatement
+     * still requires every marker to be bound before execute(), or Oracle throws
+     * "ORA-17041: Missing IN or OUT parameter". The plan doesn't depend on the
+     * actual bind values, so null them all out.
+     */
+    private static void nullBindExplainParameters(PreparedStatement statement, String sql) throws SQLException {
+        int parameterCount = -1;
+        try {
+            ParameterMetaData metadata = statement.getParameterMetaData();
+            if (metadata != null) {
+                parameterCount = metadata.getParameterCount();
+            }
+        } catch (SQLException ignored) {
+        }
+        if (parameterCount < 0) {
+            parameterCount = oracleExplainBindMarkerCount(sql);
+        }
+        for (int index = 1; index <= parameterCount; index++) {
+            statement.setNull(index, Types.VARCHAR);
+        }
+    }
+
+    private static int oracleExplainBindMarkerCount(String sql) {
+        int count = 0;
+        for (int index = 0; index < sql.length(); index++) {
+            char ch = sql.charAt(index);
+            if (ch == '\'') {
+                index = skipSingleQuotedSql(sql, index);
+            } else if (ch == '"') {
+                index = skipDoubleQuotedSql(sql, index);
+            } else if (ch == 'q' || ch == 'Q') {
+                int end = skipOracleAlternativeQuotedSql(sql, index);
+                if (end != index) {
+                    index = end;
+                }
+            } else if (ch == '-' && index + 1 < sql.length() && sql.charAt(index + 1) == '-') {
+                index = skipLineCommentSql(sql, index);
+            } else if (ch == '/' && index + 1 < sql.length() && sql.charAt(index + 1) == '*') {
+                index = skipBlockCommentSql(sql, index);
+            } else if (ch == '?') {
+                count++;
+            } else if (ch == ':') {
+                int end = oracleBindMarkerEnd(sql, index);
+                if (end > index) {
+                    count++;
+                    index = end - 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    private static int oracleBindMarkerEnd(String sql, int index) {
+        if (index + 1 >= sql.length() || (index > 0 && sql.charAt(index - 1) == ':')) {
+            return index;
+        }
+        char next = sql.charAt(index + 1);
+        int end = index + 2;
+        if (next >= '0' && next <= '9') {
+            while (end < sql.length() && sql.charAt(end) >= '0' && sql.charAt(end) <= '9') {
+                end++;
+            }
+            return end;
+        }
+        if (!isOracleIdentifierStart(next)) {
+            return index;
+        }
+        while (end < sql.length() && isOracleIdentifierPart(sql.charAt(end))) {
+            end++;
+        }
+        return end;
+    }
+
+    private static boolean isOracleIdentifierStart(char ch) {
+        return (ch >= 'a' && ch <= 'z')
+            || (ch >= 'A' && ch <= 'Z')
+            || ch == '_'
+            || ch == '$'
+            || ch == '#';
+    }
+
+    private static boolean isOracleIdentifierPart(char ch) {
+        return isOracleIdentifierStart(ch) || (ch >= '0' && ch <= '9');
+    }
+
+    private static int skipSingleQuotedSql(String sql, int index) {
+        for (int current = index + 1; current < sql.length(); current++) {
+            if (sql.charAt(current) != '\'') {
+                continue;
+            }
+            if (current + 1 < sql.length() && sql.charAt(current + 1) == '\'') {
+                current++;
+                continue;
+            }
+            return current;
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipDoubleQuotedSql(String sql, int index) {
+        for (int current = index + 1; current < sql.length(); current++) {
+            if (sql.charAt(current) != '"') {
+                continue;
+            }
+            if (current + 1 < sql.length() && sql.charAt(current + 1) == '"') {
+                current++;
+                continue;
+            }
+            return current;
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipOracleAlternativeQuotedSql(String sql, int index) {
+        if (index + 2 >= sql.length() || sql.charAt(index + 1) != '\'') {
+            return index;
+        }
+        char open = sql.charAt(index + 2);
+        char close = switch (open) {
+            case '[' -> ']';
+            case '{' -> '}';
+            case '(' -> ')';
+            case '<' -> '>';
+            default -> open;
+        };
+        for (int current = index + 3; current + 1 < sql.length(); current++) {
+            if (sql.charAt(current) == close && sql.charAt(current + 1) == '\'') {
+                return current + 1;
+            }
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipLineCommentSql(String sql, int index) {
+        for (int current = index; current < sql.length(); current++) {
+            char ch = sql.charAt(current);
+            if (ch == '\n' || ch == '\r') {
+                return current;
+            }
+        }
+        return sql.length() - 1;
+    }
+
+    private static int skipBlockCommentSql(String sql, int index) {
+        int end = sql.indexOf("*/", index + 2);
+        return end < 0 ? sql.length() - 1 : end + 1;
+    }
+
+    private static void applyExplainTimeout(Statement statement, int timeoutSecs) throws SQLException {
+        if (timeoutSecs >= 0) {
+            try {
+                statement.setQueryTimeout(timeoutSecs);
+            } catch (SQLFeatureNotSupportedException | UnsupportedOperationException ignored) {}
+        }
     }
 
     private static void applyStatementOptions(
@@ -1549,6 +1754,7 @@ public final class DbxJdbcPlugin {
         JdbcDriverQuirks quirks = driverQuirks(connection);
         String catalog = metadataCatalog(database, quirks);
         String schemaPattern = resolveSchemaPattern(meta, database, schema, quirks);
+        Set<String> allowedObjectTypes = normalizedObjectTypes(objectTypes);
 
         if (!kingbase) {
             String[] tableTypes = constrainedJdbcTableTypes(jdbcTableTypes(meta), objectTypes);
@@ -1560,16 +1766,18 @@ public final class DbxJdbcPlugin {
             }
         }
 
-        try (ResultSet rs = meta.getProcedures(catalog, schemaPattern, "%")) {
-            while (rs.next()) {
-                ObjectNode item = MAPPER.createObjectNode();
-                item.put("name", rs.getString("PROCEDURE_NAME"));
-                item.put("object_type", "PROCEDURE");
-                putNullable(item, "schema", schema);
-                putNullable(item, "comment", rs.getString("REMARKS"));
-                result.add(item);
+        if (allowedObjectTypes.isEmpty() || allowedObjectTypes.contains("PROCEDURE")) {
+            try (ResultSet rs = meta.getProcedures(catalog, schemaPattern, "%")) {
+                while (rs != null && rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString("PROCEDURE_NAME"));
+                    item.put("object_type", "PROCEDURE");
+                    putNullable(item, "schema", schema);
+                    putNullable(item, "comment", rs.getString("REMARKS"));
+                    result.add(item);
+                }
+            } catch (SQLException ignored) {
             }
-        } catch (SQLException ignored) {
         }
 
         Set<String> procedureNames = new HashSet<>();
@@ -1578,19 +1786,21 @@ public final class DbxJdbcPlugin {
                 procedureNames.add(node.path("name").asText());
             }
         }
-        try (ResultSet rs = meta.getFunctions(catalog, schemaPattern, "%")) {
-            while (rs.next()) {
-                String name = rs.getString("FUNCTION_NAME");
-                if (!procedureNames.contains(name)) {
-                    ObjectNode item = MAPPER.createObjectNode();
-                    item.put("name", name);
-                    item.put("object_type", "FUNCTION");
-                    putNullable(item, "schema", schema);
-                    putNullable(item, "comment", rs.getString("REMARKS"));
-                    result.add(item);
+        if (allowedObjectTypes.isEmpty() || allowedObjectTypes.contains("FUNCTION")) {
+            try (ResultSet rs = meta.getFunctions(catalog, schemaPattern, "%")) {
+                while (rs != null && rs.next()) {
+                    String name = rs.getString("FUNCTION_NAME");
+                    if (!procedureNames.contains(name)) {
+                        ObjectNode item = MAPPER.createObjectNode();
+                        item.put("name", name);
+                        item.put("object_type", "FUNCTION");
+                        putNullable(item, "schema", schema);
+                        putNullable(item, "comment", rs.getString("REMARKS"));
+                        result.add(item);
+                    }
                 }
+            } catch (SQLException ignored) {
             }
-        } catch (SQLException ignored) {
         }
 
         return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
@@ -2964,19 +3174,40 @@ public final class DbxJdbcPlugin {
         return keys;
     }
 
-    private static Object readValue(ResultSet rs, ResultSetMetaData meta, int index) throws SQLException {
+    private static Object readValue(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        int index,
+        boolean preserveOracleDateTime
+    ) throws SQLException {
+        int columnType = meta.getColumnType(index);
+
+        if (columnType == Types.BOOLEAN) {
+            boolean boolValue = rs.getBoolean(index);
+            if (!rs.wasNull()) {
+                return boolValue;
+            }
+            return null;
+        }
+
         Object value = rs.getObject(index);
         if (value == null) {
             return null;
         }
         if (value instanceof byte[] bytes) {
+            if (columnType == Types.BIT && bytes.length == 1 && (bytes[0] == 't' || bytes[0] == 'f')) {
+                return bytes[0] == 't';
+            }
             return binaryToHex(bytes);
+        }
+        if (value instanceof Clob clob) {
+            return clobToString(clob);
         }
         if (isBinaryColumn(meta, index)) {
             byte[] bytes = rs.getBytes(index);
             return bytes == null ? null : binaryToHex(bytes);
         }
-        Object temporalValue = readTemporalValue(rs, meta, index);
+        Object temporalValue = readTemporalValue(rs, meta, index, preserveOracleDateTime);
         if (temporalValue != null) {
             return temporalValue;
         }
@@ -2992,9 +3223,32 @@ public final class DbxJdbcPlugin {
         return value.toString();
     }
 
-    private static Object readTemporalValue(ResultSet rs, ResultSetMetaData meta, int index) throws SQLException {
+    private static String clobToString(Clob clob) throws SQLException {
+        try (Reader reader = clob.getCharacterStream()) {
+            StringBuilder out = new StringBuilder();
+            char[] buffer = new char[8192];
+            int count;
+            while ((count = reader.read(buffer)) != -1) {
+                out.append(buffer, 0, count);
+            }
+            return out.toString();
+        } catch (IOException error) {
+            throw new SQLException("Failed to read CLOB value", error);
+        }
+    }
+
+    private static Object readTemporalValue(
+        ResultSet rs,
+        ResultSetMetaData meta,
+        int index,
+        boolean preserveOracleDateTime
+    ) throws SQLException {
         return switch (meta.getColumnType(index)) {
             case Types.DATE -> {
+                if (preserveOracleDateTime) {
+                    Timestamp timestamp = rs.getTimestamp(index);
+                    yield timestamp == null ? null : timestamp.toString();
+                }
                 Date date = rs.getDate(index);
                 yield date == null ? null : date.toString();
             }

@@ -534,7 +534,7 @@ function tabMenuIcon(tab: QueryTab) {
   if (tab.mode === "objects") return TableProperties;
   if (tab.mode === "structure") return PencilRuler;
   if (tab.mode === "dameng-jobs") return CalendarClock;
-  if (tab.mode === "processlist") return Activity;
+  if (tab.mode === "processlist" || tab.mode === "sqlserver-trace") return Activity;
   if (tab.mode === "mysql-dashboard" || tab.mode === "postgres-dashboard" || tab.mode === "nacos-dashboard") return Gauge;
   return Code2;
 }
@@ -544,10 +544,13 @@ function handleTabClick(tab: QueryTab) {
   activateTab(tab.id);
 }
 
-function handleTabMouseDown(event: MouseEvent, tabId: string) {
+function handleTabMouseDown(event: PointerEvent, tabId: string) {
   if (event.button === 0) {
     dispatchBeforeTabSwitch(tabId);
-    event.preventDefault();
+    // Don't preventDefault touch pointerdowns: that would cancel the tab
+    // strip's native horizontal scroll, which is how touch users browse an
+    // overflowing tab bar.
+    if (event.pointerType !== "touch") event.preventDefault();
   }
   tabDrag.startDrag(event, tabId);
 }
@@ -663,7 +666,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                     @click="handleTabClick(tab)"
                     @dblclick.stop="startRenameTab(tab)"
                     @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
-                    @mousedown="handleTabMouseDown($event, tab.id)"
+                    @pointerdown="handleTabMouseDown($event, tab.id)"
                     @mouseenter="handleTabDragTarget($event, tab)"
                     @mousemove="handleTabDragTarget($event, tab)"
                     @mouseleave="tabDrag.clearTarget(tab.id)"
@@ -682,7 +685,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                       <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
                       <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />
                       <CalendarClock v-else-if="tab.mode === 'dameng-jobs'" class="h-3.5 w-3.5" />
-                      <Activity v-else-if="tab.mode === 'processlist'" class="h-3.5 w-3.5" />
+                      <Activity v-else-if="tab.mode === 'processlist' || tab.mode === 'sqlserver-trace'" class="h-3.5 w-3.5" />
                       <Gauge v-else-if="tab.mode === 'mysql-dashboard' || tab.mode === 'postgres-dashboard' || tab.mode === 'nacos-dashboard'" class="h-3.5 w-3.5" />
                       <Code2 v-else class="h-3.5 w-3.5" />
                     </span>
@@ -861,7 +864,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                     @click="handleTabClick(tab)"
                     @dblclick.stop="startRenameTab(tab)"
                     @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
-                    @mousedown="handleTabMouseDown($event, tab.id)"
+                    @pointerdown="handleTabMouseDown($event, tab.id)"
                     @mouseenter="handleTabDragTarget($event, tab)"
                     @mousemove="handleTabDragTarget($event, tab)"
                     @mouseleave="tabDrag.clearTarget(tab.id)"
@@ -880,7 +883,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                       <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
                       <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />
                       <CalendarClock v-else-if="tab.mode === 'dameng-jobs'" class="h-3.5 w-3.5" />
-                      <Activity v-else-if="tab.mode === 'processlist'" class="h-3.5 w-3.5" />
+                      <Activity v-else-if="tab.mode === 'processlist' || tab.mode === 'sqlserver-trace'" class="h-3.5 w-3.5" />
                       <Gauge v-else-if="tab.mode === 'mysql-dashboard' || tab.mode === 'postgres-dashboard' || tab.mode === 'nacos-dashboard'" class="h-3.5 w-3.5" />
                       <Code2 v-else class="h-3.5 w-3.5" />
                     </span>

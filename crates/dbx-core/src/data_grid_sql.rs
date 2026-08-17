@@ -2857,7 +2857,7 @@ fn data_grid_identifier(database_type: Option<DatabaseType>, name: &str, identif
     crate::sql_dialect::quote_table_data_identifier(database_type, name, identifier_quote)
 }
 
-fn data_grid_qualified_table_name(
+pub(crate) fn data_grid_qualified_table_name(
     database_type: Option<DatabaseType>,
     catalog: Option<&str>,
     schema: Option<&str>,
@@ -3091,6 +3091,22 @@ mod tests {
             deleted_rows: vec![],
             new_rows: vec![],
         }
+    }
+
+    #[test]
+    fn iris_data_grid_count_queries_the_table_without_wrapping_top_sql() {
+        assert_eq!(
+            build_data_grid_count_sql(DataGridCountSqlOptions {
+                database_type: Some(DatabaseType::Iris),
+                identifier_quote: Some("\"".to_string()),
+                catalog: None,
+                database: None,
+                schema: Some("SS".to_string()),
+                table_name: "SS_User".to_string(),
+                where_input: Some("SSUSR_IsActive = 'Y'".to_string()),
+            }),
+            "SELECT COUNT(*) AS cnt FROM \"SS\".\"SS_User\" WHERE (SSUSR_IsActive = 'Y')"
+        );
     }
 
     #[test]

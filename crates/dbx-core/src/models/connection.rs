@@ -170,6 +170,14 @@ pub struct ConnectionConfig {
     pub jdbc_driver_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub one_time: bool,
+    /// Whether the database password may be persisted locally (SQLite
+    /// `connection_secrets`). When false, the `"password"` secret is never
+    /// written (or is deleted) and the user must type it on every connect.
+    /// Defaults to `true` so pre-existing saved connections keep current
+    /// behavior; a bare `#[serde(default)]` would upgrade them to "don't save"
+    /// and delete every stored password on the next save.
+    #[serde(default = "default_true")]
+    pub save_password: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
     /// Explicitly marks every database reachable through this connection as production.
@@ -503,12 +511,16 @@ pub enum DatabaseType {
     SqlServer,
     #[serde(rename = "mongodb")]
     MongoDb,
+    #[serde(rename = "dynamodb")]
+    DynamoDb,
     #[serde(rename = "oracle")]
     Oracle,
     #[serde(rename = "elasticsearch")]
     Elasticsearch,
     #[serde(rename = "easysearch")]
     Easysearch,
+    #[serde(rename = "meilisearch")]
+    Meilisearch,
     Hbase,
     #[serde(rename = "qdrant")]
     Qdrant,
@@ -554,6 +566,8 @@ pub enum DatabaseType {
     #[serde(rename = "prestosql")]
     PrestoSql,
     Hive,
+    Kyuubi,
+    Impala,
     Spark,
     #[serde(rename = "db2")]
     Db2,
@@ -691,6 +705,8 @@ struct ConnectionConfigData {
     pub jdbc_driver_paths: Vec<String>,
     #[serde(default)]
     pub one_time: bool,
+    #[serde(default = "default_true")]
+    pub save_password: bool,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -754,6 +770,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             jdbc_driver_class: data.jdbc_driver_class,
             jdbc_driver_paths: data.jdbc_driver_paths,
             one_time: data.one_time,
+            save_password: data.save_password,
             read_only: data.read_only,
             is_production: data.is_production,
             production_databases: data.production_databases,
@@ -1078,9 +1095,14 @@ impl ConnectionConfig {
                 let db_part = mongo_uri_db_part_for_suffix(&db_part, &suffix);
                 format!("mongodb://{host}:{port}{db_part}{suffix}")
             }
+            DatabaseType::DynamoDb => {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{host}:{port}")
+            }
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
             DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
+            | DatabaseType::Meilisearch
             | DatabaseType::Hbase
             | DatabaseType::Qdrant
             | DatabaseType::Milvus
@@ -1127,6 +1149,8 @@ impl ConnectionConfig {
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
             DatabaseType::PrestoSql => format!("prestosql://{host}:{port}{db_part}"),
             DatabaseType::Hive => format!("hive://{host}:{port}{db_part}"),
+            DatabaseType::Kyuubi => format!("kyuubi://{host}:{port}{db_part}"),
+            DatabaseType::Impala => format!("impala://{host}:{port}{db_part}"),
             DatabaseType::Spark => format!("spark://{host}:{port}{db_part}"),
             DatabaseType::Db2 => format!("db2://{host}:{port}{db_part}"),
             DatabaseType::Informix => format!("informix://{host}:{port}{db_part}"),
@@ -1240,11 +1264,16 @@ impl ConnectionConfig {
                     format!("mongodb://{username}:{password}@{host}:{port}{db_part}{suffix}")
                 }
             }
+            DatabaseType::DynamoDb => {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{host}:{port}")
+            }
             DatabaseType::Oracle => {
                 format!("oracle://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
+            | DatabaseType::Meilisearch
             | DatabaseType::Hbase
             | DatabaseType::Qdrant
             | DatabaseType::Milvus
@@ -1335,6 +1364,22 @@ impl ConnectionConfig {
             }
             DatabaseType::Hive => {
                 format!("hive://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Kyuubi => {
+                if self.username.is_empty() && self.password.is_empty() {
+                    format!("kyuubi://{host}:{port}{db_part}")
+                } else if self.password.is_empty() {
+                    format!("kyuubi://{}@{host}:{port}{db_part}", username)
+                } else {
+                    format!("kyuubi://{}:{}@{host}:{port}{db_part}", username, password)
+                }
+            }
+            DatabaseType::Impala => {
+                if self.username.is_empty() && self.password.is_empty() {
+                    format!("impala://{host}:{port}{db_part}")
+                } else {
+                    format!("impala://{}:{}@{host}:{port}{db_part}", username, password)
+                }
             }
             DatabaseType::Spark => {
                 format!("spark://{}:{}@{host}:{port}{db_part}", username, password)
@@ -2317,6 +2362,12 @@ mod tests {
     }
 
     #[test]
+    fn meilisearch_database_type_serializes_stably() {
+        assert_eq!(serde_json::to_string(&DatabaseType::Meilisearch).unwrap(), "\"meilisearch\"");
+        assert_eq!(serde_json::from_str::<DatabaseType>("\"meilisearch\"").unwrap(), DatabaseType::Meilisearch);
+    }
+
+    #[test]
     fn connection_test_result_uses_camel_case_and_omits_missing_details() {
         let result =
             ConnectionTestResult::success("Connection successful").with_database_info(Some(DatabaseConnectionInfo {
@@ -2425,6 +2476,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            save_password: true,
             read_only: false,
             is_production: false,
             production_databases: vec![],
@@ -2575,6 +2627,47 @@ mod tests {
     fn easysearch_database_type_uses_stable_wire_name() {
         assert_eq!(serde_json::to_string(&DatabaseType::Easysearch).unwrap(), "\"easysearch\"");
         assert_eq!(serde_json::from_str::<DatabaseType>("\"easysearch\"").unwrap(), DatabaseType::Easysearch);
+    }
+
+    #[test]
+    fn impala_database_type_and_connection_urls_are_stable() {
+        assert_eq!(serde_json::to_string(&DatabaseType::Impala).unwrap(), "\"impala\"");
+        assert_eq!(serde_json::from_str::<DatabaseType>("\"impala\"").unwrap(), DatabaseType::Impala);
+
+        let mut config = mysql_config("", "", Some("analytics"));
+        config.db_type = DatabaseType::Impala;
+        config.host = "impala.local".to_string();
+        config.port = 21050;
+        assert_eq!(config.connection_url(), "impala://impala.local:21050/analytics");
+
+        config.username = "analyst".to_string();
+        config.password = "secret".to_string();
+        assert_eq!(
+            config.connection_url_with_host(&config.host, config.port),
+            "impala://analyst:secret@impala.local:21050/analytics"
+        );
+    }
+
+    #[test]
+    fn kyuubi_database_type_and_connection_urls_are_stable() {
+        assert_eq!(serde_json::to_string(&DatabaseType::Kyuubi).unwrap(), "\"kyuubi\"");
+        assert_eq!(serde_json::from_str::<DatabaseType>("\"kyuubi\"").unwrap(), DatabaseType::Kyuubi);
+
+        let mut config = mysql_config("dbx", "", Some("analytics"));
+        config.db_type = DatabaseType::Kyuubi;
+        config.host = "kyuubi.local".to_string();
+        config.port = 10009;
+        assert_eq!(config.connection_url(), "kyuubi://dbx@kyuubi.local:10009/analytics");
+
+        config.username.clear();
+        assert_eq!(config.connection_url(), "kyuubi://kyuubi.local:10009/analytics");
+
+        config.username = "dbx".to_string();
+        config.password = "secret".to_string();
+        assert_eq!(
+            config.connection_url_with_host(&config.host, config.port),
+            "kyuubi://dbx:secret@kyuubi.local:10009/analytics"
+        );
     }
 
     #[test]

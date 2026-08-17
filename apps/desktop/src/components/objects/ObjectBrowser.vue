@@ -120,6 +120,7 @@ import {
   type ObjectBrowserSortKey,
 } from "@/lib/table/objectBrowserRows";
 import { isSourceOnlyObjectBrowserRow, resolveRowClickAction, shouldDeferSingleClick, type ObjectBrowserRowAction } from "@/lib/table/objectBrowserRowAction";
+import { objectBrowserTableSelectionAnchor, objectBrowserTableSelectionRange } from "@/lib/table/objectBrowserSelection";
 import { customTypeCapabilities, supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
 import { createSidePanelRequestGuard } from "@/lib/table/sidePanelRequestGuard";
@@ -191,7 +192,6 @@ const tableForeignKeysLoading = ref(false);
 const tableTriggers = ref<TriggerInfo[]>([]);
 const tableTriggersLoading = ref(false);
 const tableInfoSearchQuery = ref("");
-const tableInfoWrap = ref(true);
 const tableInfoDdlPreRef = ref<HTMLPreElement | null>(null);
 const SIDE_PANEL_MIN_WIDTH = 280;
 const SIDE_PANEL_MAX_WIDTH = 900;
@@ -206,6 +206,12 @@ const effectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(
 const isGaussdbM = computed(() => effectiveDatabaseType.value === "gaussdb" && props.connection.driver_profile?.toLowerCase() === "gaussdb-m");
 const isVictoriaMetrics = computed(() => effectiveDatabaseType.value === "victoriametrics");
 const objectRowsLabel = computed(() => t(isVictoriaMetrics.value ? "objects.series" : "objects.rows"));
+
+function toggleTableDdlWordWrap() {
+  settingsStore.updateEditorSettings({
+    tableDdlWordWrap: !settingsStore.editorSettings.tableDdlWordWrap,
+  });
+}
 
 function gaussdbMColumnType(dataType: string): string {
   if (isGaussdbM.value) {
@@ -242,6 +248,7 @@ const duplicateTableName = ref("");
 const showProcedureExecutionConfirm = ref(false);
 const procedureExecutionTarget = ref<ObjectBrowserRow | null>(null);
 const selectedTableIds = ref<Set<string>>(new Set());
+const tableSelectionAnchorId = ref<string | null>(null);
 const expandedPartitionParentIds = ref<Set<string>>(new Set());
 const showBatchDropConfirm = ref(false);
 const batchDropExecuting = ref(false);
@@ -847,7 +854,27 @@ function executeRowAction(row: ObjectBrowserRow, action: ObjectBrowserRowAction)
   }
 }
 
+function toggleTableSelectionWithAnchor(row: ObjectBrowserRow) {
+  toggleTableSelection(row);
+  tableSelectionAnchorId.value = row.id;
+}
+
+function selectTableRangeFromAnchor(row: ObjectBrowserRow) {
+  const anchorId = objectBrowserTableSelectionAnchor(filteredRows.value, tableSelectionAnchorId.value, row.id);
+  tableSelectionAnchorId.value = anchorId;
+  setSelectedTableIds(new Set(objectBrowserTableSelectionRange(filteredRows.value, anchorId, row.id)));
+}
+
 function onRowClick(row: ObjectBrowserRow, event: MouseEvent) {
+  if (row.type === "TABLE" && event.shiftKey) {
+    selectTableRangeFromAnchor(row);
+    return;
+  }
+  if (row.type === "TABLE" && (event.metaKey || event.ctrlKey)) {
+    toggleTableSelectionWithAnchor(row);
+    return;
+  }
+  if (row.type === "TABLE") tableSelectionAnchorId.value = row.id;
   const activation = settingsStore.editorSettings.sidebarActivation;
   const { action, isDouble } = resolveRowClickAction(row, event.detail, activation, effectiveDatabaseType.value);
   // Double click: cancel any pending single-click and fire immediately
@@ -3029,13 +3056,12 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           </div>
           <RecycleScroller ref="listScrollerRef" class="object-browser-scroller min-h-0 flex-1" :style="{ minWidth: `${objectGridMinWidth}px` }" :items="filteredRows" :item-size="34" :buffer="600" :skip-hover="true" key-field="id">
             <template #default="{ item }">
-              <CustomContextMenu :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
+              <CustomContextMenu :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu, isOpen }">
                 <div
-                  class="grid h-[34px] cursor-default items-center gap-3 border-b px-3 hover:bg-accent/50"
+                  class="grid h-[34px] cursor-default items-center gap-3 border-b px-3"
                   :class="{
-                    'bg-accent/40': sourceRow?.id === item.id,
-                    'bg-primary/10': sidePanelRow?.id === item.id && !selectedTableIds.has(item.id),
-                    'bg-primary/5': selectedTableIds.has(item.id),
+                    'bg-accent text-accent-foreground': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedTableIds.has(item.id),
+                    'hover:bg-accent/40': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && !selectedTableIds.has(item.id),
                   }"
                   :style="{ gridTemplateColumns, boxShadow: sidePanelRow?.id === item.id && !selectedTableIds.has(item.id) ? 'inset 3px 0 0 var(--primary)' : undefined }"
                   @click="onRowClick(item, $event)"
@@ -3088,13 +3114,12 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <RecycleScroller ref="gridScrollerRef" v-if="gridRows.length > 0" class="object-browser-grid-scroller h-full" :items="gridRows" :item-size="objectGridRowHeight" :buffer="600" :skip-hover="true" key-field="key">
             <template #default="{ item: row }">
               <div class="object-browser-grid-row" :style="{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, height: `${objectGridRowHeight - OBJECT_GRID_GAP}px` }">
-                <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
+                <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu, isOpen }">
                   <div
-                    class="relative flex h-full min-h-0 cursor-default flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+                    class="relative flex h-full min-h-0 cursor-default flex-col items-center gap-1 rounded-lg border p-3 text-center transition-all"
                     :class="{
-                      'border-primary bg-primary/5': selectedTableIds.has(item.id),
-                      'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),
-                      'border-primary bg-primary/8 shadow-sm': sidePanelRow?.id === item.id && !selectedTableIds.has(item.id),
+                      'border-primary bg-accent shadow-sm': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedTableIds.has(item.id),
+                      'bg-card hover:border-primary/40 hover:bg-accent/40 hover:shadow-sm': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && !selectedTableIds.has(item.id),
                     }"
                     :title="item.displayName"
                     @click="onRowClick(item, $event)"
@@ -3146,7 +3171,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 <Copy class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("grid.copyDdl") }}</span>
               </Button>
-              <Button variant="ghost" size="icon" class="h-6 w-6" :class="{ 'bg-accent': tableInfoWrap }" @click="tableInfoWrap = !tableInfoWrap">
+              <Button variant="ghost" size="icon" class="h-6 w-6" :class="{ 'bg-accent': settingsStore.editorSettings.tableDdlWordWrap }" @click="toggleTableDdlWordWrap">
                 <WrapText class="w-3 h-3" />
               </Button>
             </div>
@@ -3286,7 +3311,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             data-native-clipboard
             tabindex="0"
             class="flex-1 min-w-0 text-xs font-mono p-3 overflow-auto ddl-code leading-5 select-text outline-none"
-            :class="tableInfoWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
+            :class="settingsStore.editorSettings.tableDdlWordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
             v-html="filteredTableDdlContent"
             @keydown="onTableInfoDdlKeydown"
           ></pre>

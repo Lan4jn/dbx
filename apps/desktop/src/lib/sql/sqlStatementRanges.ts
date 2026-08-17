@@ -2,7 +2,7 @@ import type { SqlExecutionCandidate } from "@/lib/sql/sqlExecutionTarget";
 import { cursorBelongsToTrailingStatementDelimiter } from "@/lib/sql/statementDelimiter";
 import { splitMongoCommandRanges } from "@/lib/mongo/mongoShellCommand";
 import { readSqlBracedParameterAt, type SqlParameterOptions } from "@/lib/sql/sqlParameters";
-import { isElasticsearchCompatibleDatabaseType, type DatabaseType } from "@/types/database";
+import { isElasticsearchCompatibleDatabaseType, isMeilisearchDatabaseType, type DatabaseType } from "@/types/database";
 
 /**
  * A contiguous range of SQL text expressed as document offsets plus the
@@ -14,18 +14,22 @@ export interface SqlTextRange {
   sql: string;
 }
 
-const ELASTICSEARCH_REST_REQUEST = /^(?:GET|POST|PUT|DELETE|HEAD)\s+\S+/i;
+const ELASTICSEARCH_REST_REQUEST = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+\S+/i;
+
+function isHttpJsonRestDatabaseType(databaseType?: DatabaseType): boolean {
+  return isElasticsearchCompatibleDatabaseType(databaseType) || isMeilisearchDatabaseType(databaseType);
+}
 
 export function elasticsearchRestRequestRanges(sql: string, databaseType?: DatabaseType): SqlTextRange[] {
-  if (!isElasticsearchCompatibleDatabaseType(databaseType)) return [];
+  if (!isHttpJsonRestDatabaseType(databaseType)) return [];
   const requests = splitSqlStatementRanges(sql, databaseType);
   return requests.length > 0 && requests.every((request) => ELASTICSEARCH_REST_REQUEST.test(request.sql)) ? requests : [];
 }
 
-const NON_SQL_EXECUTION_TARGET_TYPES: ReadonlySet<DatabaseType> = new Set(["mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "neo4j", "victoriametrics"]);
+const NON_SQL_EXECUTION_TARGET_TYPES: ReadonlySet<DatabaseType> = new Set(["mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "neo4j", "victoriametrics"]);
 
 export function supportsExecutionTargetPicker(databaseType?: DatabaseType): boolean {
-  return !!databaseType && (databaseType === "redis" || isElasticsearchCompatibleDatabaseType(databaseType) || !NON_SQL_EXECUTION_TARGET_TYPES.has(databaseType));
+  return !!databaseType && (databaseType === "redis" || isHttpJsonRestDatabaseType(databaseType) || !NON_SQL_EXECUTION_TARGET_TYPES.has(databaseType));
 }
 
 export function hasMultipleExecutionTargets(sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): boolean {
@@ -58,11 +62,11 @@ interface ElasticsearchRequestLineCandidate {
 }
 
 export interface ElasticsearchRestRequestTarget {
-  method: "GET" | "POST" | "PUT" | "DELETE" | "HEAD";
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD";
   path: string;
 }
 
-const ELASTICSEARCH_REST_REQUEST_LINE = /^\s*(?:GET|POST|PUT|DELETE|HEAD)\s+\S+/i;
+const ELASTICSEARCH_REST_REQUEST_LINE = /^\s*(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+\S+/i;
 
 function leadingElasticsearchPreambleEnd(value: string): number {
   let offset = 0;
@@ -145,7 +149,7 @@ function elasticsearchRequestLineCandidates(lines: ElasticsearchRequestLine[]): 
 
 export function parseElasticsearchRestRequestTarget(value: string): ElasticsearchRestRequestTarget | null {
   const requestLine = stripLeadingElasticsearchComments(value).split("\n", 1)[0]?.trim() ?? "";
-  const match = requestLine.match(/^(GET|POST|PUT|DELETE|HEAD)\s+(\S+)/i);
+  const match = requestLine.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD)\s+(\S+)/i);
   if (!match) return null;
   return {
     method: match[1].toUpperCase() as ElasticsearchRestRequestTarget["method"],
@@ -233,7 +237,7 @@ const DATABASE_SOFT_STATEMENT_KEYWORDS: Partial<Record<DatabaseType, readonly st
   sqlite: ["ATTACH", "DETACH", "REINDEX"],
   duckdb: ["ATTACH", "DETACH", "EXPORT", "IMPORT", "INSTALL", "LOAD"],
   clickhouse: ["ATTACH", "CHECK", "DETACH", "EXCHANGE", "KILL", "OPTIMIZE", "SYSTEM"],
-  sqlserver: ["BACKUP", "DBCC", "DENY", "RESTORE"],
+  sqlserver: ["BACKUP", "DBCC", "DENY", "KILL", "RESTORE"],
   saphana: ["DO"],
   oracle: ["FLASHBACK", "LOCK", "PURGE"],
   dameng: ["FLASHBACK", "LOCK", "PURGE"],
@@ -284,7 +288,7 @@ const SAP_HANA_SCRIPT_BLOCK_TERMINATORS = new Set(["IF", "FOR", "WHILE"]);
  * whitespace are excluded so editor highlights stay tight).
  */
 export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): RawStatement[] {
-  if (isElasticsearchCompatibleDatabaseType(databaseType)) {
+  if (isHttpJsonRestDatabaseType(databaseType)) {
     const requests = splitElasticsearchRestRequestRanges(sql);
     if (requests) return requests;
   }
@@ -297,6 +301,8 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
   let statementEnd = -1;
   let statementHitStart = 0;
   let pendingHintStart = -1;
+  let pendingMysqlDirectiveStart = -1;
+  let pendingMysqlDirectiveLineEnd = -1;
   let customDelimiter: string | null = null;
   let state: QuoteState = "none";
   let dollarTag = "";
@@ -305,11 +311,23 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
   let i = 0;
 
   const isWhitespace = (ch: string) => ch === " " || ch === "\t" || ch === "\r" || ch === "\n";
+  const nextLineBreak = (from: number) => {
+    const carriageReturn = sql.indexOf("\r", from);
+    const lineFeed = sql.indexOf("\n", from);
+    if (carriageReturn === -1) return lineFeed === -1 ? len : lineFeed;
+    if (lineFeed === -1) return carriageReturn;
+    return Math.min(carriageReturn, lineFeed);
+  };
 
   const markContent = (pos: number) => {
     if (statementStart === -1) {
-      statementStart = pendingHintStart === -1 ? pos : pendingHintStart;
+      // TDSQL accepts arbitrary leading block directives on the SQL line. The
+      // exact /*proxy*/ directive also keeps its historical multiline support.
+      const directiveStart = pendingMysqlDirectiveStart !== -1 && (sql.startsWith("/*proxy*/", pendingMysqlDirectiveStart) || pos < pendingMysqlDirectiveLineEnd) ? pendingMysqlDirectiveStart : -1;
+      statementStart = directiveStart !== -1 ? directiveStart : pendingHintStart === -1 ? pos : pendingHintStart;
       pendingHintStart = -1;
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
     }
     statementEnd = pos + 1;
   };
@@ -318,6 +336,8 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
     if (statementStart === -1) {
       statementEnd = -1;
       pendingHintStart = -1;
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
       postgresDollarQuotedRoutine = false;
       oraclePlSqlStatementEnd = undefined;
       return;
@@ -329,6 +349,8 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
     statementStart = -1;
     statementEnd = -1;
     pendingHintStart = -1;
+    pendingMysqlDirectiveStart = -1;
+    pendingMysqlDirectiveLineEnd = -1;
     postgresDollarQuotedRoutine = false;
     oraclePlSqlStatementEnd = undefined;
   };
@@ -433,11 +455,15 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
 
     // Line comments consume up to (and including) the newline.
     if (ch === "-" && next === "-") {
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
       const newline = sql.indexOf("\n", i);
       i = newline === -1 ? len : newline + 1;
       continue;
     }
     if (startsHashLineComment(sql, i, databaseType, parameterOptions)) {
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
       const newline = sql.indexOf("\n", i);
       i = newline === -1 ? len : newline + 1;
       continue;
@@ -447,6 +473,17 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
       const hintMarker = sql[i + 2];
       if (statementStart === -1 && pendingHintStart === -1 && (hintMarker === "+" || hintMarker === "@" || hintMarker === "&")) pendingHintStart = i;
       const close = sql.indexOf("*/", i + 2);
+      if (statementStart === -1) {
+        if (databaseType === "mysql") {
+          if (pendingMysqlDirectiveStart === -1 || i > pendingMysqlDirectiveLineEnd) {
+            pendingMysqlDirectiveStart = i;
+            pendingMysqlDirectiveLineEnd = nextLineBreak(i);
+          }
+        } else {
+          pendingMysqlDirectiveStart = -1;
+          pendingMysqlDirectiveLineEnd = -1;
+        }
+      }
       i = close === -1 ? len : close + 2;
       continue;
     }
@@ -585,7 +622,7 @@ export function statementRangeAtCursor(sql: string, cursorPos: number, databaseT
     // Cursor in indentation or inter-statement whitespace immediately before
     // the statement should still target that statement, while the returned
     // execution range remains tight around the SQL text itself.
-    if (pos >= statement.hitFrom && pos < statement.from && (sql.slice(pos, statement.from).trim() === "" || (isElasticsearchCompatibleDatabaseType(databaseType) && isElasticsearchRequestPreamble(sql.slice(statement.hitFrom, statement.from))))) {
+    if (pos >= statement.hitFrom && pos < statement.from && (sql.slice(pos, statement.from).trim() === "" || (isHttpJsonRestDatabaseType(databaseType) && isElasticsearchRequestPreamble(sql.slice(statement.hitFrom, statement.from))))) {
       const previous = statements[index - 1];
       if (previous && isCursorInTrailingDelimiterGap(sql, previous.to, pos)) {
         const previousSoftRanges = splitStatementRangeAtSoftStarts(sql, previous, databaseType, parameterOptions);
@@ -1507,7 +1544,7 @@ function mysqlRoutineBlockIsComplete(sql: string, parameterOptions?: SqlParamete
   if (!startsWithMysqlRoutineBlock(sql, parameterOptions)) return false;
 
   const tokens = mysqlRoutineTokens(sql, parameterOptions);
-  let beginDepth = 0;
+  const blockStack: Array<"BEGIN" | "CASE"> = [];
   let sawBegin = false;
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -1516,16 +1553,26 @@ function mysqlRoutineBlockIsComplete(sql: string, parameterOptions?: SqlParamete
     if (token.value === "BEGIN") {
       if (previousWordToken(tokens, index) === "END") continue;
       sawBegin = true;
-      beginDepth += 1;
+      blockStack.push("BEGIN");
+      continue;
+    }
+    if (token.value === "CASE") {
+      if (previousWordToken(tokens, index) === "END") continue;
+      blockStack.push("CASE");
       continue;
     }
     if (token.value === "END" && sawBegin) {
-      if (MYSQL_CONTROL_BLOCK_SUFFIXES.has(nextWordToken(tokens, index) ?? "")) continue;
-      beginDepth = Math.max(0, beginDepth - 1);
+      const suffix = nextWordToken(tokens, index) ?? "";
+      if (suffix === "CASE") {
+        if (blockStack[blockStack.length - 1] === "CASE") blockStack.pop();
+        continue;
+      }
+      if (MYSQL_CONTROL_BLOCK_SUFFIXES.has(suffix)) continue;
+      blockStack.pop();
     }
   }
 
-  return sawBegin && beginDepth === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
+  return sawBegin && blockStack.length === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
 }
 
 function mysqlRoutineWords(sql: string, parameterOptions?: SqlParameterOptions): string[] {

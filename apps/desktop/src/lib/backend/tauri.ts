@@ -3,6 +3,7 @@ import { BackendErrorException, type BackendError } from "@/lib/backend/errorUti
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import { ExternalSqlFileTooLargeError } from "@/lib/sql/sqlFileOpen";
+import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 
 /** Normalize Tauri rejections once at the public backend boundary. */
 async function invokeBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -87,7 +88,7 @@ import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceI
 import type { BuildViewDdlInput } from "@/lib/table/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/table/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/database/createDatabaseSql";
-import type { DatabaseNameSqlOptions, DatabasePropertyEditSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, CopyTableDataSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/database/dbAdminSql";
+import type { DatabaseNameSqlOptions, DatabasePropertyEditSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, CopyTableDataSqlOptions, MysqlAutoIncrementSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/database/dbAdminSql";
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/export/databaseExport";
 
 export interface SshPromptResolution {
@@ -318,6 +319,7 @@ export interface QueryPaginationExecutionPlan {
   pageLimit?: number;
   pageOffset?: number;
   countSql?: string;
+  exactQueryRowBound?: number;
   useAgentResultSession: boolean;
 }
 
@@ -451,6 +453,10 @@ export type AgentEvent =
     }
   | { type: "error"; message: string };
 
+type TauriAgentEvent = AgentEvent & {
+  session_id?: string;
+};
+
 export async function aiAgentStream(
   sessionId: string,
   request: AiCompletionRequest,
@@ -467,9 +473,11 @@ export async function aiAgentStream(
   confirmedSchema?: string,
   _signal?: AbortSignal,
 ): Promise<string> {
-  const unlisten: UnlistenFn = await listen<AgentEvent>("ai-agent-event", (event) => {
-    onEvent(event.payload);
-    if (event.payload.type === "agent_end" || event.payload.type === "error") {
+  const unlisten: UnlistenFn = await listen<TauriAgentEvent>("ai-agent-event", (event) => {
+    const payload = event.payload;
+    if (payload.session_id && payload.session_id !== sessionId) return;
+    onEvent(payload);
+    if (payload.type === "agent_end" || payload.type === "error") {
       unlisten();
     }
   });
@@ -625,6 +633,14 @@ export async function loadSavedSqlEditorPositions(): Promise<unknown[] | null> {
 
 export async function saveSavedSqlEditorPositions(positions: unknown[]): Promise<void> {
   return invoke("save_saved_sql_editor_positions", { positions });
+}
+
+export async function loadTransferTaskLibrary(): Promise<unknown | null> {
+  return invoke("load_transfer_task_library");
+}
+
+export async function saveTransferTaskLibrary(library: unknown): Promise<void> {
+  return invoke("save_transfer_task_library", { library });
 }
 
 export async function completeAppClose(action: "quit" | "hide"): Promise<void> {
@@ -930,6 +946,14 @@ export async function disconnectDb(connectionId: string, clientAttempt?: number)
   return invokeBackend("disconnect_db", { connectionId, clientAttempt });
 }
 
+export async function sessionCredentialStatus(connectionId: string): Promise<boolean> {
+  return invokeBackend("session_credential_status", { connectionId });
+}
+
+export async function forgetSessionCredential(connectionId: string): Promise<void> {
+  return invokeBackend("forget_session_credential", { connectionId });
+}
+
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return invokeBackend("check_connection_health", { connectionId });
 }
@@ -1130,6 +1154,7 @@ export async function executeQuery(
     catalog?: string;
     fetchSize?: number;
     pageSize?: number;
+    rowOffset?: number;
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
@@ -1161,6 +1186,10 @@ export async function executeMulti(
     catalog?: string;
     fetchSize?: number;
     pageSize?: number;
+    rowOffset?: number;
+    maxResultBytes?: number;
+    resultKeyColumns?: string[];
+    tableDataPreview?: boolean;
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
@@ -1169,8 +1198,10 @@ export async function executeMulti(
     executionMode?: "simple";
   },
 ): Promise<QueryResult[]> {
+  const diagnosticsEnabled = isDebugLoggingEnabled();
+  const startedAt = diagnosticsEnabled ? performance.now() : 0;
   try {
-    return await invoke("execute_multi", {
+    const results = await invoke<QueryResult[]>("execute_multi", {
       connectionId,
       database,
       sql,
@@ -1178,7 +1209,23 @@ export async function executeMulti(
       executionId,
       ...options,
     });
+    if (diagnosticsEnabled) {
+      appendDebugLog("info", "[DBX][query-transport:tauri]", {
+        traceId: executionId?.slice(0, 8),
+        totalMs: Math.round(performance.now() - startedAt),
+        resultCount: results.length,
+        rowCounts: results.map((result) => result.rows.length),
+        columnCounts: results.map((result) => result.columns.length),
+      });
+    }
+    return results;
   } catch (error) {
+    if (diagnosticsEnabled) {
+      appendDebugLog("warn", "[DBX][query-transport:tauri:error]", {
+        traceId: executionId?.slice(0, 8),
+        totalMs: Math.round(performance.now() - startedAt),
+      });
+    }
     throw new BackendErrorException(error);
   }
 }
@@ -1205,6 +1252,10 @@ export async function executeMultiWithProgress(
     catalog?: string;
     fetchSize?: number;
     pageSize?: number;
+    rowOffset?: number;
+    maxResultBytes?: number;
+    resultKeyColumns?: string[];
+    tableDataPreview?: boolean;
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
@@ -1269,12 +1320,13 @@ export async function executeScript(connectionId: string, database: string, sql:
   return invoke("execute_script", { connectionId, database, sql, schema });
 }
 
-export async function executeScriptWith2pc(connectionId: string, database: string, statements: string[], schema?: string): Promise<TransactionLog> {
+export async function executeScriptWith2pc(connectionId: string, database: string, statements: string[], schema?: string, destructiveConfirmed = false): Promise<TransactionLog> {
   return invoke("execute_script_with_2pc", {
     connectionId,
     database,
     statements,
     schema,
+    destructiveConfirmed,
   });
 }
 
@@ -1402,6 +1454,10 @@ export async function buildEmptyTableSql(options: TableAdminSqlOptions): Promise
 
 export async function buildTruncateTableSql(options: TableAdminSqlOptions): Promise<string> {
   return invoke("build_truncate_table_sql", { options });
+}
+
+export async function buildMysqlAutoIncrementSql(options: MysqlAutoIncrementSqlOptions): Promise<string> {
+  return invoke("build_mysql_auto_increment_sql", { options });
 }
 
 export async function buildDropDatabaseSql(options: DatabaseNameSqlOptions): Promise<string> {
@@ -1908,6 +1964,10 @@ export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return invoke("load_saved_sql_library");
 }
 
+export async function loadSavedSqlFilesForSync(): Promise<SavedSqlFile[]> {
+  return invoke("load_saved_sql_files_for_sync");
+}
+
 export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
   return invoke("load_saved_sql_file", { id });
 }
@@ -1997,6 +2057,7 @@ export interface McpServerStatus {
   data_dir: string | null;
   install_command: string;
   update_command: string;
+  uninstall_command: string;
   error: string | null;
 }
 
@@ -2006,6 +2067,10 @@ export async function checkMcpServerStatus(): Promise<McpServerStatus> {
 
 export async function installMcpServer(): Promise<string> {
   return invoke("install_mcp_server");
+}
+
+export async function uninstallMcpServer(): Promise<string> {
+  return invoke("uninstall_mcp_server");
 }
 
 export async function checkForUpdates(locale?: string, source?: UpdateDownloadSource): Promise<UpdateInfo> {
@@ -3243,6 +3308,31 @@ export interface DocumentQueryResult {
   extended_documents?: any[];
   total: number;
   total_is_exact?: boolean;
+  next_cursor?: string;
+}
+
+export interface DynamoDbKeyInfo {
+  name: string;
+  attributeType: "S" | "N" | "B" | string;
+}
+
+export interface DynamoDbIndexInfo {
+  name: string;
+  kind: "global" | "local" | string;
+  partitionKey: DynamoDbKeyInfo;
+  sortKey?: DynamoDbKeyInfo;
+  projectionType: "ALL" | "KEYS_ONLY" | "INCLUDE" | string;
+  nonKeyAttributes: string[];
+}
+
+export interface DynamoDbTableDescription {
+  name: string;
+  status: string;
+  itemCount: number;
+  sizeBytes: number;
+  partitionKey: DynamoDbKeyInfo;
+  sortKey?: DynamoDbKeyInfo;
+  indexes: DynamoDbIndexInfo[];
 }
 
 // Kept for callers that are specifically using MongoDB APIs.
@@ -3266,6 +3356,32 @@ export interface MongoDropIndexesResult {
   dropped_names: string[];
   affected_rows: number;
   failures?: MongoDropIndexFailure[];
+}
+
+export interface MongoIndexKey {
+  field: string;
+  /** `1`, `-1`, or a MongoDB key type such as `text` / `2dsphere` / `hashed`. */
+  direction: string;
+}
+
+/** Full MongoDB index specification, carrying the options `IndexInfo` cannot hold. */
+export interface MongoIndexSpec {
+  name: string;
+  keys: MongoIndexKey[];
+  is_unique: boolean;
+  is_primary: boolean;
+  is_sparse: boolean;
+  /** TTL in seconds; null when the index does not expire. */
+  expire_after_seconds: number | null;
+  partial_filter_expression: string | null;
+  /** Ignored by MongoDB 4.2+, still reported by older servers. */
+  background: boolean;
+  /** Only meaningful for geoHaystack indexes, removed in MongoDB 4.4+. */
+  bucket_size: number | null;
+  hidden: boolean;
+  /** False when the driver could not report the properties above (Legacy Agent). */
+  properties_complete: boolean;
+  extra_options: string | null;
 }
 
 export interface MongoCloneCollectionResult {
@@ -3379,7 +3495,7 @@ export async function mongoParseShellCommand(source: string): Promise<MongoComma
   return normalizeRustMongoCommand(raw);
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<DocumentQueryResult> {
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string, cursor?: string): Promise<DocumentQueryResult> {
   return invoke("document_find_documents", {
     connectionId,
     database,
@@ -3390,8 +3506,22 @@ export async function documentFindDocuments(connectionId: string, database: stri
     projection,
     sort,
     collation,
+    cursor,
     executionId,
   });
+}
+
+export async function documentCountDocuments(connectionId: string, collection: string, filter?: string, executionId?: string): Promise<number> {
+  return invoke("document_count_documents", {
+    connectionId,
+    collection,
+    filter,
+    executionId,
+  });
+}
+
+export async function dynamodbDescribeTable(connectionId: string, table: string): Promise<DynamoDbTableDescription> {
+  return invoke("dynamodb_describe_table", { connectionId, table });
 }
 
 export async function elasticsearchCountDocuments(connectionId: string, index: string, filter?: string, executionId?: string): Promise<number> {
@@ -3520,6 +3650,14 @@ export async function mongoCollectionStats(connectionId: string, database: strin
   });
 }
 
+export async function mongoListIndexSpecs(connectionId: string, database: string, collection: string): Promise<MongoIndexSpec[]> {
+  return invoke("mongo_list_index_specs", {
+    connectionId,
+    database,
+    collection,
+  });
+}
+
 export async function mongoCreateIndex(connectionId: string, database: string, collection: string, keysJson: string, optionsJson?: string): Promise<{ name: string }> {
   return invoke("mongo_create_index", {
     connectionId,
@@ -3536,6 +3674,15 @@ export async function mongoCreateUser(connectionId: string, database: string, us
     database,
     userJson,
     writeConcernJson,
+  });
+}
+
+export async function mongoRunCommand(connectionId: string, database: string, commandJson: string, executionId?: string): Promise<MongoDocumentResult> {
+  return invoke("mongo_run_command", {
+    connectionId,
+    database,
+    commandJson,
+    executionId,
   });
 }
 
@@ -3614,6 +3761,16 @@ export async function documentDeleteDocument(connectionId: string, database: str
     id,
     routing,
     documentType,
+  });
+}
+
+export async function documentSaveMeilisearchBatch(connectionId: string, collection: string, updates: Array<{ id: string; docJson: string }>, deleteIds: string[], inserts: string[]): Promise<number> {
+  return invoke("document_save_meilisearch_batch", {
+    connectionId,
+    collection,
+    updates,
+    deleteIds,
+    inserts,
   });
 }
 

@@ -20,15 +20,17 @@ import (
 )
 
 const (
-	defaultHivePort           = 10000
-	defaultHiveDatabase       = "default"
-	defaultHiveHTTPPath       = "cliservice"
-	defaultHiveService        = "hive"
-	defaultZooKeeperNamespace = "hiveserver2"
-	defaultConnectTimeout     = 15 * time.Second
-	defaultRetryInterval      = time.Second
-	defaultBrowserSSOTimeout  = 120 * time.Second
-	defaultCookieName         = "hive.server2.auth"
+	defaultHivePort            = 10000
+	defaultHiveDatabase        = "default"
+	defaultHiveHTTPPath        = "cliservice"
+	defaultHiveService         = "hive"
+	defaultImpalaService       = "impala"
+	defaultZooKeeperNamespace  = "hiveserver2"
+	resultSetUniqueColumnNames = "hive.resultset.use.unique.column.names"
+	defaultConnectTimeout      = 15 * time.Second
+	defaultRetryInterval       = time.Second
+	defaultBrowserSSOTimeout   = 120 * time.Second
+	defaultCookieName          = "hive.server2.auth"
 )
 
 type connectParams struct {
@@ -46,6 +48,7 @@ type connectParams struct {
 	ConnectTimeout   int      `json:"connect_timeout_secs"`
 	AgentJavaOptions []string `json:"agent_java_options"`
 	SessionRole      string   `json:"sessionRole"`
+	DatabaseType     string   `json:"database_type"`
 }
 
 type endpoint struct {
@@ -94,6 +97,7 @@ type zooKeeperKerberosConfig struct {
 }
 
 type connectionConfig struct {
+	DatabaseType           string
 	Endpoints              []endpoint
 	Database               string
 	Username               string
@@ -137,6 +141,7 @@ type connectionConfig struct {
 
 func parseConnectionConfig(params connectParams) (connectionConfig, error) {
 	config := connectionConfig{
+		DatabaseType:           strings.ToLower(strings.TrimSpace(params.DatabaseType)),
 		Database:               strings.TrimSpace(params.Database),
 		Username:               params.Username,
 		Password:               params.Password,
@@ -163,6 +168,10 @@ func parseConnectionConfig(params connectParams) (connectionConfig, error) {
 			QOP:               "auth",
 			CanonicalHostname: true,
 		},
+	}
+	if strings.EqualFold(params.DatabaseType, "impala") {
+		config.Auth = "NOSASL"
+		config.Kerberos.Service = defaultImpalaService
 	}
 	if config.Database == "" {
 		config.Database = defaultHiveDatabase
@@ -204,7 +213,7 @@ func parseConnectionConfig(params connectParams) (connectionConfig, error) {
 
 	urlSections := parseHiveParameterSections(params.URLParams)
 	values := mergeHiveParameters(parsed.parameters, urlSections.session)
-	hiveConfs := mergeHiveAssignments(parsed.hiveConfs, urlSections.hiveConfs)
+	hiveConfs := mergeHiveConfAssignments(parsed.hiveConfs, urlSections.hiveConfs)
 	hiveVars := mergeHiveAssignments(parsed.hiveVars, urlSections.hiveVars)
 	if value, exists := firstParameter(values, "user", "username"); exists {
 		config.Username = value
@@ -476,6 +485,17 @@ func mergeHiveAssignments(first, second map[string]string) map[string]string {
 	return result
 }
 
+func mergeHiveConfAssignments(first, second map[string]string) map[string]string {
+	result := make(map[string]string, len(first)+len(second))
+	for key, value := range first {
+		result[canonicalHiveConfKey(key)] = value
+	}
+	for key, value := range second {
+		result[canonicalHiveConfKey(key)] = value
+	}
+	return result
+}
+
 func applyHiveParameters(config *connectionConfig, values, hiveConfs map[string]string) error {
 	if value := parameter(values, "auth"); value != "" {
 		config.Auth = strings.ToUpper(value)
@@ -584,7 +604,7 @@ func applyHiveParameters(config *connectionConfig, values, hiveConfs map[string]
 		parameter(values, "clientprincipal"),
 		parameter(values, "userprincipal"),
 	)
-	kerberos.Service = firstNonEmpty(parameter(values, "service"), serviceFromPrincipal(kerberos.ServerPrincipal), defaultHiveService)
+	kerberos.Service = firstNonEmpty(parameter(values, "service"), serviceFromPrincipal(kerberos.ServerPrincipal), kerberos.Service)
 	kerberos.ServerName = parameter(values, "servername")
 	kerberos.Realm = firstNonEmpty(parameter(values, "realm"), realmFromPrincipal(kerberos.ClientPrincipal))
 	kerberos.ConfigPath = firstNonEmpty(parameter(values, "krb5conf"), parameter(values, "kerberosconfig"))
@@ -635,11 +655,12 @@ func applyHiveParameters(config *connectionConfig, values, hiveConfs map[string]
 }
 
 func applyOpenSessionVariables(config *connectionConfig, values, hiveConfs, hiveVars map[string]string) {
+	config.HiveConfiguration["set:hiveconf:"+resultSetUniqueColumnNames] = "false"
 	for key, value := range values {
 		lowerKey := strings.ToLower(key)
 		switch {
 		case strings.HasPrefix(lowerKey, "hiveconf:"):
-			config.HiveConfiguration["set:hiveconf:"+key[len("hiveconf:"):]] = value
+			config.HiveConfiguration["set:hiveconf:"+canonicalHiveConfKey(key[len("hiveconf:"):])] = value
 		case strings.HasPrefix(lowerKey, "hivevar:"):
 			config.HiveConfiguration["set:hivevar:"+key[len("hivevar:"):]] = value
 		}
@@ -648,7 +669,7 @@ func applyOpenSessionVariables(config *connectionConfig, values, hiveConfs, hive
 		if strings.EqualFold(key, "hive.server2.transport.mode") || strings.EqualFold(key, "hive.server2.thrift.http.path") {
 			continue
 		}
-		config.HiveConfiguration["set:hiveconf:"+key] = value
+		config.HiveConfiguration["set:hiveconf:"+canonicalHiveConfKey(key)] = value
 	}
 	for key, value := range hiveVars {
 		config.HiveConfiguration["set:hivevar:"+key] = value
@@ -665,6 +686,13 @@ func applyOpenSessionVariables(config *connectionConfig, values, hiveConfs, hive
 	if value := firstNonEmpty(parameter(values, "applicationname"), parameter(values, "ApplicationName")); value != "" {
 		config.HiveConfiguration["set:hivevar:wmapp"] = value
 	}
+}
+
+func canonicalHiveConfKey(key string) string {
+	if strings.EqualFold(key, resultSetUniqueColumnNames) {
+		return resultSetUniqueColumnNames
+	}
+	return key
 }
 
 func hiveAssignmentValue(values map[string]string, key string) string {

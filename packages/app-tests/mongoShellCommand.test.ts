@@ -7,6 +7,7 @@ import {
   mongoAggregateWriteStage,
   mongoCollectionStatsToQueryResult,
   mongoCountToQueryResult,
+  mongoDatabasesToQueryResult,
   mongoDistinctToQueryResult,
   mongoDocumentsToQueryResult,
   mongoDroppedIndexesToQueryResult,
@@ -17,6 +18,7 @@ import {
   parseMongoCollectionStatsCommand,
   parseMongoCommand,
   parseMongoCreateUserCommand,
+  parseMongoRunCommand,
   parseMongoCountDocumentsCommand,
   parseMongoDistinctCommand,
   parseMongoFindCommand,
@@ -75,13 +77,120 @@ db.createUser({
   roles: [{ role: "readWrite", db: "db1" }]
 })`);
 
-  assert.deepEqual(commands.map(({ command }) => command.kind), ["use", "createUser"]);
+  assert.deepEqual(
+    commands.map(({ command }) => command.kind),
+    ["use", "createUser"],
+  );
   const createUser = commands[1]?.command;
   assert.equal(createUser?.kind, "createUser");
   if (createUser?.kind === "createUser") {
     assert.equal(JSON.parse(createUser.userJson).user, "test-db");
     assert.match(evaluateMongoWriteSafety(createUser, { allowWrites: true }).reason || "", /high-risk operations/i);
     assert.equal(evaluateMongoWriteSafety(createUser, { allowWrites: true, allowDangerous: true }).allowed, true);
+  }
+});
+
+test("parseMongoRunCommand normalizes one non-empty command document", () => {
+  assert.deepEqual(
+    parseMongoRunCommand(`db.runCommand({
+      find: "orders",
+      filter: {_id: ObjectId("507f1f77bcf86cd799439011")},
+      createdAt: ISODate("2025-01-01T00:00:00Z")
+    })`),
+    {
+      commandJson: '{"find":"orders","filter":{"_id":{"$oid":"507f1f77bcf86cd799439011"}},"createdAt":{"$date":"2025-01-01T00:00:00Z"}}',
+    },
+  );
+
+  for (const source of ["db.runCommand()", "db.runCommand({})", "db.runCommand('ping')", "db.runCommand({ping: 1}, {readPreference: 'primary'})", "db.runCommand({ping: 1}).valueOf()", "db.runCommand([1, 2, 3])"]) {
+    assert.equal(parseMongoRunCommand(source), null, source);
+  }
+});
+
+test("parseMongoCommand accepts read-only show-databases aliases exactly", () => {
+  for (const source of ["show dbs", "SHOW DATABASES;", "/* databases */ show dbs -- list"]) {
+    assert.deepEqual(parseMongoCommand(source)?.command, { kind: "showDatabases" }, source);
+  }
+
+  for (const source of ["show dbs extra", "show database", "show collections", "show"]) {
+    assert.equal(parseMongoCommand(source), null, source);
+  }
+
+  assert.equal(evaluateMongoWriteSafety(parseMongoCommand("db.runCommand({listDatabases: 1})")!.command as MongoWriteCommand, {}).allowed, false);
+});
+
+test("splitMongoCommands keeps show databases after a database switch", () => {
+  assert.deepEqual(
+    splitMongoCommands("use app\nshow databases").map(({ command }) => command.kind),
+    ["use", "showDatabases"],
+  );
+});
+
+test("mongoDatabasesToQueryResult preserves metadata and bounds rows", () => {
+  assert.deepEqual(
+    mongoDatabasesToQueryResult(
+      [
+        {
+          databases: [
+            { name: "admin", sizeOnDisk: 40960, empty: false },
+            { name: "app", sizeOnDisk: { $numberLong: "8192" }, empty: true },
+            { name: "logs", sizeOnDisk: 1024, empty: false },
+          ],
+          totalSize: 50176,
+          ok: 1,
+        },
+      ],
+      4.4,
+      2,
+    ),
+    {
+      columns: ["name", "sizeOnDisk", "empty"],
+      rows: [
+        ["admin", 40960, false],
+        ["app", "8192", true],
+      ],
+      affected_rows: 3,
+      execution_time_ms: 4,
+      truncated: true,
+      has_more: true,
+    },
+  );
+
+  assert.deepEqual(mongoDatabasesToQueryResult([{ databases: [] }], 0, 10), {
+    columns: ["name", "sizeOnDisk", "empty"],
+    rows: [],
+    affected_rows: 0,
+    execution_time_ms: 0,
+    truncated: false,
+    has_more: false,
+  });
+  assert.throws(() => mongoDatabasesToQueryResult([{ ok: 1 }], 0, 10), /databases array/);
+});
+
+test("runCommand support does not accept arbitrary Mongo shell JavaScript", () => {
+  assert.deepEqual(
+    splitMongoCommands(`for (let i = 0; i < 2; i += 1) {
+  db.items.insertOne({ index: i });
+}`),
+    [],
+  );
+});
+
+test("splitMongoCommands keeps runCommand after a database switch", () => {
+  const commands = splitMongoCommands(`use admin
+
+db.runCommand({ ping: 1 })`);
+
+  assert.deepEqual(
+    commands.map(({ command }) => command.kind),
+    ["use", "runCommand"],
+  );
+  const runCommand = commands[1]?.command;
+  assert.equal(runCommand?.kind, "runCommand");
+  if (runCommand?.kind === "runCommand") {
+    assert.deepEqual(JSON.parse(runCommand.commandJson), { ping: 1 });
+    assert.equal(evaluateMongoWriteSafety(runCommand, { allowWrites: true }).allowed, false);
+    assert.equal(evaluateMongoWriteSafety(runCommand, { allowWrites: true, allowDangerous: true }).allowed, true);
   }
 });
 

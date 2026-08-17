@@ -587,8 +587,44 @@ fn pg_scalar_type_requires_text_protocol(oid: u32, col_type: PgColType) -> bool 
     Type::from_oid(oid).is_none() && !matches!(col_type, PgColType::Vector | PgColType::Geometry)
 }
 
+/// PostgreSQL `reg*` types are OID-backed, but their useful representation is
+/// the catalog name returned by the text protocol (for example `regtype`
+/// returns `integer`). Decoding their binary payload as a generic value leaves
+/// the raw four-byte OID on the UI boundary, which is rendered as gibberish.
+fn pg_type_is_reg_type(pg_type: &Type) -> bool {
+    matches!(
+        pg_type.oid(),
+        oid if [
+            Type::REGPROC.oid(),
+            Type::REGPROCEDURE.oid(),
+            Type::REGOPER.oid(),
+            Type::REGOPERATOR.oid(),
+            Type::REGCLASS.oid(),
+            Type::REGTYPE.oid(),
+            Type::REGNAMESPACE.oid(),
+            Type::REGROLE.oid(),
+            Type::REGCOLLATION.oid(),
+            Type::REGCONFIG.oid(),
+            Type::REGDICTIONARY.oid(),
+            Type::REGPROC_ARRAY.oid(),
+            Type::REGPROCEDURE_ARRAY.oid(),
+            Type::REGOPER_ARRAY.oid(),
+            Type::REGOPERATOR_ARRAY.oid(),
+            Type::REGCLASS_ARRAY.oid(),
+            Type::REGTYPE_ARRAY.oid(),
+            Type::REGNAMESPACE_ARRAY.oid(),
+            Type::REGROLE_ARRAY.oid(),
+            Type::REGCOLLATION_ARRAY.oid(),
+            Type::REGCONFIG_ARRAY.oid(),
+            Type::REGDICTIONARY_ARRAY.oid(),
+        ]
+        .contains(&oid)
+    )
+}
+
 fn pg_type_requires_text_protocol(pg_type: &Type, col_type: PgColType) -> bool {
-    if pg_type.oid() == Type::RECORD.oid() || pg_type.oid() == Type::RECORD_ARRAY.oid() {
+    if pg_type.oid() == Type::RECORD.oid() || pg_type.oid() == Type::RECORD_ARRAY.oid() || pg_type_is_reg_type(pg_type)
+    {
         return true;
     }
 
@@ -2156,9 +2192,15 @@ fn postgres_tls_client_auth(
                 return Err(format!("sslcert: no certificates found in {cert_path}"));
             }
             let private_key = read_postgres_private_key(key_path)?;
-            builder
-                .with_client_auth_cert(certs, private_key)
-                .map_err(|e| format!("PostgreSQL client certificate/key mismatch or invalid key: {e}"))
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            let signing_key = provider
+                .key_provider
+                .load_private_key(private_key)
+                .map_err(|e| format!("PostgreSQL client private key is invalid: {e}"))?;
+            // rustls' convenience builder parses the leaf with webpki while matching keys,
+            // which rejects otherwise usable X.509 v1 client certificates before TLS starts.
+            let certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
+            Ok(builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified_key))))
         }
         (Some(_), None) => Err("PostgreSQL sslcert requires sslkey".to_string()),
         (None, Some(_)) => Err("PostgreSQL sslkey requires sslcert".to_string()),
@@ -2512,14 +2554,29 @@ pub async fn completion_assistant_search(
     }
 
     if candidates.len() < limit && kinds.iter().any(CompletionAssistantObjectKind::is_routine_like) {
-        let prokinds = postgres_completion_prokinds(&kinds);
-        let rows = postgres_query_cached(
-            &client,
-            postgres_completion_routines_sql(),
-            &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
+        let rows = if has_proc_prokind {
+            let prokinds = postgres_completion_prokinds(&kinds);
+            postgres_query_cached(
+                &client,
+                postgres_completion_routines_sql(true),
+                &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        } else if kinds.iter().any(|kind| {
+            matches!(kind, CompletionAssistantObjectKind::Function | CompletionAssistantObjectKind::Routine)
+        }) {
+            postgres_query_cached(
+                &client,
+                postgres_completion_routines_sql(false),
+                &[&routine_schema, &pattern, &((limit - candidates.len()) as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            Vec::new()
+        };
         for row in rows {
             let routine_type: String = pg_row_try_string(&row, 2);
             candidates.push(CompletionAssistantCandidate {
@@ -2536,6 +2593,29 @@ pub async fn completion_assistant_search(
                 comment: row.try_get::<_, Option<String>>(3).ok().flatten(),
                 data_type: row.try_get::<_, Option<String>>(4).ok().flatten(),
                 signature: row.try_get::<_, Option<String>>(5).ok().flatten(),
+            });
+        }
+    }
+
+    if candidates.len() < limit && kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Sequence)) {
+        let rows = postgres_query_cached(
+            &client,
+            postgres_completion_sequences_sql(),
+            &[&schema, &pattern, &request.case_sensitive, &((limit - candidates.len()) as i64)],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        for row in rows {
+            candidates.push(CompletionAssistantCandidate {
+                name: pg_row_try_string(&row, 0),
+                kind: CompletionAssistantCandidateKind::Sequence,
+                database: Some(request.database.clone()),
+                schema: Some(pg_row_try_string(&row, 1)),
+                parent_schema: None,
+                parent_name: None,
+                comment: row.try_get::<_, Option<String>>(2).ok().flatten(),
+                data_type: None,
+                signature: None,
             });
         }
     }
@@ -2600,15 +2680,42 @@ fn postgres_completion_tables_sql() -> &'static str {
      ORDER BY c.relname LIMIT $4"
 }
 
-fn postgres_completion_routines_sql() -> &'static str {
-    "SELECT p.proname, n.nspname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, \
+fn postgres_completion_routines_sql(has_proc_prokind: bool) -> &'static str {
+    if has_proc_prokind {
+        return "SELECT p.proname, n.nspname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, \
             obj_description(p.oid) AS routine_comment, COALESCE(pg_get_function_result(p.oid), '') AS data_type, \
             pg_get_function_identity_arguments(p.oid) AS signature \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
      WHERE n.nspname = $1 AND p.prokind::text = ANY($3::text[]) \
        AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
-     ORDER BY p.proname LIMIT $4"
+     ORDER BY p.proname LIMIT $4";
+    }
+
+    "SELECT p.proname, n.nspname, 'FUNCTION'::text, \
+            obj_description(p.oid) AS routine_comment, COALESCE(pg_get_function_result(p.oid), '') AS data_type, \
+            pg_get_function_identity_arguments(p.oid) AS signature \
+     FROM pg_catalog.pg_proc p \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+     WHERE n.nspname = $1 \
+       AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
+     ORDER BY p.proname LIMIT $3"
+}
+
+fn postgres_completion_sequences_sql() -> &'static str {
+    "SELECT c.relname, n.nspname, obj_description(c.oid) AS sequence_comment \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE ($1::text IS NOT NULL AND n.nspname = $1 \
+            OR $1::text IS NULL AND pg_catalog.pg_table_is_visible(c.oid)) \
+       AND c.relkind = 'S' \
+       AND pg_catalog.has_schema_privilege(n.oid, 'USAGE') \
+       AND CASE WHEN c.relkind = 'S' \
+                THEN pg_catalog.has_sequence_privilege(c.oid, 'USAGE, SELECT, UPDATE') \
+                ELSE FALSE END \
+       AND ($2 = '%%' OR CASE WHEN $3 THEN c.relname LIKE $2 ESCAPE '~' \
+                              ELSE c.relname ILIKE $2 ESCAPE '~' END) \
+     ORDER BY c.relname LIMIT $4"
 }
 
 fn postgres_completion_columns_sql() -> &'static str {
@@ -2745,7 +2852,11 @@ pub async fn get_table_partition_local_objects(
 
 fn postgres_table_partition_relation_sql() -> &'static str {
     "SELECT c.relkind::text, \
-            COALESCE((pg_catalog.row_to_json(c)->>'relispartition')::boolean, false) AS is_partition \
+            EXISTS ( \
+              SELECT 1 FROM pg_catalog.pg_inherits i \
+              WHERE i.inhrelid = c.oid \
+                AND (SELECT parent.relkind FROM pg_catalog.pg_class parent WHERE parent.oid = i.inhparent) = 'p' \
+            ) AS is_partition \
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p') \
@@ -5170,7 +5281,8 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              am.amname AS index_type, \
              ix.indnkeyatts AS nkeyatts, \
              ix.indkey AS indkey, \
-             obj_description(i.oid, 'pg_class') AS index_comment \
+             obj_description(i.oid, 'pg_class') AS index_comment, \
+             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -5198,7 +5310,16 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              am.amname AS index_type, \
              NULL::smallint AS nkeyatts, \
              ix.indkey AS indkey, \
-             obj_description(i.oid, 'pg_class') AS index_comment \
+             obj_description(i.oid, 'pg_class') AS index_comment, \
+             ARRAY( \
+               SELECT a.attname IS NULL \
+               FROM generate_series(1, array_length(string_to_array(ix.indkey::text, ' '), 1)) AS pos(n) \
+               LEFT JOIN pg_attribute a \
+                 ON a.attrelid = t.oid \
+                AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
+                AND a.attnum > 0 \
+               ORDER BY pos.n \
+             ) AS key_is_expression \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -5274,6 +5395,11 @@ async fn list_indexes_with_sql(
             let split_at = nkeyatts.min(all_cols.len());
             let key_cols = all_cols[..split_at].to_vec();
             let included = if split_at < all_cols.len() { all_cols[split_at..].to_vec() } else { vec![] };
+            // `a.attname IS NULL` at a given key position means that key part came back from
+            // pg_get_indexdef (a functional/expression key part), not from a real column (#6295).
+            let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(9).unwrap_or_default();
+            let key_is_expression =
+                if all_is_expr.len() == all_cols.len() { all_is_expr[..split_at].to_vec() } else { Vec::new() };
             IndexInfo {
                 name: pg_row_try_string(row, 0),
                 columns: key_cols,
@@ -5283,6 +5409,7 @@ async fn list_indexes_with_sql(
                 index_type: row.try_get::<_, Option<String>>(5).ok().flatten(),
                 included_columns: if included.is_empty() { None } else { Some(included) },
                 comment: row.try_get::<_, Option<String>>(8).ok().flatten(),
+                key_is_expression,
             }
         })
         .collect())
@@ -6277,6 +6404,39 @@ mod tests {
             Type::new("_record".to_string(), Type::RECORD_ARRAY.oid(), Kind::Simple, "pg_catalog".to_string());
         assert!(pg_type_requires_text_protocol(&dynamic_record, PgColType::Other));
         assert!(pg_type_requires_text_protocol(&dynamic_record_array, PgColType::GenericArray));
+    }
+
+    #[test]
+    fn postgres_reg_types_use_text_protocol_for_catalog_names() {
+        // Binary reg* values are OIDs, while PostgreSQL's text output is the
+        // human-readable object/type name users expect to see in the grid.
+        for pg_type in [
+            Type::REGPROC,
+            Type::REGPROCEDURE,
+            Type::REGOPER,
+            Type::REGOPERATOR,
+            Type::REGCLASS,
+            Type::REGTYPE,
+            Type::REGNAMESPACE,
+            Type::REGROLE,
+            Type::REGCOLLATION,
+            Type::REGCONFIG,
+            Type::REGDICTIONARY,
+            Type::REGPROC_ARRAY,
+            Type::REGPROCEDURE_ARRAY,
+            Type::REGOPER_ARRAY,
+            Type::REGOPERATOR_ARRAY,
+            Type::REGCLASS_ARRAY,
+            Type::REGTYPE_ARRAY,
+            Type::REGNAMESPACE_ARRAY,
+            Type::REGROLE_ARRAY,
+            Type::REGCOLLATION_ARRAY,
+            Type::REGCONFIG_ARRAY,
+            Type::REGDICTIONARY_ARRAY,
+        ] {
+            assert!(pg_type_is_reg_type(&pg_type));
+            assert!(pg_type_requires_text_protocol(&pg_type, PgColType::Other));
+        }
     }
 
     #[test]
@@ -7613,6 +7773,94 @@ mod tests {
     }
 
     #[test]
+    fn postgres_tls_rejects_empty_client_certificate() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir();
+        let suffix = uuid::Uuid::new_v4().simple();
+        let cert = dir.join(format!("dbx-postgres-empty-client-{suffix}.crt"));
+        let key = dir.join(format!("dbx-postgres-empty-client-{suffix}.key"));
+        std::fs::write(&cert, []).unwrap();
+        std::fs::write(&key, []).unwrap();
+        let pg_config = tokio_postgres::Config::from_str("postgres://localhost/db?sslmode=require").unwrap();
+        let ssl_files = PostgresSslFiles {
+            sslcert: Some(cert.to_string_lossy().into_owned()),
+            sslkey: Some(key.to_string_lossy().into_owned()),
+            sslrootcert: None,
+        };
+
+        let error = postgres_tls_config(&pg_config, &ssl_files, true, false)
+            .expect_err("empty client certificate should fail before connecting");
+        assert!(error.contains("no certificates"), "{error}");
+
+        let _ = std::fs::remove_file(cert);
+        let _ = std::fs::remove_file(key);
+    }
+
+    #[test]
+    fn postgres_tls_rejects_malformed_private_key() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir();
+        let suffix = uuid::Uuid::new_v4().simple();
+        let cert = dir.join(format!("dbx-postgres-client-{suffix}.crt"));
+        let key = dir.join(format!("dbx-postgres-malformed-client-{suffix}.key"));
+        std::fs::write(&cert, "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\nMAA=\n-----END PRIVATE KEY-----\n").unwrap();
+        let pg_config = tokio_postgres::Config::from_str("postgres://localhost/db?sslmode=require").unwrap();
+        let ssl_files = PostgresSslFiles {
+            sslcert: Some(cert.to_string_lossy().into_owned()),
+            sslkey: Some(key.to_string_lossy().into_owned()),
+            sslrootcert: None,
+        };
+
+        let error = postgres_tls_config(&pg_config, &ssl_files, true, false)
+            .expect_err("malformed private key should fail before connecting");
+        assert!(error.contains("client private key is invalid"), "{error}");
+
+        let _ = std::fs::remove_file(cert);
+        let _ = std::fs::remove_file(key);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_MTLS_URL pointing at PostgreSQL 14 with required client certificates"]
+    async fn postgres_mtls_accepts_configured_client_identity() {
+        let url = std::env::var("DBX_TEST_POSTGRES_MTLS_URL").expect("DBX_TEST_POSTGRES_MTLS_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect with client certificate");
+        let client = pool.get().await.expect("get PostgreSQL mTLS client");
+        let row = client
+            .query_one(
+                "SELECT current_user, ssl, current_setting('server_version_num')::int \
+                 FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("query PostgreSQL TLS session");
+
+        assert_eq!(row.get::<_, String>(0), "db");
+        assert!(row.get::<_, bool>(1));
+        assert!((140_000..150_000).contains(&row.get::<_, i32>(2)));
+    }
+
+    #[test]
+    #[ignore = "requires DBX_TEST_POSTGRES_MTLS_URL with a valid client certificate"]
+    fn postgres_mtls_cancel_connector_reuses_client_identity() {
+        let url = std::env::var("DBX_TEST_POSTGRES_MTLS_URL").expect("DBX_TEST_POSTGRES_MTLS_URL");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let context = build_postgres_cancel_context(&url).expect("build PostgreSQL TLS cancel context");
+
+        make_rustls_connect_from_context(&context).expect("rebuild TLS connector with client certificate");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_MTLS_REJECT_URL that the TLS server must reject"]
+    async fn postgres_mtls_rejects_invalid_tls_identity() {
+        let url = std::env::var("DBX_TEST_POSTGRES_MTLS_REJECT_URL").expect("DBX_TEST_POSTGRES_MTLS_REJECT_URL");
+        let error =
+            connect(&url, Duration::from_secs(5)).await.expect_err("invalid TLS identity must not authenticate");
+
+        assert!(error.contains("PostgreSQL connection failed"), "{error}");
+    }
+
+    #[test]
     fn postgres_accept_all_tls_signature_does_not_parse_unverified_cert() {
         let verifier = NoPostgresCertVerification { provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()) };
         let malformed_cert = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
@@ -7774,7 +8022,12 @@ mod tests {
         let info_sql = postgres_table_partition_info_sql();
         let local_objects_sql = postgres_table_partition_local_objects_sql();
 
-        assert!(relation_sql.contains("row_to_json(c)->>'relispartition'"));
+        assert!(!relation_sql.contains("row_to_json"));
+        assert!(!relation_sql.contains("relispartition"));
+        assert!(!relation_sql.contains("relpartbound"));
+        assert!(relation_sql.contains("pg_catalog.pg_inherits"));
+        assert!(relation_sql.contains("parent.oid = i.inhparent"));
+        assert!(relation_sql.contains(") = 'p'"));
         assert!(relation_sql.contains("c.relkind IN ('r','p')"));
         assert!(info_sql.contains("pg_catalog.pg_get_expr(c.relpartbound, c.oid, true)"));
         assert!(info_sql.contains("pg_catalog.pg_get_partkeydef(c.oid)"));
@@ -7925,6 +8178,56 @@ mod tests {
         assert!(info.is_nullable);
         // int4 1 should be interpreted as true for is_primary_key
         assert!(info.is_primary_key);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL 9.x database"]
+    async fn postgres_legacy_table_ddl_uses_compatible_partition_probe() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let version = execute_query(&pool, "SHOW server_version_num").await.expect("query PostgreSQL version");
+        let version_num = version.rows[0][0]
+            .as_str()
+            .expect("server_version_num should be text")
+            .parse::<u32>()
+            .expect("server_version_num should be numeric");
+        assert!((90000..100000).contains(&version_num), "expected PostgreSQL 9.x, got {version_num}");
+
+        let schema = format!("dbx_legacy_ddl_{}", uuid::Uuid::new_v4().simple());
+        let schema_ident = pg_quote_ident(&schema);
+        let parent = format!("{schema_ident}.parent");
+        let child = format!("{schema_ident}.child");
+        let function = format!("{schema_ident}.fill_child_name");
+        let client = pool.get().await.expect("get postgres client");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema_ident}; \
+                 CREATE TABLE {parent} (id integer PRIMARY KEY); \
+                 CREATE TABLE {child} (parent_id integer REFERENCES {parent}(id), name text) INHERITS ({parent}); \
+                 ALTER TABLE {child} ADD PRIMARY KEY (id); \
+                 CREATE INDEX child_name_idx ON {child}(name); \
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.name := COALESCE(NEW.name, chr(120)); RETURN NEW; END$$; \
+                 CREATE TRIGGER child_bi BEFORE INSERT ON {child} FOR EACH ROW EXECUTE PROCEDURE {function}()"
+            ))
+            .await
+            .expect("create PostgreSQL 9.x DDL fixtures");
+        drop(client);
+
+        let partition_info =
+            get_table_partition_info(&pool, &schema, "child").await.expect("classify PostgreSQL 9.x inherited table");
+        let ddl = crate::schema::pg_ddl(&pool, &schema, "child").await;
+        execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE"))
+            .await
+            .expect("drop PostgreSQL 9.x DDL fixtures");
+        let ddl = ddl.expect("generate PostgreSQL 9.x table DDL");
+
+        assert!(ddl.contains("CREATE TABLE"), "ddl: {ddl}");
+        assert!(ddl.contains("PRIMARY KEY"), "ddl: {ddl}");
+        assert!(ddl.contains("FOREIGN KEY"), "ddl: {ddl}");
+        assert!(ddl.contains("CREATE INDEX \"child_name_idx\""), "ddl: {ddl}");
+        assert!(ddl.contains("CREATE TRIGGER child_bi"), "ddl: {ddl}");
+        assert_eq!(partition_info, PostgresTablePartitionInfo::default());
+        assert!(!ddl.contains("PARTITION OF"), "ddl: {ddl}");
     }
 
     #[tokio::test]
@@ -8143,6 +8446,15 @@ mod tests {
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("WITH ORDINALITY"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("generate_series"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("string_to_array(ix.indkey::text, ' ')"));
+    }
+
+    #[test]
+    fn postgres_index_metadata_tracks_expression_key_provenance() {
+        // #6295 fix: each index key part's `a.attname IS NULL` tags whether it came from a real
+        // column or from pg_get_indexdef, so DDL generation never has to guess from the text.
+        assert!(POSTGRES_INDEXES_SQL.contains("array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("SELECT a.attname IS NULL"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("AS key_is_expression"));
     }
 
     #[test]
@@ -9062,6 +9374,90 @@ mod tests {
             .expect("drop live table fixtures");
     }
 
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn completion_assistant_searches_visible_and_qualified_sequences() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(5), "UTC")
+            .await
+            .expect("connect PostgreSQL database");
+        let client = pool.get().await.expect("checkout postgres");
+        client
+            .batch_execute(
+                r#"DROP SCHEMA IF EXISTS dbx_issue_4005_visible CASCADE;
+                   DROP SCHEMA IF EXISTS dbx_issue_4005_shadowed CASCADE;
+                   CREATE SCHEMA dbx_issue_4005_visible;
+                   CREATE SCHEMA dbx_issue_4005_shadowed;
+                   CREATE SEQUENCE dbx_issue_4005_visible.order_seq;
+                   CREATE SEQUENCE dbx_issue_4005_shadowed.order_seq;
+                   CREATE SEQUENCE dbx_issue_4005_visible."OrderSequence";
+                   SET search_path = dbx_issue_4005_visible, dbx_issue_4005_shadowed, public;"#,
+            )
+            .await
+            .expect("create live sequence fixtures");
+        drop(client);
+
+        let visible = completion_assistant_search(
+            &pool,
+            &CompletionAssistantRequest {
+                connection_id: "live".into(),
+                database: "postgres".into(),
+                schema: None,
+                object_kinds: vec![CompletionAssistantObjectKind::Sequence],
+                mask: "order_".into(),
+                case_sensitive: false,
+                global_search: false,
+                max_results: Some(20),
+                search_in_comments: false,
+                search_in_definitions: false,
+                parent_schema: None,
+                parent_name: None,
+                match_mode: Some(CompletionAssistantMatchMode::Prefix),
+            },
+        )
+        .await
+        .expect("complete visible sequence");
+        assert_eq!(
+            visible
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.name.as_str(), candidate.schema.as_deref()))
+                .collect::<Vec<_>>(),
+            [("order_seq", Some("dbx_issue_4005_visible"))]
+        );
+
+        let qualified = completion_assistant_search(
+            &pool,
+            &CompletionAssistantRequest {
+                connection_id: "live".into(),
+                database: "postgres".into(),
+                schema: Some("dbx_issue_4005_visible".into()),
+                object_kinds: vec![CompletionAssistantObjectKind::Sequence],
+                mask: "OrderS".into(),
+                case_sensitive: true,
+                global_search: false,
+                max_results: Some(20),
+                search_in_comments: false,
+                search_in_definitions: false,
+                parent_schema: None,
+                parent_name: None,
+                match_mode: Some(CompletionAssistantMatchMode::Prefix),
+            },
+        )
+        .await
+        .expect("complete qualified mixed-case sequence");
+        assert_eq!(qualified.candidates[0].name, "OrderSequence");
+
+        let client = pool.get().await.expect("checkout postgres for cleanup");
+        client
+            .batch_execute(
+                r#"DROP SCHEMA IF EXISTS dbx_issue_4005_visible CASCADE;
+                   DROP SCHEMA IF EXISTS dbx_issue_4005_shadowed CASCADE;"#,
+            )
+            .await
+            .expect("drop live sequence fixtures");
+    }
+
     #[test]
     fn like_contains_pattern_escapes_wildcards() {
         assert_eq!(like_contains_pattern(""), "%%");
@@ -9111,10 +9507,24 @@ mod tests {
         assert!(postgres_completion_tables_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
         assert!(postgres_completion_tables_sql().contains("c.relkind::text = ANY($3::text[])"));
         assert!(postgres_completion_tables_sql().contains("ORDER BY c.relname LIMIT $4"));
-        assert!(postgres_completion_routines_sql().contains("p.proname ILIKE $2 ESCAPE '~'"));
-        assert!(postgres_completion_routines_sql().contains("p.prokind::text = ANY($3::text[])"));
-        assert!(postgres_completion_routines_sql().contains("pg_get_function_identity_arguments(p.oid) AS signature"));
-        assert!(postgres_completion_routines_sql().contains("ORDER BY p.proname LIMIT $4"));
+        assert!(postgres_completion_routines_sql(true).contains("p.proname ILIKE $2 ESCAPE '~'"));
+        assert!(postgres_completion_routines_sql(true).contains("p.prokind::text = ANY($3::text[])"));
+        assert!(
+            postgres_completion_routines_sql(true).contains("pg_get_function_identity_arguments(p.oid) AS signature")
+        );
+        assert!(postgres_completion_routines_sql(true).contains("ORDER BY p.proname LIMIT $4"));
+        assert!(!postgres_completion_routines_sql(false).contains("p.prokind"));
+        assert!(postgres_completion_routines_sql(false).contains("'FUNCTION'::text"));
+        assert!(postgres_completion_routines_sql(false).contains("ORDER BY p.proname LIMIT $3"));
+        assert!(postgres_completion_sequences_sql().contains("c.relkind = 'S'"));
+        assert!(postgres_completion_sequences_sql().contains("has_schema_privilege(n.oid, 'USAGE')"));
+        assert!(postgres_completion_sequences_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
+        assert!(postgres_completion_sequences_sql().contains("CASE WHEN c.relkind = 'S'"));
+        assert!(postgres_completion_sequences_sql()
+            .contains("THEN pg_catalog.has_sequence_privilege(c.oid, 'USAGE, SELECT, UPDATE')"));
+        assert!(postgres_completion_sequences_sql().contains("CASE WHEN $3 THEN c.relname LIKE $2 ESCAPE '~'"));
+        assert!(postgres_completion_sequences_sql().contains("ELSE c.relname ILIKE $2 ESCAPE '~' END"));
+        assert!(postgres_completion_sequences_sql().contains("ORDER BY c.relname LIMIT $4"));
         assert!(postgres_completion_columns_sql().contains("a.attname ILIKE $3 ESCAPE '~'"));
         assert!(postgres_visible_table_schema_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
     }

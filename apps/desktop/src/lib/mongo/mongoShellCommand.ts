@@ -62,9 +62,17 @@ export interface MongoVersionCommand {
   kind: "version";
 }
 
+export interface MongoShowDatabasesCommand {
+  kind: "showDatabases";
+}
+
 export interface MongoCreateUserCommand {
   userJson: string;
   writeConcernJson?: string;
+}
+
+export interface MongoRunCommand {
+  commandJson: string;
 }
 
 export type MongoCollectionStatsMetric = "stats" | "dataSize" | "storageSize" | "totalIndexSize";
@@ -81,12 +89,13 @@ export interface MongoDistinctCommand {
   filter?: string;
 }
 
-type MongoWriteKind = "insert" | "update" | "delete" | "createIndex" | "createUser" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
+type MongoWriteKind = "runCommand" | "insert" | "update" | "delete" | "createIndex" | "createUser" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
 
 export type MongoCommand =
   | ({ kind: "find" } & MongoFindCommand)
   | ({ kind: "findOne" } & MongoFindOneCommand)
   | MongoVersionCommand
+  | MongoShowDatabasesCommand
   | ({ kind: "countDocuments" } & MongoCountDocumentsCommand)
   | ({ kind: "aggregate" } & MongoAggregateCommand)
   | ({ kind: "distinct" } & MongoDistinctCommand)
@@ -94,6 +103,7 @@ export type MongoCommand =
   | ({ kind: "collectionStats" } & MongoCollectionStatsCommand)
   | ({ kind: "use" } & MongoUseCommand)
   | ({ kind: "createUser" } & MongoCreateUserCommand)
+  | ({ kind: "runCommand" } & MongoRunCommand)
   | { kind: "insert"; collection: string; docsJson: string }
   | { kind: "update"; collection: string; filter: string; update: string; options?: string; many: boolean }
   | { kind: "delete"; collection: string; filter: string; many: boolean }
@@ -499,6 +509,21 @@ export function parseMongoCreateUserCommand(input: string): MongoCreateUserComma
   };
 }
 
+export function parseMongoRunCommand(input: string): MongoRunCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const match = /^db\s*\.\s*runCommand\s*\(/i.exec(source);
+  if (!match) return null;
+  const openIndex = source.indexOf("(", match.index);
+  const closeIndex = findMatchingParen(source, openIndex);
+  if (closeIndex < 0 || source.slice(closeIndex + 1).trim()) return null;
+  const args = splitTopLevel(source.slice(openIndex + 1, closeIndex));
+  if (args.length !== 1) return null;
+  const commandJson = parseMongoObjectArgument(args[0]);
+  if (!commandJson) return null;
+  const command = JSON.parse(commandJson) as Record<string, unknown>;
+  return Object.keys(command).length > 0 ? { commandJson: JSON.stringify(command) } : null;
+}
+
 export function parseMongoWriteCommand(input: string): MongoWriteCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
   const insertOne = parseCollectionMethodTarget(source, "insertOne");
@@ -599,6 +624,7 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
   // Keep the more specific readers ahead of generic write parsing so the
   // returned kind matches the result renderer we want to use downstream.
   const parsers: Array<(source: string) => MongoCommand | null> = [
+    parseMongoShowDatabasesCommand,
     (source) => {
       const version = parseMongoVersionCommand(source);
       return version ?? null;
@@ -606,6 +632,10 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
     (source) => {
       const createUser = parseMongoCreateUserCommand(source);
       return createUser ? { kind: "createUser", ...createUser } : null;
+    },
+    (source) => {
+      const runCommand = parseMongoRunCommand(source);
+      return runCommand ? { kind: "runCommand", ...runCommand } : null;
     },
     (source) => {
       // Legacy Mongo shell uses count()/find().count(); keep accepting it
@@ -665,6 +695,11 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
   }
 
   return null;
+}
+
+export function parseMongoShowDatabasesCommand(input: string): MongoShowDatabasesCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  return /^show\s+(?:dbs|databases)$/i.test(source) ? { kind: "showDatabases" } : null;
 }
 
 export function splitMongoCommands(input: string): ParsedMongoCommand[] {
@@ -759,6 +794,27 @@ export function mongoDocumentsToQueryResult(documents: unknown[], executionTimeM
     affected_rows: total,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
     truncated: total > documents.length,
+  };
+}
+
+export function mongoDatabasesToQueryResult(documents: unknown[], executionTimeMs: number, maxRows: number): QueryResult {
+  const response = documents[0];
+  const databases = isRecord(response) ? response.databases : undefined;
+  if (!Array.isArray(databases)) throw new Error("MongoDB listDatabases response is missing the databases array.");
+  if (!databases.every(isRecord)) {
+    throw new Error("MongoDB listDatabases response contains an invalid database entry.");
+  }
+
+  const rowLimit = Number.isFinite(maxRows) ? Math.max(1, Math.trunc(maxRows)) : databases.length;
+  const rows = databases.slice(0, rowLimit).map((database) => [toCellValue(database.name), toCellValue(database.sizeOnDisk), toCellValue(database.empty)]);
+  const truncated = rows.length < databases.length;
+  return {
+    columns: ["name", "sizeOnDisk", "empty"],
+    rows,
+    affected_rows: databases.length,
+    execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
+    truncated,
+    has_more: truncated,
   };
 }
 
@@ -1086,7 +1142,7 @@ function mongoTopLevelCommandLineStarts(segment: string): number[] {
 
 function isMongoCommandLineStart(segment: string, index: number): boolean {
   const rest = segment.slice(index);
-  return /^use\b/i.test(rest) || /^db(?:\s*\.|\b)/i.test(rest);
+  return /^use\b/i.test(rest) || /^show\s+(?:dbs|databases)\b/i.test(rest) || /^db(?:\s*\.|\b)/i.test(rest);
 }
 
 function pushMongoSegment(segments: MongoTextRange[], source: string, from: number, to: number) {

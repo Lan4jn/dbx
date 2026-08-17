@@ -8,7 +8,9 @@ use crate::sql::find_statement_at_cursor;
 use crate::sql_dialect::{
     firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
 };
-use sqlparser::ast::{visit_expressions, Expr, GroupByExpr, OrderByKind, Select, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{
+    visit_expressions, Expr, GroupByExpr, OrderByKind, Select, SelectItem, SetExpr, Statement, Value, ValueWithSpan,
+};
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MsSqlDialect};
 use sqlparser::parser::Parser;
 
@@ -56,6 +58,8 @@ pub struct QueryPaginationExecutionPlan {
     pub page_offset: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count_sql: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_query_row_bound: Option<usize>,
     pub use_agent_result_session: bool,
     /// True when the statement cannot be paginated server-side and must be
     /// executed once with the whole result streamed back (single execution).
@@ -115,12 +119,25 @@ pub struct SortedQuerySqlOptions {
 pub fn build_query_pagination_execution_plan(
     options: QueryPaginationExecutionPlanOptions,
 ) -> QueryPaginationExecutionPlan {
+    // Every page DBX generates for this query is derived from the same
+    // user-written statement, so a literal LIMIT/TOP the user already wrote
+    // bounds the query's total row count regardless of how large the
+    // underlying table is — a cheap, exact upper bound that needs no
+    // COUNT(*) execution. SQL Server's TOP is covered separately from the
+    // standard LIMIT/OFFSET dialects (MySQL, Postgres, etc.) since they use
+    // different clause syntax.
+    let exact_query_row_bound = match pagination_strategy(options.database_type, PaginationContext::UserQuery) {
+        TablePaginationStrategy::SqlServerTop => top_level_top_row_count(&options.query_base_sql),
+        TablePaginationStrategy::LimitOffset => top_level_limit_row_count(&options.query_base_sql),
+        _ => None,
+    };
     let mut plan = QueryPaginationExecutionPlan {
         sql_to_execute: options.sql.clone(),
         page_sql: None,
         page_limit: None,
         page_offset: None,
         count_sql: None,
+        exact_query_row_bound,
         use_agent_result_session: false,
         single_execution: false,
     };
@@ -275,7 +292,13 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
             .unwrap_or_else(|| err("unsupported"));
     }
 
-    let alias = quote_table_identifier(options.database_type, "dbx_count");
+    let alias = if options.database_type == Some(DatabaseType::Iris) {
+        // With delimited identifiers disabled, Caché 2016 can parameterize a
+        // double-quoted alias as a string literal, leaving a trailing :%qpar.
+        "dbx_count".to_string()
+    } else {
+        quote_table_identifier(options.database_type, "dbx_count")
+    };
     let wrapped_sql = match options.database_type {
         Some(DatabaseType::Iris) => iris_statement_for_derived_table(&statement),
         _ => statement,
@@ -587,7 +610,12 @@ pub(crate) fn sqlserver_result_offset(sql: &str) -> usize {
 }
 
 fn add_sql_server_existing_top_pagination(statement: &str, limit: usize, offset: usize) -> String {
-    let row_number_order = format!("ORDER BY {}", sql_server_default_pagination_order(statement));
+    // Prefer the user's own trailing ORDER BY so wrapping the query in a
+    // derived table does not silently override their requested ordering.
+    // Fall back to the first projection column when it cannot be mapped to
+    // the derived table's output columns (existing behavior).
+    let row_number_order = sql_server_derived_pagination_order(statement)
+        .unwrap_or_else(|| format!("ORDER BY {}", sql_server_default_pagination_order(statement)));
     if offset == 0 {
         return format!("SELECT TOP ({limit}) * FROM ({statement}) [dbx_page] {row_number_order};");
     }
@@ -596,6 +624,79 @@ fn add_sql_server_existing_top_pagination(statement: &str, limit: usize, offset:
     format!(
         "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER ({row_number_order}) AS [__dbx_row_num] FROM ({statement}) dbx_page_source) dbx_page WHERE [__dbx_row_num] > {offset} AND [__dbx_row_num] <= {end} ORDER BY [__dbx_row_num];"
     )
+}
+
+/// Reuses the user's trailing ORDER BY as the pagination sort key when every
+/// expression can be expressed against the derived table's output columns.
+/// Returns None when the statement has no ORDER BY, cannot be parsed, or any
+/// sort expression is not an output column or ordinal, so callers keep their
+/// existing deterministic fallback ordering.
+fn sql_server_derived_pagination_order(statement: &str) -> Option<String> {
+    let dialect = MsSqlDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, statement) else {
+        return None;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let OrderByKind::Expressions(order_by_exprs) = &query.order_by.as_ref()?.kind else {
+        return None;
+    };
+    if order_by_exprs.is_empty() || !sql_server_derived_table_projection_safe(statement) {
+        return None;
+    }
+
+    let output_columns =
+        select.projection.iter().map(sql_server_derived_projection_name).collect::<Option<Vec<_>>>()?;
+    let column_names = output_columns.iter().map(|name| name.to_lowercase()).collect::<HashSet<_>>();
+
+    let mut parts = Vec::with_capacity(order_by_exprs.len());
+    for order_by in order_by_exprs {
+        let column = sql_server_order_expr_output_column(&order_by.expr, &output_columns, &column_names)?;
+        let direction = match order_by.options.asc {
+            Some(true) => " ASC",
+            Some(false) => " DESC",
+            None => "",
+        };
+        let mut part = column;
+        part.push_str(direction);
+        parts.push(part);
+    }
+    Some(format!("ORDER BY {}", parts.join(", ")))
+}
+
+/// Maps one ORDER BY expression to a reference that stays valid outside the
+/// derived table: output columns by name (case-insensitive, bracket/quoted
+/// identifiers already unquoted by the parser) or positional ordinals mapped
+/// to their corresponding output column.
+/// Anything else (functions, unprojected columns, ...) cannot be referenced
+/// from the wrapper and makes the caller fall back to its default ordering.
+fn sql_server_order_expr_output_column(
+    expr: &Expr,
+    output_columns: &[&str],
+    column_names: &HashSet<String>,
+) -> Option<String> {
+    match expr {
+        Expr::Identifier(identifier) => {
+            let name = identifier.value.to_lowercase();
+            column_names
+                .contains(&name)
+                .then(|| quote_table_identifier(Some(DatabaseType::SqlServer), &identifier.value))
+        }
+        Expr::CompoundIdentifier(identifiers) => {
+            let last = identifiers.last()?;
+            let name = last.value.to_lowercase();
+            column_names.contains(&name).then(|| quote_table_identifier(Some(DatabaseType::SqlServer), &last.value))
+        }
+        Expr::Value(ValueWithSpan { value: Value::Number(number, _), .. }) => {
+            let ordinal = number.parse::<usize>().ok()?.checked_sub(1)?;
+            output_columns.get(ordinal).map(|name| quote_table_identifier(Some(DatabaseType::SqlServer), name))
+        }
+        _ => None,
+    }
 }
 
 fn sql_server_default_pagination_order(statement: &str) -> String {
@@ -1161,19 +1262,34 @@ pub(crate) fn top_level_top_row_count(sql: &str) -> Option<usize> {
 }
 
 fn top_level_limit_row_count(sql: &str) -> Option<usize> {
-    let token = top_level_sql_tokens(sql).into_iter().find(|token| token.text == "LIMIT")?;
-    parse_standard_limit_row_count(sql, token.start + token.text.len())
+    let tokens = top_level_sql_tokens(sql);
+    let limit_index = tokens.iter().position(|token| token.text == "LIMIT")?;
+    let token = &tokens[limit_index];
+    let (count, suffix_start) = parse_standard_limit_row_count(sql, token.start + token.text.len())?;
+    let suffix_start = skip_sql_whitespace(sql, suffix_start);
+    if sql.get(suffix_start..)?.starts_with('%') {
+        return None;
+    }
+    if tokens[limit_index + 1..].iter().enumerate().any(|(offset, token)| {
+        token.text == "BY"
+            || token.text == "PERCENT"
+            || (token.text == "WITH" && tokens.get(limit_index + offset + 2).is_some_and(|next| next.text == "TIES"))
+    }) {
+        return None;
+    }
+    Some(count)
 }
 
-fn parse_standard_limit_row_count(sql: &str, start: usize) -> Option<usize> {
+fn parse_standard_limit_row_count(sql: &str, start: usize) -> Option<(usize, usize)> {
     let mut cursor = skip_sql_whitespace(sql, start);
     let first = parse_usize_literal(sql, &mut cursor)?;
     cursor = skip_sql_whitespace(sql, cursor);
     if sql.get(cursor..)?.starts_with(',') {
         cursor = skip_sql_whitespace(sql, cursor + 1);
-        return parse_usize_literal(sql, &mut cursor);
+        let count = parse_usize_literal(sql, &mut cursor)?;
+        return Some((count, cursor));
     }
-    Some(first)
+    Some((first, cursor))
 }
 
 fn parse_usize_literal(sql: &str, cursor: &mut usize) -> Option<usize> {
@@ -1976,6 +2092,118 @@ mod tests {
         assert_eq!(
             result.sql.unwrap(),
             "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS [__dbx_row_num] FROM (SELECT TOP 1000 * FROM TicketInfo) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
+        );
+    }
+
+    #[test]
+    fn paginates_existing_sqlserver_top_clause_keeping_user_order_by_desc() {
+        let sql = "SELECT top 10 [ID], [ProcInstID], [ActInstID], [ActInstDestID], [StartDate], [DestUser], [Status], [Data], [SerialNumber] FROM [dbo].[_WorkList] ORDER BY ID DESC";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT TOP (100) * FROM (SELECT top 10 [ID], [ProcInstID], [ActInstID], [ActInstDestID], [StartDate], [DestUser], [Status], [Data], [SerialNumber] FROM [dbo].[_WorkList] ORDER BY ID DESC) [dbx_page] ORDER BY [ID] DESC;"
+        );
+    }
+
+    #[test]
+    fn paginates_existing_sqlserver_top_clause_later_page_keeping_user_order_by_desc() {
+        let sql = "SELECT top 10 [ID], [ProcInstID] FROM [dbo].[_WorkList] ORDER BY ID DESC";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY [ID] DESC) AS [__dbx_row_num] FROM (SELECT top 10 [ID], [ProcInstID] FROM [dbo].[_WorkList] ORDER BY ID DESC) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
+        );
+    }
+
+    #[test]
+    fn paginates_existing_sqlserver_top_clause_keeping_multi_column_user_order_by() {
+        let sql = "SELECT top 100 [ID], [StartDate] FROM [dbo].[_WorkList] ORDER BY [StartDate] DESC, ID";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT TOP (100) * FROM (SELECT top 100 [ID], [StartDate] FROM [dbo].[_WorkList] ORDER BY [StartDate] DESC, ID) [dbx_page] ORDER BY [StartDate] DESC, [ID];"
+        );
+    }
+
+    #[test]
+    fn paginates_existing_sqlserver_top_clause_keeping_ordinal_order_by() {
+        let sql = "SELECT top 100 [ID], [Name] FROM [dbo].[_WorkList] ORDER BY 2 DESC";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT TOP (100) * FROM (SELECT top 100 [ID], [Name] FROM [dbo].[_WorkList] ORDER BY 2 DESC) [dbx_page] ORDER BY [Name] DESC;"
+        );
+    }
+
+    #[test]
+    fn paginates_later_sqlserver_top_page_mapping_ordinal_order_to_output_column() {
+        let sql = "SELECT top 100 [ID], [Name] FROM [dbo].[_WorkList] ORDER BY 2 DESC";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY [Name] DESC) AS [__dbx_row_num] FROM (SELECT top 100 [ID], [Name] FROM [dbo].[_WorkList] ORDER BY 2 DESC) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
+        );
+    }
+
+    #[test]
+    fn paginates_sqlserver_top_clause_falling_back_for_out_of_range_ordinal() {
+        let sql = "SELECT top 100 [ID], [Name] FROM [dbo].[_WorkList] ORDER BY 3 DESC";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY [ID]) AS [__dbx_row_num] FROM (SELECT top 100 [ID], [Name] FROM [dbo].[_WorkList] ORDER BY 3 DESC) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
+        );
+    }
+
+    #[test]
+    fn paginates_existing_sqlserver_top_clause_falls_back_when_order_by_not_projected() {
+        let sql = "SELECT top 100 [ID] FROM [dbo].[_WorkList] ORDER BY [SerialNumber]";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT TOP (100) * FROM (SELECT top 100 [ID] FROM [dbo].[_WorkList] ORDER BY [SerialNumber]) [dbx_page] ORDER BY [ID];"
         );
     }
 
@@ -3099,7 +3327,7 @@ WHERE u.id = picked.id;
 
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT id, appointment_time FROM patients WHERE status = ?) \"dbx_count\";"
+            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT id, appointment_time FROM patients WHERE status = ?) dbx_count;"
         );
     }
 
@@ -3113,7 +3341,7 @@ WHERE u.id = picked.id;
 
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM (SELECT TOP ? id FROM visits WHERE status = ? ORDER BY created_at DESC) recent WHERE id > ?) \"dbx_count\";"
+            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM (SELECT TOP ? id FROM visits WHERE status = ? ORDER BY created_at DESC) recent WHERE id > ?) dbx_count;"
         );
     }
 
@@ -3126,7 +3354,20 @@ WHERE u.id = picked.id;
 
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT id FROM visits WHERE status = ?) \"dbx_count\";"
+            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT id FROM visits WHERE status = ?) dbx_count;"
+        );
+    }
+
+    #[test]
+    fn iris_count_query_uses_unquoted_alias_for_legacy_cache() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT * FROM TATFY WHERE UpdateDate = '2026-07-30' AND UpdateTime > '08:00:00'".to_string(),
+            database_type: Some(DatabaseType::Iris),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM TATFY WHERE UpdateDate = '2026-07-30' AND UpdateTime > '08:00:00') dbx_count;"
         );
     }
 
@@ -3313,6 +3554,52 @@ WHERE u.id = picked.id;
         assert_eq!(top_level_top_row_count("SELECT * FROM events"), None);
         // TOP only inside a subquery is not a top-level clause.
         assert_eq!(top_level_top_row_count("SELECT * FROM (SELECT TOP 5 * FROM events) t"), None);
+    }
+
+    #[test]
+    fn pagination_plan_exposes_only_safe_exact_row_bounds() {
+        for (database_type, sql, expected) in [
+            (Some(DatabaseType::SqlServer), "SELECT TOP 100 * FROM events", Some(100)),
+            (Some(DatabaseType::SqlServer), "SELECT TOP(50) * FROM events", Some(50)),
+            (Some(DatabaseType::SqlServer), "SELECT TOP (250) * FROM events", Some(250)),
+            (Some(DatabaseType::SqlServer), "SELECT TOP 10 PERCENT * FROM events", None),
+            (Some(DatabaseType::SqlServer), "SELECT TOP (2) WITH TIES * FROM events", None),
+            (Some(DatabaseType::SqlServer), "SELECT TOP (100 + 1) * FROM events", None),
+            (Some(DatabaseType::SqlServer), "SELECT TOP (@row_count) * FROM events", None),
+            (Some(DatabaseType::SqlServer), "SELECT * FROM (SELECT TOP 5 * FROM events) t", None),
+            (Some(DatabaseType::SqlServer), "SELECT * FROM events", None),
+            (Some(DatabaseType::Postgres), "SELECT TOP 100 * FROM events", None),
+            (Some(DatabaseType::Kingbase), "SELECT TOP 100 * FROM events", None),
+            // The standard LIMIT/OFFSET dialects (MySQL, Postgres, and every
+            // other database that isn't given its own pagination_strategy
+            // arm) bound the query the same way SQL Server's TOP does.
+            (Some(DatabaseType::Postgres), "SELECT * FROM events LIMIT 100", Some(100)),
+            (Some(DatabaseType::Mysql), "SELECT * FROM events LIMIT 50", Some(50)),
+            (Some(DatabaseType::Mysql), "SELECT * FROM events LIMIT 100 OFFSET 100", Some(100)),
+            (Some(DatabaseType::ClickHouse), "SELECT * FROM events LIMIT 10 BY user_id", None),
+            (Some(DatabaseType::ClickHouse), "SELECT * FROM events LIMIT 10 OFFSET 5 BY user_id", None),
+            (Some(DatabaseType::ClickHouse), "SELECT * FROM events LIMIT 10 WITH TIES", None),
+            (Some(DatabaseType::DuckDb), "SELECT * FROM events LIMIT 10%", None),
+            (Some(DatabaseType::DuckDb), "SELECT * FROM events LIMIT 10 PERCENT", None),
+            (None, "SELECT * FROM events LIMIT 100", Some(100)),
+            (Some(DatabaseType::Postgres), "SELECT * FROM events", None),
+        ] {
+            let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+                sql: sql.to_string(),
+                query_base_sql: sql.to_string(),
+                database_type,
+                pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+                use_agent_cursor: false,
+                first_page_uses_actual_sql: false,
+            });
+
+            assert_eq!(plan.exact_query_row_bound, expected, "unexpected bound for {database_type:?}: {sql}");
+            let serialized = serde_json::to_value(&plan).unwrap();
+            assert_eq!(
+                serialized.get("exactQueryRowBound").and_then(serde_json::Value::as_u64),
+                expected.map(|value| value as u64)
+            );
+        }
     }
 
     #[test]

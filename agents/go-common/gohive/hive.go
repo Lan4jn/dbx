@@ -270,6 +270,7 @@ type connectConfiguration struct {
 	BrowserResponsePort        int
 	BrowserResponseTimeout     time.Duration
 	BrowserDisableSSLCheck     bool
+	WaitForNonQueryCompletion  bool
 	// Maximum length of the data in bytes. Used for SASL.
 	MaxSize        uint32
 	MaxMessageSize int32
@@ -615,11 +616,7 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 	protocolFactory := thrift.NewTBinaryProtocolFactoryConf(&thrift.TConfiguration{MaxMessageSize: configuration.MaxMessageSize})
 	client := hiveserver.NewTCLIServiceClientFactory(transport, protocolFactory)
 
-	openSession := hiveserver.NewTOpenSessionReq()
-	openSession.ClientProtocol = hiveserver.TProtocolVersion_HIVE_CLI_SERVICE_PROTOCOL_V10
-	openSession.Configuration = configuration.HiveConfiguration
-	openSession.Username = &configuration.Username
-	openSession.Password = &configuration.Password
+	openSession := newOpenSessionRequest(configuration)
 	// Context is ignored
 	response, err := client.OpenSession(ctx, openSession)
 	if auth == "BROWSER" && browserClient != nil && err != nil && browserClient.HasRedirect() {
@@ -671,6 +668,15 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 	}
 
 	return conn, nil
+}
+
+func newOpenSessionRequest(configuration *connectConfiguration) *hiveserver.TOpenSessionReq {
+	request := hiveserver.NewTOpenSessionReq()
+	request.ClientProtocol = hiveserver.TProtocolVersion_HIVE_CLI_SERVICE_PROTOCOL_V6
+	request.Configuration = configuration.HiveConfiguration
+	request.Username = &configuration.Username
+	request.Password = &configuration.Password
+	return request
 }
 
 type cookieDedupTransport struct {
@@ -1400,6 +1406,54 @@ func (c *cursor) hasMore(ctx context.Context) bool {
 	}
 
 	return c.state != _FINISHED || c.totalRows != c.columnIndex
+}
+
+func (c *cursor) waitForCompletion(ctx context.Context) error {
+	if c.operationHandle == nil {
+		return errors.New("HiveServer2 returned no operation handle")
+	}
+	for {
+		request := hiveserver.NewTGetOperationStatusReq()
+		request.OperationHandle = c.operationHandle
+		c.conn.clientMu.Lock()
+		response, err := c.conn.client.GetOperationStatus(ctx, request)
+		c.conn.clientMu.Unlock()
+		if err != nil {
+			return err
+		}
+		if response == nil {
+			return errors.New("HiveServer2 GetOperationStatus returned no response")
+		}
+		if !success(safeStatus(response.GetStatus())) {
+			return hiveStatusError("checking operation status", response.GetStatus())
+		}
+		switch response.GetOperationState() {
+		case hiveserver.TOperationState_FINISHED_STATE, hiveserver.TOperationState_CLOSED_STATE:
+			if response.IsSetNumModifiedRows() {
+				modified := float64(response.GetNumModifiedRows())
+				c.operationHandle.ModifiedRowCount = &modified
+			}
+			return nil
+		case hiveserver.TOperationState_ERROR_STATE:
+			return &Error{
+				Err:       errors.New("HiveServer2 operation failed: " + response.GetErrorMessage()),
+				Message:   response.GetErrorMessage(),
+				ErrorCode: int(response.GetErrorCode()),
+				SQLState:  response.GetSqlState(),
+			}
+		case hiveserver.TOperationState_CANCELED_STATE:
+			return errors.New("HiveServer2 operation was canceled")
+		case hiveserver.TOperationState_TIMEDOUT_STATE:
+			return errors.New("HiveServer2 operation timed out")
+		}
+		timer := time.NewTimer(time.Duration(c.conn.configuration.PollIntervalInMillis) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *cursor) error() error {

@@ -20,6 +20,62 @@ afterEach(() => {
 });
 
 describe("CustomContextMenu lifecycle", () => {
+  it("exposes the open state and closes only the active target", async () => {
+    const firstOpen = vi.fn();
+    const firstClose = vi.fn();
+    const secondOpen = vi.fn();
+    const secondClose = vi.fn();
+    const root = defineComponent({
+      setup() {
+        const menu = (id: string, onOpen: () => void, onClose: () => void) =>
+          h(
+            CustomContextMenu,
+            { items: [{ label: `Inspect ${id}` }], onOpen, onClose },
+            {
+              default: ({ onContextMenu, isOpen }: { onContextMenu: (event: MouseEvent) => void; isOpen: boolean }) => h("div", { id, "data-context-open": String(isOpen), onContextmenu: onContextMenu }, id),
+            },
+          );
+        return () => [menu("first-target", firstOpen, firstClose), menu("second-target", secondOpen, secondClose)];
+      },
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+
+    const firstTarget = container.querySelector("#first-target");
+    const secondTarget = container.querySelector("#second-target");
+    firstTarget?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    expect(firstTarget?.getAttribute("data-context-open")).toBe("true");
+    expect(secondTarget?.getAttribute("data-context-open")).toBe("false");
+    expect(firstOpen).toHaveBeenCalledTimes(1);
+    expect(firstClose).not.toHaveBeenCalled();
+
+    firstTarget?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    expect(firstTarget?.getAttribute("data-context-open")).toBe("true");
+    expect(secondTarget?.getAttribute("data-context-open")).toBe("false");
+    expect(firstOpen).toHaveBeenCalledTimes(2);
+    expect(firstClose).toHaveBeenCalledTimes(1);
+
+    secondTarget?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+    expect(firstTarget?.getAttribute("data-context-open")).toBe("false");
+    expect(secondTarget?.getAttribute("data-context-open")).toBe("true");
+    expect(firstClose).toHaveBeenCalledTimes(2);
+    expect(secondOpen).toHaveBeenCalledTimes(1);
+
+    window.dispatchEvent(new Event("resize"));
+    window.dispatchEvent(new Event("resize"));
+    await nextTick();
+    expect(secondTarget?.getAttribute("data-context-open")).toBe("false");
+    expect(secondClose).toHaveBeenCalledTimes(1);
+
+    app.unmount();
+  });
+
   it("removes the capture keydown listener when unmounted while open", async () => {
     const documentAdd = vi.spyOn(document, "addEventListener");
     const documentRemove = vi.spyOn(document, "removeEventListener");
@@ -191,6 +247,50 @@ describe("CustomContextMenu lifecycle", () => {
     expect(current?.firstElementChild?.querySelector("svg")).not.toBeNull();
     expect(current?.lastElementChild?.tagName.toLowerCase()).toBe("span");
     expect(other?.querySelector("svg")).toBeNull();
+
+    app.unmount();
+  });
+
+  it("keeps a destructive submenu trigger red while expanded", async () => {
+    const root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            CustomContextMenu,
+            {
+              items: [
+                {
+                  label: "More",
+                  variant: "destructive",
+                  children: [{ label: "Drop table", variant: "destructive" }],
+                },
+              ],
+            },
+            {
+              default: ({ onContextMenu }: { onContextMenu: (event: MouseEvent) => void }) => h("div", { id: "context-target", onContextmenu: onContextMenu }, "Target"),
+            },
+          );
+      },
+    });
+    const container = document.createElement("div");
+    mountedContainers.push(container);
+    document.body.append(container);
+    const app = createApp(root);
+    app.mount(container);
+
+    container.querySelector("#context-target")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+    await nextTick();
+
+    const trigger = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent?.includes("More"));
+    expect(trigger?.classList.contains("text-destructive")).toBe(true);
+    expect(trigger?.querySelector("svg")?.classList.contains("text-destructive")).toBe(true);
+
+    trigger?.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await nextTick();
+
+    expect(trigger?.classList.contains("bg-destructive/10")).toBe(true);
+    expect(trigger?.classList.contains("text-accent-foreground")).toBe(false);
+    expect(document.body.textContent).toContain("Drop table");
 
     app.unmount();
   });

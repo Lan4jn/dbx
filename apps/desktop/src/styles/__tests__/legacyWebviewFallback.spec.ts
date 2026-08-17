@@ -87,7 +87,8 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(globalsCss).toContain("border-color: rgba(var(--dbx-primary-rgb), 0.3) !important;");
     expect(globalsCss).toContain(".hover\\:bg-primary\\/15:hover");
     expect(connectionTreeSource).toContain("showActiveConnectionsOnly");
-    expect(connectionTreeSource.match(/bg-primary\/10 border-primary\/30/g)?.length).toBe(3);
+    // Three pre-existing usages plus the sidebar regex-search toggle.
+    expect(connectionTreeSource.match(/bg-primary\/10 border-primary\/30/g)?.length).toBe(4);
   });
 
   it("keeps legacy tab triggers connected to the configured corner style", () => {
@@ -110,6 +111,12 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(connectionDialogLegacyCss).toContain("height: 720px !important;");
     expect(connectionDialogLegacyCss).toContain('[data-slot="dialog-content"].connection-dialog-content--config .connection-form-body');
     expect(connectionDialogLegacyCss).toContain("align-content: start !important;");
+    expect(connectionDialogSource).toContain("connection-dialog-footer");
+    expect(connectionDialogSource).toContain("connection-dialog-test-status");
+    expect(connectionDialogLegacyCss).toContain('[data-slot="dialog-content"].connection-dialog-content--config .connection-dialog-footer');
+    expect(connectionDialogLegacyCss).toContain("flex-wrap: nowrap !important;");
+    expect(connectionDialogLegacyCss).toContain('[data-slot="dialog-content"].connection-dialog-content--config .connection-dialog-test-status');
+    expect(connectionDialogLegacyCss).toContain("min-width: 12rem !important;");
     expect(connectionDialogSource).toContain("connection-url-params-row--compact");
     expect(connectionDialogSource).toContain("connection-url-params-row--with-hint");
     expect(connectionDialogSource).toContain("connection-url-params-label");
@@ -121,6 +128,17 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(connectionDialogLegacyCss).toContain(".connection-db-picker-option");
     expect(connectionDialogLegacyCss).not.toContain("width >=");
     expect(connectionDialogSource).not.toContain("@media (min-width: 640px)");
+  });
+
+  it("keeps the sidebar table tree scrollbar unchanged outside legacy WebViews", () => {
+    expect(connectionTreeSource).toContain('class="sidebar-tree-scrollbar"');
+    expect(connectionTreeSource).toMatch(/\.sidebar-tree-scrollbar \{[\s\S]*?opacity: 0;/);
+    expect(connectionTreeSource).toContain("html.dbx-legacy-webview .sidebar-tree-scrollbar");
+    expect(connectionTreeSource).toMatch(/html\.dbx-legacy-webview \.sidebar-tree-scrollbar \{[\s\S]*?opacity: 0\.9;/);
+    expect(connectionTreeSource).toContain("html.dbx-legacy-webview .sidebar-tree-scrollbar__thumb");
+    expect(connectionTreeSource).toContain("background: rgba(82, 82, 82, 0.42);");
+    expect(connectionTreeSource).toContain("html.dbx-legacy-webview.dark .sidebar-tree-scrollbar__thumb");
+    expect(connectionTreeSource).toContain("background: rgba(212, 212, 216, 0.42);");
   });
 
   it("keeps selected tiles readable in WebViews without color-mix support", () => {
@@ -262,6 +280,13 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(fallback).toContain("line-height: 1.25rem !important;");
     expect(fallback).toContain("-webkit-appearance: inner-spin-button !important;");
     expect(fallback).toContain("::-webkit-inner-spin-button");
+    expect(editorSettingsDialogSource).toContain("settings-mcp-config-tabs");
+    expect(editorSettingsDialogSource).toContain("settings-mcp-config-tab");
+    expect(fallback).toContain(".settings-layout .settings-mcp-config-tabs");
+    expect(fallback).toContain("gap: 0.25rem !important;");
+    expect(fallback).toContain(".settings-layout .settings-mcp-config-tab");
+    expect(fallback).toContain("flex: 0 0 auto !important;");
+    expect(fallback).toContain("min-width: max-content !important;");
     expect(editorSettingsDialogSource).toContain('class="settings-ai-back-button"');
     expect(fallback).toContain(".settings-ai-back-button");
     expect(fallback).toContain("margin-left: -0.625rem !important;");

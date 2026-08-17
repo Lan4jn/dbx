@@ -13,6 +13,7 @@ import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
+import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
 import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
 
@@ -33,7 +34,10 @@ export function useSidebarDataOpenRuntime() {
     const reuseMode = options.reuseMode ?? settingsStore.editorSettings.dataTabReuseMode;
     if (config?.db_type === "hbase") {
       await connectionStore.ensureConnected(node.connectionId);
-      const tabId = queryStore.createTab(node.connectionId, node.database, node.label, "hbase", undefined, node.label, undefined, { forceNew: openMode === "new-tab" || reuseMode === "always-new" });
+      const tabId = queryStore.createTab(node.connectionId, node.database, node.label, "hbase", undefined, node.label, undefined, {
+        forceNew: openMode === "new-tab" || reuseMode === "always-new",
+        insertAfterActive: settingsStore.editorSettings.openDataTabsNextToActive,
+      });
       queryStore.updateSql(tabId, node.label);
       return;
     }
@@ -140,6 +144,7 @@ export function useSidebarDataOpenRuntime() {
       tab.resultSortDirection = undefined;
       tab.resultSortMode = undefined;
       tab.resultLocalSortOriginalRows = undefined;
+      tab.resultLocalSortOriginalLargeValueCells = undefined;
       tab.resultLocalSortOriginalMongoDocuments = undefined;
       tab.resultLocalSortOriginalMongoCopyDocuments = undefined;
       tab.resultSortedSql = undefined;
@@ -172,7 +177,10 @@ export function useSidebarDataOpenRuntime() {
         resetReusedDataTabState(existingDataTabCandidate.tab);
         return existingDataTabCandidate.tab.id;
       }
-      return queryStore.createTab(node.connectionId, node.database, node.label, "data", tableSchema, undefined, node.catalog, { forceNew: true });
+      return queryStore.createTab(node.connectionId, node.database, node.label, "data", tableSchema, undefined, node.catalog, {
+        forceNew: true,
+        insertAfterActive: settingsStore.editorSettings.openDataTabsNextToActive,
+      });
     })();
     openDataLog("info", "tab-created", { traceId, tabId, elapsed: elapsed() });
     logPhase("tab-created", { tabId });
@@ -292,8 +300,12 @@ export function useSidebarDataOpenRuntime() {
       } else if (deferTableMetaRefresh) {
         logPhase("metadata-deferred", { tabId });
       } else {
-        void refreshTableMetaInBackground(tabId);
         logPhase("metadata-started", { tabId });
+      }
+
+      const metadataRefresh = shouldRefreshTableMeta && !deferTableMetaRefresh ? refreshTableMetaInBackground(tabId) : undefined;
+      if (!cachedTableMeta && (effectiveDbType === "mysql" || effectiveDbType === "postgres")) {
+        await metadataRefresh;
       }
 
       // Check if superseded by a newer openData call
@@ -302,8 +314,9 @@ export function useSidebarDataOpenRuntime() {
         return;
       }
 
-      const columns = cachedTableMeta?.columns ?? [];
-      const primaryKeys = cachedTableMeta?.primaryKeys ?? [];
+      const loadedTableMeta = cachedTableMeta ?? queryStore.tabs.find((item) => item.id === tabId)?.tableMeta;
+      const columns = loadedTableMeta?.columns ?? [];
+      const primaryKeys = loadedTableMeta?.primaryKeys ?? [];
       const includeRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, tableType);
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
@@ -316,6 +329,7 @@ export function useSidebarDataOpenRuntime() {
         catalog: node.catalog,
         columns: columns.map((column) => column.name),
         primaryKeys,
+        ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, limit),
         limit,
         includeRowId,
       });

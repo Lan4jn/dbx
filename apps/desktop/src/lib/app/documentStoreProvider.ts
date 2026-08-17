@@ -1,10 +1,10 @@
 import type { ComposerTranslation } from "vue-i18n";
 import { normalizeJsonArgument } from "@dbx-app/mongo-shell";
-import { isElasticsearchCompatibleDatabaseType, type DatabaseType } from "@/types/database";
+import { isElasticsearchCompatibleDatabaseType, isMeilisearchDatabaseType, type DatabaseType } from "@/types/database";
 import { quoteUnquotedObjectKeys } from "@/lib/mongo/mongoShellCommand";
 import { formatMongoShellLiteral } from "@/lib/mongo/mongoDocumentValues";
 
-export type DocumentStoreKind = "mongodb" | "elasticsearch";
+export type DocumentStoreKind = "mongodb" | "dynamodb" | "elasticsearch" | "meilisearch";
 export type DocumentFilterMode = "equals" | "not-equals" | "like" | "not-like" | "greater-than" | "greater-than-or-equal" | "less-than" | "less-than-or-equal" | "is-null" | "is-not-null";
 export type DocumentFilterValueType = "auto" | "string" | "number" | "boolean" | "object-id" | "date" | "int32" | "int64" | "decimal128" | "json";
 export type ElasticsearchBoolClause = "filter" | "must" | "should" | "must_not";
@@ -63,6 +63,10 @@ export const documentFilterModeOptions: Array<{ value: DocumentFilterMode; label
   { value: "is-null", labelKey: "grid.filterBuilderIsNull" },
   { value: "is-not-null", labelKey: "grid.filterBuilderIsNotNull" },
 ];
+
+export function documentFilterModeOptionsFor(kind: DocumentStoreKind): Array<{ value: DocumentFilterMode; labelKey: string }> {
+  return kind === "meilisearch" ? documentFilterModeOptions.filter((option) => option.value !== "like" && option.value !== "not-like") : documentFilterModeOptions;
+}
 
 export const documentFilterValueTypeOptions: Array<{ value: DocumentFilterValueType; labelKey: string }> = [
   { value: "auto", labelKey: "grid.filterBuilderValueTypeAuto" },
@@ -130,8 +134,54 @@ const elasticsearchDocumentProvider: DocumentStoreProvider = {
   sortInputForColumn: mongoDocumentProvider.sortInputForColumn,
 };
 
+const meilisearchDocumentProvider: DocumentStoreProvider = {
+  kind: "meilisearch",
+  filterInputLabel: "filter",
+  sortInputLabel: "sort",
+  documentsLabel: ({ total }) => `${total} Documents`,
+  queryPreview: ({ collection, filterJson, sortJson, skip, limit }) => {
+    const lines = ["DBX MEILISEARCH FETCH DOCUMENTS", `index: ${JSON.stringify(collection)}`, `offset: ${skip}`, `limit: ${limit}`];
+    const filter = documentStorePreviewJson(filterJson);
+    if (filter) lines.push("filter:", filter);
+    const sort = documentStorePreviewJson(sortJson);
+    if (sort) lines.push("sort:", sort);
+    return lines.join("\n");
+  },
+  sortInputForColumn: mongoDocumentProvider.sortInputForColumn,
+};
+
+const dynamodbDocumentProvider: DocumentStoreProvider = {
+  kind: "dynamodb",
+  filterInputLabel: "filter",
+  sortInputLabel: "sort key",
+  documentsLabel: ({ total, totalIsExact, t }) => `${totalIsExact ? "" : "≥"}${t("dynamodb.items", { count: total })}`,
+  queryPreview: ({ collection, filterJson, sortJson, limit }) => {
+    const filter = documentStorePreviewJson(filterJson);
+    const sort = documentStorePreviewJson(sortJson);
+    const operation = filterJson?.includes('"$index"') || (filterJson && filterJson !== "{}") ? "QUERY / SCAN" : "SCAN";
+    const lines = [`DBX DYNAMODB ${operation}`, `table: ${JSON.stringify(collection)}`, `limit: ${limit}`];
+    if (filter) lines.push("filter:", filter);
+    if (sort) lines.push("sort:", sort);
+    return lines.join("\n");
+  },
+  sortInputForColumn: mongoDocumentProvider.sortInputForColumn,
+};
+
+function documentStorePreviewJson(value?: string): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed === "{}") return null;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
+  }
+}
+
 export function documentStoreProviderFor(databaseType?: DatabaseType): DocumentStoreProvider {
-  return isElasticsearchCompatibleDatabaseType(databaseType) ? elasticsearchDocumentProvider : mongoDocumentProvider;
+  if (databaseType === "dynamodb") return dynamodbDocumentProvider;
+  if (isElasticsearchCompatibleDatabaseType(databaseType)) return elasticsearchDocumentProvider;
+  if (isMeilisearchDatabaseType(databaseType)) return meilisearchDocumentProvider;
+  return mongoDocumentProvider;
 }
 
 export function defaultDocumentFilterRule(id: string, fieldName = ""): DocumentFilterRule {
@@ -450,8 +500,10 @@ export function buildDocumentFilterCondition(rule: DocumentFilterRule, options: 
     case "not-equals":
       return { [rule.fieldName]: { $ne: value } };
     case "like":
+      if (options.kind === "dynamodb") return { [rule.fieldName]: { $contains: value } };
       return { [rule.fieldName]: { $regex: escapeRegexLiteral(textValue), $options: "i" } };
     case "not-like":
+      if (options.kind === "dynamodb") return { [rule.fieldName]: { $notContains: value } };
       return { [rule.fieldName]: { $not: { $regex: escapeRegexLiteral(textValue), $options: "i" } } };
     case "greater-than":
       return { [rule.fieldName]: { $gt: value } };
@@ -638,7 +690,9 @@ type DocumentQueryInputNormalizer = (input: string) => string | null;
 
 const documentQueryInputNormalizers: Record<DocumentStoreKind, DocumentQueryInputNormalizer> = {
   mongodb: normalizeJsonArgument,
+  dynamodb: quoteUnquotedObjectKeys,
   elasticsearch: quoteUnquotedObjectKeys,
+  meilisearch: quoteUnquotedObjectKeys,
 };
 
 function normalizeDocumentQueryObjectInput(input: string, kind?: DocumentStoreKind): string {

@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures::StreamExt;
-use mysql_async::consts::ColumnType;
+use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::*;
 use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
@@ -9,6 +9,7 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -21,8 +22,8 @@ use crate::sql::{starts_with_executable_sql_keyword, starts_with_executable_sql_
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
-    ForeignKeyInfo, IndexInfo, ObjectInfo, ObjectStatistics, QueryMessage, QueryResult, SpatialColumnBuilder,
-    TableInfo, TriggerInfo,
+    ForeignKeyInfo, IndexInfo, LargeValueCell, ObjectInfo, ObjectStatistics, QueryMessage, QueryResult,
+    SpatialColumnBuilder, TableInfo, TriggerInfo,
 };
 
 use super::file_validator::validate_file_path;
@@ -41,14 +42,12 @@ pub(crate) fn mysql_catalog_dialect(
     db_type: DatabaseType,
     driver_profile: Option<&str>,
 ) -> Option<MySqlCatalogDialect> {
-    match db_type {
-        DatabaseType::Doris => Some(MySqlCatalogDialect::Doris),
-        DatabaseType::StarRocks => Some(MySqlCatalogDialect::StarRocks),
-        _ => match driver_profile.map(str::to_ascii_lowercase).as_deref() {
-            Some("doris" | "selectdb") => Some(MySqlCatalogDialect::Doris),
-            Some("starrocks") => Some(MySqlCatalogDialect::StarRocks),
-            _ => None,
-        },
+    if super::doris::is_profile(&db_type, driver_profile) {
+        Some(MySqlCatalogDialect::Doris)
+    } else if super::starrocks::is_profile(&db_type, driver_profile) {
+        Some(MySqlCatalogDialect::StarRocks)
+    } else {
+        None
     }
 }
 
@@ -57,16 +56,28 @@ pub struct MySqlQueryDialect {
     supports_admin_show_results: bool,
 }
 
+#[derive(Debug)]
+pub struct MySqlQueryResult {
+    pub result: QueryResult,
+    pub large_value_cells: Vec<LargeValueCell>,
+}
+
+impl MySqlQueryResult {
+    fn exact(result: QueryResult) -> Self {
+        Self { result, large_value_cells: Vec::new() }
+    }
+}
+
+const MYSQL_RESULT_CELL_PREVIEW_MIN_BYTES: usize = 256;
+const MYSQL_RESULT_CELL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+
 impl MySqlQueryDialect {
     pub fn for_connection(db_type: DatabaseType, driver_profile: Option<&str>) -> Self {
-        let profile = driver_profile.map(str::to_ascii_lowercase);
         Self {
-            supports_admin_show_results: matches!(
-                db_type,
-                DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch
-            ) || profile
-                .as_deref()
-                .is_some_and(|profile| matches!(profile, "doris" | "selectdb" | "starrocks" | "manticoresearch")),
+            supports_admin_show_results: super::doris::is_profile(&db_type, driver_profile)
+                || super::starrocks::is_profile(&db_type, driver_profile)
+                || super::manticoresearch::is_profile(&db_type, driver_profile)
+                || super::tidb::is_profile(&db_type, driver_profile),
         }
     }
 }
@@ -76,7 +87,7 @@ pub enum MySqlQueryStreamItem {
     Row(Vec<serde_json::Value>),
 }
 
-fn quote_value(s: &str) -> String {
+pub(super) fn quote_value(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
@@ -569,6 +580,111 @@ fn mysql_spatial_column_builder(columns: &[mysql_async::Column]) -> SpatialColum
     )
 }
 
+fn mysql_result_cell_preview_bytes(
+    max_result_bytes: usize,
+    row_limit: usize,
+    columns: &[mysql_async::Column],
+) -> usize {
+    let serialized_column_weight = columns
+        .iter()
+        .map(
+            |column| {
+                if is_mysql_blob_column(column) || is_mysql_binary_string_column(column) {
+                    2usize
+                } else {
+                    1usize
+                }
+            },
+        )
+        .sum::<usize>()
+        .max(1);
+    max_result_bytes
+        .checked_div(row_limit.max(1))
+        .and_then(|per_row| per_row.checked_div(serialized_column_weight))
+        .unwrap_or(MYSQL_RESULT_CELL_PREVIEW_MIN_BYTES)
+        .clamp(MYSQL_RESULT_CELL_PREVIEW_MIN_BYTES, MYSQL_RESULT_CELL_PREVIEW_MAX_BYTES)
+}
+
+fn mysql_column_can_use_bounded_preview(column: &mysql_async::Column) -> bool {
+    match column.column_type() {
+        ColumnType::MYSQL_TYPE_JSON
+        | ColumnType::MYSQL_TYPE_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB => true,
+        ColumnType::MYSQL_TYPE_TINY_BLOB => false,
+        ColumnType::MYSQL_TYPE_STRING | ColumnType::MYSQL_TYPE_VAR_STRING | ColumnType::MYSQL_TYPE_VARCHAR => {
+            column.column_length() > 8 * 1024
+        }
+        _ => false,
+    }
+}
+
+fn mysql_bounded_value_preview(
+    row: &mysql_async::Row,
+    index: usize,
+    preview_bytes: usize,
+    protected_indexes: &HashSet<usize>,
+) -> Option<(serde_json::Value, usize)> {
+    if protected_indexes.contains(&index) {
+        return None;
+    }
+    let column = row.columns_ref().get(index)?;
+    if !mysql_column_can_use_bounded_preview(column) {
+        return None;
+    }
+    let mysql_async::Value::Bytes(bytes) = row.as_ref(index)? else {
+        return None;
+    };
+    if bytes.len() <= preview_bytes {
+        return None;
+    }
+
+    let end = if is_mysql_binary_charset(column) {
+        preview_bytes.min(bytes.len())
+    } else {
+        let mut end = preview_bytes.min(bytes.len());
+        while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+            end -= 1;
+        }
+        end
+    };
+    let mut value = if is_mysql_binary_charset(column) {
+        mysql_bytes_to_json(bytes[..end].to_vec(), column)
+    } else {
+        let text = String::from_utf8_lossy(&bytes[..end]);
+        serde_json::Value::String(fix_potential_double_encoding(&text))
+    };
+    if let serde_json::Value::String(text) = &mut value {
+        text.push_str("...");
+    }
+    Some((value, bytes.len()))
+}
+
+fn mysql_result_protected_column_indexes(
+    columns: &[mysql_async::Column],
+    protected_columns: &[String],
+) -> HashSet<usize> {
+    let protected: HashSet<String> = protected_columns.iter().map(|column| column.to_ascii_lowercase()).collect();
+    let mut indexes = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            (column.flags().contains(ColumnFlags::PRI_KEY_FLAG)
+                || protected.contains(&column.name_str().to_ascii_lowercase()))
+            .then_some(index)
+        })
+        .collect::<HashSet<_>>();
+    for (index, column) in columns.iter().enumerate() {
+        if column.name_str().to_ascii_uppercase().starts_with(crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX) {
+            indexes.insert(index);
+            if index > 0 {
+                indexes.insert(index - 1);
+            }
+        }
+    }
+    indexes
+}
+
 fn mysql_row_to_json_with_srids(
     row: &mysql_async::Row,
     spatial_columns: &mut SpatialColumnBuilder,
@@ -601,6 +717,51 @@ fn mysql_row_to_json_with_srids(
         })
         .collect();
     (values, srids)
+}
+
+fn mysql_row_to_json_with_srids_and_previews(
+    row: &mysql_async::Row,
+    spatial_columns: &mut SpatialColumnBuilder,
+    row_index: usize,
+    preview_bytes: Option<usize>,
+    protected_indexes: &HashSet<usize>,
+) -> (Vec<serde_json::Value>, Vec<Option<u32>>, Vec<LargeValueCell>) {
+    let mut srids = vec![None; row.len()];
+    let mut large_value_cells = Vec::new();
+    let values = (0..row.len())
+        .map(|index| {
+            let is_geometry = row
+                .columns_ref()
+                .get(index)
+                .is_some_and(|column| column.column_type() == ColumnType::MYSQL_TYPE_GEOMETRY);
+            if is_geometry {
+                let Some(bytes) = row_get::<Vec<u8>, _>(row, index) else {
+                    spatial_columns.observe(index, None);
+                    return serde_json::Value::Null;
+                };
+                return match decode_mysql_geometry(&bytes) {
+                    Some(geometry) => {
+                        spatial_columns.observe(index, geometry.srid);
+                        srids[index] = geometry.srid;
+                        serde_json::Value::String(geometry.wkt)
+                    }
+                    None => {
+                        spatial_columns.observe(index, None);
+                        super::binary_value_to_json(&bytes)
+                    }
+                };
+            }
+
+            if let Some((preview, original_bytes)) =
+                preview_bytes.and_then(|limit| mysql_bounded_value_preview(row, index, limit, protected_indexes))
+            {
+                large_value_cells.push(LargeValueCell { row_index, column_index: index, original_bytes });
+                return preview;
+            }
+            mysql_value_to_json(row, index)
+        })
+        .collect();
+    (values, srids, large_value_cells)
 }
 
 fn mysql_temporal_value_to_json(
@@ -1984,12 +2145,16 @@ const DATABASE_LIST_QUERY_PLAN: [(&str, bool); 2] =
     [(SHOW_DATABASES_SQL, true), (INFORMATION_SCHEMA_DATABASES_SQL, false)];
 
 pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
+    list_databases_with_timeout(pool, super::connection_timeout()).await
+}
+
+pub async fn list_databases_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<Vec<DatabaseInfo>, String> {
     let [(primary_sql, primary_catalogless), (fallback_sql, fallback_catalogless)] = DATABASE_LIST_QUERY_PLAN;
-    match list_databases_with_query(pool, primary_sql, primary_catalogless).await {
+    match list_databases_with_query(pool, primary_sql, primary_catalogless, timeout).await {
         Ok(databases) => Ok(databases),
         Err(err) => {
             log::debug!("Falling back to information_schema.SCHEMATA after SHOW DATABASES failed: {err}");
-            list_databases_with_query(pool, fallback_sql, fallback_catalogless).await
+            list_databases_with_query(pool, fallback_sql, fallback_catalogless, timeout).await
         }
     }
 }
@@ -2032,15 +2197,23 @@ async fn list_databases_with_query(
     pool: &MySqlPool,
     sql: &str,
     include_catalogless_when_blank: bool,
+    timeout: Duration,
 ) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let mut conn = get_conn_with_timeout(pool, timeout).await?;
     let result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), include_catalogless_when_blank))
 }
 
 pub async fn list_databases_show(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    list_databases_with_query(pool, SHOW_DATABASES_SQL, true).await
+    list_databases_show_with_timeout(pool, super::connection_timeout()).await
+}
+
+pub async fn list_databases_show_with_timeout(
+    pool: &MySqlPool,
+    timeout: Duration,
+) -> Result<Vec<DatabaseInfo>, String> {
+    list_databases_with_query(pool, SHOW_DATABASES_SQL, true, timeout).await
 }
 
 pub(super) fn database_infos_from_names(
@@ -2499,7 +2672,7 @@ pub async fn get_table_comment(pool: &MySqlPool, database: &str, table: &str) ->
 }
 
 #[derive(Clone, Debug, Default)]
-struct TableStatusMeta {
+pub(super) struct TableStatusMeta {
     comment: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -2613,6 +2786,15 @@ async fn list_table_names_show_filtered(
     exact_names: &[String],
 ) -> Result<Vec<TableInfo>, String> {
     let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    list_table_names_show_filtered_with_conn(&mut conn, database, filter, exact_names).await
+}
+
+pub(super) async fn list_table_names_show_filtered_with_conn(
+    conn: &mut mysql_async::Conn,
+    database: &str,
+    filter: Option<&str>,
+    exact_names: &[String],
+) -> Result<Vec<TableInfo>, String> {
     let mut last_error = None;
     let mut rows = None;
     for attempt in show_tables_query_attempts(database, filter, exact_names) {
@@ -2733,7 +2915,7 @@ fn mysql_fallback_like_patterns(filter: &str) -> Vec<String> {
     patterns
 }
 
-async fn list_tables_show_with_status(
+pub(super) async fn list_tables_show_with_status(
     pool: &MySqlPool,
     database: &str,
 ) -> Result<(Vec<TableInfo>, HashMap<String, TableStatusMeta>), String> {
@@ -2785,116 +2967,6 @@ async fn list_tables_show_filtered(
 
 pub async fn list_tables_show(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
     list_tables_show_with_status(pool, database).await.map(|(tables, _)| tables)
-}
-
-fn starrocks_materialized_views_sql(database: &str) -> String {
-    format!(
-        "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = {}",
-        quote_value(database)
-    )
-}
-
-/// Fallback DDL source for StarRocks materialized views when `SHOW CREATE
-/// MATERIALIZED VIEW` fails (e.g. on versions predating starrocks/starrocks#73396,
-/// merged 2026-05-19, which reject the statement for sync MVs with "Table not
-/// found" because sync MVs are not registered as separate Tables).
-///
-/// `information_schema.materialized_views` is documented as the authoritative
-/// list of all materialized views, with a column distinguishing SYNC from
-/// ASYNC. See
-/// https://docs.starrocks.io/docs/sql-reference/information_schema/materialized_views/.
-///
-/// Made `pub(super)` so the dispatch site in `schema::mysql_object_source` can
-/// rely on it without rewriting the escape convention.
-pub(crate) fn mysql_materialized_view_definition_sql(database: &str, name: &str) -> String {
-    format!(
-        "SELECT MATERIALIZED_VIEW_DEFINITION \
-         FROM information_schema.materialized_views \
-         WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
-         LIMIT 1",
-        quote_value(database),
-        quote_value(name)
-    )
-}
-
-async fn list_starrocks_materialized_view_names(pool: &MySqlPool, database: &str) -> Result<HashSet<String>, String> {
-    let sql = starrocks_materialized_views_sql(database);
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let name = get_str_by_name(row, "TABLE_NAME").trim().to_string();
-            (!name.is_empty()).then_some(name)
-        })
-        .collect())
-}
-
-fn merge_starrocks_materialized_views(
-    tables: &mut Vec<TableInfo>,
-    materialized_view_names: Result<HashSet<String>, String>,
-    database: &str,
-) {
-    let materialized_view_names = match materialized_view_names {
-        Ok(names) => names,
-        Err(err) => {
-            // Older StarRocks versions and restricted accounts may not expose this
-            // information_schema view; keep the base SHOW TABLES result usable.
-            log::warn!("Skipping materialized view classification for StarRocks database `{database}`: {err}");
-            return;
-        }
-    };
-
-    // Snapshot the names already returned by SHOW FULL TABLES so the second pass can
-    // append MVs that are absent from SHOW FULL TABLES without duplicating rows.
-    let known_names: HashSet<String> = tables.iter().map(|table| table.name.clone()).collect();
-
-    // Step 1 — reclassify: rows whose name appears in `information_schema.materialized_views`
-    // are MVs even when SHOW FULL TABLES labeled them as VIEW (sync MVs) or BASE TABLE
-    // (async MVs). See https://docs.starrocks.io/docs/sql-reference/information_schema/materialized_views/
-    // for the authoritative distinction between the two MV kinds.
-    for table in tables.iter_mut() {
-        if materialized_view_names.contains(&table.name) {
-            table.table_type = "MATERIALIZED_VIEW".to_string();
-        }
-    }
-
-    // Step 2 — union: on StarRocks versions predating starrocks/starrocks#73396 (merged
-    // 2026-05-19), sync MVs "are not registered as separate Tables" so SHOW FULL TABLES
-    // omits them entirely. Append those rows from the system view so they appear in the
-    // sidebar and the DDL source path has something to resolve. Sort names so that
-    // the resulting table order is deterministic across runs.
-    let mut materialized_view_names_sorted: Vec<&String> = materialized_view_names.iter().collect();
-    materialized_view_names_sorted.sort();
-    for name in materialized_view_names_sorted {
-        if !known_names.contains(name.as_str()) {
-            tables.push(TableInfo {
-                name: name.clone(),
-                table_type: "MATERIALIZED_VIEW".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            });
-        }
-    }
-}
-
-async fn list_starrocks_tables_with_status(
-    pool: &MySqlPool,
-    database: &str,
-) -> Result<(Vec<TableInfo>, HashMap<String, TableStatusMeta>), String> {
-    let (tables, materialized_view_names) = tokio::join!(
-        list_tables_show_with_status(pool, database),
-        list_starrocks_materialized_view_names(pool, database)
-    );
-    let (mut tables, status) = tables?;
-    merge_starrocks_materialized_views(&mut tables, materialized_view_names, database);
-    Ok((tables, status))
-}
-
-pub async fn list_starrocks_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
-    list_starrocks_tables_with_status(pool, database).await.map(|(tables, _)| tables)
 }
 
 fn requested_object_type(object_types: Option<&[String]>, object_type: &str) -> bool {
@@ -2958,6 +3030,26 @@ fn list_routines_sql(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> String {
+    list_routines_sql_for_query(database, object_types, limit, offset, RoutineMetadataQuery::Timestamps)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutineMetadataQuery {
+    Timestamps,
+    Legacy,
+}
+
+fn routine_metadata_queries() -> [RoutineMetadataQuery; 2] {
+    [RoutineMetadataQuery::Timestamps, RoutineMetadataQuery::Legacy]
+}
+
+fn list_routines_sql_for_query(
+    database: &str,
+    object_types: Option<&[String]>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    query: RoutineMetadataQuery,
+) -> String {
     let routine_types = [
         ("PROCEDURE", requested_object_type(object_types, "PROCEDURE")),
         ("FUNCTION", requested_object_type(object_types, "FUNCTION")),
@@ -2966,9 +3058,13 @@ fn list_routines_sql(
     .filter_map(|(routine_type, requested)| requested.then_some(format!("'{}'", routine_type)))
     .collect::<Vec<_>>()
     .join(", ");
+    let timestamps = match query {
+        RoutineMetadataQuery::Timestamps => "CREATED AS created_at, LAST_ALTERED AS updated_at",
+        RoutineMetadataQuery::Legacy => "NULL AS created_at, NULL AS updated_at",
+    };
     format!(
         "SELECT ROUTINE_NAME AS object_name, ROUTINE_TYPE AS object_type, NULL AS object_comment, \
-           NULL AS created_at, NULL AS updated_at, \
+           {timestamps}, \
            NULL AS parent_schema, NULL AS parent_name, \
            CASE WHEN ROUTINE_TYPE = 'PROCEDURE' THEN 2 ELSE 3 END AS sort_order \
          FROM information_schema.ROUTINES \
@@ -2977,6 +3073,40 @@ fn list_routines_sql(
         db = quote_value(database),
         pagination = sql_pagination(limit, offset),
     )
+}
+
+async fn query_routine_rows(
+    conn: &mut mysql_async::Conn,
+    database: &str,
+    object_types: Option<&[String]>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<mysql_async::Row>, String> {
+    let mut last_error = None;
+    for query in routine_metadata_queries() {
+        let sql = match query {
+            RoutineMetadataQuery::Timestamps => list_routines_sql(database, object_types, limit, offset),
+            RoutineMetadataQuery::Legacy => {
+                list_routines_sql_for_query(database, object_types, limit, offset, RoutineMetadataQuery::Legacy)
+            }
+        };
+        let result = match conn.query_iter(&sql).await {
+            Ok(result) => result.collect_and_drop::<mysql_async::Row>().await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(rows) => return Ok(rows),
+            Err(error) => {
+                if query == RoutineMetadataQuery::Timestamps {
+                    log::debug!(
+                        "Routine timestamps are unavailable for database `{database}`; retrying legacy metadata: {error}"
+                    );
+                }
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Routine metadata returned no result".to_string()))
 }
 
 fn list_completion_triggers_sql(database: &str) -> String {
@@ -3120,16 +3250,10 @@ pub async fn list_objects(
     // OceanBase/TiDB variants, restricted accounts) reject information_schema.ROUTINES with
     // ER_UNKNOWN_ERROR (1105). Degrading gracefully keeps tables/views usable.
     if wants_routines {
-        let routines_sql = list_routines_sql(database, object_types, query_limit, query_offset);
-        match conn.query_iter(&routines_sql).await {
-            Ok(result) => match result.collect_and_drop::<mysql_async::Row>().await {
-                Ok(routine_rows) => {
-                    objects.extend(routine_rows.iter().map(|row| row_to_object(row, database)));
-                }
-                Err(e) => {
-                    log::warn!("Skipping routines for database `{}` in object browser: {}", database, e);
-                }
-            },
+        match query_routine_rows(&mut conn, database, object_types, query_limit, query_offset).await {
+            Ok(routine_rows) => {
+                objects.extend(routine_rows.iter().map(|row| row_to_object(row, database)));
+            }
             Err(e) => {
                 log::warn!("Skipping routines for database `{}` in object browser: {}", database, e);
             }
@@ -3239,21 +3363,7 @@ fn filter_table_objects_fallback(
         .collect()
 }
 
-pub async fn list_starrocks_table_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let (tables, routines) =
-        tokio::join!(list_starrocks_tables_with_status(pool, database), list_routine_objects(pool, database));
-    let (tables, status) = tables?;
-    let mut objects = table_infos_to_objects(tables, &status, database);
-
-    match routines {
-        Ok(routines) => objects.extend(routines),
-        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
-    }
-
-    Ok(objects)
-}
-
-fn table_infos_to_objects(
+pub(super) fn table_infos_to_objects(
     tables: Vec<TableInfo>,
     status: &HashMap<String, TableStatusMeta>,
     database: &str,
@@ -3289,11 +3399,9 @@ fn table_infos_to_objects(
         .collect()
 }
 
-async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
+pub(super) async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
     let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let routines_sql = list_routines_sql(database, None, None, None);
-    let result = conn.query_iter(&routines_sql).await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    let rows = query_routine_rows(&mut conn, database, None, None, None).await?;
     Ok(rows.iter().map(|row| row_to_object(row, database)).collect())
 }
 
@@ -3301,12 +3409,8 @@ pub async fn list_completion_objects(pool: &MySqlPool, database: &str) -> Result
     let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let mut objects = Vec::new();
 
-    let routines_sql = list_routines_sql(database, None, None, None);
-    match conn.query_iter(&routines_sql).await {
-        Ok(result) => match result.collect_and_drop::<mysql_async::Row>().await {
-            Ok(rows) => objects.extend(rows.iter().map(|row| row_to_object(row, database))),
-            Err(e) => log::warn!("Skipping routines for completion in database `{}`: {}", database, e),
-        },
+    match query_routine_rows(&mut conn, database, None, None, None).await {
+        Ok(rows) => objects.extend(rows.iter().map(|row| row_to_object(row, database))),
         Err(e) => log::warn!("Skipping routines for completion in database `{}`: {}", database, e),
     }
 
@@ -3371,7 +3475,7 @@ fn normalize_mysql_column_charset_metadata(columns: &mut [ColumnInfo], table_col
 /// Example: "主键" → UTF-8 bytes [E4 B8 BB E9 94 AE]
 ///   → each byte → CP1252 char → UTF-8 re-encoded → garbled text
 ///   → reversal: map each char back to its CP1252 byte, decode as UTF-8
-pub(super) fn fix_potential_double_encoding(s: &str) -> String {
+pub(crate) fn fix_potential_double_encoding(s: &str) -> String {
     // Map each character to its CP1252 byte value
     let mut bytes = Vec::with_capacity(s.len());
     for c in s.chars() {
@@ -3794,12 +3898,8 @@ async fn get_conn_with_timeout_and_cancel(
     timeout: Duration,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<mysql_async::Conn, String> {
-    let get_future = async {
-        tokio::time::timeout(timeout, pool.get_conn())
-            .await
-            .map_err(|_| "MySQL get connection timed out".to_string())?
-            .map_err(|e| e.to_string())
-    };
+    let get_future =
+        connection_result_with_timeout(timeout, async { pool.get_conn().await.map_err(|error| error.to_string()) });
 
     match cancel_token {
         Some(token) => {
@@ -3814,10 +3914,14 @@ async fn get_conn_with_timeout_and_cancel(
 }
 
 pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
-    tokio::time::timeout(timeout, pool.get_conn())
-        .await
-        .map_err(|_| "MySQL get connection timed out".to_string())?
-        .map_err(|e| e.to_string())
+    connection_result_with_timeout(timeout, async { pool.get_conn().await.map_err(|error| error.to_string()) }).await
+}
+
+async fn connection_result_with_timeout<T, F>(timeout: Duration, future: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::time::timeout(timeout, future).await.map_err(|_| "MySQL get connection timed out".to_string())?
 }
 
 async fn ping_conn_with_timeout_and_cancel(
@@ -3923,16 +4027,22 @@ async fn execute_result_set_with_text_protocol_on_conn(
     sql: &str,
     row_limit: usize,
     max_rows: Option<usize>,
+    max_result_bytes: Option<usize>,
+    result_key_columns: &[String],
+    diagnostic_trace_id: Option<&str>,
     start: Instant,
-) -> Result<QueryResult, String> {
+) -> Result<MySqlQueryResult, String> {
+    let diagnostics_enabled = diagnostic_trace_id.is_some() && log::log_enabled!(log::Level::Info);
+    let dispatch_started_at = diagnostics_enabled.then(Instant::now);
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
+    let dispatch_ms = dispatch_started_at.map_or(0, |started_at| started_at.elapsed().as_millis());
     if !advance_to_result_set_with_columns(&mut result).await? {
         let affected_rows = result.affected_rows();
         let warnings = result.warnings();
         let info = result.info().into_owned();
         drop(result);
         let messages = collect_mysql_server_messages(conn, warnings, &info).await;
-        return Ok(QueryResult {
+        return Ok(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
@@ -3946,13 +4056,16 @@ async fn execute_result_set_with_text_protocol_on_conn(
             has_more: false,
             elasticsearch_raw_body: None,
             messages,
-        });
+        }));
     }
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
     let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
     let mut spatial_columns = mysql_spatial_column_builder(result.columns_ref());
+    let preview_bytes =
+        max_result_bytes.map(|max_bytes| mysql_result_cell_preview_bytes(max_bytes, row_limit, result.columns_ref()));
+    let protected_indexes = mysql_result_protected_column_indexes(result.columns_ref(), result_key_columns);
 
-    if should_collect_text_result_set(sql, row_limit, max_rows) {
+    if max_result_bytes.is_none() && should_collect_text_result_set(sql, row_limit, max_rows) {
         let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
         // collect_and_drop consumed the result; warnings/info now reflect the
         // trailing EOF/OK packet of the finished result set.
@@ -3971,7 +4084,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
             })
             .collect();
 
-        return Ok(QueryResult {
+        return Ok(MySqlQueryResult::exact(QueryResult {
             columns,
             column_types,
             column_sortables: vec![],
@@ -3985,27 +4098,48 @@ async fn execute_result_set_with_text_protocol_on_conn(
             has_more: false,
             elasticsearch_raw_body: None,
             messages,
-        });
+        }));
     }
 
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
+    let mut large_value_cells = Vec::new();
     let mut truncated = false;
+    let mut row_read_time = Duration::ZERO;
+    let mut row_convert_time = Duration::ZERO;
     let mut stream = result
         .stream::<mysql_async::Row>()
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Empty result set stream".to_string())?;
 
-    while let Some(row) = stream.next().await {
+    loop {
+        let read_started_at = diagnostics_enabled.then(Instant::now);
+        let next_row = stream.next().await;
+        if let Some(started_at) = read_started_at {
+            row_read_time += started_at.elapsed();
+        }
+        let Some(row) = next_row else { break };
         let row = row.map_err(|e| e.to_string())?;
         if result_rows.len() >= row_limit {
             truncated = true;
             break;
         }
-        let (values, srids) = mysql_row_to_json_with_srids(&row, &mut spatial_columns);
+        let row_index = result_rows.len();
+        let convert_started_at = diagnostics_enabled.then(Instant::now);
+        let (values, srids, mut row_large_values) = mysql_row_to_json_with_srids_and_previews(
+            &row,
+            &mut spatial_columns,
+            row_index,
+            preview_bytes,
+            &protected_indexes,
+        );
         result_rows.push(values);
         spatial_values.push(srids);
+        large_value_cells.append(&mut row_large_values);
+        if let Some(started_at) = convert_started_at {
+            row_convert_time += started_at.elapsed();
+        }
     }
     drop(stream);
 
@@ -4013,6 +4147,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
     // terminator packet arrived, so `result.warnings()`/`result.info()` still
     // hold the previous statement's values; skip capture instead of reporting
     // stale messages.
+    let finalize_started_at = diagnostics_enabled.then(Instant::now);
     let messages = if truncated {
         drop(result);
         Vec::new()
@@ -4022,21 +4157,38 @@ async fn execute_result_set_with_text_protocol_on_conn(
         drop(result);
         collect_mysql_server_messages(conn, warnings, &info).await
     };
+    if diagnostics_enabled {
+        log::info!(
+            "[query][mysql-result] trace_id={} protocol=text dispatch_ms={} row_read_ms={} row_convert_ms={} finalize_ms={} rows={} columns={} truncated={} preview_cells={}",
+            diagnostic_trace_id.unwrap_or("none"),
+            dispatch_ms,
+            row_read_time.as_millis(),
+            row_convert_time.as_millis(),
+            finalize_started_at.map_or(0, |started_at| started_at.elapsed().as_millis()),
+            result_rows.len(),
+            columns.len(),
+            truncated,
+            large_value_cells.len()
+        );
+    }
 
-    Ok(QueryResult {
-        columns,
-        column_types,
-        column_sortables: vec![],
-        spatial_columns: spatial_columns.finish(),
-        spatial_values,
-        rows: result_rows,
-        affected_rows: 0,
-        execution_time_ms: start.elapsed().as_millis(),
-        truncated,
-        session_id: None,
-        has_more: false,
-        elasticsearch_raw_body: None,
-        messages,
+    Ok(MySqlQueryResult {
+        result: QueryResult {
+            columns,
+            column_types,
+            column_sortables: vec![],
+            spatial_columns: spatial_columns.finish(),
+            spatial_values,
+            rows: result_rows,
+            affected_rows: 0,
+            execution_time_ms: start.elapsed().as_millis(),
+            truncated,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages,
+        },
+        large_value_cells,
     })
 }
 
@@ -4045,8 +4197,11 @@ async fn execute_result_sets_with_text_protocol_on_conn(
     sql: &str,
     row_limit: usize,
     max_rows: Option<usize>,
+    max_result_bytes: Option<usize>,
+    result_key_columns: &[String],
+    diagnostic_trace_id: Option<&str>,
     start: Instant,
-) -> Result<Vec<QueryResult>, String> {
+) -> Result<Vec<MySqlQueryResult>, String> {
     // Per-set warnings/info read after each `collect()` are only accurate when
     // the connection negotiated CLIENT_DEPRECATE_EOF: with legacy EOF packets
     // the next result set's column-definition EOF clobbers the previous OK
@@ -4058,28 +4213,47 @@ async fn execute_result_sets_with_text_protocol_on_conn(
     // per-set messages stay empty and only the final SHOW WARNINGS attachment
     // on the last result set reports warnings.
     let capture_per_set_messages = conn.opts().deprecate_eof();
+    let diagnostics_enabled = diagnostic_trace_id.is_some() && log::log_enabled!(log::Level::Info);
+    let dispatch_started_at = diagnostics_enabled.then(Instant::now);
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
-    let mut results: Vec<QueryResult> = Vec::new();
+    let dispatch_ms = dispatch_started_at.map_or(0, |started_at| started_at.elapsed().as_millis());
+    let mut results: Vec<MySqlQueryResult> = Vec::new();
     let mut result_set_warnings: Vec<u16> = Vec::new();
+    let mut row_read_time = Duration::ZERO;
+    let mut row_convert_time = Duration::ZERO;
 
     while advance_to_result_set_with_columns(&mut result).await? {
         let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
         let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
         let mut spatial_columns = mysql_spatial_column_builder(result.columns_ref());
         let mut spatial_values = Vec::new();
+        let mut large_value_cells = Vec::new();
         let mut truncated = false;
+        let preview_bytes = max_result_bytes
+            .map(|max_bytes| mysql_result_cell_preview_bytes(max_bytes, row_limit, result.columns_ref()));
+        let protected_indexes = mysql_result_protected_column_indexes(result.columns_ref(), result_key_columns);
 
-        let rows = if should_collect_text_result_set(sql, row_limit, max_rows) {
+        let rows = if max_result_bytes.is_none() && should_collect_text_result_set(sql, row_limit, max_rows) {
+            let read_started_at = diagnostics_enabled.then(Instant::now);
             let rows: Vec<mysql_async::Row> = result.collect().await.map_err(|e| e.to_string())?;
+            if let Some(started_at) = read_started_at {
+                row_read_time += started_at.elapsed();
+            }
             truncated = rows.len() > row_limit;
-            rows.iter()
+            let convert_started_at = diagnostics_enabled.then(Instant::now);
+            let converted_rows = rows
+                .iter()
                 .take(row_limit)
                 .map(|row| {
                     let (values, srids) = mysql_row_to_json_with_srids(row, &mut spatial_columns);
                     spatial_values.push(srids);
                     values
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            if let Some(started_at) = convert_started_at {
+                row_convert_time += started_at.elapsed();
+            }
+            converted_rows
         } else {
             let mut rows = Vec::new();
             let mut stream = result
@@ -4088,12 +4262,30 @@ async fn execute_result_sets_with_text_protocol_on_conn(
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "Empty result set stream".to_string())?;
 
-            while let Some(row) = stream.next().await {
+            loop {
+                let read_started_at = diagnostics_enabled.then(Instant::now);
+                let next_row = stream.next().await;
+                if let Some(started_at) = read_started_at {
+                    row_read_time += started_at.elapsed();
+                }
+                let Some(row) = next_row else { break };
                 let row = row.map_err(|e| e.to_string())?;
                 if rows.len() < row_limit {
-                    let (values, srids) = mysql_row_to_json_with_srids(&row, &mut spatial_columns);
+                    let row_index = rows.len();
+                    let convert_started_at = diagnostics_enabled.then(Instant::now);
+                    let (values, srids, mut row_large_values) = mysql_row_to_json_with_srids_and_previews(
+                        &row,
+                        &mut spatial_columns,
+                        row_index,
+                        preview_bytes,
+                        &protected_indexes,
+                    );
                     rows.push(values);
                     spatial_values.push(srids);
+                    large_value_cells.append(&mut row_large_values);
+                    if let Some(started_at) = convert_started_at {
+                        row_convert_time += started_at.elapsed();
+                    }
                 } else {
                     truncated = true;
                 }
@@ -4108,30 +4300,34 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             Vec::new()
         };
         result_set_warnings.push(warnings);
-        results.push(QueryResult {
-            columns,
-            column_types,
-            column_sortables: vec![],
-            spatial_columns: spatial_columns.finish(),
-            spatial_values,
-            rows,
-            affected_rows: 0,
-            execution_time_ms: start.elapsed().as_millis(),
-            truncated,
-            session_id: None,
-            has_more: false,
-            elasticsearch_raw_body: None,
-            messages,
+        results.push(MySqlQueryResult {
+            result: QueryResult {
+                columns,
+                column_types,
+                column_sortables: vec![],
+                spatial_columns: spatial_columns.finish(),
+                spatial_values,
+                rows,
+                affected_rows: 0,
+                execution_time_ms: start.elapsed().as_millis(),
+                truncated,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+                messages,
+            },
+            large_value_cells,
         });
     }
 
     if results.is_empty() {
+        let finalize_started_at = diagnostics_enabled.then(Instant::now);
         let affected_rows = result.affected_rows();
         let warnings = result.warnings();
         let info = result.info().into_owned();
         drop(result);
         let messages = collect_mysql_server_messages(conn, warnings, &info).await;
-        results.push(QueryResult {
+        results.push(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
@@ -4145,7 +4341,17 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             has_more: false,
             elasticsearch_raw_body: None,
             messages,
-        });
+        }));
+        if diagnostics_enabled {
+            log::info!(
+                "[query][mysql-result] trace_id={} protocol=text-multi dispatch_ms={} row_read_ms={} row_convert_ms={} finalize_ms={} result_count=1 row_counts=[0] column_counts=[0] truncated_sets=0 preview_cells=0",
+                diagnostic_trace_id.unwrap_or("none"),
+                dispatch_ms,
+                row_read_time.as_millis(),
+                row_convert_time.as_millis(),
+                finalize_started_at.map_or(0, |started_at| started_at.elapsed().as_millis())
+            );
+        }
         return Ok(results);
     }
     // Without per-set capture (no CLIENT_DEPRECATE_EOF) the per-iteration
@@ -4156,6 +4362,7 @@ async fn execute_result_sets_with_text_protocol_on_conn(
         let last_index = result_set_warnings.len() - 1;
         result_set_warnings[last_index] = result.warnings();
     }
+    let finalize_started_at = diagnostics_enabled.then(Instant::now);
     drop(result);
 
     // SHOW WARNINGS only reports the last executed statement, so detailed
@@ -4168,10 +4375,26 @@ async fn execute_result_sets_with_text_protocol_on_conn(
         }
         if index == last_index {
             let mut messages = collect_mysql_server_messages(conn, warnings, "").await;
-            results[index].messages.append(&mut messages);
+            results[index].result.messages.append(&mut messages);
         } else {
-            results[index].messages.push(mysql_warnings_fallback_message(warnings));
+            results[index].result.messages.push(mysql_warnings_fallback_message(warnings));
         }
+    }
+
+    if diagnostics_enabled {
+        log::info!(
+            "[query][mysql-result] trace_id={} protocol=text-multi dispatch_ms={} row_read_ms={} row_convert_ms={} finalize_ms={} result_count={} row_counts={:?} column_counts={:?} truncated_sets={} preview_cells={}",
+            diagnostic_trace_id.unwrap_or("none"),
+            dispatch_ms,
+            row_read_time.as_millis(),
+            row_convert_time.as_millis(),
+            finalize_started_at.map_or(0, |started_at| started_at.elapsed().as_millis()),
+            results.len(),
+            results.iter().map(|result| result.result.rows.len()).collect::<Vec<_>>(),
+            results.iter().map(|result| result.result.columns.len()).collect::<Vec<_>>(),
+            results.iter().filter(|result| result.result.truncated).count(),
+            results.iter().map(|result| result.large_value_cells.len()).sum::<usize>()
+        );
     }
 
     Ok(results)
@@ -4193,31 +4416,61 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
     conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
+    max_result_bytes: Option<usize>,
+    result_key_columns: &[String],
+    diagnostic_trace_id: Option<&str>,
     start: Instant,
-) -> Result<QueryResult, String> {
+) -> Result<MySqlQueryResult, String> {
+    let diagnostics_enabled = diagnostic_trace_id.is_some() && log::log_enabled!(log::Level::Info);
+    let dispatch_started_at = diagnostics_enabled.then(Instant::now);
     let mut result = conn.exec_iter(sql, ()).await.map_err(|e| e.to_string())?;
+    let dispatch_ms = dispatch_started_at.map_or(0, |started_at| started_at.elapsed().as_millis());
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
     let column_types: Vec<String> = result.columns_ref().iter().map(mysql_column_type_name).collect();
     let mut spatial_columns = mysql_spatial_column_builder(result.columns_ref());
+    let preview_bytes =
+        max_result_bytes.map(|max_bytes| mysql_result_cell_preview_bytes(max_bytes, row_limit, result.columns_ref()));
+    let protected_indexes = mysql_result_protected_column_indexes(result.columns_ref(), result_key_columns);
 
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
+    let mut large_value_cells = Vec::new();
     let mut truncated = false;
+    let mut row_read_time = Duration::ZERO;
+    let mut row_convert_time = Duration::ZERO;
     let mut stream = result
         .stream::<mysql_async::Row>()
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Empty result set stream".to_string())?;
 
-    while let Some(row) = stream.next().await {
+    loop {
+        let read_started_at = diagnostics_enabled.then(Instant::now);
+        let next_row = stream.next().await;
+        if let Some(started_at) = read_started_at {
+            row_read_time += started_at.elapsed();
+        }
+        let Some(row) = next_row else { break };
         let row = row.map_err(|e| e.to_string())?;
         if result_rows.len() >= row_limit {
             truncated = true;
             break;
         }
-        let (values, srids) = mysql_row_to_json_with_srids(&row, &mut spatial_columns);
+        let row_index = result_rows.len();
+        let convert_started_at = diagnostics_enabled.then(Instant::now);
+        let (values, srids, mut row_large_values) = mysql_row_to_json_with_srids_and_previews(
+            &row,
+            &mut spatial_columns,
+            row_index,
+            preview_bytes,
+            &protected_indexes,
+        );
         result_rows.push(values);
         spatial_values.push(srids);
+        large_value_cells.append(&mut row_large_values);
+        if let Some(started_at) = convert_started_at {
+            row_convert_time += started_at.elapsed();
+        }
     }
     drop(stream);
 
@@ -4225,6 +4478,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
     // terminator packet arrived, so `result.warnings()`/`result.info()` still
     // hold the previous statement's values; skip capture instead of reporting
     // stale messages.
+    let finalize_started_at = diagnostics_enabled.then(Instant::now);
     let messages = if truncated {
         drop(result);
         Vec::new()
@@ -4234,21 +4488,38 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
         drop(result);
         collect_mysql_server_messages(conn, warnings, &info).await
     };
+    if diagnostics_enabled {
+        log::info!(
+            "[query][mysql-result] trace_id={} protocol=prepared dispatch_ms={} row_read_ms={} row_convert_ms={} finalize_ms={} rows={} columns={} truncated={} preview_cells={}",
+            diagnostic_trace_id.unwrap_or("none"),
+            dispatch_ms,
+            row_read_time.as_millis(),
+            row_convert_time.as_millis(),
+            finalize_started_at.map_or(0, |started_at| started_at.elapsed().as_millis()),
+            result_rows.len(),
+            columns.len(),
+            truncated,
+            large_value_cells.len()
+        );
+    }
 
-    Ok(QueryResult {
-        columns,
-        column_types,
-        column_sortables: vec![],
-        spatial_columns: spatial_columns.finish(),
-        spatial_values,
-        rows: result_rows,
-        affected_rows: 0,
-        execution_time_ms: start.elapsed().as_millis(),
-        truncated,
-        session_id: None,
-        has_more: false,
-        elasticsearch_raw_body: None,
-        messages,
+    Ok(MySqlQueryResult {
+        result: QueryResult {
+            columns,
+            column_types,
+            column_sortables: vec![],
+            spatial_columns: spatial_columns.finish(),
+            spatial_values,
+            rows: result_rows,
+            affected_rows: 0,
+            execution_time_ms: start.elapsed().as_millis(),
+            truncated,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages,
+        },
+        large_value_cells,
     })
 }
 
@@ -4479,17 +4750,62 @@ pub async fn execute_query_on_conn_with_max_rows(
     max_rows: Option<usize>,
     dialect: MySqlQueryDialect,
 ) -> Result<QueryResult, String> {
+    execute_query_on_conn_with_limits(conn, sql, bare, max_rows, None, &[], dialect, None)
+        .await
+        .map(|result| result.result)
+}
+
+pub async fn execute_query_on_conn_with_limits(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    bare: bool,
+    max_rows: Option<usize>,
+    max_result_bytes: Option<usize>,
+    result_key_columns: &[String],
+    dialect: MySqlQueryDialect,
+    diagnostic_trace_id: Option<&str>,
+) -> Result<MySqlQueryResult, String> {
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
     if is_result_set_query(sql, dialect) {
         if bare || prefers_text_protocol_query(sql, dialect) {
-            execute_result_set_with_text_protocol_on_conn(conn, sql, row_limit, max_rows, start).await
+            execute_result_set_with_text_protocol_on_conn(
+                conn,
+                sql,
+                row_limit,
+                max_rows,
+                max_result_bytes,
+                result_key_columns,
+                diagnostic_trace_id,
+                start,
+            )
+            .await
         } else {
-            match execute_result_set_with_prepared_protocol_on_conn(conn, sql, row_limit, start).await {
+            match execute_result_set_with_prepared_protocol_on_conn(
+                conn,
+                sql,
+                row_limit,
+                max_result_bytes,
+                result_key_columns,
+                diagnostic_trace_id,
+                start,
+            )
+            .await
+            {
                 Ok(result) => Ok(result),
                 Err(err) if mysql_error_should_retry_with_text_protocol(&err) => {
-                    execute_result_set_with_text_protocol_on_conn(conn, sql, row_limit, max_rows, start).await
+                    execute_result_set_with_text_protocol_on_conn(
+                        conn,
+                        sql,
+                        row_limit,
+                        max_rows,
+                        max_result_bytes,
+                        result_key_columns,
+                        diagnostic_trace_id,
+                        start,
+                    )
+                    .await
                 }
                 Err(err) => Err(err),
             }
@@ -4514,7 +4830,7 @@ pub async fn execute_query_on_conn_with_max_rows(
         restore_explicit_timestamp_defaults_for_query(conn, previous_explicit_timestamp_defaults).await;
         drop_result.map_err(|e| e.to_string())?;
 
-        Ok(QueryResult {
+        Ok(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
@@ -4528,7 +4844,7 @@ pub async fn execute_query_on_conn_with_max_rows(
             has_more: false,
             elasticsearch_raw_body: None,
             messages,
-        })
+        }))
     }
 }
 
@@ -4539,12 +4855,47 @@ pub async fn execute_query_results_on_conn_with_max_rows(
     max_rows: Option<usize>,
     dialect: MySqlQueryDialect,
 ) -> Result<Vec<QueryResult>, String> {
+    execute_query_results_on_conn_with_limits(conn, sql, bare, max_rows, None, &[], dialect, None)
+        .await
+        .map(|results| results.into_iter().map(|result| result.result).collect())
+}
+
+pub async fn execute_query_results_on_conn_with_limits(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    bare: bool,
+    max_rows: Option<usize>,
+    max_result_bytes: Option<usize>,
+    result_key_columns: &[String],
+    dialect: MySqlQueryDialect,
+    diagnostic_trace_id: Option<&str>,
+) -> Result<Vec<MySqlQueryResult>, String> {
     if is_result_set_query(sql, dialect) && (bare || prefers_text_protocol_query(sql, dialect)) {
         let start = Instant::now();
-        execute_result_sets_with_text_protocol_on_conn(conn, sql, query_result_row_limit(max_rows), max_rows, start)
-            .await
+        execute_result_sets_with_text_protocol_on_conn(
+            conn,
+            sql,
+            query_result_row_limit(max_rows),
+            max_rows,
+            max_result_bytes,
+            result_key_columns,
+            diagnostic_trace_id,
+            start,
+        )
+        .await
     } else {
-        execute_query_on_conn_with_max_rows(conn, sql, bare, max_rows, dialect).await.map(|result| vec![result])
+        execute_query_on_conn_with_limits(
+            conn,
+            sql,
+            bare,
+            max_rows,
+            max_result_bytes,
+            result_key_columns,
+            dialect,
+            diagnostic_trace_id,
+        )
+        .await
+        .map(|result| vec![result])
     }
 }
 
@@ -4819,6 +5170,7 @@ pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Resu
                     index_type: Some(get_str_by_name(&row, "INDEX_TYPE")),
                     included_columns: None,
                     comment: get_opt_str(&row, "INDEX_COMMENT").filter(|value| !value.is_empty()),
+                    key_is_expression: Vec::new(),
                 });
                 index_position
             };
@@ -4851,438 +5203,6 @@ pub async fn show_create_table_ddl(pool: &MySqlPool, database: &str, table: &str
         .and_then(|result| result.ok())
         .or_else(|| row.get_opt::<Vec<u8>, usize>(1).and_then(|result| result.ok()).map(bytes_to_string_lossy))
         .ok_or_else(|| "Failed to read DDL".to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Doris / StarRocks multi-catalog support.
-//
-// These engines expose external catalogs (iceberg, hive, jdbc, ...) alongside
-// the native `internal` catalog via `SHOW CATALOGS`. The functions below address
-// objects in a specific catalog using 3-part qualified names
-// (`<catalog>.<database>.<table>`), which the engines accept directly without
-// needing to `SWITCH` the session catalog.
-// ---------------------------------------------------------------------------
-
-/// Build a 2-part qualified identifier `` `<catalog>`.`<database>` ``.
-fn doris_catalog_database_ref(catalog: &str, database: &str) -> String {
-    format!("{}.{}", quote_identifier(catalog), quote_identifier(database))
-}
-
-/// Build a 3-part qualified identifier `` `<catalog>`.`<database>`.`<table>` ``.
-fn doris_catalog_table_ref(catalog: &str, database: &str, table: &str) -> String {
-    format!("{}.{}.{}", quote_identifier(catalog), quote_identifier(database), quote_identifier(table))
-}
-
-/// `SHOW CATALOGS` → list of catalogs visible to the current user.
-///
-/// Column layouts differ between engines: Doris exposes `CatalogName` (with
-/// `CatalogId`/`IsCurrent`/`CreateTime`/`LastUpdateTime`), while StarRocks
-/// exposes `Catalog` (only `Type`/`Comment`, no `IsCurrent`). The name is read
-/// from either column; missing trailing columns degrade gracefully to
-/// empty/None. The built-in catalog is named `internal` in Doris and
-/// `default_catalog` in StarRocks (both with `Type=internal`); detection is
-/// type-based (see `CatalogInfo::is_internal`), not name-based.
-pub async fn list_doris_catalogs(pool: &MySqlPool) -> Result<Vec<crate::db::CatalogInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let result = conn.query_iter("SHOW CATALOGS").await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    let catalogs: Vec<crate::db::CatalogInfo> = rows
-        .iter()
-        .filter_map(|row| {
-            // Doris column is `CatalogName`; StarRocks column is `Catalog`.
-            let name = first_nonempty_str_by_name(row, &["CatalogName", "Catalog"]).trim().to_string();
-            if name.is_empty() {
-                return None;
-            }
-            let catalog_type = get_str_by_name(row, "Type").trim().to_string();
-            let is_current = {
-                let value = get_str_by_name(row, "IsCurrent").trim().to_ascii_lowercase();
-                !value.is_empty() && value != "no" && value != "false" && value != "0"
-            };
-            let comment = get_opt_str(row, "Comment").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            Some(crate::db::CatalogInfo { name, catalog_type, is_current, comment })
-        })
-        .collect();
-    Ok(normalize_doris_catalogs(catalogs))
-}
-
-/// Sort with the built-in catalog first, then the rest alphabetically by name.
-/// The built-in catalog is identified by `CatalogInfo::is_internal` (type-based)
-/// rather than by name, so StarRocks `default_catalog` sorts first just like
-/// Doris `internal`. No synthetic catalog is injected: `SHOW CATALOGS` always
-/// lists the built-in catalog on both engines, and a single-catalog result is
-/// handled by the flat-sidebar fallback in the caller.
-fn normalize_doris_catalogs(mut catalogs: Vec<crate::db::CatalogInfo>) -> Vec<crate::db::CatalogInfo> {
-    catalogs.sort_by(|a, b| match (a.is_internal(), b.is_internal()) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.cmp(&b.name),
-    });
-    catalogs
-}
-
-/// `SHOW DATABASES FROM <catalog>` → databases in the given catalog.
-pub async fn list_databases_show_from(pool: &MySqlPool, catalog: &str) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let sql = format!("SHOW DATABASES FROM {}", quote_identifier(catalog));
-    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), false))
-}
-
-/// `SHOW TABLES FROM <catalog>.<database>` → tables in an external catalog.
-///
-/// External catalogs do not support `SHOW TABLE STATUS`, so comments/status are
-/// not fetched (the caller only needs names + types for browsing).
-pub async fn list_tables_show_from(pool: &MySqlPool, catalog: &str, database: &str) -> Result<Vec<TableInfo>, String> {
-    let sql = format!("SHOW TABLES FROM {}", doris_catalog_database_ref(catalog, database));
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    let mut tables: Vec<TableInfo> = rows
-        .iter()
-        .filter_map(|row| {
-            let name = get_str(row, 0).trim().to_string();
-            if name.is_empty() {
-                return None;
-            }
-            // SHOW FULL TABLES exposes a type column; plain SHOW TABLES does not.
-            let table_type = get_str(row, 1);
-            Some(TableInfo {
-                name,
-                table_type: if table_type.trim().is_empty() { "TABLE".to_string() } else { table_type },
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            })
-        })
-        .collect();
-    tables.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(tables)
-}
-
-/// `SHOW COLUMNS FROM <catalog>.<database>.<table>` → columns of an external
-/// catalog table. Falls back to `DESCRIBE` if `SHOW COLUMNS` is rejected.
-pub async fn get_columns_show_from(
-    pool: &MySqlPool,
-    catalog: &str,
-    database: &str,
-    table: &str,
-) -> Result<Vec<ColumnInfo>, String> {
-    let qualified = doris_catalog_table_ref(catalog, database, table);
-    let full_sql = format!("SHOW FULL COLUMNS FROM {qualified}");
-    let plain_sql = format!("SHOW COLUMNS FROM {qualified}");
-    let describe_sql = format!("DESCRIBE {qualified}");
-    let mut conn = get_conn_with_health_check(pool).await?;
-    let rows: Vec<mysql_async::Row> = match conn.query_iter(&full_sql).await {
-        Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
-        Err(_) => match conn.query_iter(&plain_sql).await {
-            Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
-            Err(_) => {
-                let result = conn.query_iter(&describe_sql).await.map_err(|e| e.to_string())?;
-                result.collect_and_drop().await.map_err(|e| e.to_string())?
-            }
-        },
-    };
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let name = get_str_by_name(row, "Field").trim().to_string();
-            if name.is_empty() {
-                return None;
-            }
-            let key = get_str_by_name(row, "Key");
-            let collation = get_opt_str(row, "Collation").filter(|s| !s.is_empty());
-            Some(ColumnInfo {
-                name,
-                data_type: get_str_by_name(row, "Type"),
-                is_nullable: get_str_by_name(row, "Null").eq_ignore_ascii_case("YES"),
-                column_default: get_opt_str(row, "Default"),
-                is_primary_key: key.eq_ignore_ascii_case("PRI"),
-                is_unique: key.eq_ignore_ascii_case("UNI"),
-                extra: get_opt_str(row, "Extra"),
-                comment: get_opt_str(row, "Comment")
-                    .map(|s| fix_potential_double_encoding(&s))
-                    .filter(|s| !s.is_empty()),
-                numeric_precision: None,
-                numeric_scale: None,
-                character_maximum_length: None,
-                enum_values: None,
-                character_set: collation
-                    .as_deref()
-                    .and_then(|c| c.split_once('_').map(|(charset, _)| charset.to_string()))
-                    .filter(|s| !s.is_empty()),
-                collation,
-            })
-        })
-        .collect())
-}
-
-/// `SHOW CREATE TABLE <catalog>.<database>.<table>` → DDL for an external
-/// catalog table.
-pub async fn show_create_table_ddl_from(
-    pool: &MySqlPool,
-    catalog: &str,
-    database: &str,
-    table: &str,
-) -> Result<String, String> {
-    let sql = format!("SHOW CREATE TABLE {}", doris_catalog_table_ref(catalog, database, table));
-    let mut conn = get_conn_with_health_check(pool).await?;
-    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    let row = rows.first().ok_or("DDL not found")?;
-    row.get_opt::<String, usize>(1)
-        .and_then(|result| result.ok())
-        .or_else(|| {
-            row.get_opt::<Vec<u8>, usize>(1)
-                .and_then(|result| result.ok())
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-        })
-        .ok_or_else(|| "Failed to read DDL".to_string())
-}
-
-/// Best-effort index listing for an external catalog table. External catalogs
-/// generally do not expose MySQL-style index metadata via `information_schema`
-/// (that view is scoped to the internal catalog), so indexes are derived from
-/// `SHOW CREATE TABLE` parsing. Returns empty on failure (graceful degradation
-/// — indexes are informational for external tables).
-pub async fn list_doris_catalog_indexes(
-    pool: &MySqlPool,
-    catalog: &str,
-    database: &str,
-    table: &str,
-) -> Result<Vec<IndexInfo>, String> {
-    let ddl = show_create_table_ddl_from(pool, catalog, database, table).await?;
-    Ok(doris_indexes_from_create_table_ddl(&ddl))
-}
-
-fn doris_indexes_from_create_table_ddl(ddl: &str) -> Vec<IndexInfo> {
-    let mut indexes = Vec::new();
-    for raw_line in ddl.lines() {
-        let line = trim_ddl_definition_line(raw_line);
-        if line.is_empty() {
-            continue;
-        }
-        let upper = line.to_ascii_uppercase();
-        if upper.starts_with("PRIMARY KEY") {
-            if let Some(index) = doris_table_key_index("PRIMARY", line, true, true, "PRIMARY KEY") {
-                indexes.push(index);
-            }
-        } else if upper.starts_with("UNIQUE KEY") {
-            if let Some(index) = doris_table_key_index("UNIQUE KEY", line, true, false, "UNIQUE KEY") {
-                indexes.push(index);
-            }
-        } else if upper.starts_with("INDEX ") {
-            if let Some(index) = doris_secondary_index(line) {
-                indexes.push(index);
-            }
-        }
-    }
-    indexes
-}
-
-fn trim_ddl_definition_line(line: &str) -> &str {
-    let mut trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix(',') {
-        trimmed = rest.trim_start();
-    }
-    while let Some(rest) = trimmed.strip_suffix(',') {
-        trimmed = rest.trim_end();
-    }
-    trimmed
-}
-
-fn doris_table_key_index(
-    name: &str,
-    line: &str,
-    is_unique: bool,
-    is_primary: bool,
-    index_type: &str,
-) -> Option<IndexInfo> {
-    let columns = parse_mysql_index_columns(first_parenthesized_content(line)?);
-    if columns.is_empty() {
-        return None;
-    }
-    Some(IndexInfo {
-        name: name.to_string(),
-        columns,
-        is_unique,
-        is_primary,
-        filter: None,
-        index_type: Some(index_type.to_string()),
-        included_columns: None,
-        comment: None,
-    })
-}
-
-fn doris_secondary_index(line: &str) -> Option<IndexInfo> {
-    let (_, rest) = split_keyword_prefix(line, "INDEX")?;
-    let (name, after_name) = read_mysql_identifier(rest.trim_start())?;
-    let columns = parse_mysql_index_columns(first_parenthesized_content(after_name)?);
-    if columns.is_empty() {
-        return None;
-    }
-    Some(IndexInfo {
-        name,
-        columns,
-        is_unique: false,
-        is_primary: false,
-        filter: None,
-        index_type: mysql_keyword_argument(after_name, "USING").or_else(|| Some("INDEX".to_string())),
-        included_columns: None,
-        comment: mysql_quoted_string_argument(after_name, "COMMENT"),
-    })
-}
-
-fn split_keyword_prefix<'a>(line: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
-    if line.len() < keyword.len() || !line[..keyword.len()].eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    let rest = &line[keyword.len()..];
-    if !rest.is_empty() && is_mysql_identifier_byte(rest.as_bytes()[0]) {
-        return None;
-    }
-    Some((&line[..keyword.len()], rest))
-}
-
-fn read_mysql_identifier(input: &str) -> Option<(String, &str)> {
-    let input = input.trim_start();
-    if input.is_empty() {
-        return None;
-    }
-    let bytes = input.as_bytes();
-    if bytes[0] == b'`' {
-        let mut i = 1;
-        let mut value = String::new();
-        while i < bytes.len() {
-            if bytes[i] == b'`' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
-                    value.push('`');
-                    i += 2;
-                    continue;
-                }
-                return Some((value, &input[i + 1..]));
-            }
-            let ch = input[i..].chars().next()?;
-            value.push(ch);
-            i += ch.len_utf8();
-        }
-        return None;
-    }
-
-    let end = input.find(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',')).unwrap_or(input.len());
-    if end == 0 {
-        return None;
-    }
-    Some((input[..end].to_string(), &input[end..]))
-}
-
-fn first_parenthesized_content(input: &str) -> Option<&str> {
-    let bytes = input.as_bytes();
-    let mut depth = 0usize;
-    let mut start = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                i = skip_mysql_quoted(input, i, bytes[i]);
-                continue;
-            }
-            b'(' => {
-                if depth == 0 {
-                    start = Some(i + 1);
-                }
-                depth += 1;
-            }
-            b')' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    return start.map(|start| &input[start..i]);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn split_top_level_csv(input: &str) -> Vec<&str> {
-    let bytes = input.as_bytes();
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                i = skip_mysql_quoted(input, i, bytes[i]);
-                continue;
-            }
-            b'(' => depth += 1,
-            b')' if depth > 0 => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(input[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(input[start..].trim());
-    parts
-}
-
-fn parse_mysql_index_columns(input: &str) -> Vec<String> {
-    split_top_level_csv(input)
-        .into_iter()
-        .filter_map(|part| read_mysql_identifier(part).map(|(column, _)| column))
-        .filter(|column| !column.is_empty())
-        .collect()
-}
-
-fn mysql_keyword_argument(input: &str, keyword: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                i = skip_mysql_quoted(input, i, bytes[i]);
-                continue;
-            }
-            _ if mysql_keyword_at(input, i, keyword) => {
-                return read_mysql_identifier(&input[i + keyword.len()..]).map(|(value, _)| value);
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn mysql_quoted_string_argument(input: &str, keyword: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                i = skip_mysql_quoted(input, i, bytes[i]);
-                continue;
-            }
-            _ if mysql_keyword_at(input, i, keyword) => {
-                let rest = input[i + keyword.len()..].trim_start();
-                if rest.as_bytes().first().copied() != Some(b'\'') {
-                    return None;
-                }
-                let end = skip_mysql_quoted(rest, 0, b'\'');
-                if end <= 1 || end > rest.len() {
-                    return None;
-                }
-                return Some(rest[1..end - 1].replace("\\'", "'").replace("''", "'"));
-            }
-            _ => i += 1,
-        }
-    }
-    None
 }
 
 pub async fn list_foreign_keys(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
@@ -5391,6 +5311,10 @@ mod tests {
         new_row(values, columns)
     }
 
+    fn mysql_test_row_with_columns(values: Vec<Value>, columns: Vec<Column>) -> mysql_async::Row {
+        new_row(values, columns.into())
+    }
+
     #[test]
     fn mysql_first_column_value_ignores_extra_result_columns() {
         let row = mysql_async::from_row::<mysql_async::Row>(mysql_test_row(vec![
@@ -5399,6 +5323,38 @@ mod tests {
         ]));
 
         assert_eq!(first_column_value::<String>(&row), Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn mysql_database_list_timeout_controls_checkout_deadline() {
+        let exact = connection_result_with_timeout(Duration::from_millis(100), async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            Ok::<_, String>("connection")
+        });
+        let adjacent = connection_result_with_timeout(Duration::from_millis(50), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok::<_, String>("connection")
+        });
+        let configured_five = connection_result_with_timeout(Duration::from_millis(50), async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            Ok::<_, String>("connection")
+        });
+
+        let (exact, adjacent, configured_five) = tokio::join!(exact, adjacent, configured_five);
+
+        assert_eq!(exact, Ok("connection"));
+        assert_eq!(adjacent, Ok("connection"));
+        assert_eq!(configured_five, Err("MySQL get connection timed out".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mysql_database_list_timeout_preserves_immediate_errors_and_fallback_plan() {
+        let error =
+            connection_result_with_timeout(Duration::from_secs(10), async { Err::<(), _>("driver error".to_string()) })
+                .await;
+
+        assert_eq!(error, Err("driver error".to_string()));
+        assert_eq!(DATABASE_LIST_QUERY_PLAN, [(SHOW_DATABASES_SQL, true), (INFORMATION_SCHEMA_DATABASES_SQL, false)]);
     }
 
     #[test]
@@ -5763,12 +5719,55 @@ mod tests {
     }
 
     #[test]
+    fn tidb_admin_show_queries_are_treated_as_result_sets() {
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::Mysql, Some("tidb"));
+
+        for sql in [
+            "ADMIN SHOW DDL",
+            "ADMIN SHOW DDL JOBS 20",
+            "-- inspect DDL\nadmin /* TiDB */ show ddl jobs 20",
+            "ADMIN SHOW DDL JOB QUERIES 1",
+        ] {
+            assert!(is_result_set_query(sql, dialect), "{sql}");
+            assert!(requires_text_protocol_query(sql, dialect), "{sql}");
+        }
+    }
+
+    #[test]
+    fn tidb_non_show_admin_statements_are_not_treated_as_result_sets() {
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::Mysql, Some("tidb"));
+
+        for sql in [
+            "ADMIN SET BDR ROLE PRIMARY",
+            "ADMIN CANCEL DDL JOBS 1",
+            "ADMIN PAUSE DDL JOBS 1",
+            "ADMIN RESUME DDL JOBS 1",
+            "ADMIN ALTER DDL JOBS 1 THREAD = 8",
+        ] {
+            assert!(!is_result_set_query(sql, dialect), "{sql}");
+            assert!(!requires_text_protocol_query(sql, dialect), "{sql}");
+        }
+    }
+
+    #[test]
     fn mysql_admin_show_queries_are_not_treated_as_result_sets() {
         let sql = "ADMIN SHOW FRONTEND CONFIG LIKE '%default_replication_num%'";
         let dialect = MySqlQueryDialect::for_connection(DatabaseType::Mysql, None);
 
         assert!(!is_result_set_query(sql, dialect));
         assert!(!requires_text_protocol_query(sql, dialect));
+    }
+
+    #[test]
+    fn unrelated_mysql_profiles_do_not_enable_admin_show_results() {
+        let sql = "ADMIN SHOW DDL JOBS 20";
+
+        for profile in ["mariadb", "oceanbase", "tdsql", "polardb", "greatsql", "custom"] {
+            let dialect = MySqlQueryDialect::for_connection(DatabaseType::Mysql, Some(profile));
+
+            assert!(!is_result_set_query(sql, dialect), "{profile}");
+            assert!(!requires_text_protocol_query(sql, dialect), "{profile}");
+        }
     }
 
     #[test]
@@ -6045,182 +6044,6 @@ mod tests {
     }
 
     #[test]
-    fn starrocks_materialized_views_are_classified_without_duplicating_tables() {
-        let mut tables = vec![
-            TableInfo {
-                name: "orders".to_string(),
-                table_type: "BASE TABLE".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-            TableInfo {
-                name: "orders_view".to_string(),
-                table_type: "VIEW".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-            TableInfo {
-                name: "orders_mv".to_string(),
-                table_type: "VIEW".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-        ];
-        let materialized_views = HashSet::from(["orders_mv".to_string(), "orders_mv".to_string()]);
-
-        merge_starrocks_materialized_views(&mut tables, Ok(materialized_views), "analytics");
-
-        assert_eq!(tables.len(), 3);
-        assert_eq!(
-            tables.iter().map(|table| (table.name.as_str(), table.table_type.as_str())).collect::<Vec<_>>(),
-            vec![("orders", "BASE TABLE"), ("orders_view", "VIEW"), ("orders_mv", "MATERIALIZED_VIEW")]
-        );
-    }
-
-    #[test]
-    fn starrocks_async_materialized_views_reported_as_base_table_are_reclassified() {
-        // Async materialized views (StarRocks >= 2.5) appear as `BASE TABLE` in
-        // `SHOW FULL TABLES`. Classification must trust the
-        // `information_schema.materialized_views` source.
-        let mut tables = vec![
-            TableInfo {
-                name: "orders".to_string(),
-                table_type: "BASE TABLE".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-            TableInfo {
-                name: "orders_async_mv".to_string(),
-                table_type: "BASE TABLE".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-        ];
-        let materialized_views = HashSet::from(["orders_async_mv".to_string()]);
-
-        merge_starrocks_materialized_views(&mut tables, Ok(materialized_views), "analytics");
-
-        assert_eq!(
-            tables.iter().map(|table| (table.name.as_str(), table.table_type.as_str())).collect::<Vec<_>>(),
-            vec![("orders", "BASE TABLE"), ("orders_async_mv", "MATERIALIZED_VIEW")]
-        );
-    }
-
-    #[test]
-    fn starrocks_materialized_view_lookup_failure_keeps_base_types() {
-        let mut tables = vec![TableInfo {
-            name: "orders_mv".to_string(),
-            table_type: "VIEW".to_string(),
-            comment: None,
-            parent_schema: None,
-            parent_name: None,
-        }];
-
-        merge_starrocks_materialized_views(&mut tables, Err("permission denied".to_string()), "analytics");
-
-        assert_eq!(tables[0].table_type, "VIEW");
-    }
-
-    #[test]
-    fn starrocks_sync_mv_absent_from_show_full_tables_is_appended_from_information_schema() {
-        // StarRocks versions predating starrocks/starrocks#73396 (merged
-        // 2026-05-19) report sync MVs as "not registered as separate Tables",
-        // so SHOW FULL TABLES omits them. The merger must union names from
-        // information_schema.materialized_views so the sidebar and DDL path
-        // still resolve them.
-        let mut tables = vec![TableInfo {
-            name: "orders".to_string(),
-            table_type: "BASE TABLE".to_string(),
-            comment: None,
-            parent_schema: None,
-            parent_name: None,
-        }];
-        let materialized_views = HashSet::from([
-            "orders_mv".to_string(),       // already present (reclassify path)
-            "daily_orders_mv".to_string(), // absent from SHOW FULL TABLES (union path)
-        ]);
-
-        merge_starrocks_materialized_views(&mut tables, Ok(materialized_views), "analytics");
-
-        assert_eq!(tables.len(), 3);
-        assert_eq!(
-            tables.iter().map(|table| (table.name.as_str(), table.table_type.as_str())).collect::<Vec<_>>(),
-            vec![
-                ("orders", "BASE TABLE"),
-                ("daily_orders_mv", "MATERIALIZED_VIEW"),
-                ("orders_mv", "MATERIALIZED_VIEW"),
-            ]
-        );
-    }
-
-    #[test]
-    fn starrocks_materialized_view_query_is_scoped_to_database() {
-        let sql = starrocks_materialized_views_sql("tenant's analytics");
-
-        assert_eq!(
-            sql,
-            "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant\\'s analytics'"
-        );
-    }
-
-    #[test]
-    fn mysql_materialized_view_definition_fallback_is_scoped_to_db_and_name() {
-        // StarRocks predating PR 73396 (merged 2026-05-19) rejects
-        // `SHOW CREATE MATERIALIZED VIEW` for sync MVs with "Table not found"
-        // because sync MVs are not registered as separate Tables. The fallback
-        // path queries information_schema.materialized_views directly. The
-        // regression guards the SQL shape and the value escaping used by that
-        // fallback so the wire format isn't accidentally regressed.
-        assert_eq!(
-            mysql_materialized_view_definition_sql("shop", "daily_sales_mv"),
-            "SELECT MATERIALIZED_VIEW_DEFINITION FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'shop' AND TABLE_NAME = 'daily_sales_mv' LIMIT 1"
-        );
-        assert_eq!(
-            mysql_materialized_view_definition_sql("tenant's analytics", "weird'name"),
-            "SELECT MATERIALIZED_VIEW_DEFINITION FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant\\'s analytics' AND TABLE_NAME = 'weird\\'name' LIMIT 1"
-        );
-    }
-
-    #[test]
-    fn starrocks_object_conversion_preserves_table_view_and_materialized_view_types() {
-        let tables = vec![
-            TableInfo {
-                name: "orders".to_string(),
-                table_type: "BASE TABLE".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-            TableInfo {
-                name: "orders_view".to_string(),
-                table_type: "VIEW".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-            TableInfo {
-                name: "orders_mv".to_string(),
-                table_type: "MATERIALIZED_VIEW".to_string(),
-                comment: None,
-                parent_schema: None,
-                parent_name: None,
-            },
-        ];
-
-        let objects = table_infos_to_objects(tables, &HashMap::new(), "analytics");
-
-        assert_eq!(
-            objects.iter().map(|object| (object.name.as_str(), object.object_type.as_str())).collect::<Vec<_>>(),
-            vec![("orders", "TABLE"), ("orders_view", "VIEW"), ("orders_mv", "MATERIALIZED_VIEW")]
-        );
-    }
-
-    #[test]
     fn mysql_table_comment_sql_targets_single_table() {
         let sql = table_comment_sql("app", "users");
 
@@ -6273,8 +6096,8 @@ mod tests {
         assert!(!sql.contains("UNION"));
         assert!(sql.contains("'PROCEDURE'"));
         assert!(sql.contains("'FUNCTION'"));
-        assert!(!sql.contains("LAST_ALTERED"));
-        assert!(!sql.contains("CREATED AS created_at"));
+        assert!(sql.contains("CREATED AS created_at"));
+        assert!(sql.contains("LAST_ALTERED AS updated_at"));
     }
 
     #[test]
@@ -6285,6 +6108,59 @@ mod tests {
         assert!(sql.contains("ROUTINE_TYPE IN ('PROCEDURE')"));
         assert!(!sql.contains("'FUNCTION'"));
         assert!(sql.ends_with("LIMIT 101 OFFSET 200"));
+    }
+
+    #[test]
+    fn mysql_list_routines_legacy_sql_preserves_filtering_and_paging() {
+        let object_types = vec!["FUNCTION".to_string()];
+        let sql =
+            list_routines_sql_for_query("app", Some(&object_types), Some(101), Some(200), RoutineMetadataQuery::Legacy);
+
+        assert!(sql.contains("NULL AS created_at, NULL AS updated_at"));
+        assert!(!sql.contains("CREATED AS created_at"));
+        assert!(sql.contains("ROUTINE_TYPE IN ('FUNCTION')"));
+        assert!(!sql.contains("ROUTINE_TYPE IN ('PROCEDURE')"));
+        assert!(sql.ends_with("LIMIT 101 OFFSET 200"));
+    }
+
+    #[test]
+    fn mysql_routine_metadata_queries_are_bounded_to_one_fallback() {
+        assert_eq!(routine_metadata_queries(), [RoutineMetadataQuery::Timestamps, RoutineMetadataQuery::Legacy]);
+    }
+
+    #[test]
+    fn mysql_routine_row_preserves_creation_and_update_times() {
+        let columns = [
+            "object_name",
+            "object_type",
+            "object_comment",
+            "created_at",
+            "updated_at",
+            "parent_schema",
+            "parent_name",
+            "sort_order",
+        ]
+        .into_iter()
+        .map(|name| Column::new(ColumnType::MYSQL_TYPE_VAR_STRING).with_name(name.as_bytes()))
+        .collect();
+        let row = mysql_test_row_with_columns(
+            vec![
+                Value::Bytes(b"refresh_orders".to_vec()),
+                Value::Bytes(b"PROCEDURE".to_vec()),
+                Value::NULL,
+                Value::Bytes(b"2026-08-13 04:00:00".to_vec()),
+                Value::Bytes(b"2026-08-13 04:05:00".to_vec()),
+                Value::NULL,
+                Value::NULL,
+                Value::Int(2),
+            ],
+            columns,
+        );
+
+        let object = row_to_object(&row, "app");
+
+        assert_eq!(object.created_at.as_deref(), Some("2026-08-13 04:00:00"));
+        assert_eq!(object.updated_at.as_deref(), Some("2026-08-13 04:05:00"));
     }
 
     #[test]
@@ -6491,6 +6367,128 @@ mod tests {
             mysql_bytes_to_json(vec![0xde, 0xad, 0xbe, 0xef], &varbinary_column),
             serde_json::json!("0xdeadbeef")
         );
+    }
+
+    #[test]
+    fn mysql_large_text_preview_preserves_key_and_reports_cell_coordinates() {
+        let id_column = Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"id")
+            .with_character_set(45)
+            .with_column_length(64);
+        let payload_column = Column::new(ColumnType::MYSQL_TYPE_LONG_BLOB)
+            .with_name(b"payload")
+            .with_character_set(45)
+            .with_column_length(u32::MAX);
+        let row = mysql_test_row_with_columns(
+            vec![Value::Bytes(vec![b'k'; 2048]), Value::Bytes(vec![b'x'; 32 * 1024])],
+            vec![id_column, payload_column],
+        );
+        let protected = mysql_result_protected_column_indexes(row.columns_ref(), &["id".to_string()]);
+        let mut spatial_columns = mysql_spatial_column_builder(row.columns_ref());
+
+        let (values, _srids, cells) =
+            mysql_row_to_json_with_srids_and_previews(&row, &mut spatial_columns, 7, Some(1024), &protected);
+
+        assert_eq!(values[0], serde_json::json!("k".repeat(2048)));
+        assert_eq!(values[1].as_str().map(str::len), Some(1027));
+        assert!(values[1].as_str().is_some_and(|value| value.ends_with("...")));
+        assert_eq!(cells, vec![LargeValueCell { row_index: 7, column_index: 1, original_bytes: 32 * 1024 }]);
+    }
+
+    #[test]
+    fn mysql_large_value_preview_protects_protocol_primary_keys_without_frontend_metadata() {
+        let id_column = Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"id")
+            .with_character_set(45)
+            .with_flags(ColumnFlags::PRI_KEY_FLAG)
+            .with_column_length(3072);
+        let payload_column = Column::new(ColumnType::MYSQL_TYPE_JSON)
+            .with_name(b"payload")
+            .with_character_set(45)
+            .with_column_length(u32::MAX);
+        let row = mysql_test_row_with_columns(
+            vec![Value::Bytes(vec![b'k'; 2048]), Value::Bytes(vec![b'x'; 4096])],
+            vec![id_column, payload_column],
+        );
+        let protected = mysql_result_protected_column_indexes(row.columns_ref(), &[]);
+        let mut spatial_columns = mysql_spatial_column_builder(row.columns_ref());
+
+        let (values, _srids, cells) =
+            mysql_row_to_json_with_srids_and_previews(&row, &mut spatial_columns, 0, Some(512), &protected);
+
+        assert_eq!(values[0], serde_json::json!("k".repeat(2048)));
+        assert_eq!(cells, vec![LargeValueCell { row_index: 0, column_index: 1, original_bytes: 4096 }]);
+    }
+
+    #[test]
+    fn mysql_large_value_preview_skips_bounded_strings_and_server_preview_columns() {
+        let ordinary_column = Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"image_url")
+            .with_character_set(45)
+            .with_column_length(2048);
+        let large_column = Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"large_note")
+            .with_character_set(45)
+            .with_column_length(40_000);
+        let server_preview_column = Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"image_data")
+            .with_character_set(63)
+            .with_column_length(1680);
+        let marker_column = Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(format!("{}B_2", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX).as_bytes())
+            .with_character_set(45)
+            .with_column_length(64);
+        let row = mysql_test_row_with_columns(
+            vec![
+                Value::Bytes(vec![b'u'; 500]),
+                Value::Bytes(vec![b'n'; 10_000]),
+                Value::Bytes(vec![0xab; 420]),
+                Value::Bytes(b"B:419:25143".to_vec()),
+            ],
+            vec![ordinary_column, large_column, server_preview_column, marker_column],
+        );
+        let protected = mysql_result_protected_column_indexes(row.columns_ref(), &[]);
+        let mut spatial_columns = mysql_spatial_column_builder(row.columns_ref());
+
+        let (values, _srids, cells) =
+            mysql_row_to_json_with_srids_and_previews(&row, &mut spatial_columns, 0, Some(256), &protected);
+
+        assert_eq!(values[0].as_str().map(str::len), Some(500));
+        assert!(values[1].as_str().is_some_and(|value| value.ends_with("...")));
+        assert_eq!(values[2].as_str().map(str::len), Some(2 + 420 * 2));
+        assert_eq!(values[3], serde_json::json!("B:419:25143"));
+        assert_eq!(cells, vec![LargeValueCell { row_index: 0, column_index: 1, original_bytes: 10_000 }]);
+    }
+
+    #[test]
+    fn mysql_large_binary_preview_is_bounded_hex() {
+        let payload_column = Column::new(ColumnType::MYSQL_TYPE_LONG_BLOB)
+            .with_name(b"payload")
+            .with_character_set(63)
+            .with_flags(ColumnFlags::BLOB_FLAG)
+            .with_column_length(u32::MAX);
+        let row = mysql_test_row_with_columns(vec![Value::Bytes(vec![0xAB; 4096])], vec![payload_column]);
+        let mut spatial_columns = mysql_spatial_column_builder(row.columns_ref());
+
+        let (values, _srids, cells) =
+            mysql_row_to_json_with_srids_and_previews(&row, &mut spatial_columns, 0, Some(512), &HashSet::new());
+
+        let preview = values[0].as_str().unwrap();
+        assert!(preview.starts_with("0xabab"));
+        assert!(preview.ends_with("..."));
+        assert_eq!(preview.len(), 2 + 512 * 2 + 3);
+        assert_eq!(cells[0].original_bytes, 4096);
+    }
+
+    #[test]
+    fn mysql_result_preview_budget_scales_with_page_and_column_count() {
+        let text_column = mysql_test_column(ColumnType::MYSQL_TYPE_LONG_BLOB, 45, ColumnFlags::empty(), u32::MAX);
+        let binary_column = mysql_test_column(ColumnType::MYSQL_TYPE_LONG_BLOB, 63, ColumnFlags::BLOB_FLAG, u32::MAX);
+        assert_eq!(mysql_result_cell_preview_bytes(32 * 1024 * 1024, 1, std::slice::from_ref(&text_column)), 8 * 1024);
+        assert_eq!(mysql_result_cell_preview_bytes(32 * 1024 * 1024, 1000, &vec![text_column.clone(); 4]), 8 * 1024);
+        assert_eq!(mysql_result_cell_preview_bytes(32 * 1024 * 1024, 1000, &vec![text_column.clone(); 16]), 2097);
+        assert_eq!(mysql_result_cell_preview_bytes(1, 1000, &vec![text_column; 100]), 256);
+        assert_eq!(mysql_result_cell_preview_bytes(32 * 1024 * 1024, 1000, &vec![binary_column; 4]), 4194);
     }
 
     #[test]

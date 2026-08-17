@@ -115,6 +115,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@${t("tabs.etcdAccessControl")}`;
   }
+  if (tab.mode === "nacos-access-control") {
+    if (compact) return connectionDisplayName(tab.connectionId);
+    return `${connectionDisplayName(tab.connectionId)}@${t("tabs.nacosAccessControl")}`;
+  }
   if (tab.mode === "zookeeper") {
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@keys`;
@@ -349,6 +353,10 @@ export function resultGridCacheKey(tab: Pick<QueryTab, "id" | "activeResultRunId
   return `${tab.id}-${tab.activeResultRunId ?? "current"}-${tab.activeResultIndex ?? 0}`;
 }
 
+export function resultGridInstanceKey(tab: Pick<QueryTab, "id" | "activeResultRunId" | "activeResultIndex" | "resultGridRevision">): string {
+  return `${resultGridCacheKey(tab)}-${tab.resultGridRevision ?? "initial"}`;
+}
+
 export function nextExecutionSummaryView(currentView: OutputView, canShowResult: boolean): OutputView {
   if (currentView === "summary" && canShowResult) return "result";
   return "summary";
@@ -436,6 +444,7 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "etcd") return t("tabs.etcd");
   if (tab.mode === "etcd-dashboard") return t("tabs.etcdDashboard");
   if (tab.mode === "etcd-access-control") return t("tabs.etcdAccessControl");
+  if (tab.mode === "nacos-access-control") return t("tabs.nacosAccessControl");
   if (tab.mode === "zookeeper") return t("tabs.zookeeper");
   if (tab.mode === "consul") return t("tabs.consul");
   if (tab.mode === "consul-overview") return t("consul.ui.overview");

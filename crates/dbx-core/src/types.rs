@@ -181,6 +181,7 @@ pub enum CompletionAssistantObjectKind {
     Procedure,
     Function,
     Column,
+    Sequence,
 }
 
 impl CompletionAssistantObjectKind {
@@ -203,6 +204,7 @@ pub enum CompletionAssistantCandidateKind {
     Procedure,
     Function,
     Column,
+    Sequence,
     Object,
 }
 
@@ -341,6 +343,15 @@ impl QueryMessage {
     }
 }
 
+/// A result cell whose full variable-length value was replaced by a bounded
+/// preview before the result crossed the desktop/web transport boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeValueCell {
+    pub row_index: usize,
+    pub column_index: usize,
+    pub original_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -394,6 +405,11 @@ pub struct IndexInfo {
     pub index_type: Option<String>,
     pub included_columns: Option<Vec<String>>,
     pub comment: Option<String>,
+    /// Parallel to `columns`: `true` at index `i` means `columns[i]` is a raw expression
+    /// (e.g. sourced from `pg_get_indexdef`), not a plain column name. Empty when the
+    /// introspection source doesn't track this (provenance unknown for that dialect/path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_is_expression: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Pane, Splitpanes } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { Activity, Check, ChevronDown, ChevronRight, Clock3, Copy, Download, FolderClosed, FolderOpen, KeyRound, Loader2, LockKeyhole, Pencil, Plus, RefreshCw, Search, Square, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -237,6 +238,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const { toast } = useToast();
 const connectionStore = useConnectionStore();
+const settingsStore = useSettingsStore();
 const searchInputRef = ref<HTMLInputElement>();
 const prefix = ref("");
 const keySuggestionOpen = ref(false);
@@ -248,6 +250,7 @@ const listRevision = ref<KvInt64 | null>(null);
 const listFilteredByAcls = ref(false);
 const loading = ref(false);
 const loadingMore = ref(false);
+const listError = ref("");
 const expandedGroupIds = ref<Set<string>>(new Set());
 const selectedKey = ref<string | null>(null);
 const selectedKeyIdentity = ref<string | null>(null);
@@ -590,6 +593,7 @@ async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
   const keyIdentityToRestore = options.preserveSelection ? selectedKeyIdentity.value : null;
   if (reset) {
     loading.value = true;
+    listError.value = "";
     continuation.value = null;
     listRevision.value = null;
     listFilteredByAcls.value = false;
@@ -618,6 +622,10 @@ async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
         clearSelectedKey();
       }
     }
+  } catch (error) {
+    if (reset && generation === keyLoadGeneration && props.connectionId === connectionId) {
+      listError.value = error instanceof Error ? error.message : String(error);
+    }
   } finally {
     if (generation === keyLoadGeneration && props.connectionId === connectionId) {
       loading.value = false;
@@ -640,6 +648,7 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
   };
   const previousExpanded = new Set(expandedGroupIds.value);
   loading.value = true;
+  listError.value = "";
   loadingMore.value = false;
   listFilteredByAcls.value = false;
   if (!options.preserveSelection) {
@@ -692,6 +701,10 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
       }
     } else {
       expandedGroupIds.value = focusedRootExpansion(rootPath);
+    }
+  } catch (error) {
+    if (lazyLoadContextValid(context)) {
+      listError.value = error instanceof Error ? error.message : String(error);
     }
   } finally {
     if (lazyLoadContextValid(context)) loading.value = false;
@@ -1865,15 +1878,18 @@ defineExpose({
             <Loader2 class="mr-2 h-4 w-4 animate-spin" />
             {{ labels.loadingKeys }}
           </div>
+          <div v-else-if="listError" class="flex h-full items-center justify-center px-4 text-center text-sm text-destructive">
+            {{ listError }}
+          </div>
           <div v-else-if="visibleRows.length === 0" class="flex h-full items-center justify-center text-sm text-muted-foreground">
             {{ labels.empty }}
           </div>
           <div v-else class="h-full overflow-auto py-1 text-sm">
             <template v-for="row in visibleRows" :key="row.type === 'node' ? row.node.id : row.id">
-              <CustomContextMenu v-if="row.type === 'node'" :items="nodeContextMenuItems(row.node)" v-slot="{ onContextMenu }">
+              <CustomContextMenu v-if="row.type === 'node'" :items="nodeContextMenuItems(row.node)" v-slot="{ onContextMenu, isOpen }">
                 <div
-                  class="flex h-8 w-full select-none items-center gap-1.5 pr-2 text-left transition-colors hover:bg-accent"
-                  :class="rowIsSelected(row.node) ? 'bg-primary/10 font-medium text-foreground shadow-[inset_3px_0_0_hsl(var(--primary))]' : ''"
+                  class="flex h-8 w-full select-none items-center gap-1.5 pr-2 text-left transition-colors"
+                  :class="isOpen || rowIsSelected(row.node) ? 'bg-accent font-medium text-accent-foreground shadow-[inset_3px_0_0_hsl(var(--primary))]' : 'hover:bg-accent/40'"
                   :style="{ paddingLeft: `${8 + row.depth * 18}px` }"
                   @mousedown.right.prevent
                   @contextmenu="(event) => onRowContextMenu(event, row.node, onContextMenu)"
@@ -2024,7 +2040,8 @@ defineExpose({
                   </Button>
                   <pre
                     data-native-clipboard
-                    class="dbx-editor-font-family m-0 max-h-[40vh] min-h-32 overflow-auto rounded-md border bg-muted/20 whitespace-pre-wrap break-words p-3 pr-12 text-sm"
+                    class="dbx-editor-font-family m-0 max-h-[40vh] min-h-32 overflow-auto rounded-md border bg-muted/20 p-3 pr-12 text-sm"
+                    :class="settingsStore.editorSettings.wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
                   ><template v-for="(segment, index) in selectedValueHighlightSegments" :key="index"><mark v-if="segment.matched" class="rounded-sm bg-amber-300/80 px-0.5 text-foreground dark:bg-amber-500/40">{{ segment.text }}</mark><span v-else>{{ segment.text }}</span></template></pre>
                 </div>
                 <div v-if="selectedValueCanPrettyJson" class="mt-2 flex justify-end">

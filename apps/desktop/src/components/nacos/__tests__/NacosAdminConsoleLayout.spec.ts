@@ -4,6 +4,11 @@ import { describe, expect, it } from "vitest";
 const source = readFileSync(new URL("../NacosAdminConsole.vue", import.meta.url), "utf8");
 
 describe("NacosAdminConsole config workbench layout", () => {
+  it("keeps access control outside the namespace-scoped workbench", () => {
+    expect(source).not.toContain("NacosAccessControl");
+    expect(source).toContain('type AdminTab = "configs" | "services";');
+  });
+
   it("keeps the editor as the final and primary workbench surface", () => {
     const contextBar = source.indexOf('class="nacos-config-context-bar');
     const inspector = source.indexOf('class="nacos-config-inspector');
@@ -121,6 +126,13 @@ describe("NacosAdminConsole config workbench layout", () => {
     expect(source).toContain("fontSizeFromWheelDelta(configEditorFontSize.value, event.deltaY)");
     expect(source).toContain("if (!event.metaKey && !event.ctrlKey) return false;");
     expect(source).toContain("configEditorZoomCommitScheduler.dispose()");
+  });
+
+  it("keeps the configuration editor word wrapping aligned with the global editor setting", () => {
+    expect(source).toContain("const configEditorWordWrap = new Compartment()");
+    expect(source).toContain("configEditorWordWrap.of(editorSettings.wordWrap ? EditorView.lineWrapping : [])");
+    expect(source).toContain("configEditorWordWrap.reconfigure(settings.wordWrap ? EditorView.lineWrapping : [])");
+    expect(source).not.toContain("\n        EditorView.lineWrapping,\n");
   });
 
   it("allows optional configuration columns to be hidden without hiding the data ID", () => {
