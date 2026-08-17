@@ -10,9 +10,15 @@ case "$target" in
 esac
 
 version="${DBX_GATEWAY_VERSION:-$(cargo pkgid -p dbx-gateway | sed -E 's/.*[@#]([^@#]+)$/\1/')}"
-binary_dir="target/${target}/release"
+client_version="$(node -p "require('./package.json').version")"
+if [ "$version" != "$client_version" ]; then
+  echo "gateway version $version does not match client version $client_version" >&2
+  exit 1
+fi
+target_dir="${CARGO_TARGET_DIR:-target}"
+binary_dir="${target_dir}/${target}/release"
 if [ ! -x "$binary_dir/dbx-gateway" ] && [ "$target" = "$(rustc -vV | sed -n 's/^host: //p')" ]; then
-  binary_dir="target/release"
+  binary_dir="${target_dir}/release"
 fi
 for binary in dbx-gateway dbx-gateway-pki; do
   if [ ! -x "$binary_dir/$binary" ]; then
@@ -34,6 +40,6 @@ install -m 0644 docs/dbx-gateway/*.md "$package_dir/docs/dbx-gateway/"
 install -m 0644 LICENSE "$package_dir/"
 
 (cd "$package_dir" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-tar -C "$output_dir" -czf "$tarball" "$package_name"
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$output_dir" -czf "$tarball" "$package_name"
 (cd "$output_dir" && sha256sum "$(basename "$tarball")" > "$(basename "$tarball").sha256")
 echo "$tarball"

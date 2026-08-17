@@ -14,21 +14,33 @@ useradd --system --gid dbx-gateway --home-dir /var/lib/dbx-gateway --shell /usr/
 install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway /etc/dbx-gateway/certs
 install -d -o dbx-gateway -g dbx-gateway -m 0700 /var/lib/dbx-gateway
 install -m 0755 bin/dbx-gateway /usr/bin/dbx-gateway
-install -m 0640 examples/edge.toml /etc/dbx-gateway/edge.toml
+install -o root -g dbx-gateway -m 0640 examples/edge.toml /etc/dbx-gateway/edge.toml
 ```
 
-预期服务用户不可登录，数据目录只有该用户可读写。若账号已存在，核对后跳过创建命令。把 Main Server CA 复制为 `/etc/dbx-gateway/certs/main-server-ca.pem`，不要把任何 CA 私钥复制到 Edge。
-
-从可信 Main 证书计算 SPKI pin，在已核验证书的管理主机执行：
+以上安装命令由 `root` 执行，但 systemd 启动后的进程使用 unit 中的 `User=dbx-gateway`、`Group=dbx-gateway`。因此 `/etc/dbx-gateway/edge.toml` 和 Main Server CA 必须允许这个**运行账户**读取；配置文件建议为 `root:dbx-gateway 0640`。若修改过 unit 的 `User` 或 `Group`，以实际值为准：
 
 ```bash
-openssl x509 -in main.pem -pubkey -noout \
+systemctl show dbx-gateway-edge.service -p User -p Group
+```
+
+预期默认输出 `User=dbx-gateway` 和 `Group=dbx-gateway`。服务用户不可登录，数据目录只有该用户可读写。若账号已存在，核对后跳过创建命令。把 Main Server CA 复制为 `/etc/dbx-gateway/certs/main-server-ca.pem`，不要把任何 CA 私钥复制到 Edge。
+
+在 **Main 主机**确认 `main.toml` 中当前服务端证书路径：
+
+```bash
+grep '^certificate' /etc/dbx-gateway/main.toml
+```
+
+默认路径为 `/etc/dbx-gateway/certs/main.pem`。从这个当前服务端证书计算 SPKI pin：
+
+```bash
+openssl x509 -in /etc/dbx-gateway/certs/main.pem -pubkey -noout \
   | openssl pkey -pubin -outform DER \
   | openssl dgst -sha256 -hex \
   | awk '{print $NF}'
 ```
 
-预期输出单行 64 位十六进制值。通过另一条可信渠道核对后写入 `server_spki_sha256`。pin 错误会使首次领证 fail closed；不要为“先跑起来”而关闭校验。
+预期输出单行 64 位十六进制值。它是 Main 当前服务端证书的**公钥摘要**，不是 CA 指纹或整张证书的指纹。通过另一条可信渠道核对后写入 Edge `edge.toml` 的 `[bootstrap].server_spki_sha256`。Main 更换私钥后必须重新计算并更新 Edge；pin 错误会使首次领证 fail closed，不要为“先跑起来”而关闭校验。
 
 ## 令牌领证
 
@@ -41,23 +53,34 @@ dbx-gateway-pki enrollment create \
   --ttl 10m
 ```
 
-预期前三项为 token ID、Edge ID、到期时间，最后一行是唯一一次显示的明文令牌。数据库只保存 Argon2id 哈希。把最后一行通过受控通道传到 Edge，不要写入工单、聊天记录或 shell history。
+输出格式如下：
+
+```text
+enrollment token 11111111-2222-3333-4444-555555555555 for edge-prod-01 expires at <到期时间>
+11111111-2222-3333-4444-555555555555.<秘密部分>
+```
+
+第一行中的 UUID 是 **Token ID**，只用于审计或撤销，不能单独领证。最后一行是 **完整一次性注册令牌**，格式为 `<Token ID>.<秘密部分>`；两行不是两个可用 Token。只有最后一整行需要通过受控通道传到 Edge，在线 PKI 数据库只保存其 Argon2id 哈希。不要把完整令牌写入工单、聊天记录或 shell history。
 
 在 Edge 主机以 `root` 写入令牌：
 
 ```bash
 umask 077
-printf '%s\n' 'REPLACE_WITH_ONE_TIME_TOKEN' > /var/lib/dbx-gateway/enrollment.token
+printf '%s\n' 'REPLACE_WITH_FULL_TOKEN_ID_DOT_SECRET' > /var/lib/dbx-gateway/enrollment.token
 chown dbx-gateway:dbx-gateway /var/lib/dbx-gateway/enrollment.token
 ```
 
-预期文件权限 `0600`。随后以服务用户校验配置并启动：
+预期文件权限 `0600`。启动前使用与 systemd unit 相同的运行账户检查配置文件和 CA 是否可读，再校验配置：
 
 ```bash
+sudo -u dbx-gateway test -r /etc/dbx-gateway/edge.toml
+sudo -u dbx-gateway test -r /etc/dbx-gateway/certs/main-server-ca.pem
 sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/edge.toml check-config
 systemctl enable --now dbx-gateway-edge.service
 journalctl -u dbx-gateway-edge.service -f
 ```
+
+前两条命令没有输出表示可读；返回非零时，检查文件所有者、组和父目录权限。若 unit 使用了其他 `User`/`Group`，把命令中的 `dbx-gateway` 替换为实际 `User`。
 
 首次启动时 Edge 在本地生成私钥，向 Main 提交 CSR 与令牌，验证返回证书后原子写入 `/var/lib/dbx-gateway/edge.pem` 和 `edge.key`，删除 token 文件并以 mTLS 重连。Main 和 PKI 从不收到 Edge 私钥。若 token 文件删除失败，Edge 不会进入长期运行，先修正目录权限再用新的 token 重试。
 
@@ -74,6 +97,8 @@ dbx-gateway-pki enrollment create \
 `--replace` 会撤销该 Edge 的现有活动证书并发新令牌。只在确认私钥丢失、孤儿证书或主机替换后使用；普通续期不需要 replace。
 
 ## 本地目标
+
+DBX 支持的常见数据库默认端口、完整 `edge.toml` 示例和多节点限制见 [Edge 本机数据库目标配置](local-database-targets.md)。
 
 最安全的目标是 Unix Socket 或 loopback：
 

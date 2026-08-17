@@ -30,7 +30,7 @@ function resolvedLayer(layer: TransportLayerConfig, profiles: TunnelProfile[]): 
   const profile = profiles.find((candidate) => candidate.id === layer.profile_id && candidate.type === layer.type);
   if (!profile) return layer;
   if (layer.type === "dbx_gateway" && profile.type === "dbx_gateway") {
-    return { ...profile, id: layer.id, enabled: layer.enabled, profile_id: layer.profile_id, edge_id: layer.edge_id, target_id: layer.target_id };
+    return { ...profile, id: layer.id, enabled: layer.enabled, profile_id: layer.profile_id, edge_id: layer.edge_id, target_id: layer.target_id, use_as_connection_info: layer.use_as_connection_info };
   }
   return { ...profile, id: layer.id, enabled: layer.enabled, profile_id: layer.profile_id } as TransportLayerConfig;
 }
@@ -70,7 +70,7 @@ function failedNodeIndex(nodes: ConnectionNetworkPathNode[], errorMessage: strin
 
 export function buildConnectionNetworkPath(input: ConnectionNetworkPathInput): ConnectionNetworkPathNode[] {
   const nodes: ConnectionNetworkPathNode[] = [{ key: "client", kind: "client", label: "DBX", detail: "DBX", status: "idle" }];
-  const layers = input.layers.filter((layer) => layer.enabled !== false).map((layer) => resolvedLayer(layer, input.profiles));
+  const layers = input.layers.filter((layer) => layer.enabled !== false && (layer.type !== "dbx_gateway" || layer.use_as_connection_info !== false)).map((layer) => resolvedLayer(layer, input.profiles));
   let gatewayTargetId = "";
 
   layers.forEach((layer, sourceLayerIndex) => {

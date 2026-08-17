@@ -275,7 +275,9 @@ impl TransportLayerConfig {
         let mut resolved = profile.clone();
         let (id, enabled, profile_id) = (self.id().to_string(), self.enabled(), self.profile_id().to_string());
         let route = match self {
-            TransportLayerConfig::DbxGateway(layer) => Some((layer.edge_id.clone(), layer.target_id.clone())),
+            TransportLayerConfig::DbxGateway(layer) => {
+                Some((layer.edge_id.clone(), layer.target_id.clone(), layer.use_as_connection_info))
+            }
             _ => None,
         };
         match &mut resolved {
@@ -298,9 +300,10 @@ impl TransportLayerConfig {
                 layer.id = id;
                 layer.enabled = enabled;
                 layer.profile_id = profile_id;
-                if let Some((edge_id, target_id)) = route {
+                if let Some((edge_id, target_id, use_as_connection_info)) = route {
                     layer.edge_id = edge_id;
                     layer.target_id = target_id;
+                    layer.use_as_connection_info = use_as_connection_info;
                 }
             }
         }
@@ -338,6 +341,13 @@ impl TransportLayerConfig {
             TransportLayerConfig::Proxy(layer) => layer.enabled,
             TransportLayerConfig::HttpTunnel(layer) => layer.enabled,
             TransportLayerConfig::DbxGateway(layer) => layer.enabled,
+        }
+    }
+
+    pub fn active_for_connection(&self) -> bool {
+        match self {
+            TransportLayerConfig::DbxGateway(layer) => layer.enabled && layer.use_as_connection_info,
+            _ => self.enabled(),
         }
     }
 
@@ -477,6 +487,10 @@ pub struct DbxGatewayConfig {
     pub edge_id: String,
     #[serde(default)]
     pub target_id: String,
+    /// Whether this logical Gateway route replaces the connection host and port.
+    /// Missing values stay enabled so connections saved by older releases keep working.
+    #[serde(default = "default_true")]
+    pub use_as_connection_info: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -941,7 +955,7 @@ fn copy_u64(
 
 impl ConnectionConfig {
     pub fn effective_transport_layers(&self) -> Vec<TransportLayerConfig> {
-        self.transport_layers.iter().filter(|layer| layer.enabled()).cloned().collect()
+        self.transport_layers.iter().filter(|layer| layer.active_for_connection()).cloned().collect()
     }
 
     pub fn effective_ssh_tunnels(&self) -> Vec<SshTunnelConfig> {
@@ -2386,6 +2400,7 @@ mod tests {
             connect_timeout_secs: 10,
             edge_id: "edge-prod-01".to_string(),
             target_id: "postgres-primary".to_string(),
+            use_as_connection_info: true,
         });
         let profile = TransportLayerConfig::DbxGateway(DbxGatewayConfig {
             id: "profile-1".to_string(),
@@ -2399,6 +2414,7 @@ mod tests {
             connect_timeout_secs: 15,
             edge_id: String::new(),
             target_id: String::new(),
+            use_as_connection_info: true,
         });
 
         let TransportLayerConfig::DbxGateway(resolved) = reference.resolved_from_profile(&profile) else {
@@ -2426,6 +2442,7 @@ mod tests {
             connect_timeout_secs: 15,
             edge_id: String::new(),
             target_id: String::new(),
+            use_as_connection_info: true,
         });
 
         let json = serde_json::to_string(&layer).unwrap();
@@ -2433,6 +2450,45 @@ mod tests {
         assert!(!json.contains("private_key"));
         assert!(!json.contains("pkcs12"));
         assert_eq!(serde_json::from_str::<TransportLayerConfig>(&json).unwrap(), layer);
+    }
+
+    #[test]
+    fn gateway_only_participates_when_used_as_connection_info() {
+        let mut layer = DbxGatewayConfig {
+            id: "gateway-1".to_string(),
+            name: String::new(),
+            enabled: true,
+            profile_id: "profile-1".to_string(),
+            main_url: String::new(),
+            identity_id: String::new(),
+            server_ca_pem: String::new(),
+            server_spki_sha256: String::new(),
+            connect_timeout_secs: 10,
+            edge_id: "edge-1".to_string(),
+            target_id: "database-1".to_string(),
+            use_as_connection_info: false,
+        };
+
+        assert!(!TransportLayerConfig::DbxGateway(layer.clone()).active_for_connection());
+        layer.use_as_connection_info = true;
+        assert!(TransportLayerConfig::DbxGateway(layer).active_for_connection());
+    }
+
+    #[test]
+    fn legacy_gateway_defaults_to_connection_info_target() {
+        let json = r#"{
+            "type":"dbx_gateway",
+            "id":"gateway-1",
+            "enabled":true,
+            "profile_id":"profile-1",
+            "edge_id":"edge-1",
+            "target_id":"database-1"
+        }"#;
+
+        let TransportLayerConfig::DbxGateway(layer) = serde_json::from_str(json).unwrap() else {
+            panic!("expected gateway layer")
+        };
+        assert!(layer.use_as_connection_info);
     }
     use super::{
         database_info_from_protocol_value, default_query_timeout_secs, default_redis_key_separator,

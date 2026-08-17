@@ -64,6 +64,7 @@ mod tests {
             connect_timeout_secs: 10,
             edge_id: String::new(),
             target_id: String::new(),
+            use_as_connection_info: true,
         });
 
         let error = test_tunnel_profile(State(state), Json(profile)).await.unwrap_err();

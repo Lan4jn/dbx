@@ -437,6 +437,7 @@ mod tests {
             connect_timeout_secs: 10,
             edge_id: "edge-prod-01".to_string(),
             target_id: "postgres-primary".to_string(),
+            use_as_connection_info: true,
         })
     }
 

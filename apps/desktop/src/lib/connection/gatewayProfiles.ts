@@ -10,6 +10,7 @@ export interface GatewayLayerRoute {
   enabled?: boolean;
   edge_id?: string;
   target_id?: string;
+  use_as_connection_info?: boolean;
 }
 
 export function createDbxGatewayProfile(): DbxGatewayProfile {
@@ -58,6 +59,7 @@ export function gatewayProfileReferenceLayer(profile: DbxGatewayProfile, previou
     profile_id: profile.id,
     edge_id: previous.edge_id || "",
     target_id: previous.target_id || "",
+    use_as_connection_info: previous.use_as_connection_info === true,
   };
 }
 

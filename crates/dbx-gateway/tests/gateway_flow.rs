@@ -442,6 +442,55 @@ async fn client_discovers_online_logical_routes_without_database_addresses() {
 }
 
 #[tokio::test]
+async fn client_discovers_same_target_id_on_multiple_edges() {
+    let mut fixture = Fixture::new();
+    fixture.config.client_route_acl.insert(
+        "desktop-routes".to_string(),
+        vec!["edge-a/postgres".to_string(), "edge-b/postgres".to_string()],
+    );
+    let gateway = fixture.start().await;
+    let edge_a = EdgeGateway::start(fixture.edge_config(gateway.local_addr(), "edge-a")).unwrap();
+    let edge_b = EdgeGateway::start(fixture.edge_config(gateway.local_addr(), "edge-b")).unwrap();
+    wait_for_edge(&gateway, "edge-a", true).await;
+    wait_for_edge(&gateway, "edge-b", true).await;
+    let client = issue_client(
+        &fixture.client_ca,
+        &["urn:dbx-gateway:client:desktop-routes"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        valid_window(),
+    );
+    let mut socket = connect_dbx_socket(gateway.local_addr(), &fixture.server_ca, &client).await;
+    socket
+        .send(Message::Binary(
+            encode_control_frame(&ClientMessage::ListRoutes {
+                version: ProtocolVersion::current(),
+                request_id: uuid::Uuid::new_v4(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let _authenticated = socket.next().await.unwrap().unwrap();
+    let Message::Binary(routes) = socket.next().await.unwrap().unwrap() else { panic!("expected routes") };
+    let ClientEvent::Routes { mut edges } = serde_json::from_slice(&routes).unwrap() else {
+        panic!("expected routes event")
+    };
+    edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+
+    assert_eq!(edges.iter().map(|edge| edge.edge_id.as_str()).collect::<Vec<_>>(), ["edge-a", "edge-b"]);
+    assert!(edges.iter().all(|edge| edge.online));
+    assert!(edges
+        .iter()
+        .all(|edge| edge.routes.iter().map(|route| route.target_id.as_str()).collect::<Vec<_>>() == ["postgres"]));
+
+    edge_a.shutdown().await;
+    edge_b.shutdown().await;
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn data_tcp_round_trip_reports_all_gateway_stages() {
     let fixture = Fixture::new();
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

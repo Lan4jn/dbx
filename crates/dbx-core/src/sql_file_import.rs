@@ -2001,8 +2001,14 @@ mod tests {
 
     #[test]
     fn execution_error_progress_preserves_cumulative_counters() {
-        let progress =
-            SqlFileExecutionProgress { statement_index: 4, success_count: 3, failure_count: 1, affected_rows: 9 };
+        let progress = SqlFileExecutionProgress {
+            statement_index: 4,
+            success_count: 3,
+            failure_count: 1,
+            affected_rows: 9,
+            bytes_processed: None,
+            total_bytes: None,
+        };
 
         let terminal =
             sql_file_execution_error_progress("exec-1", Instant::now(), &progress, "file missing".to_string());

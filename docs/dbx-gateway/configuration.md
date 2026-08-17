@@ -62,7 +62,7 @@ Unix 端点只设置 `unix_socket`。远程端点必须同时设置 `remote_addr
 | `bootstrap` | 无 | 证书不存在时必须提供。 |
 | `targets` | 必填 | 以逻辑目标 ID 为 key 的目标表。 |
 
-`[bootstrap]` 字段：`token_file`、`enrollment_url`、`server_spki_sha256` 必填，`renew_before_days` 默认 `30`。SPKI pin 使用 64 位小写十六进制 SHA-256，必须从可信渠道核对。
+`[bootstrap]` 字段：`token_file`、`enrollment_url`、`server_spki_sha256` 必填，`renew_before_days` 默认 `30`。`server_spki_sha256` 是从 Main 当前服务端证书公钥计算的 64 位十六进制 SHA-256，不是 CA 或整张证书的指纹，必须从可信渠道核对。`token_file` 的内容必须是 `enrollment create` 输出最后一行的完整 `<Token ID>.<秘密部分>`；第一行单独显示的 Token ID 不能用于领证。
 
 每个 `[targets.<id>]` 支持：
 
@@ -86,10 +86,17 @@ Unix 端点只设置 `unix_socket`。远程端点必须同时设置 `remote_addr
 
 ## 校验与重载
 
-在 Main 或 Edge 主机，以对应服务用户执行：
+安装文件时通常使用 `root`，但读取配置的是 systemd unit 中 `User=` 指定的运行账户。Main 和 Edge 的默认运行账户都是 `dbx-gateway`；若改过 unit，先查询实际值：
+
+```bash
+systemctl show dbx-gateway-edge.service -p User -p Group
+```
+
+然后以同一个运行账户校验对应配置：
 
 ```bash
 sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
+sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/edge.toml check-config
 ```
 
-预期输出为 `configuration is valid`。失败时不要重启服务；按错误信息修正路径、权限或字段。配置验证后执行 `systemctl reload` 若 unit 配置了 reload，或向进程发送 `SIGHUP`。监听地址、限额和管理监听等不可变字段变化会返回 `restart_required`，需要安排重启；错误重载会继续使用旧配置。
+只在当前主机执行对应角色的命令。预期输出为 `configuration is valid`。出现 `configuration file could not be read` 时，检查配置文件是否允许 unit 的 `User`/`Group` 读取，并检查 `/etc/dbx-gateway` 等父目录是否允许该账户进入。失败时不要重启服务；按错误信息修正路径、权限或字段。配置验证后执行 `systemctl reload` 若 unit 配置了 reload，或向进程发送 `SIGHUP`。监听地址、限额和管理监听等不可变字段变化会返回 `restart_required`，需要安排重启；错误重载会继续使用旧配置。

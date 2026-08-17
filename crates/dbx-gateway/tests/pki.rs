@@ -62,11 +62,25 @@ fn online_edge_store_does_not_require_root_server_or_client_private_keys() {
     fs::copy(offline.join("edge/ca.crt.pem"), online.join("edge/ca.crt.pem")).unwrap();
     fs::copy(offline.join("edge/ca.key.encrypted.pem"), online.join("edge/ca.key.encrypted.pem")).unwrap();
 
-    assert!(PkiStore::open_online_edge(&online).is_ok());
+    let store = PkiStore::open_online_edge(&online).unwrap();
     assert!(PkiStore::open(&online).is_err());
     assert!(!online.join("root/ca.key.encrypted.pem").exists());
     assert!(!online.join("server/ca.key.encrypted.pem").exists());
     assert!(!online.join("client/ca.key.encrypted.pem").exists());
+
+    let key = KeyPair::generate().unwrap();
+    let csr = CertificateParams::default().serialize_request(&key).unwrap();
+    let issued = store
+        .issue_edge(
+            EdgeIssueRequest {
+                edge_id: "edge-online-01",
+                csr_der: csr.der(),
+                validity: time::Duration::days(30),
+            },
+            &password,
+        )
+        .unwrap();
+    assert_eq!(issued.chain_pem, fs::read_to_string(online.join("edge/ca.crt.pem")).unwrap());
 
     fs::remove_dir_all(offline).unwrap();
     fs::remove_dir_all(online).unwrap();
@@ -238,6 +252,26 @@ fn issues_role_limited_certificates_and_modern_client_bundle() {
     PrivateKeyInfoRef::from_der(key_chain.key()).unwrap();
     assert_eq!(key_chain.chain().len(), 3);
 
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn rejects_ip_literals_in_server_dns_sans() {
+    let data_dir = temp_dir();
+    let ca_password = Zeroizing::new("ca-password".to_string());
+    let store = PkiStore::init(&data_dir, &ca_password).unwrap();
+
+    let result = store.issue_server(
+        ServerIssueRequest {
+            name: "main",
+            dns_sans: &["192.0.2.53"],
+            ip_sans: &[],
+            validity: time::Duration::days(30),
+        },
+        &ca_password,
+    );
+
+    assert!(result.is_err());
     fs::remove_dir_all(data_dir).unwrap();
 }
 

@@ -2,19 +2,19 @@
 
 本文用于在 Linux 上部署 DBX Gateway 的 Main、Edge 和在线 PKI，并在 DBX 桌面端通过双向 TLS 访问数据库。示例约定如下，部署前请替换为实际值：
 
-| 项目 | 示例值 |
-|---|---|
-| Main 域名 | `gateway.example.com` |
-| Main 监听端口 | `443` |
-| Edge ID | `edge-prod-01` |
-| 数据库目标 ID | `postgres-primary` |
-| DBX Client 身份 | `desktop-prod` |
-| Gateway 配置目录 | `/etc/dbx-gateway` |
-| Gateway 数据目录 | `/var/lib/dbx-gateway` |
-| 在线 PKI 配置目录 | `/etc/dbx-gateway-pki` |
-| 在线 PKI 数据目录 | `/var/lib/dbx-gateway-pki` |
+| 项目            | 示例值                        |
+| ------------- | -------------------------- |
+| Main 域名       | `gateway.example.com`      |
+| Main 监听端口     | `443`                      |
+| Edge ID       | `edge-prod-01`             |
+| 数据库目标 ID      | `postgres-primary`         |
+| DBX Client 身份 | `desktop-prod`             |
+| Gateway 配置目录  | `/etc/dbx-gateway`         |
+| Gateway 数据目录  | `/var/lib/dbx-gateway`     |
+| 在线 PKI 配置目录   | `/etc/dbx-gateway-pki`     |
+| 在线 PKI 数据目录   | `/var/lib/dbx-gateway-pki` |
 
-没有域名时可以直接使用固定 IP，例如 `10.235.10.53`。证书 SAN 类型必须与 URL 一致：域名使用 `--dns-san`，IP 地址使用 `--ip-san`。不能把 IP 字符串写入 `--dns-san`。
+没有域名时可以直接使用固定 IP，例如文档保留地址 `192.0.2.53`。证书 SAN 类型必须与 URL 一致：域名使用 `--dns-san`，IP 地址使用 `--ip-san`。不能把 IP 字符串写入 `--dns-san`。
 
 ## 1. 架构与安全边界
 
@@ -51,13 +51,13 @@ flowchart LR
 
 ### 2.2 网络规则
 
-| 来源 | 目标 | 端口 | 说明 |
-|---|---|---:|---|
-| DBX 客户端 | Main | `443/tcp` | WSS + mTLS |
-| Edge | Main | `443/tcp` | WSS + mTLS、首次领证和续期 |
-| Main 本机 | 健康检查 | `9080/tcp` | 只监听 loopback |
-| Edge | 数据库 | 数据库端口或 Unix Socket | 由 Edge 主动建立 |
-| Main | 在线 PKI | Unix Socket | 默认 `/run/dbx-gateway/pki.sock` |
+| 来源      | 目标     | 端口                 | 说明                             |
+| ------- | ------ | ------------------:| ------------------------------ |
+| DBX 客户端 | Main   | `443/tcp`          | WSS + mTLS                     |
+| Edge    | Main   | `443/tcp`          | WSS + mTLS、首次领证和续期             |
+| Main 本机 | 健康检查   | `9080/tcp`         | 只监听 loopback                   |
+| Edge    | 数据库    | 数据库端口或 Unix Socket | 由 Edge 主动建立                    |
+| Main    | 在线 PKI | Unix Socket        | 默认 `/run/dbx-gateway/pki.sock` |
 
 若 Main 前置 Nginx、HAProxy 或云负载均衡，只能做 TCP/TLS passthrough，不能终止 TLS。Main 必须直接取得 Client 和 Edge 证书。
 
@@ -73,9 +73,9 @@ DBX_Gateway_<版本>_arm64.tar.gz
 在每台 Linux 主机校验并解包：
 
 ```bash
-sha256sum -c DBX_Gateway_0.5.75_x64.tar.gz.sha256
-tar -xzf DBX_Gateway_0.5.75_x64.tar.gz
-cd DBX_Gateway_0.5.75_x64
+sha256sum -c DBX_Gateway_0.5.83_x64.tar.gz.sha256
+tar -xzf DBX_Gateway_0.5.83_x64.tar.gz
+cd DBX_Gateway_0.5.83_x64
 ./bin/dbx-gateway --version
 ./bin/dbx-gateway-pki --version
 ```
@@ -92,10 +92,10 @@ cargo build --release -p dbx-gateway
 
 本节所有命令都在**离线 PKI 主机**执行。下面两个路径含义不同：
 
-| 路径 | 谁创建 | 用途 | 是否交付给其他主机 |
-|---|---|---|---|
-| `/secure/dbx-pki-password` | 管理员先创建 | 解密 CA 私钥的密码文件 | 只向在线 PKI 交付一份受控副本 |
-| `/secure/dbx-gateway-pki-offline` | `init` 命令创建 | 完整 PKI 数据库 | 绝不能整体复制到在线主机 |
+| 路径                                | 谁创建         | 用途            | 是否交付给其他主机         |
+| --------------------------------- | ----------- | ------------- | ----------------- |
+| `/secure/dbx-pki-password`        | 管理员先创建      | 解密 CA 私钥的密码文件 | 只向在线 PKI 交付一份受控副本 |
+| `/secure/dbx-gateway-pki-offline` | `init` 命令创建 | 完整 PKI 数据库    | 绝不能整体复制到在线主机      |
 
 先创建密码文件，再初始化 PKI：
 
@@ -152,12 +152,11 @@ dbx-gateway-pki server issue \
   --data-dir /secure/dbx-gateway-pki-offline \
   --password-file /secure/dbx-pki-password \
   --identity main-gateway \
-  --dns-san localhost \
-  --ip-san 10.235.10.53 \
+  --ip-san 192.0.2.53 \
   --output-dir /secure/export/main-server-ip
 ```
 
-当前 CLI 要求至少填写一个 `--dns-san`，所以纯 IP 场景用 `localhost` 占位；真正让 `wss://10.235.10.53/...` 通过校验的是 `--ip-san 10.235.10.53`。不要写成 `--dns-san 10.235.10.53`。
+纯 IP 场景只需填写 `--ip-san 192.0.2.53`。不要写成 `--dns-san 192.0.2.53`；PKI 会直接拒绝把 IP 字面量作为 DNS SAN，防止签出无法用于 IP URL 的证书。
 
 签发后必须检查 SAN：
 
@@ -167,22 +166,24 @@ openssl x509 \
   -noout -text | grep -A2 "Subject Alternative Name"
 ```
 
-纯 IP 场景应看到 `IP Address:10.235.10.53`。如果只看到 `DNS:10.235.10.53`，该证书不能用于 IP URL，必须重新签发。
+纯 IP 场景应看到 `IP Address:192.0.2.53`。如果只看到 `DNS:192.0.2.53`，该证书不能用于 IP URL，必须重新签发。
+
+IPv6 同样使用 IP SAN，例如文档保留地址 `--ip-san 2001:db8::53`；DBX 和 Edge URL 必须使用带方括号的形式：`wss://[2001:db8::53]/_dbx/client`、`wss://[2001:db8::53]/_dbx/edge`。
 
 域名命令创建 `/secure/export/main-server`；纯 IP 命令创建 `/secure/export/main-server-ip`。下表用 `<MAIN_SERVER_OUTPUT>` 表示你实际选择的那个目录：
 
-| 生成文件 | 用途 | 最终位置 |
-|---|---|---|
-| `<MAIN_SERVER_OUTPUT>/certificate.pem` | Main 的叶证书 | Main 的 `/etc/dbx-gateway/certs/main.pem` 首段 |
-| `<MAIN_SERVER_OUTPUT>/chain.pem` | Main Server CA 证书链 | 追加到 Main 的 `main.pem`；同时作为 DBX 和 Edge 信任 Main 的 CA PEM |
-| `<MAIN_SERVER_OUTPUT>/private-key.pem` | Main 服务端私钥 | Main 的 `/etc/dbx-gateway/certs/main.key`，权限必须为 `0600` |
+| 生成文件                                   | 用途                 | 最终位置                                                   |
+| -------------------------------------- | ------------------ | ------------------------------------------------------ |
+| `<MAIN_SERVER_OUTPUT>/certificate.pem` | Main 的叶证书          | Main 的 `/etc/dbx-gateway/certs/main.pem` 首段            |
+| `<MAIN_SERVER_OUTPUT>/chain.pem`       | Main Server CA 证书链 | 追加到 Main 的 `main.pem`；同时作为 DBX 和 Edge 信任 Main 的 CA PEM |
+| `<MAIN_SERVER_OUTPUT>/private-key.pem` | Main 服务端私钥         | Main 的 `/etc/dbx-gateway/certs/main.key`，权限必须为 `0600`  |
 
 另外从完整 PKI 取出两个**公开 CA 证书**交给 Main：
 
-| 源文件 | Main 最终位置 | Main 用它验证谁 |
-|---|---|---|
-| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem` | `/etc/dbx-gateway/certs/edge-ca.pem` | Edge Gateway |
-| `/secure/dbx-gateway-pki-offline/client/ca.crt.pem` | `/etc/dbx-gateway/certs/client-ca.pem` | DBX Client |
+| 源文件                                                 | Main 最终位置                              | Main 用它验证谁   |
+| --------------------------------------------------- | -------------------------------------- | ------------ |
+| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem`   | `/etc/dbx-gateway/certs/edge-ca.pem`   | Edge Gateway |
+| `/secure/dbx-gateway-pki-offline/client/ca.crt.pem` | `/etc/dbx-gateway/certs/client-ca.pem` | DBX Client   |
 
 不要把 `edge/ca.key.encrypted.pem`、`client/ca.key.encrypted.pem` 或 Root 私钥交给 Main。
 
@@ -205,11 +206,11 @@ install -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
 
 通过加密介质把下面三个源文件送到在线 PKI 主机，然后执行明确的安装命令：
 
-| 离线 PKI 主机上的源文件 | 在线 PKI 主机上的目标文件 |
-|---|---|
-| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem` | `/var/lib/dbx-gateway-pki/edge/ca.crt.pem` |
+| 离线 PKI 主机上的源文件                                              | 在线 PKI 主机上的目标文件                                      |
+| ----------------------------------------------------------- | ---------------------------------------------------- |
+| `/secure/dbx-gateway-pki-offline/edge/ca.crt.pem`           | `/var/lib/dbx-gateway-pki/edge/ca.crt.pem`           |
 | `/secure/dbx-gateway-pki-offline/edge/ca.key.encrypted.pem` | `/var/lib/dbx-gateway-pki/edge/ca.key.encrypted.pem` |
-| `/secure/dbx-pki-password` | `/etc/dbx-gateway-pki/password` |
+| `/secure/dbx-pki-password`                                  | `/etc/dbx-gateway-pki/password`                      |
 
 假设加密介质挂载在 `/mnt/secure-transfer`：
 
@@ -380,12 +381,12 @@ dbx-gateway-pki client issue \
 
 命令输出目录中的文件用途：
 
-| 文件 | 用途 | 是否交付给 DBX 用户 |
-|---|---|---|
-| `/secure/export/desktop-prod/client.p12` | 包含 Client 证书、私钥和证书链的导入包 | 是 |
-| `/secure/client-bundle-password` | 解锁这个 `client.p12` 的导入密码 | 是，与 `.p12` 分渠道 |
-| `certificate.pem`、`chain.pem`、`private-key.pem` | PEM 形式的同一 Client 身份，主要用于管理员检查或非 DBX 集成 | DBX 桌面端不需要 |
-| `/secure/dbx-pki-password` | CA 私钥密码 | 绝不交付 |
+| 文件                                              | 用途                                     | 是否交付给 DBX 用户   |
+| ----------------------------------------------- | -------------------------------------- | -------------- |
+| `/secure/export/desktop-prod/client.p12`        | 包含 Client 证书、私钥和证书链的导入包                | 是              |
+| `/secure/client-bundle-password`                | 解锁这个 `client.p12` 的导入密码                | 是，与 `.p12` 分渠道 |
+| `certificate.pem`、`chain.pem`、`private-key.pem` | PEM 形式的同一 Client 身份，主要用于管理员检查或非 DBX 集成 | DBX 桌面端不需要     |
+| `/secure/dbx-pki-password`                      | CA 私钥密码                                | 绝不交付           |
 
 还要把 Main 签发目录中的 `/secure/export/main-server/chain.pem` 交付给用户，作为 DBX 中的 **Main Server CA PEM**。它与 `client.p12` 的 bundle 密码无关。
 
@@ -397,9 +398,9 @@ DBX 桌面端操作：
 4. Main URL 填写 `wss://gateway.example.com/_dbx/client`。
 5. 选择导入的 Client 身份，并把 Main 签发目录中的 `chain.pem` 导入为 Main Server CA PEM。
 6. 可选填写 Main Server SPKI SHA-256 Pin。
-7. 点击“测试 Main”，成功后保存 Gateway 档案。
+7. 点击“测试”，成功后保存 Gateway 档案。
 
-纯 IP 部署时第 4 步改为 `wss://10.235.10.53/_dbx/client`，并确保 Main 证书包含 `IP Address:10.235.10.53` SAN。
+纯 IP 部署时第 4 步改为 `wss://192.0.2.53/_dbx/client`，并确保 Main 证书包含 `IP Address:192.0.2.53` SAN。
 
 私钥进入系统钥匙串，不会写入普通 SQLite 字段或连接导出文件。浏览器版不支持 Gateway 客户端身份。
 
@@ -417,28 +418,42 @@ useradd --system --gid dbx-gateway --home-dir /var/lib/dbx-gateway --shell /usr/
 install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway /etc/dbx-gateway/certs
 install -d -o dbx-gateway -g dbx-gateway -m 0700 /var/lib/dbx-gateway
 install -m 0755 bin/dbx-gateway /usr/bin/dbx-gateway
-install -m 0640 examples/edge.toml /etc/dbx-gateway/edge.toml
+install -o root -g dbx-gateway -m 0640 examples/edge.toml /etc/dbx-gateway/edge.toml
 install -m 0644 /mnt/secure-transfer/main-server/chain.pem \
   /etc/dbx-gateway/certs/main-server-ca.pem
+```
+
+这些安装命令由 `root` 执行，但 Edge 进程由 systemd unit 中的 `User=dbx-gateway`、`Group=dbx-gateway` 运行。运行账户必须能读取 `edge.toml` 和 Main Server CA；默认配置文件权限应为 `root:dbx-gateway 0640`。若改过 unit，先查询实际运行账户：
+
+```bash
+systemctl show dbx-gateway-edge.service -p User -p Group
 ```
 
 纯 IP 部署时，这两个 URL 必须同时改为证书 `--ip-san` 中的同一个 IP：
 
 ```toml
-main_url = "wss://10.235.10.53/_dbx/edge"
+main_url = "wss://192.0.2.53/_dbx/edge"
 
 [bootstrap]
-enrollment_url = "https://10.235.10.53/_dbx/enroll"
+enrollment_url = "https://192.0.2.53/_dbx/enroll"
 ```
 
-计算并通过另一可信渠道核对 Main 证书 SPKI Pin：
+在 **Main 主机**确认 `main.toml` 中当前服务端证书路径：
 
 ```bash
-openssl x509 -in main.pem -pubkey -noout \
+grep '^certificate' /etc/dbx-gateway/main.toml
+```
+
+默认路径为 `/etc/dbx-gateway/certs/main.pem`。从这个当前服务端证书计算并通过另一可信渠道核对 SPKI Pin：
+
+```bash
+openssl x509 -in /etc/dbx-gateway/certs/main.pem -pubkey -noout \
   | openssl pkey -pubin -outform DER \
   | openssl dgst -sha256 -hex \
   | awk '{print $NF}'
 ```
+
+这条命令必须读取 Main **当前实际使用的服务端证书**。输出是该证书公钥的 64 位十六进制 SHA-256 摘要，不是 CA 指纹或整张证书的指纹；将整行填入 Edge `[bootstrap].server_spki_sha256`。Main 更换私钥后必须重新计算并更新所有 Edge。
 
 ### 8.2 配置 Edge 和数据库目标
 
@@ -493,11 +508,18 @@ sudo -u dbx-gateway-pki dbx-gateway-pki enrollment create \
   --ttl 10m
 ```
 
-明文令牌只显示一次。通过受控通道送到 Edge，然后在 Edge 主机执行：
+输出的第一行包含 Token ID、Edge ID 和到期时间，最后一行才是完整一次性注册令牌：
+
+```text
+enrollment token 11111111-2222-3333-4444-555555555555 for edge-prod-01 expires at <到期时间>
+11111111-2222-3333-4444-555555555555.<秘密部分>
+```
+
+Token ID 只用于审计或撤销，不能单独领证。完整令牌由 `<Token ID>.<秘密部分>` 组成，因此两行看起来相似，但不是两个可用 Token。只把最后一整行通过受控通道送到 Edge，然后在 Edge 主机执行：
 
 ```bash
 umask 077
-printf '%s\n' 'REPLACE_WITH_ONE_TIME_TOKEN' > /var/lib/dbx-gateway/enrollment.token
+printf '%s\n' 'REPLACE_WITH_FULL_TOKEN_ID_DOT_SECRET' > /var/lib/dbx-gateway/enrollment.token
 chown dbx-gateway:dbx-gateway /var/lib/dbx-gateway/enrollment.token
 chmod 0600 /var/lib/dbx-gateway/enrollment.token
 ```
@@ -505,6 +527,8 @@ chmod 0600 /var/lib/dbx-gateway/enrollment.token
 ### 8.4 启动 Edge
 
 ```bash
+sudo -u dbx-gateway test -r /etc/dbx-gateway/edge.toml
+sudo -u dbx-gateway test -r /etc/dbx-gateway/certs/main-server-ca.pem
 sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/edge.toml check-config
 install -m 0644 systemd/dbx-gateway-edge.service /etc/systemd/system/
 systemctl daemon-reload
@@ -512,13 +536,13 @@ systemctl enable --now dbx-gateway-edge.service
 journalctl -u dbx-gateway-edge.service -f
 ```
 
-首次启动时 Edge 在本地生成私钥，使用令牌提交 CSR，写入 `/var/lib/dbx-gateway/edge.pem` 和 `edge.key`，删除令牌文件，然后以 mTLS 重连 Main。Main 和 PKI 不会收到 Edge 私钥。
+前两条命令没有输出表示默认 systemd 运行账户可以读取文件。若 unit 使用其他 `User`，应将检查命令中的账户替换为实际值。首次启动时 Edge 在本地生成私钥，使用令牌提交 CSR，写入 `/var/lib/dbx-gateway/edge.pem` 和 `edge.key`，删除令牌文件，然后以 mTLS 重连 Main。Main 和 PKI 不会收到 Edge 私钥。
 
 首次启动后的两个产物用途如下：
 
-| Edge 本机文件 | 谁生成 | 用途 |
-|---|---|---|
-| `/var/lib/dbx-gateway/edge.pem` | Edge 自动写入 | Edge 叶证书和证书链，对应 `certificate` |
+| Edge 本机文件                       | 谁生成       | 用途                                    |
+| ------------------------------- | --------- | ------------------------------------- |
+| `/var/lib/dbx-gateway/edge.pem` | Edge 自动写入 | Edge 叶证书和证书链，对应 `certificate`         |
 | `/var/lib/dbx-gateway/edge.key` | Edge 本机生成 | Edge 私钥，对应 `private_key`，不得离开 Edge 主机 |
 
 ## 9. 在 DBX 中使用 Gateway 路由
@@ -613,16 +637,16 @@ dbx-gateway-pki edge revoke \
 
 ## 13. 常见故障
 
-| 错误 | 常见原因 | 处理 |
-|---|---|---|
-| TLS 握手失败 | CA、证书链、时间、EKU 或 TLS 版本不正确 | 核对双方时间、证书链和 URI SAN；Gateway 只使用 TLS 1.3。 |
-| `identity_rejected` | Edge/Client 证书角色、身份或 serial 不符合 | 检查证书 URI SAN、Main CA 配置、允许列表和吊销列表。 |
-| `edge_offline` | Edge 控制通道未注册 | 检查 Edge 服务、DNS、防火墙、Main `allowed_edge_ids`。 |
-| `route_denied` | Client ACL 不允许该逻辑路由 | 核对证书身份与 `[client_route_acl]`。 |
-| `target_unavailable` | Edge 无法连接数据库 | 在 Edge 使用 `nc` 或数据库客户端测试目标，检查 Unix Socket 权限。 |
-| `capacity_exceeded` | 总连接、单身份通道或缓冲预算超限 | 排查异常并发和连接洪泛，再按容量评估调整限额。 |
-| enrollment token rejected | 令牌过期、已消费、已撤销或 Edge ID 不符 | 撤销旧令牌并创建新的短期令牌。 |
-| `restart_required` | 修改了不可热重载字段 | 保留当前运行态并安排重启。 |
+| 错误                        | 常见原因                            | 处理                                            |
+| ------------------------- | ------------------------------- | --------------------------------------------- |
+| TLS 握手失败                  | CA、证书链、时间、EKU 或 TLS 版本不正确       | 核对双方时间、证书链和 URI SAN；Gateway 只使用 TLS 1.3。      |
+| `identity_rejected`       | Edge/Client 证书角色、身份或 serial 不符合 | 检查证书 URI SAN、Main CA 配置、允许列表和吊销列表。            |
+| `edge_offline`            | Edge 控制通道未注册                    | 检查 Edge 服务、DNS、防火墙、Main `allowed_edge_ids`。   |
+| `route_denied`            | Client ACL 不允许该逻辑路由             | 核对证书身份与 `[client_route_acl]`。                 |
+| `target_unavailable`      | Edge 无法连接数据库                    | 在 Edge 使用 `nc` 或数据库客户端测试目标，检查 Unix Socket 权限。 |
+| `capacity_exceeded`       | 总连接、单身份通道或缓冲预算超限                | 排查异常并发和连接洪泛，再按容量评估调整限额。                       |
+| enrollment token rejected | 令牌过期、已消费、已撤销或 Edge ID 不符        | 撤销旧令牌并创建新的短期令牌。                               |
+| `restart_required`        | 修改了不可热重载字段                      | 保留当前运行态并安排重启。                                 |
 
 统一采集诊断：
 
@@ -662,6 +686,7 @@ systemctl restart dbx-gateway-main.service
 - [部署总览](../dbx-gateway.md)
 - [Main Gateway 部署](main-gateway.md)
 - [Edge Gateway 部署](edge-gateway.md)
+- [Edge 本机数据库目标配置](local-database-targets.md)
 - [Edge 节点证书生成与领取](edge-certificate.md)
 - [DBX Client 证书生成与交付](client-certificate.md)
 - [PKI 与证书运维](pki.md)

@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# This account must be able to read edge.toml and the Main CA.
 User=dbx-gateway
 Group=dbx-gateway
 ExecStart=/usr/bin/dbx-gateway --config /etc/dbx-gateway/edge.toml serve

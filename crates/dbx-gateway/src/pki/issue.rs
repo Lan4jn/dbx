@@ -12,7 +12,7 @@ use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::parse_x509_certificate;
 use zeroize::Zeroizing;
 
-use super::store::{load_issuer, pki_error, read_certificate, record_issued_certificate};
+use super::store::{load_issuer, pki_error, read_certificate, read_optional_certificate, record_issued_certificate};
 use super::{CertificateRole, PkiStore};
 use crate::GatewayError;
 
@@ -59,6 +59,9 @@ impl PkiStore {
     ) -> Result<IssuedKeyPair, GatewayError> {
         if request.dns_sans.is_empty() && request.ip_sans.is_empty() {
             return Err(pki_error("server certificate requires at least one SAN"));
+        }
+        if request.dns_sans.iter().any(|name| name.parse::<IpAddr>().is_ok()) {
+            return Err(pki_error("server IP addresses must use an IP SAN"));
         }
         let key = KeyPair::generate().map_err(|_| pki_error("could not generate server private key"))?;
         let mut params = leaf_params(request.name, request.validity)?;
@@ -216,7 +219,7 @@ fn issued_certificate(
         hex::encode(serial.as_ref().ok_or_else(|| pki_error("certificate serial was not generated"))?.as_ref());
     record_issued_certificate(data_dir, role, &serial_hex, &certificate_pem, identity)?;
     let intermediate = read_certificate(data_dir, role.as_str())?;
-    let root = read_certificate(data_dir, "root")?;
+    let root = read_optional_certificate(data_dir, "root")?.unwrap_or_default();
     Ok(IssuedCertificate { serial_hex, certificate_pem, chain_pem: format!("{intermediate}{root}") })
 }
 

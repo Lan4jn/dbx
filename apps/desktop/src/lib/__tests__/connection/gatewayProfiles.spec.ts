@@ -64,11 +64,13 @@ describe("gatewayProfileReferenceLayer", () => {
       id: "layer-1",
       edge_id: "edge-prod-01",
       target_id: "postgres-primary",
+      use_as_connection_info: true,
     });
 
     expect(layer.profile_id).toBe(profile.id);
     expect(layer.edge_id).toBe("edge-prod-01");
     expect(layer.target_id).toBe("postgres-primary");
+    expect(layer.use_as_connection_info).toBe(true);
     expect(layer.main_url).toBe("");
     expect(layer.identity_id).toBe("");
   });

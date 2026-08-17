@@ -556,7 +556,7 @@ async function testSelected() {
       >
         <Loader2 v-if="isTesting" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
         <ShieldCheck v-else-if="selectedGateway" class="mr-1.5 h-3.5 w-3.5" />
-        {{ isTesting ? t("settings.tunnelsTesting") : selectedGateway ? t("settings.tunnelsGatewayTestMain") : t("settings.tunnelsTest") }}
+        {{ isTesting ? t("settings.tunnelsTesting") : t("settings.tunnelsTest") }}
       </Button>
       <p v-if="isDirty" class="text-xs text-muted-foreground">{{ t("settings.tunnelsUnsavedHint") }}</p>
     </div>

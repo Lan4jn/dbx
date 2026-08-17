@@ -86,8 +86,9 @@ CRL 尚未生成时第一条可不存在；SQLite 预期输出 `ok`。不要直�
 
 | 现象/错误 | 含义 | 处理 |
 |---|---|---|
+| `configuration file could not be read` | systemd unit 的运行账户不能读取配置文件或进入父目录 | 用 `systemctl show <unit> -p User -p Group` 查询实际账户，并以该账户执行 `test -r` 和 `check-config`；不要用 `root` 的读取结果代替。 |
 | TLS 握手失败 | CA、有效期、EKU、TLS 版本或证书链错误 | 检查双方时间、证书链和 URI SAN；只支持 TLS 1.3。 |
-| `certificate not valid for name "10.x.x.x"; certificate is only valid for DnsName("10.x.x.x")` | IP 被错误写入 DNS SAN | 在离线 PKI 重新签发 Main 证书，使用 `--ip-san 10.x.x.x`；URL 使用同一个 IP。当前 CLI 仍需额外提供 `--dns-san localhost`。 |
+| `certificate not valid for name "10.x.x.x"; certificate is only valid for DnsName("10.x.x.x")` | IP 被错误写入 DNS SAN | 在离线 PKI 重新签发 Main 证书，只使用 `--ip-san 10.x.x.x`；URL 使用同一个 IP，然后替换 Main 的证书与私钥并重启服务。 |
 | `identity_rejected` | 证书角色、唯一 URI SAN、serial 或 CA 不符合 | 用 `openssl x509 -text` 核对 `urn:dbx-gateway:edge:edge-prod-01` 或 client URI。 |
 | `edge_offline` | Main 没有在线 Edge 控制通道 | 检查 Edge 服务、DNS、防火墙、Main ACL 和证书。 |
 | `route_denied` | target ID 未注册、角色错误或地址策略拒绝 | 核对 `postgres-primary`、`allow_remote` 和解析后的所有 IP。 |

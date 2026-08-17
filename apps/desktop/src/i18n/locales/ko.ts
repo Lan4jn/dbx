@@ -5025,7 +5025,6 @@ export default withEnglishFallback({
     tunnelsGatewaySpkiPin: "SPKI SHA-256",
     tunnelsGatewaySpkiPinPlaceholder: "선택 사항, 64자 소문자 16진수 Pin",
     tunnelsGatewayTimeout: "제한 시간(초)",
-    tunnelsGatewayTestMain: "Main 테스트",
     tunnelsProfileName: "프로필 이름",
     tunnelsProfileNamePlaceholder: "예: 사무실 배스천",
     tunnelsDelete: "삭제",

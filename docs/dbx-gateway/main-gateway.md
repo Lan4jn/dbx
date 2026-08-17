@@ -39,12 +39,11 @@ dbx-gateway-pki server issue \
   --data-dir /secure/dbx-gateway-pki-offline \
   --password-file /secure/dbx-pki-password \
   --identity main-gateway \
-  --dns-san localhost \
-  --ip-san 10.235.10.53 \
+  --ip-san 192.0.2.53 \
   --output-dir /secure/export/main-server-ip
 ```
 
-纯 IP 场景必须使用 `--ip-san`。当前 CLI 要求至少有一个 DNS SAN，因此示例保留 `--dns-san localhost` 作为占位。`--dns-san 10.235.10.53` 会生成 `DNS:10.235.10.53`，不能通过 IP 地址校验。
+纯 IP 场景只使用 `--ip-san`。`--dns-san 192.0.2.53` 会生成错误类型的 SAN，不能通过 IP 地址校验；新版 PKI 会直接拒绝这种输入。
 
 安装前检查：
 
@@ -53,7 +52,9 @@ openssl x509 -in /secure/export/main-server-ip/certificate.pem \
   -noout -text | grep -A2 "Subject Alternative Name"
 ```
 
-应包含 `IP Address:10.235.10.53`。
+应包含 `IP Address:192.0.2.53`。
+
+IPv6 的签发参数写作 `--ip-san 2001:db8::53`，客户端 URL 写作 `wss://[2001:db8::53]/_dbx/client`；方括号只属于 URL，不写入 SAN 参数。
 
 预期输出 `issued server certificate <serial>`。将 `certificate.pem`、`chain.pem`、`private-key.pem` 通过受控通道送到 Main；Server 私钥只能在 PKI 签发主机与 Main 间短暂传递，导入后删除导出副本。若输出目录已存在，工具会拒绝覆盖，改用新的空目录。
 
@@ -167,11 +168,11 @@ curl -fsS http://127.0.0.1:9080/healthz
 在 Main 主机以 `root` 升级：
 
 ```bash
-sha256sum -c DBX_Gateway_0.5.75_x64.tar.gz.sha256
-tar -xzf DBX_Gateway_0.5.75_x64.tar.gz
+sha256sum -c DBX_Gateway_0.5.83_x64.tar.gz.sha256
+tar -xzf DBX_Gateway_0.5.83_x64.tar.gz
 /usr/bin/dbx-gateway --version > /var/lib/dbx-gateway/previous-version.txt
 cp /usr/bin/dbx-gateway /var/lib/dbx-gateway/dbx-gateway.previous
-install -m 0755 DBX_Gateway_0.5.75_x64/bin/dbx-gateway /usr/bin/dbx-gateway
+install -m 0755 DBX_Gateway_0.5.83_x64/bin/dbx-gateway /usr/bin/dbx-gateway
 sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
 systemctl restart dbx-gateway-main.service
 ```

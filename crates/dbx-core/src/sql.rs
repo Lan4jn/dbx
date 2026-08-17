@@ -2622,6 +2622,8 @@ mod tests {
             total_bytes: Some(256),
             current_statement: Some("SELECT 1".to_string()),
             error: None,
+            file_index: None,
+            file_name: None,
         };
         let value = serde_json::to_value(progress).unwrap();
         assert_eq!(value["bytesProcessed"], 128);

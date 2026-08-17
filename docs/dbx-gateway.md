@@ -47,7 +47,7 @@ Nginx、HAProxy 或云负载均衡只能使用 TCP/TLS passthrough。不能在�
 2. 在 PKI 主机启动只监听 Unix Socket 的在线受限 PKI。
 3. 为 Main 签发 `gateway.example.com` Server 证书并启动 Main。
 4. 为 DBX 用户签发 `client.p12`，安全导入桌面客户端。
-5. 创建 10 分钟一次性 Edge 注册令牌，在 Edge 主机保存为 `0600` 文件。
+5. 创建 10 分钟一次性 Edge 注册令牌。第一行 UUID 是仅供审计或撤销的 Token ID；将最后一行 `<Token ID>.<秘密部分>` 完整令牌保存到 Edge 的 `0600` 文件。
 6. 启动 Edge；Edge 本地生成私钥、经 Main 领证、删除令牌并用 mTLS 重新连接。
 7. 在 DBX 连接中选择 `edge-prod-01 / postgres-primary` 并测试链路。
 
@@ -59,7 +59,7 @@ Gateway 身份依赖系统钥匙串，因此只能在 DBX 桌面端配置和使�
 2. 在“导入身份”中填写便于识别的名称，点击“选择 PKCS#12”并选择 `.p12` 或 `.pfx`；再点击密码框右侧的文件按钮选择 bundle 密码文件，也可手工输入密码。
 3. 确认证书文件已选择且密码框非空，点击该行最右侧的“导入”。导入成功后密码立即从界面内存清空，私钥只进入系统钥匙串。
 4. 在 Gateway 档案中填写 Main URL，例如 `wss://gateway.example.com/_dbx/client`；选择刚导入的客户端身份；导入专用 CA PEM，并按需填写 64 位小写十六进制 SPKI SHA-256 Pin 和连接超时。
-5. 点击“测试 Main”。该测试只验证 Main、mTLS 身份和服务端 CA/SPKI，不要求选择 Edge 或数据库目标。测试失败时先检查客户端身份是否存在、证书是否过期、Main URL、CA/SPKI 和网络可达性。
+5. 点击“测试”。该测试只验证 Main、mTLS 身份和服务端 CA/SPKI，不要求选择 Edge 或数据库目标。测试失败时先检查客户端身份是否存在、证书是否过期、Main URL、CA/SPKI 和网络可达性。
 6. 保存档案。Gateway 档案只管理 Main、客户端身份、CA/SPKI 和超时，不包含 Edge 或 target。
 7. 新建或编辑数据库连接，进入“传输”选项卡，点击“添加 Gateway”。Gateway 一条连接最多一个，并且必须位于传输链最后一层；DBX 会阻止把它拖到 SSH、Proxy 或 HTTP Tunnel 之前。
 8. 选择共享 Gateway 档案，点击刷新图标读取当前客户端证书获准访问的逻辑路由。使用搜索框按 Edge ID、target ID 或显示名称筛选，然后选择在线 Edge 下的 target。离线 Edge 仍会显示，但不能用于新连接。
@@ -74,6 +74,7 @@ Gateway 身份依赖系统钥匙串，因此只能在 DBX 桌面端配置和使�
 - [完整部署与使用说明书](dbx-gateway/deployment-manual.md)
 - [Main Gateway 部署](dbx-gateway/main-gateway.md)
 - [Edge Gateway 部署](dbx-gateway/edge-gateway.md)
+- [Edge 本机数据库目标配置](dbx-gateway/local-database-targets.md)
 - [Edge 节点证书生成与领取](dbx-gateway/edge-certificate.md)
 - [DBX Client 证书生成与交付](dbx-gateway/client-certificate.md)
 - [PKI 与证书](dbx-gateway/pki.md)

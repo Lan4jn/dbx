@@ -33,6 +33,7 @@ required_paths=(
   docs/dbx-gateway.md
   docs/dbx-gateway/main-gateway.md
   docs/dbx-gateway/edge-gateway.md
+  docs/dbx-gateway/local-database-targets.md
   docs/dbx-gateway/pki.md
   docs/dbx-gateway/configuration.md
   docs/dbx-gateway/operations.md
@@ -64,6 +65,8 @@ require_heading docs/dbx-gateway/main-gateway.md "## 升级与回滚"
 require_heading docs/dbx-gateway/edge-gateway.md "## 令牌领证"
 require_heading docs/dbx-gateway/edge-gateway.md "## 本地目标"
 require_heading docs/dbx-gateway/edge-gateway.md "## 重连与迁移"
+require_heading docs/dbx-gateway/local-database-targets.md "## 关系型数据库"
+require_heading docs/dbx-gateway/local-database-targets.md "## 多节点与多端口限制"
 require_heading docs/dbx-gateway/pki.md "## 离线 Root CA"
 require_heading docs/dbx-gateway/pki.md "## 在线 Edge CA"
 require_heading docs/dbx-gateway/pki.md "## 续期与吊销"

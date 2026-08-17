@@ -134,7 +134,7 @@ struct ServerIssueArgs {
     password_file: PathBuf,
     #[arg(long)]
     identity: String,
-    #[arg(long = "dns-san", required = true)]
+    #[arg(long = "dns-san")]
     dns_sans: Vec<String>,
     #[arg(long = "ip-san")]
     ip_sans: Vec<IpAddr>,
@@ -505,7 +505,7 @@ fn pki_error(message: &str) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_password_file, Cli, Command, EnrollmentAction};
+    use super::{read_password_file, Cli, Command, EnrollmentAction, ServerAction};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -544,6 +544,37 @@ mod tests {
         };
 
         assert_eq!(args.ttl, std::time::Duration::from_secs(600));
+    }
+
+    #[test]
+    fn server_issue_accepts_an_ip_san_without_a_dns_san() {
+        for ip in ["192.0.2.53", "2001:db8::53"] {
+            let cli = Cli::try_parse_from([
+                "dbx-gateway-pki",
+                "server",
+                "issue",
+                "--data-dir",
+                "/tmp/pki",
+                "--password-file",
+                "/tmp/password",
+                "--identity",
+                "main-gateway",
+                "--ip-san",
+                ip,
+                "--output-dir",
+                "/tmp/output",
+            ])
+            .unwrap();
+            let Command::Server(command) = cli.command else {
+                panic!("expected server command");
+            };
+            let ServerAction::Issue(args) = command.command else {
+                panic!("expected server issue command");
+            };
+
+            assert!(args.dns_sans.is_empty());
+            assert_eq!(args.ip_sans, [ip.parse::<std::net::IpAddr>().unwrap()]);
+        }
     }
 
     #[cfg(unix)]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -170,6 +171,13 @@ impl GatewayEndpoint {
         let port = url.port_or_known_default().ok_or_else(|| "Gateway Main URL has no port".to_string())?;
         Ok(Self { host, port })
     }
+
+    fn server_name(&self) -> Result<ServerName<'static>, String> {
+        if let Ok(ip) = self.host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            return Ok(ServerName::IpAddress(ip.into()));
+        }
+        ServerName::try_from(self.host.clone()).map_err(|_| "Gateway TLS server name is invalid".to_string())
+    }
 }
 
 fn validate_config(config: &DbxGatewayConfig, require_route: bool) -> Result<(), String> {
@@ -197,7 +205,7 @@ async fn connect_gateway(
     let endpoint = GatewayEndpoint::parse(&config.main_url)?;
     let identity = identities.load(&config.identity_id).await?;
     let tls = build_tls_config(&identity, config)?;
-    let server_name = ServerName::try_from(endpoint.host.clone()).map_err(|_| "Gateway TLS server name is invalid")?;
+    let server_name = endpoint.server_name()?;
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs.max(1));
     let tcp = timeout(connect_timeout, TcpStream::connect((dial_host, dial_port)))
         .await
@@ -476,7 +484,22 @@ mod tests {
             connect_timeout_secs: 1,
             edge_id: "edge-prod-01".to_string(),
             target_id: "postgres-primary".to_string(),
+            use_as_connection_info: true,
         }
+    }
+
+    #[test]
+    fn gateway_ip_endpoints_use_ip_tls_server_names() {
+        for url in ["wss://192.0.2.53/_dbx/client", "wss://[2001:db8::53]/_dbx/client"] {
+            let endpoint = GatewayEndpoint::parse(url).unwrap();
+            assert!(matches!(endpoint.server_name().unwrap(), ServerName::IpAddress(_)), "{url}");
+        }
+    }
+
+    #[test]
+    fn gateway_dns_endpoint_uses_a_dns_tls_server_name() {
+        let endpoint = GatewayEndpoint::parse("wss://gateway.example.com/_dbx/client").unwrap();
+        assert!(matches!(endpoint.server_name().unwrap(), ServerName::DnsName(_)));
     }
 
     type MemoryIdentity = (Vec<Vec<u8>>, Vec<u8>);
@@ -686,6 +709,7 @@ mod tests {
                 connect_timeout_secs: 5,
                 edge_id: EDGE_ID.to_string(),
                 target_id: TARGET_ID.to_string(),
+                use_as_connection_info: true,
             };
             let identities = Arc::new(MemoryIdentityProvider {
                 identities: Mutex::new(HashMap::from([(

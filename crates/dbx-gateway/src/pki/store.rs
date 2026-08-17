@@ -453,6 +453,14 @@ pub(crate) fn read_certificate(data_dir: &Path, role: &str) -> Result<String, Ga
         .map_err(|_| pki_error("could not parse CA certificate"))
 }
 
+pub(crate) fn read_optional_certificate(data_dir: &Path, role: &str) -> Result<Option<String>, GatewayError> {
+    match fs::symlink_metadata(certificate_path(data_dir, role)) {
+        Ok(_) => read_certificate(data_dir, role).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(pki_error("CA certificate could not be inspected")),
+    }
+}
+
 fn read_issued_record(data_dir: &Path, role: CertificateRole, serial_hex: &str) -> Result<IssuedRecord, GatewayError> {
     let path = issued_record_path(data_dir, role, serial_hex);
     let input = String::from_utf8(

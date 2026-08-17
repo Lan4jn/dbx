@@ -448,6 +448,7 @@ function defaultGatewayTunnel(): DbxGatewayConfig {
     connect_timeout_secs: 10,
     edge_id: "",
     target_id: "",
+    use_as_connection_info: false,
   };
 }
 
@@ -487,6 +488,7 @@ function normalizeGatewayTunnel(layer: Partial<DbxGatewayConfig>): DbxGatewayCon
     connect_timeout_secs: Number(layer.connect_timeout_secs) || 10,
     edge_id: layer.edge_id || "",
     target_id: layer.target_id || "",
+    use_as_connection_info: layer.use_as_connection_info !== false,
   };
 }
 
@@ -2642,6 +2644,8 @@ const selectedSshLayer = computed(() => (selectedTransportLayer.value?.type === 
 const selectedProxyLayer = computed(() => (selectedTransportLayer.value?.type === "proxy" ? selectedTransportLayer.value : null));
 const selectedHttpTunnelLayer = computed(() => (selectedTransportLayer.value?.type === "http_tunnel" ? selectedTransportLayer.value : null));
 const selectedGatewayLayer = computed(() => (selectedTransportLayer.value?.type === "dbx_gateway" ? selectedTransportLayer.value : null));
+const connectionInfoGatewayLayer = computed(() => transportLayers.value.find((layer): layer is Extract<TransportLayerConfig, { type: "dbx_gateway" }> => layer.type === "dbx_gateway") || null);
+const gatewayAsConnectionInfo = computed(() => connectionInfoGatewayLayer.value?.enabled !== false && connectionInfoGatewayLayer.value?.use_as_connection_info === true);
 
 const tunnelProfiles = computed(() => tunnelProfileStore.profiles);
 const gatewayTunnelProfiles = computed(() => tunnelProfiles.value.filter((profile) => profile.type === "dbx_gateway"));
@@ -2668,14 +2672,14 @@ const filteredGatewayRouteGroups = computed(() => {
 });
 
 const selectedGatewayRouteLabel = computed(() => {
-  const layer = selectedGatewayLayer.value;
+  const layer = connectionInfoGatewayLayer.value;
   if (!layer?.edge_id || !layer.target_id) return t("connection.gatewayRoutePlaceholder");
   const edge = gatewayRouteGroups.value.find((candidate) => candidate.edge_id === layer.edge_id);
   const route = edge?.routes.find((candidate) => candidate.target_id === layer.target_id);
   return route ? `${edge?.edge_id} / ${route.display_name || route.target_id}` : `${layer.edge_id} / ${layer.target_id}`;
 });
 
-const networkGatewayLayer = computed(() => transportLayers.value.find((layer) => layer.type === "dbx_gateway"));
+const networkGatewayLayer = computed(() => (gatewayAsConnectionInfo.value ? connectionInfoGatewayLayer.value : undefined));
 const networkGatewayRouteLabel = computed(() => {
   const layer = networkGatewayLayer.value;
   if (!layer?.edge_id || !layer.target_id) return "";
@@ -2728,7 +2732,8 @@ function applyTunnelProfileSelection(value: unknown) {
 }
 
 async function refreshGatewayRoutes() {
-  const profile = selectedLayerProfile.value;
+  const layer = connectionInfoGatewayLayer.value;
+  const profile = layer?.profile_id ? tunnelProfileStore.profileById(layer.profile_id) : undefined;
   if (profile?.type !== "dbx_gateway" || isLoadingGatewayRoutes.value) return;
   isLoadingGatewayRoutes.value = true;
   gatewayRoutesError.value = "";
@@ -2749,15 +2754,19 @@ async function refreshGatewayRoutes() {
 }
 
 function selectGatewayRoute(edge: GatewayEdgeRoutes, targetId: string) {
-  if (!edge.online || !selectedGatewayLayer.value) return;
-  selectedGatewayLayer.value.edge_id = edge.edge_id;
-  selectedGatewayLayer.value.target_id = targetId;
+  if (!edge.online || !connectionInfoGatewayLayer.value) return;
+  connectionInfoGatewayLayer.value.edge_id = edge.edge_id;
+  connectionInfoGatewayLayer.value.target_id = targetId;
   gatewayRoutePickerOpen.value = false;
   resetTestState();
 }
 
+function selectConnectionInfoGatewayRoute(edge: GatewayEdgeRoutes, targetId: string) {
+  selectGatewayRoute(edge, targetId);
+}
+
 watch(
-  () => (selectedGatewayLayer.value ? selectedLayerProfileId.value : ""),
+  () => connectionInfoGatewayLayer.value?.profile_id || "",
   (profileId) => {
     gatewayRouteSearch.value = "";
     gatewayRoutesError.value = "";
@@ -2786,7 +2795,7 @@ function transportLayerDisplayName(layer: TransportLayerConfig, index: number): 
 }
 
 const transportPathSegments = computed(() => {
-  const layers = transportLayers.value.filter((layer) => layer.enabled !== false);
+  const layers = transportLayers.value.filter((layer) => layer.enabled !== false && (layer.type !== "dbx_gateway" || layer.use_as_connection_info === true));
   return ["DBX", ...layers.map(transportLayerDisplayName), form.value.host || "Database"];
 });
 
@@ -3534,6 +3543,7 @@ const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
 const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
 const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 const hasRequiredConnectionTarget = computed(() => {
+  if (gatewayAsConnectionInfo.value) return !!connectionInfoGatewayLayer.value?.edge_id && !!connectionInfoGatewayLayer.value?.target_id;
   if (form.value.db_type === "mq") {
     if (mqSystemKind.value === "kafka") return mqKafkaConnectionSource.value === "zookeeper" ? !!mqKafkaZooKeeperServers.value.trim() : !!mqKafkaBootstrapServers.value.trim();
     if (mqSystemKind.value === "rocketmq") return !!mqRocketmqNamesrvAddr.value.trim();
@@ -3837,7 +3847,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     normalized.connect_timeout_secs = Number.isFinite(timeout) && timeout > 0 ? timeout : 5;
     return { type: "ssh", ...normalized };
   });
-  if (config.db_type === "oracle" && config.oracle_connection_type === "tns" && config.transport_layers.some((layer) => layer.enabled !== false)) {
+  if (config.db_type === "oracle" && config.oracle_connection_type === "tns" && config.transport_layers.some((layer) => layer.enabled !== false && (layer.type !== "dbx_gateway" || layer.use_as_connection_info === true))) {
     throw new Error(t("connection.oracleTnsTransportUnsupported"));
   }
   validateTransportLayers(config);
@@ -5133,10 +5143,10 @@ function updateSelectedSshAuthMethod(value: unknown) {
 
 function validateTransportLayers(config: LegacyConnectionConfig) {
   const layers = config.transport_layers || [];
-  const gatewayLayers = layers.filter((layer) => layer.enabled !== false && layer.type === "dbx_gateway");
+  const gatewayLayers = layers.filter((layer) => layer.enabled !== false && layer.type === "dbx_gateway" && layer.use_as_connection_info === true);
   if (gatewayLayers.length > 1) throw new Error(t("connection.gatewayOnlyOne"));
   layers.forEach((layer, index) => {
-    if (layer.enabled === false) return;
+    if (layer.enabled === false || (layer.type === "dbx_gateway" && layer.use_as_connection_info !== true)) return;
     if (layer.type === "dbx_gateway") {
       // A gateway must be the final transport layer because it owns the logical database route.
       if (index !== layers.length - 1) throw new Error(t("connection.gatewayInvalidOrder"));
@@ -5894,6 +5904,65 @@ function openExternalUrl(url: string) {
                   </div>
                 </div>
 
+                <div v-if="gatewayAsConnectionInfo" data-gateway-connection-host class="grid grid-cols-4 items-start gap-4">
+                  <div class="flex items-center gap-1 pt-2">
+                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" align="center" class="max-w-[320px] text-xs leading-relaxed">
+                        {{ t("connection.gatewayHostOverrideHint") }}
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                  <div class="col-span-3 grid min-w-0 gap-2">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <Popover v-model:open="gatewayRoutePickerOpen">
+                        <PopoverTrigger as-child>
+                          <Button type="button" variant="outline" class="h-9 min-w-0 flex-1 justify-between font-normal" :disabled="isLoadingGatewayRoutes">
+                            <span class="min-w-0 truncate" :title="selectedGatewayRouteLabel">{{ selectedGatewayRouteLabel }}</span>
+                            <Network class="ml-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent align="start" class="w-[min(28rem,calc(100vw-2rem))] p-2">
+                          <Input v-model="gatewayRouteSearch" class="mb-2 h-9" :placeholder="t('connection.gatewayRouteSearch')" />
+                          <div class="h-64 overflow-y-auto">
+                            <p v-if="!filteredGatewayRouteGroups.length" class="px-2 py-8 text-center text-xs text-muted-foreground">{{ t("connection.gatewayRoutesEmpty") }}</p>
+                            <section v-for="edge in filteredGatewayRouteGroups" :key="edge.edge_id" class="border-b py-1 last:border-b-0">
+                              <div class="flex min-w-0 items-center gap-2 px-2 py-1 text-xs font-medium">
+                                <span class="min-w-0 flex-1 truncate" :title="edge.edge_id">{{ edge.edge_id }}</span>
+                                <span class="shrink-0 text-[11px]" :class="edge.online ? 'text-emerald-600' : 'text-muted-foreground'">{{ edge.online ? t("connection.gatewayEdgeOnline") : t("connection.gatewayEdgeOffline", { edge: edge.edge_id }) }}</span>
+                              </div>
+                              <button
+                                v-for="route in edge.routes"
+                                :key="route.target_id"
+                                type="button"
+                                class="flex h-9 w-full min-w-0 items-center rounded px-2 text-left text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                :disabled="!edge.online"
+                                :title="`${edge.edge_id} / ${route.display_name || route.target_id}`"
+                                @click="selectConnectionInfoGatewayRoute(edge, route.target_id)"
+                              >
+                                <span class="min-w-0 flex-1 truncate">{{ route.display_name || route.target_id }}</span>
+                                <span class="ml-2 max-w-40 shrink-0 truncate text-muted-foreground">{{ route.target_id }}</span>
+                              </button>
+                            </section>
+                          </div>
+                        </PopoverContent>
+                      </Popover>
+                      <Tooltip>
+                        <TooltipTrigger as-child>
+                          <Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="isLoadingGatewayRoutes" @click="refreshGatewayRoutes">
+                            <RefreshCw class="h-4 w-4" :class="isLoadingGatewayRoutes ? 'animate-spin' : ''" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>{{ t("connection.gatewayRoutesRefresh") }}</TooltipContent>
+                      </Tooltip>
+                    </div>
+                    <p v-if="gatewayRoutesError" class="text-xs text-red-500" role="alert">{{ gatewayRoutesError }}</p>
+                  </div>
+                </div>
+
                 <div v-if="form.db_type === 'h2'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.mode") }}</Label>
                   <div class="col-span-3 flex gap-2">
@@ -6481,7 +6550,7 @@ function openExternalUrl(url: string) {
                       </Button>
                     </div>
                   </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ form.redis_connection_mode === "sentinel" ? t("connection.redisFirstSentinel") : form.redis_connection_mode === "cluster" ? t("connection.redisFirstClusterNode") : t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -6617,7 +6686,7 @@ function openExternalUrl(url: string) {
 
                 <!-- etcd: endpoints, user, password, TLS -->
                 <template v-else-if="form.db_type === 'etcd'">
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -6648,7 +6717,7 @@ function openExternalUrl(url: string) {
 
                 <!-- ZooKeeper: host, connect string, user, password -->
                 <template v-else-if="form.db_type === 'zookeeper'">
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" placeholder="127.0.0.1" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -6724,7 +6793,7 @@ function openExternalUrl(url: string) {
                     </div>
                   </template>
                   <template v-else>
-                    <div class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -6902,7 +6971,7 @@ function openExternalUrl(url: string) {
                 </template>
 
                 <template v-else-if="form.db_type === 'victoriametrics'">
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -6952,7 +7021,7 @@ function openExternalUrl(url: string) {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -7000,7 +7069,7 @@ function openExternalUrl(url: string) {
 
                 <!-- Turso: simplified form (URL + Token) -->
                 <template v-else-if="form.db_type === 'turso'">
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-3" :placeholder="t('connection.tursoHostPlaceholder')" />
                   </div>
@@ -7073,7 +7142,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <!-- GaussDB: multi-host dynamic list -->
-                  <template v-if="form.db_type === 'gaussdb'">
+                  <template v-if="form.db_type === 'gaussdb' && !gatewayAsConnectionInfo">
                     <div class="grid grid-cols-4 items-start gap-4">
                       <Label :class="connectionLabelTopClass">{{ t("connection.host") }}</Label>
                       <div class="col-span-3 space-y-2">
@@ -7091,7 +7160,7 @@ function openExternalUrl(url: string) {
                       </div>
                     </div>
                   </template>
-                  <div v-else-if="form.db_type !== 'oracle' || form.oracle_connection_type !== 'tns'" class="grid grid-cols-4 items-center gap-4">
+                  <div v-else-if="!gatewayAsConnectionInfo && (form.db_type !== 'oracle' || form.oracle_connection_type !== 'tns')" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ form.db_type === "elasticsearch" && elasticsearchConnectionMode === "kibana" ? t("connection.elasticsearchKibanaHost") : t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" @input="markSqlServerPortExplicit" />
@@ -8214,10 +8283,10 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-start gap-4">
                       <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.gatewayRoute") }}</Label>
                       <div class="col-span-3 grid min-w-0 gap-2">
-                        <div class="flex min-w-0 items-center gap-2">
+                        <div class="flex min-w-0 items-center gap-2" :title="gatewayAsConnectionInfo ? t('connection.gatewayRouteManagedInConnectionInfo') : undefined">
                           <Popover v-model:open="gatewayRoutePickerOpen">
                             <PopoverTrigger as-child>
-                              <Button type="button" variant="outline" class="h-9 min-w-0 flex-1 justify-between font-normal" :disabled="!selectedLayerProfileId || isLoadingGatewayRoutes">
+                              <Button type="button" variant="outline" class="h-9 min-w-0 flex-1 justify-between font-normal" :disabled="gatewayAsConnectionInfo || !selectedLayerProfileId || isLoadingGatewayRoutes">
                                 <span class="min-w-0 truncate" :title="selectedGatewayRouteLabel">{{ selectedGatewayRouteLabel }}</span>
                                 <Network class="ml-2 h-4 w-4 shrink-0 text-muted-foreground" />
                               </Button>
@@ -8249,7 +8318,7 @@ function openExternalUrl(url: string) {
                           </Popover>
                           <Tooltip>
                             <TooltipTrigger as-child>
-                              <Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="!selectedLayerProfileId || isLoadingGatewayRoutes" @click="refreshGatewayRoutes">
+                              <Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="gatewayAsConnectionInfo || !selectedLayerProfileId || isLoadingGatewayRoutes" @click="refreshGatewayRoutes">
                                 <RefreshCw class="h-4 w-4" :class="isLoadingGatewayRoutes ? 'animate-spin' : ''" />
                               </Button>
                             </TooltipTrigger>
@@ -8258,6 +8327,23 @@ function openExternalUrl(url: string) {
                         </div>
                         <p v-if="gatewayRoutesError" class="text-xs text-red-500" role="alert">{{ gatewayRoutesError }}</p>
                         <p v-else-if="!gatewayTunnelProfiles.length" class="text-xs text-muted-foreground">{{ t("connection.gatewayNoProfiles") }}</p>
+                      </div>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <div class="col-span-3 flex items-center gap-2 text-sm">
+                        <label class="flex items-center gap-2">
+                          <input v-model="selectedGatewayLayer.use_as_connection_info" type="checkbox" class="mr-0" @change="resetTestState" />
+                          <span>{{ t("connection.gatewayUseAsConnectionInfo") }}</span>
+                        </label>
+                        <Tooltip>
+                          <TooltipTrigger as-child>
+                            <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                          </TooltipTrigger>
+                          <TooltipContent side="top" align="center" class="max-w-[320px] text-xs leading-relaxed">
+                            {{ t("connection.gatewayUseAsConnectionInfoHint") }}
+                          </TooltipContent>
+                        </Tooltip>
                       </div>
                     </div>
                   </template>

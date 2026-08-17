@@ -93,9 +93,9 @@ DBX 还需要验证 Main Server。应交付 Main Server 签发命令输出的：
 5. 在 Gateway 档案中选择刚导入的 Client 身份。
 6. Main URL 填写 `wss://gateway.example.com/_dbx/client`。
 7. “Main Server CA PEM”选择 `/secure/export/main-server/chain.pem` 的交付副本。
-8. 点击“测试 Main”，成功后保存。
+8. 点击“测试”，成功后保存。
 
-没有域名时，Main URL 可以填写 `wss://10.235.10.53/_dbx/client`，但 Main Server 证书必须通过 `--ip-san 10.235.10.53` 签发。把 IP 写进 `--dns-san` 不等价，测试会因证书名称不匹配而失败。
+没有域名时，Main URL 可以填写 `wss://192.0.2.53/_dbx/client`，但 Main Server 证书必须通过 `--ip-san 192.0.2.53` 签发。把 IP 写进 `--dns-san` 不等价，测试会因证书名称不匹配而失败。
 
 `client.p12` 导入成功后，Client 私钥进入操作系统凭据存储。bundle 密码只用于导入，不是以后每次连接 Main 时输入的登录密码。
 

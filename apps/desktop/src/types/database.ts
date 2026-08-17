@@ -318,6 +318,8 @@ export interface DbxGatewayConfig {
   connect_timeout_secs?: number;
   edge_id: string;
   target_id: string;
+  /** Use the selected Edge route instead of the connection host and port. */
+  use_as_connection_info?: boolean;
 }
 
 export interface GatewayIdentityMetadata {

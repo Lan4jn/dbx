@@ -117,7 +117,7 @@ dbx-gateway-pki client issue \
 4. 确认证书文件已选择且密码框非空，点击该行最右侧的“导入”。
 5. 导入成功后，从“客户端身份”下拉框选择该身份。DBX 会立即清空导入密码；PKCS#12 私钥和密码不会写入连接 JSON、SQLite 普通字段、导出文件或云同步快照。
 6. 导入专用 Server CA PEM；需要双重固定时再填写 Main Server 公钥的 SPKI SHA-256 Pin。Pin 格式为 64 位小写十六进制，不是证书指纹的 Base64 文本。
-7. 点击“测试 Main”。成功只表示 Main URL、客户端证书和服务端 CA/SPKI 校验通过；数据库路由在具体连接的“传输”选项卡中选择。
+7. 点击“测试”。成功只表示 Main URL、客户端证书和服务端 CA/SPKI 校验通过；数据库路由在具体连接的“传输”选项卡中选择。
 
 若提示密码错误或 PKCS#12 无法解析，重新核对 bundle 密码和文件完整性，不要尝试把私钥 PEM 粘贴进 Gateway 档案。若提示身份过期、吊销或不存在，应由 PKI 管理员重新签发，导入新 identity，并把引用该身份的 Gateway 档案迁移后再删除旧 identity。
 
@@ -151,7 +151,7 @@ dbx-gateway-pki enrollment revoke \
   --token-id REPLACE_WITH_TOKEN_UUID
 ```
 
-预期输出 `revoked enrollment token <uuid>`。明文 token 不存库，无法找回，只能撤销并创建新的 10 分钟 token。
+`--token-id` 使用 `enrollment create` 输出第一行中的 UUID，不要填写最后一行的 `<Token ID>.<秘密部分>` 完整令牌。预期输出 `revoked enrollment token <uuid>`。完整令牌不存库，无法找回，只能撤销并创建新的 10 分钟令牌。
 
 ## 备份与恢复
 

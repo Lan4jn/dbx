@@ -54,6 +54,15 @@ describe("connection network path", () => {
     expect(nodes.map((node) => node.label)).toEqual(["DBX", "Shared SSH", "orders"]);
   });
 
+  it("uses the manual host path when Gateway is not used as connection information", () => {
+    const layers = input().layers.map((layer) => (layer.type === "dbx_gateway" ? { ...layer, use_as_connection_info: false } : layer));
+
+    const nodes = buildConnectionNetworkPath(input({ layers, gatewayRouteLabel: "" }));
+
+    expect(nodes.map((node) => node.kind)).toEqual(["client", "ssh", "proxy", "target"]);
+    expect(nodes.at(-1)?.detail).toBe("orders.internal:5432");
+  });
+
   it.each([
     ["idle", ["idle", "idle", "idle", "idle", "idle", "idle"]],
     ["testing", ["testing", "testing", "testing", "testing", "testing", "testing"]],

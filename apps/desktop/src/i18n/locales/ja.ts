@@ -5325,7 +5325,6 @@ export default withEnglishFallback({
     tunnelsGatewaySpkiPin: "SPKI SHA-256",
     tunnelsGatewaySpkiPinPlaceholder: "任意、64 文字の小文字 16 進 Pin",
     tunnelsGatewayTimeout: "タイムアウト（秒）",
-    tunnelsGatewayTestMain: "Main をテスト",
     tunnelsProfileName: "プロファイル名",
     tunnelsProfileNamePlaceholder: "例：オフィスの踏み台サーバー",
     tunnelsDelete: "削除",

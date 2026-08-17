@@ -8,7 +8,8 @@ ca_certificate = "/etc/dbx-gateway/certs/main-server-ca.pem"
 [bootstrap]
 token_file = "/var/lib/dbx-gateway/enrollment.token"
 enrollment_url = "https://gateway.example.com/_dbx/enroll"
-# Replace this 64-character hexadecimal placeholder before enrollment.
+# SHA-256 of the public key in Main's active server certificate, not a certificate fingerprint.
+# Generate it with the command documented in docs/dbx-gateway/edge-certificate.md.
 server_spki_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 renew_before_days = 30
 

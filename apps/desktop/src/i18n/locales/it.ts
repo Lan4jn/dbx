@@ -5286,7 +5286,6 @@ export default withEnglishFallback({
     tunnelsGatewaySpkiPin: "SPKI SHA-256",
     tunnelsGatewaySpkiPinPlaceholder: "Pin esadecimale minuscolo opzionale di 64 caratteri",
     tunnelsGatewayTimeout: "Timeout (secondi)",
-    tunnelsGatewayTestMain: "Test Main",
     tunnelsProfileName: "Nome profilo",
     tunnelsProfileNamePlaceholder: "es. Bastion dell'ufficio",
     tunnelsDelete: "Elimina",

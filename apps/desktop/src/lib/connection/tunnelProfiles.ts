@@ -123,6 +123,7 @@ export function detachTunnelProfileLayer(layer: TransportLayerConfig, profile: T
       enabled: layer.enabled !== false,
       edge_id: layer.edge_id,
       target_id: layer.target_id,
+      use_as_connection_info: layer.use_as_connection_info,
     };
     delete detached.profile_id;
     return detached;
