@@ -235,13 +235,9 @@ async fn post_main_request(
     }
     let host = uri.host().ok_or_else(|| internal_error("Edge enrollment URL is invalid"))?;
     let port = uri.port_u16().unwrap_or(443);
-    let address = tokio::net::lookup_host((host, port))
+    let stream = TcpStream::connect((host, port))
         .await
-        .map_err(|_| internal_error("Main enrollment endpoint could not be resolved"))?
-        .next()
-        .ok_or_else(|| internal_error("Main enrollment endpoint could not be resolved"))?;
-    let stream =
-        TcpStream::connect(address).await.map_err(|_| internal_error("Main enrollment endpoint is unavailable"))?;
+        .map_err(|_| internal_error("Main enrollment endpoint is unavailable"))?;
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|_| internal_error("Edge enrollment server name is invalid"))?;
     let mut stream = TlsConnector::from(client)
