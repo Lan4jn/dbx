@@ -57,6 +57,9 @@ import type {
   SavedSqlLibrary,
   SshConfigHostEntry,
   TunnelProfile,
+  DbxGatewayConfig,
+  GatewayEdgeRoutes,
+  GatewayIdentityMetadata,
   TransactionLog,
   ExternalSqlFileVersion,
 } from "@/types/database";
@@ -1789,6 +1792,26 @@ export async function saveTunnelProfiles(profiles: TunnelProfile[]): Promise<voi
 
 export async function testTunnelProfile(profile: TunnelProfile): Promise<string> {
   return invoke("test_tunnel_profile", { profile });
+}
+
+export async function importGatewayIdentity(path: string, password: string, name: string): Promise<GatewayIdentityMetadata> {
+  return invoke("import_gateway_identity", { path, password, name });
+}
+
+export async function listGatewayIdentities(): Promise<GatewayIdentityMetadata[]> {
+  return invoke("list_gateway_identities");
+}
+
+export async function deleteGatewayIdentity(identityId: string): Promise<void> {
+  return invoke("delete_gateway_identity", { identityId });
+}
+
+export async function listGatewayRoutes(profile: DbxGatewayConfig): Promise<GatewayEdgeRoutes[]> {
+  return invoke("list_gateway_routes", { profile });
+}
+
+export async function testGatewayProfile(profile: DbxGatewayConfig): Promise<string> {
+  return invoke("test_gateway_profile", { profile });
 }
 
 export async function resolveSshPrompt(resolution: SshPromptResolution): Promise<void> {

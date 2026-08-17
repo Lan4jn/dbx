@@ -25,6 +25,7 @@ function mergeMessages(base: LocaleMessages, override: LocaleMessages): LocaleMe
   return result;
 }
 
+// Keep partial locale modules structurally complete as feature keys are added.
 export function withEnglishFallback(messages: LocaleMessages): LocaleMessages {
   return mergeMessages(en as LocaleMessages, messages);
 }

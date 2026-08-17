@@ -1,0 +1,29 @@
+[Unit]
+Description=DBX Gateway Online PKI
+After=local-fs.target
+Before=dbx-gateway-main.service
+
+[Service]
+Type=simple
+User=dbx-gateway-pki
+Group=dbx-gateway
+RuntimeDirectory=dbx-gateway
+RuntimeDirectoryMode=0770
+ExecStart=/usr/bin/dbx-gateway-pki serve --config /etc/dbx-gateway-pki/pki.toml
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitCORE=0
+ReadWritePaths=/var/lib/dbx-gateway-pki /run/dbx-gateway
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+mode = "edge"
+edge_id = "edge-prod-01"
+main_url = "wss://gateway.example.com/_dbx/edge"
+certificate = "/var/lib/dbx-gateway/edge.pem"
+private_key = "/var/lib/dbx-gateway/edge.key"
+ca_certificate = "/etc/dbx-gateway/certs/main-server-ca.pem"
+
+[bootstrap]
+token_file = "/var/lib/dbx-gateway/enrollment.token"
+enrollment_url = "https://gateway.example.com/_dbx/enroll"
+# SHA-256 of the public key in Main's active server certificate, not a certificate fingerprint.
+# Generate it with the command documented in docs/dbx-gateway/edge-certificate.md.
+server_spki_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+renew_before_days = 30
+
+[targets.postgres-primary]
+display_name = "PostgreSQL Primary"
+address = "127.0.0.1:5432"
+allow_remote = false

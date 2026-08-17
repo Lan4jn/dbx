@@ -44,6 +44,9 @@ import type {
   SavedSqlLibrary,
   SshConfigHostEntry,
   TunnelProfile,
+  DbxGatewayConfig,
+  GatewayEdgeRoutes,
+  GatewayIdentityMetadata,
 } from "@/types/database";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
@@ -429,6 +432,30 @@ export async function saveTunnelProfiles(profiles: TunnelProfile[]): Promise<voi
 
 export async function testTunnelProfile(profile: TunnelProfile): Promise<string> {
   return post("/api/tunnel-profiles/test", profile);
+}
+
+function gatewayDesktopOnly(): never {
+  throw new Error("DBX Gateway identities are only available in the desktop app.");
+}
+
+export async function importGatewayIdentity(_path: string, _password: string, _name: string): Promise<GatewayIdentityMetadata> {
+  return gatewayDesktopOnly();
+}
+
+export async function listGatewayIdentities(): Promise<GatewayIdentityMetadata[]> {
+  return gatewayDesktopOnly();
+}
+
+export async function deleteGatewayIdentity(_identityId: string): Promise<void> {
+  return gatewayDesktopOnly();
+}
+
+export async function listGatewayRoutes(_profile: DbxGatewayConfig): Promise<GatewayEdgeRoutes[]> {
+  return gatewayDesktopOnly();
+}
+
+export async function testGatewayProfile(_profile: DbxGatewayConfig): Promise<string> {
+  return gatewayDesktopOnly();
 }
 
 export async function resolveSshPrompt(resolution: SshPromptResolution): Promise<void> {

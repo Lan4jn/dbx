@@ -11,6 +11,7 @@ const apiMock = vi.hoisted(() => ({
   installDownloadedUpdate: vi.fn<() => Promise<void>>(),
 }));
 const listenMock = vi.hoisted(() => vi.fn());
+const openMock = vi.hoisted(() => vi.fn());
 const toastMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/backend/api", () => apiMock);
@@ -29,6 +30,9 @@ vi.mock("@/stores/settingsStore", () => ({
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: listenMock,
+}));
+vi.mock("@tauri-apps/plugin-shell", () => ({
+  open: openMock,
 }));
 
 interface Deferred<T> {
@@ -121,6 +125,26 @@ describe("useAppUpdater download attempts", () => {
     expect(apiMock.installDownloadedUpdate).toHaveBeenCalledOnce();
     expect(updater.isDownloadingUpdate.value).toBe(false);
     expect(updater.updateReady.value).toBe(true);
+  });
+
+  it("opens the self-hosted download page", async () => {
+    let updater!: ReturnType<typeof useAppUpdater>;
+    container = document.createElement("div");
+    document.body.append(container);
+    app = createApp(
+      defineComponent({
+        setup() {
+          updater = useAppUpdater();
+          return () => h("div");
+        },
+      }),
+    );
+    app.use(i18n);
+    app.mount(container);
+
+    updater.openLatestRelease();
+
+    await vi.waitFor(() => expect(openMock).toHaveBeenCalledWith("https://ser2.sjser.ccwu.cc:880/dbx/osx/"));
   });
 });
 

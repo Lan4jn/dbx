@@ -1,0 +1,27 @@
+[Unit]
+Description=DBX Main Gateway
+After=network-online.target dbx-gateway-pki.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dbx-gateway
+Group=dbx-gateway
+ExecStart=/usr/bin/dbx-gateway --config /etc/dbx-gateway/main.toml serve
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitCORE=0
+ReadWritePaths=/var/lib/dbx-gateway /run/dbx-gateway
+
+[Install]
+WantedBy=multi-user.target

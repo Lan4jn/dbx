@@ -1,5 +1,6 @@
 use crate::models::connection::TransportLayerConfig;
 
+use super::dbx_gateway::DbxGatewayManager;
 use super::http_tunnel::HttpTunnelManager;
 use super::proxy_tunnel::ProxyTunnelManager;
 use super::ssh_tunnel::TunnelManager;
@@ -13,6 +14,21 @@ struct LayerEndpoint {
 impl LayerEndpoint {
     fn localhost(port: u16) -> Self {
         Self { host: "127.0.0.1".to_string(), port }
+    }
+}
+
+fn layer_endpoint(layer: &TransportLayerConfig) -> LayerEndpoint {
+    match layer {
+        TransportLayerConfig::DbxGateway(gateway) => url::Url::parse(&gateway.main_url)
+            .ok()
+            .and_then(|url| {
+                Some(LayerEndpoint { host: url.host_str()?.to_string(), port: url.port_or_known_default()? })
+            })
+            .unwrap_or_else(|| LayerEndpoint { host: gateway.main_url.clone(), port: 0 }),
+        _ => {
+            let (host, port) = layer.endpoint();
+            LayerEndpoint { host: host.to_string(), port }
+        }
     }
 }
 
@@ -47,6 +63,7 @@ pub async fn start_transport_layers(
     ssh_tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
 ) -> Result<u16, String> {
     start_transport_layers_with_final_ssh_local_port(
         connection_id,
@@ -57,6 +74,7 @@ pub async fn start_transport_layers(
         ssh_tunnels,
         proxy_tunnels,
         http_tunnels,
+        dbx_gateway,
     )
     .await
 }
@@ -70,6 +88,7 @@ pub(crate) async fn start_transport_layers_with_final_ssh_local_port(
     ssh_tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
 ) -> Result<u16, String> {
     start_transport_layers_internal(
         connection_id,
@@ -81,6 +100,7 @@ pub(crate) async fn start_transport_layers_with_final_ssh_local_port(
         ssh_tunnels,
         proxy_tunnels,
         http_tunnels,
+        dbx_gateway,
     )
     .await
 }
@@ -92,12 +112,24 @@ pub(crate) async fn start_transport_layers_with_final_ssh_socks5(
     ssh_tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
 ) -> Result<u16, String> {
     if !matches!(layers.last(), Some(TransportLayerConfig::Ssh(_))) {
         return Err("Dynamic SOCKS5 routing requires SSH as the final transport layer".to_string());
     }
-    start_transport_layers_internal(connection_id, layers, "", 0, None, true, ssh_tunnels, proxy_tunnels, http_tunnels)
-        .await
+    start_transport_layers_internal(
+        connection_id,
+        layers,
+        "",
+        0,
+        None,
+        true,
+        ssh_tunnels,
+        proxy_tunnels,
+        http_tunnels,
+        dbx_gateway,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -111,6 +143,7 @@ async fn start_transport_layers_internal(
     ssh_tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
 ) -> Result<u16, String> {
     if layers.is_empty() {
         return Err("No transport layers configured".to_string());
@@ -126,15 +159,11 @@ async fn start_transport_layers_internal(
     for (index, layer) in layers.iter().enumerate() {
         let layer_id = layer_id(connection_id, index);
         let is_last = index + 1 == layers.len();
-        let (layer_host, layer_port) = layer.endpoint();
-        let connect_endpoint = next_connect_endpoint
-            .clone()
-            .unwrap_or_else(|| LayerEndpoint { host: layer_host.to_string(), port: layer_port });
+        let connect_endpoint = next_connect_endpoint.clone().unwrap_or_else(|| layer_endpoint(layer));
         let target_endpoint = if is_last {
             LayerEndpoint { host: remote_host.to_string(), port: remote_port }
         } else {
-            let (next_host, next_port) = layers[index + 1].endpoint();
-            LayerEndpoint { host: next_host.to_string(), port: next_port }
+            layer_endpoint(&layers[index + 1])
         };
 
         let local_port = match layer {
@@ -204,6 +233,10 @@ async fn start_transport_layers_internal(
                 )
                 .await
                 .map_err(|err| format!("HTTP tunnel layer {} failed: {err}", index + 1))?,
+            TransportLayerConfig::DbxGateway(gateway) => dbx_gateway
+                .start_tunnel(&layer_id, &connect_endpoint.host, connect_endpoint.port, gateway)
+                .await
+                .map_err(|err| format!("DBX Gateway layer {} failed: {err}", index + 1))?,
         };
 
         final_local_port = local_port;
@@ -219,19 +252,28 @@ pub async fn stop_transport_layers(
     ssh_tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
 ) {
     for index in 0..layer_count {
         let layer_id = layer_id(connection_id, index);
         ssh_tunnels.stop_tunnel(&layer_id).await;
         proxy_tunnels.stop_tunnel(&layer_id).await;
         http_tunnels.stop_tunnel(&layer_id).await;
+        dbx_gateway.stop_tunnel(&layer_id).await;
     }
 }
 
 fn validate_transport_layers(layers: &[TransportLayerConfig]) -> Result<(), String> {
+    let gateway_count = layers.iter().filter(|layer| matches!(layer, TransportLayerConfig::DbxGateway(_))).count();
+    if gateway_count > 1 {
+        return Err("Only one DBX Gateway layer is allowed".to_string());
+    }
     for (index, layer) in layers.iter().enumerate() {
         if matches!(layer, TransportLayerConfig::HttpTunnel(_)) && index != 0 {
             return Err("HTTP tunnel must be the first transport layer".to_string());
+        }
+        if matches!(layer, TransportLayerConfig::DbxGateway(_)) && index + 1 != layers.len() {
+            return Err("DBX Gateway must be the final transport layer".to_string());
         }
     }
     Ok(())
@@ -255,6 +297,7 @@ enum PlannedLayerType {
     Ssh,
     Proxy,
     HttpTunnel,
+    DbxGateway,
 }
 
 #[cfg(test)]
@@ -294,19 +337,20 @@ fn plan_transport_layers_with_resolver(
     let mut next_connect_endpoint: Option<(String, u16)> = None;
     for (index, layer) in layers.iter().enumerate() {
         let is_last = index + 1 == layers.len();
-        let (layer_host, layer_port) = layer.endpoint();
+        let own_endpoint = layer_endpoint(layer);
         let (connect_host, connect_port) =
-            next_connect_endpoint.clone().unwrap_or_else(|| (layer_host.to_string(), layer_port));
+            next_connect_endpoint.clone().unwrap_or((own_endpoint.host, own_endpoint.port));
         let (target_host, target_port) = if is_last {
             (remote_host.to_string(), remote_port)
         } else {
-            let (next_host, next_port) = layers[index + 1].endpoint();
-            (next_host.to_string(), next_port)
+            let next = layer_endpoint(&layers[index + 1]);
+            (next.host, next.port)
         };
         let layer_type = match layer {
             TransportLayerConfig::Ssh(_) => PlannedLayerType::Ssh,
             TransportLayerConfig::Proxy(_) => PlannedLayerType::Proxy,
             TransportLayerConfig::HttpTunnel(_) => PlannedLayerType::HttpTunnel,
+            TransportLayerConfig::DbxGateway(_) => PlannedLayerType::DbxGateway,
         };
         planned.push(PlannedTransportLayer {
             layer_type,
@@ -329,7 +373,7 @@ mod tests {
         PlannedTransportLayer,
     };
     use crate::models::connection::{
-        HttpTunnelConfig, ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
+        DbxGatewayConfig, HttpTunnelConfig, ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
     };
 
     fn ssh_layer(id: &str, host: &str, port: u16) -> TransportLayerConfig {
@@ -377,6 +421,23 @@ mod tests {
             url: url.to_string(),
             token: String::new(),
             connect_timeout_secs: 10,
+        })
+    }
+
+    fn gateway_layer(id: &str) -> TransportLayerConfig {
+        TransportLayerConfig::DbxGateway(DbxGatewayConfig {
+            id: id.to_string(),
+            name: String::new(),
+            enabled: true,
+            profile_id: String::new(),
+            main_url: "wss://gateway.example.com/_dbx/client".to_string(),
+            identity_id: "identity-1".to_string(),
+            server_ca_pem: "ca".to_string(),
+            server_spki_sha256: String::new(),
+            connect_timeout_secs: 10,
+            edge_id: "edge-prod-01".to_string(),
+            target_id: "postgres-primary".to_string(),
+            use_as_connection_info: true,
         })
     }
 
@@ -523,5 +584,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn gateway_is_the_final_layer_and_dials_through_the_previous_hop() {
+        let layers = vec![ssh_layer("ssh-a", "bastion-a", 22), gateway_layer("gateway")];
+
+        validate_transport_layers(&layers).unwrap();
+        let planned = plan_transport_layers(&layers, "db.internal", 5432, &[41001, 41002]);
+
+        assert_eq!(planned[0].remote_host, "gateway.example.com");
+        assert_eq!(planned[0].remote_port, 443);
+        assert_eq!(planned[1].layer_type, PlannedLayerType::DbxGateway);
+        assert_eq!(planned[1].connect_host, "127.0.0.1");
+        assert_eq!(planned[1].connect_port, 41001);
+    }
+
+    #[test]
+    fn gateway_before_another_layer_is_rejected() {
+        let error =
+            validate_transport_layers(&[gateway_layer("gateway"), ssh_layer("ssh-a", "bastion-a", 22)]).unwrap_err();
+        assert!(error.contains("final"));
     }
 }

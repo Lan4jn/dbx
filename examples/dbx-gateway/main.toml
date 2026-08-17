@@ -1,0 +1,31 @@
+mode = "main"
+listen = "0.0.0.0:443"
+health_listen = "127.0.0.1:9080"
+state_file = "/var/lib/dbx-gateway/main-state.sqlite3"
+certificate = "/etc/dbx-gateway/certs/main.pem"
+private_key = "/etc/dbx-gateway/certs/main.key"
+edge_ca_certificate = "/etc/dbx-gateway/certs/edge-ca.pem"
+client_ca_certificate = "/etc/dbx-gateway/certs/client-ca.pem"
+edge_path = "/_dbx/edge"
+dbx_path = "/_dbx/client"
+fallback_upstream = "https://www.example.com"
+allowed_edge_ids = ["edge-prod-01"]
+max_connections = 1024
+max_streams_per_edge = 256
+max_streams_per_client = 32
+connection_rate_per_second = 64
+connection_rate_burst = 128
+global_buffer_budget_bytes = 268435456
+tls_handshake_timeout_secs = 10
+http_header_timeout_secs = 10
+
+[client_route_acl]
+desktop-prod = ["edge-prod-01/postgres-primary"]
+
+[enrollment]
+path = "/_dbx/enroll"
+renewal_path = "/_dbx/renew"
+allowed_edge_ids = ["edge-prod-01"]
+
+[enrollment.pki]
+unix_socket = "/run/dbx-gateway/pki.sock"

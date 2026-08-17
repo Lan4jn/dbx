@@ -1,0 +1,8 @@
+data_dir = "/var/lib/dbx-gateway-pki"
+password_file = "/etc/dbx-gateway-pki/password"
+state_file = "/var/lib/dbx-gateway-pki/gateway-state.sqlite3"
+
+[unix]
+path = "/run/dbx-gateway/pki.sock"
+allowed_uid = 991
+allowed_gid = 991

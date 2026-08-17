@@ -1,6 +1,6 @@
 {
   "repository": "t8y2/dbx",
-  "generatedAt": "2026-08-16T18:05:15.456Z",
+  "generatedAt": "2026-08-16T18:36:06.385Z",
   "stars": 15086,
   "contributors": [
     {
@@ -16,16 +16,16 @@
       "login": "zipg",
       "avatarUrl": "https://avatars.githubusercontent.com/u/4047349?v=4",
       "profileUrl": "https://github.com/zipg",
-      "commits": 545,
-      "mergedPullRequests": 546,
+      "commits": 547,
+      "mergedPullRequests": 547,
       "firstContributionAt": "2026-06-22T06:10:59Z",
-      "latestContributionAt": "2026-08-16T17:52:15Z"
+      "latestContributionAt": "2026-08-16T18:09:50Z"
     },
     {
       "login": "eryajf",
       "avatarUrl": "https://avatars.githubusercontent.com/u/33259379?v=4",
       "profileUrl": "https://github.com/eryajf",
-      "commits": 150,
+      "commits": 152,
       "mergedPullRequests": 151,
       "firstContributionAt": "2026-06-08T11:45:45Z",
       "latestContributionAt": "2026-08-16T17:51:19Z"
@@ -362,6 +362,15 @@
       "mergedPullRequests": 3,
       "firstContributionAt": "2026-05-11T05:22:15Z",
       "latestContributionAt": "2026-05-11T14:10:01Z"
+    },
+    {
+      "login": "q396921921",
+      "avatarUrl": "https://avatars.githubusercontent.com/u/37297228?v=4",
+      "profileUrl": "https://github.com/q396921921",
+      "commits": 6,
+      "mergedPullRequests": 9,
+      "firstContributionAt": "2026-07-20T13:41:21Z",
+      "latestContributionAt": "2026-08-12T18:12:10Z"
     },
     {
       "login": "dbin0123",

@@ -29,6 +29,11 @@ describe("tunnelProfileSummary", () => {
     expect(tunnelProfileSummary(http)).toBe("https://example.com/dbx_tunnel.php");
   });
 
+  it("returns the Main URL for gateway profiles", () => {
+    const gateway = { ...createTunnelProfile("dbx_gateway"), main_url: "wss://gateway.example.com/_dbx/client" } as TunnelProfile;
+    expect(tunnelProfileSummary(gateway)).toBe("wss://gateway.example.com/_dbx/client");
+  });
+
   it("returns an empty string when the target is not configured yet", () => {
     expect(tunnelProfileSummary(createTunnelProfile("ssh"))).toBe("");
   });
@@ -86,6 +91,21 @@ describe("tunnelProfileReferenceLayer", () => {
     const stub = tunnelProfileReferenceLayer(sshProfile());
     expect(stub.id).toBeTruthy();
     expect(stub.enabled).toBe(true);
+  });
+
+  it("preserves a gateway connection route", () => {
+    const profile = { ...createTunnelProfile("dbx_gateway"), id: "gateway-profile" } as TunnelProfile;
+    const stub = tunnelProfileReferenceLayer(profile, {
+      id: "gateway-layer",
+      enabled: true,
+      edge_id: "edge-1",
+      target_id: "postgres-primary",
+    });
+
+    expect(stub.type).toBe("dbx_gateway");
+    if (stub.type !== "dbx_gateway") throw new Error("expected gateway layer");
+    expect(stub.edge_id).toBe("edge-1");
+    expect(stub.target_id).toBe("postgres-primary");
   });
 });
 

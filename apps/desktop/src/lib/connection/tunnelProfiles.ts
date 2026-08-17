@@ -1,5 +1,6 @@
 import { uuid } from "@/lib/common/utils";
 import type { TransportLayerConfig, TunnelProfile } from "@/types/database";
+import { createDbxGatewayProfile, gatewayProfileReferenceLayer, type GatewayLayerRoute } from "@/lib/connection/gatewayProfiles";
 
 export type TunnelProfileType = TunnelProfile["type"];
 
@@ -27,6 +28,7 @@ export function createTunnelProfileTestGuard(): TunnelProfileTestGuard {
 }
 
 export function createTunnelProfile(type: TunnelProfileType): TunnelProfile {
+  if (type === "dbx_gateway") return createDbxGatewayProfile();
   if (type === "proxy") {
     return {
       type: "proxy",
@@ -71,6 +73,7 @@ export function createTunnelProfile(type: TunnelProfileType): TunnelProfile {
 }
 
 export function tunnelProfileSummary(profile: TunnelProfile): string {
+  if (profile.type === "dbx_gateway") return profile.main_url || "";
   if (profile.type === "ssh") {
     if (!profile.host) return "";
     const user = profile.user ? `${profile.user}@` : "";
@@ -93,7 +96,8 @@ export function layerReferencesProfile(layer: TransportLayerConfig): boolean {
  * the backend swaps in the profile's full configuration at connect time, and
  * keeping credentials out of the stub avoids stale copies.
  */
-export function tunnelProfileReferenceLayer(profile: TunnelProfile, previous?: Pick<TransportLayerConfig, "id" | "enabled">): TransportLayerConfig {
+export function tunnelProfileReferenceLayer(profile: TunnelProfile, previous?: GatewayLayerRoute): TransportLayerConfig {
+  if (profile.type === "dbx_gateway") return gatewayProfileReferenceLayer(profile, previous);
   const stub = createTunnelProfile(profile.type);
   stub.id = previous?.id || stub.id;
   stub.enabled = previous?.enabled !== false;
@@ -109,6 +113,18 @@ export function tunnelProfileReferenceLayer(profile: TunnelProfile, previous?: P
 export function detachTunnelProfileLayer(layer: TransportLayerConfig, profile: TunnelProfile | undefined): TransportLayerConfig {
   if (!profile) {
     const detached = { ...layer };
+    delete detached.profile_id;
+    return detached;
+  }
+  if (layer.type === "dbx_gateway" && profile.type === "dbx_gateway") {
+    const detached = {
+      ...profile,
+      id: layer.id,
+      enabled: layer.enabled !== false,
+      edge_id: layer.edge_id,
+      target_id: layer.target_id,
+      use_as_connection_info: layer.use_as_connection_info,
+    };
     delete detached.profile_id;
     return detached;
   }

@@ -580,6 +580,55 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" "$ASSET" "$CHECKSUM" \
             --repo "${GITHUB_REPOSITORY}" --clobber
 
+  gateway-release:
+    needs: release-ready
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
+
+      - name: Verify gateway
+        run: cargo test -p dbx-gateway --all-targets
+
+      - name: Build static gateway binaries
+        run: cargo zigbuild --release -p dbx-gateway --target ${{ matrix.target }}
+
+      - name: Package and verify gateway
+        env:
+          DBX_GATEWAY_TARGET: ${{ matrix.target }}
+        run: |
+          chmod +x scripts/package-gateway.sh scripts/verify-gateway-package.sh
+          scripts/package-gateway.sh
+          scripts/verify-gateway-package.sh dist-gateway/DBX_Gateway_*.tar.gz
+
+      - name: Upload gateway release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dbx-gateway") | .version')"
+          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "Release tag version $VERSION does not match dbx-gateway package version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" dist-gateway/DBX_Gateway_*.tar.gz dist-gateway/DBX_Gateway_*.tar.gz.sha256 \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
   cleanup-release-signatures:
     needs: [build, build-windows-7-offline]
     runs-on: ubuntu-latest
@@ -670,7 +719,7 @@ jobs:
   publish:
     # Keep the release as a draft until every release-blocking platform job passes.
     # Nix packaging is advisory and runs independently from publication.
-    needs: [cleanup-release-signatures, docker-manifest, jdbc-plugin, static-browser]
+    needs: [cleanup-release-signatures, docker-manifest, gateway-release, jdbc-plugin, static-browser]
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release

@@ -14,6 +14,8 @@ interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
 }
 
+const SELF_HOSTED_DOWNLOAD_URL = "https://ser2.sjser.ccwu.cc:880/dbx/osx/";
+
 export function shouldOpenUpdateDialog(options: { silent?: boolean }) {
   return options.silent !== true;
 }
@@ -85,16 +87,11 @@ export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDow
 }
 
 export function tagVersion(version: string): string {
-  const trimmed = version.trim();
-  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+  return version.startsWith("v") ? version : `v${version}`;
 }
 
-export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unknown, fallbackUrl: string): string {
-  const normalizedSource = normalizeUpdateDownloadSource(source);
-  if (normalizedSource === "cnb" && info?.latest_version) {
-    return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
-  }
-  return info?.release_url || fallbackUrl;
+export function resolveUpdateReleaseUrl(_info: api.UpdateInfo | null, _source: SettingsUpdateDownloadSource, _fallbackUrl: string): string {
+  return SELF_HOSTED_DOWNLOAD_URL;
 }
 
 export async function resolveUpdaterProxy(): Promise<string | undefined> {
@@ -124,7 +121,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const isIgnoringUpdate = ref(false);
   const activeTaskCount = computed(() => Math.max(0, Math.trunc(options.getActiveTaskCount?.() ?? 0)));
   const hasUpdateAvailable = computed(() => updateInfo.value?.update_available === true && !isUpdateIgnored(updateInfo.value, settingsStore.editorSettings.ignoredUpdateVersion));
-  const latestReleaseUrl = "https://github.com/t8y2/dbx/releases/latest";
+  const latestReleaseUrl = SELF_HOSTED_DOWNLOAD_URL;
   let activeDownloadAttempt = 0;
   let pendingCancellation: Promise<void> | undefined;
 
@@ -176,8 +173,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   }
 
   function openLatestRelease() {
-    const url = resolveUpdateReleaseUrl(updateInfo.value, settingsStore.editorSettings.updateDownloadSource, latestReleaseUrl);
-    openUrl(url);
+    openUrl(latestReleaseUrl);
   }
 
   async function ignoreCurrentVersion() {

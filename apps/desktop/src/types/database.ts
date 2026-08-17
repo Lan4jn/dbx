@@ -230,7 +230,7 @@ export interface ConnectionTestResult {
   databaseInfo?: DatabaseConnectionInfo;
 }
 
-export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
+export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig) | ({ type: "dbx_gateway" } & DbxGatewayConfig);
 
 /**
  * A shared tunnel configuration managed in Settings > Tunnels. Structurally a
@@ -308,6 +308,41 @@ export interface HttpTunnelConfig {
   connect_timeout_secs?: number;
   /** See {@link SshTunnelConfig.profile_id}. */
   profile_id?: string;
+}
+
+export interface DbxGatewayConfig {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  profile_id?: string;
+  main_url: string;
+  identity_id: string;
+  server_ca_pem: string;
+  server_spki_sha256: string;
+  connect_timeout_secs?: number;
+  edge_id: string;
+  target_id: string;
+  /** Use the selected Edge route instead of the connection host and port. */
+  use_as_connection_info?: boolean;
+}
+
+export interface GatewayIdentityMetadata {
+  id: string;
+  name: string;
+  subject: string;
+  expires_at: string;
+  fingerprint_sha256: string;
+}
+
+export interface GatewayRoute {
+  target_id: string;
+  display_name: string;
+}
+
+export interface GatewayEdgeRoutes {
+  edge_id: string;
+  online: boolean;
+  routes: GatewayRoute[];
 }
 
 export interface AttachedDatabaseConfig {

@@ -78,6 +78,62 @@ describe("connectionAttemptTimeout", () => {
     ).toBe(27_000);
   });
 
+  it("includes DBX Gateway connection timeout values", () => {
+    expect(
+      connectionAttemptTimeoutMs({
+        db_type: "mysql",
+        connect_timeout_secs: 5,
+        transport_layers: [
+          {
+            type: "dbx_gateway",
+            id: "gateway",
+            main_url: "wss://gateway.example.com/_dbx/client",
+            identity_id: "identity-1",
+            server_ca_pem: "ca",
+            server_spki_sha256: "",
+            connect_timeout_secs: 35,
+            edge_id: "edge-1",
+            target_id: "mysql-primary",
+          },
+        ],
+      }),
+    ).toBe(47_000);
+  });
+
+  it("uses the resolved shared Gateway profile timeout", () => {
+    const profile = {
+      type: "dbx_gateway" as const,
+      id: "gateway-profile",
+      main_url: "wss://gateway.example.com/_dbx/client",
+      identity_id: "identity-1",
+      server_ca_pem: "ca",
+      server_spki_sha256: "",
+      connect_timeout_secs: 45,
+      edge_id: "",
+      target_id: "",
+    };
+
+    expect(
+      connectionAttemptTimeoutMs(
+        {
+          db_type: "mysql",
+          connect_timeout_secs: 5,
+          transport_layers: [
+            {
+              ...profile,
+              id: "gateway-layer",
+              profile_id: profile.id,
+              connect_timeout_secs: 10,
+              edge_id: "edge-1",
+              target_id: "mysql-primary",
+            },
+          ],
+        },
+        (profileId) => (profileId === profile.id ? profile : undefined),
+      ),
+    ).toBe(57_000);
+  });
+
   it("uses resolved shared SSH profile settings instead of reference stub defaults", () => {
     const profile = {
       type: "ssh" as const,

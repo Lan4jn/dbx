@@ -31,6 +31,7 @@ const APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY: &str = "saved_sql_editor_positio
 const APP_STATE_TRANSFER_TASK_LIBRARY_KEY: &str = "transfer_task_library";
 const MCP_GLOBAL_POLICY_KEY: &str = "mcp_global_policy";
 const MAX_RETRIES_KEY: &str = "max_retries";
+const GATEWAY_IDENTITIES_KEY: &str = "gateway_identities_v1";
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
 const SNIPPET_SYNC_IDS_KEY: &str = "snippet_sync_ids";
@@ -429,6 +430,40 @@ const SCHEMA_STATEMENTS: &[&str] = &[
 ];
 
 impl Storage {
+    pub async fn save_gateway_identity_metadata(
+        &self,
+        identities: &[crate::db::dbx_gateway::GatewayIdentityMetadata],
+    ) -> Result<(), String> {
+        let identities = serde_json::to_value(identities).map_err(|error| error.to_string())?;
+        self.with_conn(move |conn| {
+            let current: Option<String> = conn
+                .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let mut settings = match current {
+                Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+                    .map_err(|error| format!("invalid app settings JSON: {error}"))?,
+                None => serde_json::Map::new(),
+            };
+            settings.insert(GATEWAY_IDENTITIES_KEY.to_string(), identities);
+            let json = serde_json::Value::Object(settings).to_string();
+            conn.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [json])
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_gateway_identity_metadata(
+        &self,
+    ) -> Result<Vec<crate::db::dbx_gateway::GatewayIdentityMetadata>, String> {
+        let settings = self.load_app_settings_json().await?;
+        let Some(value) = settings.get(GATEWAY_IDENTITIES_KEY) else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_value(value.clone()).map_err(|error| format!("invalid Gateway identity metadata: {error}"))
+    }
+
     pub async fn open(db_path: &Path) -> Result<Self, String> {
         let path = db_path.to_path_buf();
         let db_path = db_path.to_string_lossy().to_string();
@@ -692,6 +727,7 @@ fn scrub_transport_layer_secrets(config: &mut ConnectionConfig) {
             TransportLayerConfig::HttpTunnel(http) => {
                 http.token.clear();
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
 }
@@ -1427,7 +1463,7 @@ impl Storage {
                 .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let dedicated_keys = [MCP_GLOBAL_POLICY_KEY, MAX_RETRIES_KEY];
+            let dedicated_keys = [MCP_GLOBAL_POLICY_KEY, MAX_RETRIES_KEY, GATEWAY_IDENTITIES_KEY];
             for key in dedicated_keys {
                 settings.remove(key);
             }
@@ -2271,6 +2307,7 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
                     &http.token,
                 )?;
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
     persist_secret_in_tx(tx, &config.id, "redis_sentinel_password", &config.redis_sentinel_password)?;
@@ -2709,7 +2746,9 @@ impl Storage {
                                 TransportLayerConfig::Ssh(layer) => {
                                     self.get_secret(&id, &ssh_tunnel_password_key(index, layer)).await?
                                 }
-                                TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => None,
+                                TransportLayerConfig::Proxy(_)
+                                | TransportLayerConfig::HttpTunnel(_)
+                                | TransportLayerConfig::DbxGateway(_) => None,
                             })
                             .unwrap_or_default();
                         ssh.key_passphrase = self
@@ -2722,7 +2761,9 @@ impl Storage {
                                 TransportLayerConfig::Ssh(layer) => {
                                     self.get_secret(&id, &ssh_tunnel_key_passphrase_key(index, layer)).await?
                                 }
-                                TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => None,
+                                TransportLayerConfig::Proxy(_)
+                                | TransportLayerConfig::HttpTunnel(_)
+                                | TransportLayerConfig::DbxGateway(_) => None,
                             })
                             .unwrap_or_default();
                     }
@@ -2744,6 +2785,7 @@ impl Storage {
                             .await?
                             .unwrap_or_default();
                     }
+                    TransportLayerConfig::DbxGateway(_) => {}
                 }
             }
             config.redis_sentinel_password = self.get_secret(&id, "redis_sentinel_password").await?.unwrap_or_default();
@@ -5382,6 +5424,25 @@ mod tests {
         storage.save_app_settings_json(&stale_settings).await.unwrap();
 
         assert_eq!(storage.load_max_retries().await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_metadata_survives_stale_app_settings_save() {
+        let path = temp_db_path("gateway-identities-stale-save");
+        let storage = Storage::open(&path).await.unwrap();
+        let stale_settings = storage.load_app_settings_json().await.unwrap();
+        let identities = vec![crate::db::dbx_gateway::GatewayIdentityMetadata {
+            id: "identity-1".to_string(),
+            name: "Production".to_string(),
+            subject: "CN=desktop".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            fingerprint_sha256: "11".repeat(32),
+        }];
+
+        storage.save_gateway_identity_metadata(&identities).await.unwrap();
+        storage.save_app_settings_json(&stale_settings).await.unwrap();
+
+        assert_eq!(storage.load_gateway_identity_metadata().await.unwrap(), identities);
     }
 
     #[tokio::test]

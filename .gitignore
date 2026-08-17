@@ -81,5 +81,8 @@ DBX_*_x64-portable.zip
 dbx-devtest-connections.json
 .npmrc
 
+# Local Git worktrees
+/.worktrees/
+
 # Real database integration credentials (see docs/TEST_ENVIRONMENTS.md)
 /docs/TEST_ENVIRONMENTS.md

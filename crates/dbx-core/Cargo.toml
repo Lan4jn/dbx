@@ -68,7 +68,14 @@ cbc = "0.1"
 argon2 = "0.5"
 sha2 = "0.10"
 async-trait = "0.1"
+zeroize = { version = "1", features = ["derive"] }
 bytes = "1"
+dbx-gateway = { path = "../dbx-gateway", default-features = false }
+hex = "0.4"
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+url = "2"
+x509-parser = "0.18"
 font-kit = { version = "0.14.3", optional = true }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 flate2 = "1"
@@ -86,4 +93,7 @@ tempfile = "3"
 iana-time-zone = "0.1"
 
 [dev-dependencies]
+dbx-gateway = { path = "../dbx-gateway", features = ["server"] }
 mysql_common = { git = "https://github.com/t8y2/rust_mysql_common.git", rev = "47740d85a8277167a5717afac785d37b46a36296", default-features = false }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"

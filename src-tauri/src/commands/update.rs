@@ -13,9 +13,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 #[cfg(any(feature = "legacy-native-window-decorations", target_vendor = "win7"))]
-const OFFICIAL_UPDATE_ENDPOINTS: [&str; 1] = ["https://server.sjserver.fun:880/dbx/legacy/latest.json"];
+const OFFICIAL_UPDATE_ENDPOINTS: [&str; 1] = ["https://ser2.sjser.ccwu.cc:880/dbx/osx/latest.json"];
 #[cfg(not(any(feature = "legacy-native-window-decorations", target_vendor = "win7")))]
-const OFFICIAL_UPDATE_ENDPOINTS: [&str; 1] = ["https://server.sjserver.fun:880/dbx/modern/latest.json"];
+const OFFICIAL_UPDATE_ENDPOINTS: [&str; 1] = ["https://ser2.sjser.ccwu.cc:880/dbx/osx/latest.json"];
 const R2_LATEST_RELEASE_DOWNLOAD_PREFIX: &str = "https://dl.dbxio.com/releases/latest/";
 const CNB_RELEASE_DOWNLOAD_PREFIX: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/download/";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/t8y2/dbx/releases/download/";
