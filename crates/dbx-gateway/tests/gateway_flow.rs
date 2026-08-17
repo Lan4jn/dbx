@@ -444,10 +444,10 @@ async fn client_discovers_online_logical_routes_without_database_addresses() {
 #[tokio::test]
 async fn client_discovers_same_target_id_on_multiple_edges() {
     let mut fixture = Fixture::new();
-    fixture.config.client_route_acl.insert(
-        "desktop-routes".to_string(),
-        vec!["edge-a/postgres".to_string(), "edge-b/postgres".to_string()],
-    );
+    fixture
+        .config
+        .client_route_acl
+        .insert("desktop-routes".to_string(), vec!["edge-a/postgres".to_string(), "edge-b/postgres".to_string()]);
     let gateway = fixture.start().await;
     let edge_a = EdgeGateway::start(fixture.edge_config(gateway.local_addr(), "edge-a")).unwrap();
     let edge_b = EdgeGateway::start(fixture.edge_config(gateway.local_addr(), "edge-b")).unwrap();

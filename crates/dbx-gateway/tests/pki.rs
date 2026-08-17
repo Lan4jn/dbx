@@ -72,11 +72,7 @@ fn online_edge_store_does_not_require_root_server_or_client_private_keys() {
     let csr = CertificateParams::default().serialize_request(&key).unwrap();
     let issued = store
         .issue_edge(
-            EdgeIssueRequest {
-                edge_id: "edge-online-01",
-                csr_der: csr.der(),
-                validity: time::Duration::days(30),
-            },
+            EdgeIssueRequest { edge_id: "edge-online-01", csr_der: csr.der(), validity: time::Duration::days(30) },
             &password,
         )
         .unwrap();
