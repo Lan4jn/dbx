@@ -1,5 +1,7 @@
 # Main Gateway 部署
 
+本页的可执行步骤只覆盖同机 Unix Socket：Main 与在线 PKI 必须位于同一主机。远程 RA mTLS 仅是高级配置能力，当前手册未提供其专用 CA 和双方证书签发流程。
+
 Main 是公网入口、客户端与 Edge 的身份验证点及透明字节中继。Main 会看到数据库协议明文，因此主机应使用最小管理员范围、磁盘加密、审计和严格出站规则。
 
 DBX 用户身份的单独签发与交付步骤见 [DBX Client 证书生成与交付](client-certificate.md)，Edge 身份见 [Edge 节点证书生成与领取](edge-certificate.md)。
@@ -14,7 +16,7 @@ useradd --system --gid dbx-gateway --home-dir /var/lib/dbx-gateway --shell /usr/
 install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway /etc/dbx-gateway/certs
 install -d -o dbx-gateway -g dbx-gateway -m 0750 /var/lib/dbx-gateway /run/dbx-gateway
 install -m 0755 bin/dbx-gateway /usr/bin/dbx-gateway
-install -m 0644 examples/main.toml /etc/dbx-gateway/main.toml
+install -o root -g dbx-gateway -m 0640 examples/main.toml /etc/dbx-gateway/main.toml
 ```
 
 若用户或目录已存在，命令会提示冲突；核对其 UID、GID、home 和 shell 后跳过对应创建命令，不要删除已有数据目录。
@@ -78,7 +80,7 @@ install -o root -g dbx-gateway -m 0644 client-ca.crt.pem /etc/dbx-gateway/certs/
 sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
 ```
 
-预期 `configuration is valid`。端口低于 1024 时，可由 systemd 添加最小的 `AmbientCapabilities=CAP_NET_BIND_SERVICE`，或把 Main 监听改为 `8443` 并由防火墙做端口重定向；不要以 root 运行 Main。
+预期 `configuration is valid`。随包提供的 Main systemd unit 只授予 `CAP_NET_BIND_SERVICE`，因此非 root 的 `dbx-gateway` 用户可以绑定默认 `443`。若自定义 unit，必须保留 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 和 `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`，或把 Main 改为监听 `8443` 并由防火墙做端口重定向；不要以 root 运行 Main。
 
 ## HTTPS 回退
 
@@ -133,7 +135,7 @@ journalctl -u dbx-gateway-main.service -n 50 --no-pager
 
 预期新配置原子生效，不再允许新会话，受影响控制和数据通道关闭。若日志出现 `restart_required` 或配置错误，旧配置继续运行；先修正并再次发送 HUP。
 
-防火墙只需允许公网到 Main `443/tcp`；健康端口 `127.0.0.1:9080` 不对外开放。Main 到数据库网段不需要路由，Main 到 PKI 只允许 Unix Socket，分机部署时仅允许 PKI RA mTLS 端口。
+防火墙只需允许公网到 Main `443/tcp`；健康端口 `127.0.0.1:9080` 不对外开放。Main 到数据库网段不需要路由；按本页同机流程，Main 到 PKI 只使用 Unix Socket，不开放 PKI TCP 端口。
 
 ## systemd
 
@@ -168,16 +170,17 @@ curl -fsS http://127.0.0.1:9080/healthz
 在 Main 主机以 `root` 升级：
 
 ```bash
-sha256sum -c DBX_Gateway_0.5.83_x64.tar.gz.sha256
-tar -xzf DBX_Gateway_0.5.83_x64.tar.gz
+VERSION=0.5.83
+sha256sum -c DBX_Gateway_${VERSION}_x64.tar.gz.sha256
+tar -xzf DBX_Gateway_${VERSION}_x64.tar.gz
 /usr/bin/dbx-gateway --version > /var/lib/dbx-gateway/previous-version.txt
 cp /usr/bin/dbx-gateway /var/lib/dbx-gateway/dbx-gateway.previous
-install -m 0755 DBX_Gateway_0.5.83_x64/bin/dbx-gateway /usr/bin/dbx-gateway
+install -m 0755 DBX_Gateway_${VERSION}_x64/bin/dbx-gateway /usr/bin/dbx-gateway
 sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
 systemctl restart dbx-gateway-main.service
 ```
 
-预期 checksum 成功、版本为 `0.5.75`、服务恢复 active。升级会中断活动隧道，安排维护窗口。
+预期 checksum 成功、程序报告版本为 `${VERSION}`、服务恢复 active。升级会中断活动隧道，安排维护窗口。
 
 若新版本无法启动，立即回滚：
 

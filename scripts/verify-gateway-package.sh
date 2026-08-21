@@ -31,8 +31,11 @@ required_paths=(
   systemd/dbx-gateway-edge.service
   systemd/dbx-gateway-pki.service
   docs/dbx-gateway.md
+  docs/dbx-gateway/deployment-manual.md
   docs/dbx-gateway/main-gateway.md
   docs/dbx-gateway/edge-gateway.md
+  docs/dbx-gateway/edge-certificate.md
+  docs/dbx-gateway/client-certificate.md
   docs/dbx-gateway/local-database-targets.md
   docs/dbx-gateway/pki.md
   docs/dbx-gateway/configuration.md
@@ -57,6 +60,8 @@ require_heading() {
 require_heading docs/dbx-gateway.md "## 信任边界"
 require_heading docs/dbx-gateway.md "## 网络拓扑"
 require_heading docs/dbx-gateway.md "## 文档入口"
+require_heading docs/dbx-gateway/deployment-manual.md "## 2. 部署准备"
+require_heading docs/dbx-gateway/deployment-manual.md "## 14. 备份和升级"
 require_heading docs/dbx-gateway/main-gateway.md "## 安装"
 require_heading docs/dbx-gateway/main-gateway.md "## HTTPS 回退"
 require_heading docs/dbx-gateway/main-gateway.md "## ACL"
@@ -65,6 +70,8 @@ require_heading docs/dbx-gateway/main-gateway.md "## 升级与回滚"
 require_heading docs/dbx-gateway/edge-gateway.md "## 令牌领证"
 require_heading docs/dbx-gateway/edge-gateway.md "## 本地目标"
 require_heading docs/dbx-gateway/edge-gateway.md "## 重连与迁移"
+require_heading docs/dbx-gateway/edge-certificate.md "## 更换或重建 Edge 身份"
+require_heading docs/dbx-gateway/client-certificate.md "## 7. 遗失、替换和撤销"
 require_heading docs/dbx-gateway/local-database-targets.md "## 关系型数据库"
 require_heading docs/dbx-gateway/local-database-targets.md "## 多节点与多端口限制"
 require_heading docs/dbx-gateway/pki.md "## 离线 Root CA"
@@ -97,5 +104,9 @@ for unit in "$runtime_dir"/systemd/*.service; do
   grep -q '^LimitCORE=0$' "$unit"
   grep -q '^ReadWritePaths=' "$unit"
 done
+
+main_unit="$runtime_dir/systemd/dbx-gateway-main.service"
+grep -q '^AmbientCapabilities=CAP_NET_BIND_SERVICE$' "$main_unit"
+grep -q '^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$' "$main_unit"
 
 echo "gateway package verification passed: $tarball"

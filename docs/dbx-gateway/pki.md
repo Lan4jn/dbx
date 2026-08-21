@@ -1,5 +1,7 @@
 # PKI 与证书运维
 
+本页的可执行步骤只覆盖同机 Unix Socket：在线 PKI 与 Main 必须位于同一主机。远程 RA mTLS 的配置字段不是完整部署步骤，缺少专用证书体系时不要启用远程监听。
+
 DBX Gateway 使用角色隔离证书：Server 证书只用于 Main 服务端，DBX Client 和 Edge 都是 `clientAuth`，并分别由 Client CA 与 Edge CA 签发。证书身份放在唯一 URI SAN 中，不能仅靠 CN 冒用。
 
 ## 离线 Root CA
@@ -31,16 +33,18 @@ Root CA 有效期长于三个中间 CA。叶证书有效期不能超过签发中
 
 本节只部署用于 Edge 自动领证的在线 CA。Edge 节点实际领证步骤见 [Edge 节点证书生成与领取](edge-certificate.md)，DBX 用户身份签发见 [DBX Client 证书生成与交付](client-certificate.md)。
 
-先在在线 PKI 主机以 `root` 创建用户和目录：
+Main 与在线 PKI 同机，因此这里同时创建两个服务用户。若组或用户已由 Main 安装步骤创建，先用 `getent group dbx-gateway` 和 `getent passwd <用户名>` 核对 GID、home 与 shell，再跳过对应创建命令；不要删除或重建已有账户。
+
+然后在在线 PKI 主机以 `root` 创建尚不存在的用户和目录：
 
 ```bash
 groupadd --system dbx-gateway
-useradd --system --home-dir /var/lib/dbx-gateway-pki --shell /usr/sbin/nologin dbx-gateway-pki
-usermod -a -G dbx-gateway dbx-gateway-pki
-install -d -o root -g dbx-gateway-pki -m 0750 /etc/dbx-gateway-pki
-install -d -o dbx-gateway-pki -g dbx-gateway-pki -m 0700 /var/lib/dbx-gateway-pki
+useradd --system --gid dbx-gateway --home-dir /var/lib/dbx-gateway --shell /usr/sbin/nologin dbx-gateway
+useradd --system --gid dbx-gateway --home-dir /var/lib/dbx-gateway-pki --shell /usr/sbin/nologin dbx-gateway-pki
+install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway-pki
+install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 /var/lib/dbx-gateway-pki
 install -m 0755 bin/dbx-gateway-pki /usr/bin/dbx-gateway-pki
-install -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
+install -o root -g dbx-gateway -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
 ```
 
 从离线主机通过加密介质只导出以下三个文件：
@@ -54,14 +58,14 @@ install -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
 假设加密介质在在线主机挂载为 `/mnt/secure-transfer`，执行：
 
 ```bash
-install -d -o dbx-gateway-pki -g dbx-gateway-pki -m 0700 /var/lib/dbx-gateway-pki/edge
-install -o dbx-gateway-pki -g dbx-gateway-pki -m 0644 \
+install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 /var/lib/dbx-gateway-pki/edge
+install -o dbx-gateway-pki -g dbx-gateway -m 0644 \
   /mnt/secure-transfer/edge/ca.crt.pem \
   /var/lib/dbx-gateway-pki/edge/ca.crt.pem
-install -o dbx-gateway-pki -g dbx-gateway-pki -m 0600 \
+install -o dbx-gateway-pki -g dbx-gateway -m 0600 \
   /mnt/secure-transfer/edge/ca.key.encrypted.pem \
   /var/lib/dbx-gateway-pki/edge/ca.key.encrypted.pem
-install -o dbx-gateway-pki -g dbx-gateway-pki -m 0600 \
+install -o dbx-gateway-pki -g dbx-gateway -m 0600 \
   /mnt/secure-transfer/dbx-pki-password \
   /etc/dbx-gateway-pki/password
 ```
@@ -86,7 +90,7 @@ systemctl enable --now dbx-gateway-pki.service
 systemctl status dbx-gateway-pki.service --no-pager
 ```
 
-预期 `/run/dbx-gateway/pki.sock` 为 `0660`，只有配置的 Main UID/GID 可调用。远程部署必须使用 RA mTLS，并在 `allowed_ra_uri_sans` 中固定 Main RA 身份；不要把在线 PKI 暴露为普通 HTTPS 签发 API。
+预期 `/run/dbx-gateway/pki.sock` 为 `0660`，只有配置的 Main UID/GID 可调用。按本页流程不要启用 TCP 监听，也不要把在线 PKI 暴露为普通 HTTPS 签发 API；远程 RA mTLS 只能在另有完整证书生命周期方案时部署。
 
 ## DBX Client PKCS#12
 
@@ -105,7 +109,7 @@ dbx-gateway-pki client issue \
   --output-dir /secure/export/desktop-admin-01
 ```
 
-预期输出 `issued client certificate <serial>`，导出目录包含 `certificate.pem`、`chain.pem`、`private-key.pem` 和 `client.p12`。把 `client.p12` 与密码分渠道交付给 DBX 用户，导入后删除传输副本。遗失设备时按 Client 角色吊销对应 serial，并重新签发新 identity 或新证书。
+预期输出 `issued client certificate <serial>`，导出目录包含 `certificate.pem`、`chain.pem`、`private-key.pem` 和 `client.p12`。把 `client.p12` 与密码分渠道交付给 DBX 用户，导入后删除传输副本。设备遗失时必须从 Main ACL 删除旧 identity、重启 Main，并使用新的 Client identity 签发替代证书；不能只重签相同 identity。
 
 ### 导入 DBX 桌面端
 
@@ -134,19 +138,38 @@ Edge 在证书到期前 `renew_before_days`（默认 30 天）用当前 mTLS 身
 手工吊销 Edge，在在线 PKI 主机以 `dbx-gateway-pki` 用户执行：
 
 ```bash
-dbx-gateway-pki edge revoke \
+sudo -u dbx-gateway-pki dbx-gateway-pki edge revoke \
   --data-dir /var/lib/dbx-gateway-pki \
   --password-file /etc/dbx-gateway-pki/password \
+  --state-file /var/lib/dbx-gateway-pki/gateway-state.sqlite3 \
   --serial REPLACE_WITH_EDGE_SERIAL \
   --reason key_compromise
 ```
 
-预期输出 `revoked edge certificate; CRL number <n>`，并原子更新签发记录和 `edge/crl.pem`。将规范化 serial 加入 Main 的 `revoked_edge_serials`，验证配置后向 Main 发送 HUP；对应控制和数据通道会关闭。保留 CRL 作为审计和向其他验证器分发的标准文件。
+`--state-file` 必须与在线 `pki.toml` 完全一致，用于同时阻止该证书续期。预期输出 `revoked edge certificate; CRL number <n>`，并更新签发记录、`edge/crl.pem` 和在线状态。Main 当前不会自动读取 `edge/crl.pem`，因此还必须在 `/etc/dbx-gateway/main.toml` 顶层加入规范化 serial：
+
+```toml
+revoked_edge_serials = ["REPLACE_WITH_NORMALIZED_EDGE_SERIAL"]
+```
+
+在 Main 主机验证并重载：
+
+```bash
+sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
+systemctl kill -s HUP dbx-gateway-main.service
+journalctl -u dbx-gateway-main.service -n 50 --no-pager
+```
+
+成功重载后，对应控制和数据通道会关闭。保留 CRL 作为审计和向其他验证器分发的标准文件，但它不能代替 Main blocklist。
+
+若命令报告 CRL 已更新但在线 revocation state 未更新，当前处于部分提交状态：Main blocklist 步骤仍要执行，并且必须用完全相同的参数重试，直到 SQLite 更新成功。重复使用同一 serial 和 reason 是幂等恢复路径；不要改 reason，也不要删除 CRL、签发记录或 SQLite 行。
+
+Main 当前不读取 Client CRL，也没有 Client serial 吊销列表。`dbx-gateway-pki client revoke` 只能更新离线 PKI 的签发记录和 Client CRL；要阻断遗失的客户端，必须从 Main ACL 移除旧 Client identity、为替代证书使用新 identity，并重启 Main 终止既有会话。具体步骤见 [DBX Client 证书生成与交付](client-certificate.md)。
 
 一次性令牌可在未消费前撤销：
 
 ```bash
-dbx-gateway-pki enrollment revoke \
+sudo -u dbx-gateway-pki dbx-gateway-pki enrollment revoke \
   --data-dir /var/lib/dbx-gateway-pki \
   --token-id REPLACE_WITH_TOKEN_UUID
 ```
@@ -155,13 +178,15 @@ dbx-gateway-pki enrollment revoke \
 
 ## 备份与恢复
 
-离线备份应包含完整 `/secure/dbx-gateway-pki-offline`、密码的独立密封副本、签发清单和恢复说明。在线备份包含：
+离线备份应包含完整 `/secure/dbx-gateway-pki-offline`、密码的独立密封副本、签发清单和恢复说明。在线备份集包含下列文件以及单独密封保存的同一 CA 密码；密码不要放进在线数据压缩包：
 
 ```text
 /var/lib/dbx-gateway-pki/edge
 /var/lib/dbx-gateway-pki/gateway-state.sqlite3
 /etc/dbx-gateway-pki/pki.toml
 ```
+
+如果 `pki.toml` 的 `state_file` 位于 `/var/lib/dbx-gateway-pki` 之外，下面的默认压缩命令不会包含它。必须把该文件单独加入同一时间点的备份，并在恢复时写回配置中的绝对路径，设置为 `dbx-gateway-pki:dbx-gateway 0600`。所有 `enrollment create/revoke` 运维命令也必须传相同的 `--state-file`。
 
 在在线 PKI 主机以 `root` 执行一致性备份：
 
@@ -173,6 +198,29 @@ sha256sum /secure-backup/dbx-gateway-pki-online.tar.gz > /secure-backup/dbx-gate
 systemctl start dbx-gateway-pki.service
 ```
 
-预期服务恢复 active，checksum 文件单独保存。恢复到新主机时先校验 SHA-256，按原 UID/GID 和权限解包，再启动 PKI、Main，最后让 Edge 重连。SQLite 和 `edge/issued` 必须来自同一备份时间点；不一致时停止在线签发，从可信离线记录和证书清单重建，不要猜测或删除吊销记录。
+预期服务恢复 active，checksum 文件单独保存。恢复到已创建 `dbx-gateway` 组、`dbx-gateway` 用户和 `dbx-gateway-pki` 用户的新主机时，以 `root` 执行：
+
+```bash
+systemctl stop dbx-gateway-main.service dbx-gateway-pki.service
+sha256sum -c /secure-backup/dbx-gateway-pki-online.tar.gz.sha256
+RESTORE_ROOT=$(mktemp -d)
+tar -xzf /secure-backup/dbx-gateway-pki-online.tar.gz -C "$RESTORE_ROOT"
+install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway-pki
+install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 /var/lib/dbx-gateway-pki
+cp -a "$RESTORE_ROOT/var/lib/dbx-gateway-pki/." /var/lib/dbx-gateway-pki/
+chown -R dbx-gateway-pki:dbx-gateway /var/lib/dbx-gateway-pki
+install -o root -g dbx-gateway -m 0640 \
+  "$RESTORE_ROOT/etc/dbx-gateway-pki/pki.toml" \
+  /etc/dbx-gateway-pki/pki.toml
+install -o dbx-gateway-pki -g dbx-gateway -m 0600 \
+  /mnt/secure-transfer/dbx-pki-password \
+  /etc/dbx-gateway-pki/password
+rm -rf "$RESTORE_ROOT"
+systemctl start dbx-gateway-pki.service
+systemctl start dbx-gateway-main.service
+systemctl is-active dbx-gateway-pki.service dbx-gateway-main.service
+```
+
+`/mnt/secure-transfer/dbx-pki-password` 必须来自与该 Edge CA 匹配的密封密码副本。不要直接依赖压缩包中的旧数字 UID/GID；上面的 `chown` 按新主机账户重新设置属主。SQLite 和 `edge/issued` 必须来自同一备份时间点；不一致时停止在线签发，从可信离线记录和证书清单重建，不要猜测或删除吊销记录。
 
 若 Edge CA 私钥泄露，普通备份恢复不够：离线生成新 PKI/Edge CA，替换 Main 信任链，为每个 Edge 发 replace token 重新领证，并撤销旧链。

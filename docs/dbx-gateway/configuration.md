@@ -82,7 +82,41 @@ Unix 端点只设置 `unix_socket`。远程端点必须同时设置 `remote_addr
 
 `[unix]` 包含 `path`、`allowed_uid`、`allowed_gid`，Socket 权限固定为 `0660`。示例 UID/GID 必须改成部署主机上 `dbx-gateway` 的真实数值。
 
-`[remote]` 包含 `listen`、`certificate`、`private_key`、`main_ra_ca_certificate`、`allowed_ra_uri_sans`。远程接口仍只能签 Edge `clientAuth`，不能签 Server 或 DBX Client。
+`[remote]` 包含 `listen`、`certificate`、`private_key`、`main_ra_ca_certificate`、`allowed_ra_uri_sans`。远程接口仍只能签 Edge `clientAuth`，不能签 Server 或 DBX Client。远程 RA mTLS 字段仅作为高级配置参考；当前部署手册没有覆盖专用 RA CA、Main RA 身份和 PKI Server 身份的签发与轮换，不能只按本字段表上线分机拓扑。
+
+`enrollment create/revoke` 使用自定义 `state_file` 时必须同时传入 `--state-file`，否则 CLI 为保持兼容会使用 `<data-dir>/gateway-state.sqlite3`。建议传入与 `pki.toml` 完全相同的绝对路径，例如：
+
+```bash
+sudo -u dbx-gateway-pki dbx-gateway-pki enrollment create \
+  --data-dir /var/lib/dbx-gateway-pki \
+  --state-file /srv/dbx-gateway-pki/state.sqlite3 \
+  --edge-id edge-prod-01 \
+  --ttl 10m
+```
+
+该自定义路径还必须加入 PKI systemd 沙箱的可写范围。以 `root` 创建目录并执行 `systemctl edit dbx-gateway-pki.service`：
+
+```bash
+install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 /srv/dbx-gateway-pki
+systemctl edit dbx-gateway-pki.service
+```
+
+在 drop-in 编辑器中写入：
+
+```systemd
+[Service]
+ReadWritePaths=/srv/dbx-gateway-pki
+```
+
+保存后执行：
+
+```bash
+systemctl daemon-reload
+systemctl restart dbx-gateway-pki.service
+systemctl status dbx-gateway-pki.service --no-pager
+```
+
+`ProtectSystem=strict` 下只修改 TOML 而不扩展 `ReadWritePaths` 会导致 SQLite 主文件、WAL 或临时文件无法创建。若选择其他目录，把上述三个位置和 `pki.toml`、CLI 的 `--state-file` 一并改成同一绝对路径。
 
 ## 校验与重载
 

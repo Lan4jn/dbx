@@ -22,7 +22,7 @@
 flowchart LR
     DBX["DBX 桌面客户端"] -->|"TLS 1.3 + Client 证书"| Main["Main Gateway"]
     Edge["Edge Gateway"] -->|"TLS 1.3 + Edge 证书"| Main
-    Main -->|"Unix Socket 或 RA mTLS"| PKI["在线受限 PKI"]
+    Main -->|"同机 Unix Socket"| PKI["在线受限 PKI"]
     Edge -->|"TCP / Unix Socket"| DB["数据库"]
     Browser["普通 HTTPS 请求"] --> Main
     Main -->|"可选固定回退上游"| Site["普通网站"]
@@ -36,6 +36,8 @@ flowchart LR
 - Edge 到数据库使用数据库原生协议。数据库不支持 TLS 时，优先将 Edge 部署在数据库同机并使用 Unix Socket。
 - PKI Root CA 应离线保存。在线 PKI 只持有 Edge CA，只允许签发 Edge `clientAuth` 证书。
 
+本手册主流程要求 Main 与在线 PKI 部署在同一台主机，并只使用 Unix Socket。远程 RA mTLS 不属于本手册的可直接执行流程：当前 CLI 没有生成专用 RA CA、Main RA 身份和 PKI Server 身份的完整工作流，在补齐独立证书生命周期手册前不要把下文步骤改成分机部署。
+
 ## 2. 部署准备
 
 ### 2.1 主机规划
@@ -43,7 +45,7 @@ flowchart LR
 建议至少规划以下角色：
 
 1. 离线 PKI 主机：初始化 Root、Server、Client、Edge 四类 CA，签发 Main 和 DBX Client 证书。
-2. Main 主机：公网或跨网入口；可与在线 PKI 同机。
+2. Main/在线 PKI 主机：公网或跨网入口；本手册要求两个服务同机并通过 Unix Socket 通信。
 3. Edge 主机：位于数据库同机或数据库所在安全区。
 4. DBX 桌面客户端：导入 Client PKCS#12 身份并选择逻辑路由。
 
@@ -73,9 +75,10 @@ DBX_Gateway_<版本>_arm64.tar.gz
 在每台 Linux 主机校验并解包：
 
 ```bash
-sha256sum -c DBX_Gateway_0.5.83_x64.tar.gz.sha256
-tar -xzf DBX_Gateway_0.5.83_x64.tar.gz
-cd DBX_Gateway_0.5.83_x64
+VERSION=0.5.83
+sha256sum -c DBX_Gateway_${VERSION}_x64.tar.gz.sha256
+tar -xzf DBX_Gateway_${VERSION}_x64.tar.gz
+cd DBX_Gateway_${VERSION}_x64
 ./bin/dbx-gateway --version
 ./bin/dbx-gateway-pki --version
 ```
@@ -201,7 +204,7 @@ useradd --system --gid dbx-gateway --home-dir /var/lib/dbx-gateway-pki --shell /
 install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway-pki
 install -d -o dbx-gateway-pki -g dbx-gateway -m 0700 /var/lib/dbx-gateway-pki
 install -m 0755 bin/dbx-gateway-pki /usr/bin/dbx-gateway-pki
-install -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
+install -o root -g dbx-gateway -m 0640 examples/pki.toml /etc/dbx-gateway-pki/pki.toml
 ```
 
 通过加密介质把下面三个源文件送到在线 PKI 主机，然后执行明确的安装命令：
@@ -273,7 +276,7 @@ systemctl status dbx-gateway-pki.service --no-pager
 install -d -o root -g dbx-gateway -m 0750 /etc/dbx-gateway /etc/dbx-gateway/certs
 install -d -o dbx-gateway -g dbx-gateway -m 0750 /var/lib/dbx-gateway /run/dbx-gateway
 install -m 0755 bin/dbx-gateway /usr/bin/dbx-gateway
-install -m 0640 examples/main.toml /etc/dbx-gateway/main.toml
+install -o root -g dbx-gateway -m 0640 examples/main.toml /etc/dbx-gateway/main.toml
 
 install -o root -g dbx-gateway -m 0644 \
   /mnt/secure-transfer/main-server/certificate.pem \
@@ -338,6 +341,8 @@ curl -fsS http://127.0.0.1:9080/healthz
 ```
 
 预期配置校验输出 `configuration is valid`，systemd 状态为 `active (running)`，健康接口返回 `status: ok`。
+
+默认 Main unit 通过 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 和 `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` 只授予绑定 `443` 所需的能力。不要删除前者后仍使用低于 1024 的端口，也不要改成以 root 运行 Main。
 
 ### 6.3 Nginx TCP 透传（可选）
 
@@ -612,11 +617,11 @@ Edge 使用对应的 `edge.toml` 和 `dbx-gateway-edge.service`。可热变更�
 
 - Edge 默认在到期前 30 天自动续期，并在本地生成新私钥。
 - Main Server 证书由离线 PKI、企业 CA 或现有证书平台续期；当前程序不内置 ACME。
-- Client 设备遗失时，应吊销旧 Client 证书并签发新身份。
+- Client 设备遗失时，应移除旧 Client identity 的 Main ACL，并签发新 identity。Main 当前不读取 Client CRL，也没有 Client serial 吊销列表；只运行 `client revoke` 不能阻断访问。
 - Edge 私钥丢失或迁移主机时，创建 replace token：
 
 ```bash
-dbx-gateway-pki enrollment create \
+sudo -u dbx-gateway-pki dbx-gateway-pki enrollment create \
   --data-dir /var/lib/dbx-gateway-pki \
   --edge-id edge-prod-01 \
   --ttl 10m \
@@ -626,14 +631,31 @@ dbx-gateway-pki enrollment create \
 吊销 Edge：
 
 ```bash
-dbx-gateway-pki edge revoke \
+sudo -u dbx-gateway-pki dbx-gateway-pki edge revoke \
   --data-dir /var/lib/dbx-gateway-pki \
   --password-file /etc/dbx-gateway-pki/password \
+  --state-file /var/lib/dbx-gateway-pki/gateway-state.sqlite3 \
   --serial REPLACE_WITH_EDGE_SERIAL \
   --reason key_compromise
 ```
 
-随后将证书 serial 加入 Main 的 `revoked_edge_serials`，校验配置并向 Main 发送 HUP。
+Main 当前不会自动读取 `edge/crl.pem`。必须在 `/etc/dbx-gateway/main.toml` 的顶层加入规范化 serial（只保留十六进制字符）：
+
+```toml
+revoked_edge_serials = ["REPLACE_WITH_NORMALIZED_EDGE_SERIAL"]
+```
+
+然后在 Main 主机执行：
+
+```bash
+sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
+systemctl kill -s HUP dbx-gateway-main.service
+journalctl -u dbx-gateway-main.service -n 50 --no-pager
+```
+
+只有 Main 成功重载 blocklist 后，新连接才会拒绝该证书，已有对应 Edge 会话也会关闭。PKI CRL 用于审计和其他验证器，不能代替这一步。
+
+若吊销命令报告 CRL 已更新但在线 revocation state 未更新，Main blocklist 步骤仍要执行，并且必须用完全相同的参数重试，直到 SQLite 更新成功。相同 serial 和 reason 可安全重试；不要手工删除 CRL、签发记录或 SQLite 行。
 
 ## 13. 常见故障
 
@@ -665,7 +687,7 @@ journalctl -u dbx-gateway-main -u dbx-gateway-edge -u dbx-gateway-pki \
 必须备份：
 
 - 离线完整 PKI、独立密封的 CA 密码和恢复说明。
-- 在线 PKI 的 `edge` 目录、状态 SQLite 和 `pki.toml`。
+- 在线 PKI 的完整数据目录、`pki.toml`，以及单独密封保存的在线 CA 密码。
 - Main/Edge 配置、证书、私钥和当前版本记录。
 
 推荐升级顺序：在线 PKI、Main、Edge、DBX 客户端。每一步验证健康后再继续。Main 或 Edge 升级会中断活动隧道，应安排维护窗口。

@@ -88,6 +88,8 @@ struct EnrollmentCreateArgs {
     #[arg(long)]
     data_dir: PathBuf,
     #[arg(long)]
+    state_file: Option<PathBuf>,
+    #[arg(long)]
     edge_id: String,
     #[arg(long, default_value = "10m", value_parser = parse_ttl)]
     ttl: std::time::Duration,
@@ -101,6 +103,8 @@ struct EnrollmentCreateArgs {
 struct EnrollmentRevokeArgs {
     #[arg(long)]
     data_dir: PathBuf,
+    #[arg(long)]
+    state_file: Option<PathBuf>,
     #[arg(long)]
     token_id: uuid::Uuid,
 }
@@ -203,6 +207,8 @@ struct RevokeArgs {
     #[arg(long)]
     password_file: PathBuf,
     #[arg(long)]
+    state_file: Option<PathBuf>,
+    #[arg(long)]
     serial: String,
     #[arg(long, default_value = "unspecified")]
     reason: String,
@@ -232,15 +238,15 @@ async fn dispatch(cli: Cli) -> Result<String, GatewayError> {
         }
         Command::Server(command) => match command.command {
             ServerAction::Issue(args) | ServerAction::Renew(args) => issue_server(args),
-            ServerAction::Revoke(args) => revoke(CertificateRole::Server, args),
+            ServerAction::Revoke(args) => revoke(CertificateRole::Server, args).await,
         },
         Command::Client(command) => match command.command {
             ClientAction::Issue(args) | ClientAction::Renew(args) => issue_client(args),
-            ClientAction::Revoke(args) => revoke(CertificateRole::Client, args),
+            ClientAction::Revoke(args) => revoke(CertificateRole::Client, args).await,
         },
         Command::Edge(command) => match command.command {
             EdgeAction::Issue(args) | EdgeAction::Renew(args) => issue_edge(args),
-            EdgeAction::Revoke(args) => revoke(CertificateRole::Edge, args),
+            EdgeAction::Revoke(args) => revoke(CertificateRole::Edge, args).await,
         },
         Command::Enrollment(command) => match command.command {
             EnrollmentAction::Create(args) => create_enrollment(args).await,
@@ -328,7 +334,7 @@ async fn create_enrollment(args: EnrollmentCreateArgs) -> Result<String, Gateway
     if args.replace && !args.yes {
         confirm_replace(&args.edge_id)?;
     }
-    let state = GatewayState::open(args.data_dir.join("gateway-state.sqlite3")).await?;
+    let state = GatewayState::open(enrollment_state_file(&args.data_dir, args.state_file.as_deref())).await?;
     let token = state.enrollments.create(&args.edge_id, args.ttl, args.replace).await?;
     Ok(format!(
         "enrollment token {} for {} expires at {}\n{}",
@@ -340,9 +346,13 @@ async fn create_enrollment(args: EnrollmentCreateArgs) -> Result<String, Gateway
 }
 
 async fn revoke_enrollment(args: EnrollmentRevokeArgs) -> Result<String, GatewayError> {
-    let state = GatewayState::open(args.data_dir.join("gateway-state.sqlite3")).await?;
+    let state = GatewayState::open(enrollment_state_file(&args.data_dir, args.state_file.as_deref())).await?;
     state.enrollments.revoke(args.token_id).await?;
     Ok(format!("revoked enrollment token {}", args.token_id))
+}
+
+fn enrollment_state_file(data_dir: &Path, state_file: Option<&Path>) -> PathBuf {
+    state_file.map(Path::to_path_buf).unwrap_or_else(|| data_dir.join("gateway-state.sqlite3"))
 }
 
 fn confirm_replace(edge_id: &str) -> Result<(), GatewayError> {
@@ -433,12 +443,42 @@ fn issue_edge(args: EdgeIssueArgs) -> Result<String, GatewayError> {
     Ok(format!("issued edge certificate {}", issued.serial_hex))
 }
 
-fn revoke(role: CertificateRole, args: RevokeArgs) -> Result<String, GatewayError> {
+async fn revoke(role: CertificateRole, args: RevokeArgs) -> Result<String, GatewayError> {
     let password = read_password_file(&args.password_file)?;
     let reason = RevocationReason::from_str(&args.reason)?;
-    let store = PkiStore::open(&args.data_dir)?;
+    let state = if role == CertificateRole::Edge {
+        let state_file = args
+            .state_file
+            .as_ref()
+            .ok_or_else(|| pki_error("edge revoke requires --state-file to update online revocation state"))?;
+        if !state_file.is_file() {
+            return Err(pki_error("edge revoke state file does not exist"));
+        }
+        Some(GatewayState::open(state_file.clone()).await?)
+    } else {
+        None
+    };
+    let store = open_store_for_revoke(role, &args.data_dir)?;
     let crl = store.revoke(role, &args.serial, reason, &password)?;
+    if let Some(state) = state {
+        if let Err(error) = state.revoke_issued_certificate(&args.serial, &args.reason).await {
+            return Err(GatewayError {
+                code: error.code,
+                message: format!(
+                    "CRL was updated but online revocation state was not; retry the exact edge revoke command: {}",
+                    error.message
+                ),
+            });
+        }
+    }
     Ok(format!("revoked {role} certificate; CRL number {}", crl.number))
+}
+
+fn open_store_for_revoke(role: CertificateRole, data_dir: &Path) -> Result<PkiStore, GatewayError> {
+    match role {
+        CertificateRole::Edge => PkiStore::open_online_edge(data_dir),
+        CertificateRole::Server | CertificateRole::Client => PkiStore::open(data_dir),
+    }
 }
 
 fn read_password_file(path: &Path) -> Result<Zeroizing<String>, GatewayError> {
@@ -505,8 +545,14 @@ fn pki_error(message: &str) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_password_file, Cli, Command, EnrollmentAction, ServerAction};
+    use super::{
+        enrollment_state_file, open_store_for_revoke, read_password_file, Cli, Command, EnrollmentAction, ServerAction,
+    };
     use clap::{CommandFactory, Parser};
+    use dbx_gateway::pki::{CertificateRole, EdgeIssueRequest, PkiStore};
+    use dbx_gateway::state::GatewayState;
+    use rcgen::{CertificateParams, KeyPair};
+    use zeroize::Zeroizing;
 
     #[test]
     fn pki_help_exposes_nested_role_commands_without_plaintext_passwords() {
@@ -575,6 +621,100 @@ mod tests {
             assert!(args.dns_sans.is_empty());
             assert_eq!(args.ip_sans, [ip.parse::<std::net::IpAddr>().unwrap()]);
         }
+    }
+
+    #[test]
+    fn edge_revoke_accepts_an_online_edge_only_pki_store() {
+        let directory = std::env::temp_dir().join(format!(
+            "dbx-gateway-online-edge-revoke-test-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let password = Zeroizing::new("test-password".to_string());
+        PkiStore::init(&directory, &password).unwrap();
+        for role in ["root", "server", "client"] {
+            std::fs::remove_dir_all(directory.join(role)).unwrap();
+        }
+
+        assert!(open_store_for_revoke(CertificateRole::Edge, &directory).is_ok());
+        assert!(open_store_for_revoke(CertificateRole::Client, &directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn enrollment_commands_allow_an_explicit_state_file() {
+        let cli = Cli::try_parse_from([
+            "dbx-gateway-pki",
+            "enrollment",
+            "create",
+            "--data-dir",
+            "/var/lib/dbx-gateway-pki",
+            "--state-file",
+            "/srv/dbx/state.sqlite3",
+            "--edge-id",
+            "edge-prod-01",
+        ])
+        .unwrap();
+        let Command::Enrollment(command) = cli.command else {
+            panic!("expected enrollment command");
+        };
+        let EnrollmentAction::Create(args) = command.command else {
+            panic!("expected enrollment create command");
+        };
+
+        assert_eq!(args.state_file.unwrap(), std::path::PathBuf::from("/srv/dbx/state.sqlite3"));
+        assert_eq!(
+            enrollment_state_file(&args.data_dir, None),
+            std::path::PathBuf::from("/var/lib/dbx-gateway-pki/gateway-state.sqlite3")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_revoke_recovers_when_sqlite_update_initially_fails_after_crl_commit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "dbx-gateway-edge-revoke-retry-test-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let data_dir = directory.join("pki");
+        let password = Zeroizing::new("test-password".to_string());
+        let store = PkiStore::init(&data_dir, &password).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let csr = CertificateParams::default().serialize_request(&key).unwrap();
+        let issued = store
+            .issue_edge(
+                EdgeIssueRequest { edge_id: "edge-prod-01", csr_der: csr.der(), validity: time::Duration::days(30) },
+                &password,
+            )
+            .unwrap();
+        for role in ["root", "server", "client"] {
+            std::fs::remove_dir_all(data_dir.join(role)).unwrap();
+        }
+        let password_file = directory.join("password");
+        std::fs::write(&password_file, password.as_bytes()).unwrap();
+        std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let state_file = directory.join("state.sqlite3");
+        let state = GatewayState::open(state_file.clone()).await.unwrap();
+        let args = || super::RevokeArgs {
+            data_dir: data_dir.clone(),
+            password_file: password_file.clone(),
+            state_file: Some(state_file.clone()),
+            serial: issued.serial_hex.clone(),
+            reason: "key_compromise".to_string(),
+        };
+
+        let error = super::revoke(CertificateRole::Edge, args()).await.unwrap_err();
+        assert!(error.message.contains("CRL was updated but online revocation state was not"));
+        assert!(data_dir.join("edge/crl.pem").is_file());
+
+        state.record_issued_certificate("edge-prod-01", &issued.serial_hex).await.unwrap();
+        super::revoke(CertificateRole::Edge, args()).await.unwrap();
+        assert!(!state.certificate_is_active("edge-prod-01", &issued.serial_hex).await.unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

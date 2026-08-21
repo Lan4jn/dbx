@@ -109,3 +109,16 @@ desktop-prod = ["edge-prod-01/postgres-primary"]
 ```
 
 修改 Main 配置后先执行 `check-config`，再向服务发送 HUP。身份拼写必须完全一致。
+
+## 7. 遗失、替换和撤销
+
+Main 当前不读取 Client CRL，也没有 Client serial 吊销列表。离线执行 `dbx-gateway-pki client revoke` 只生成审计用 CRL，不能单独阻断 DBX 访问。
+
+设备或私钥遗失时，为替代证书使用新的 Client identity，例如把 `desktop-prod` 更换为 `desktop-prod-2026`。在 Main 的 `[client_route_acl]` 中删除旧 identity，只给新 identity 配置所需路由；ACL 表必须保持非空，因为空表表示兼容模式并允许所有已认证 Client identity。签发和交付新证书后，在 Main 主机执行：
+
+```bash
+sudo -u dbx-gateway dbx-gateway --config /etc/dbx-gateway/main.toml check-config
+systemctl restart dbx-gateway-main.service
+```
+
+当前版本重载 ACL 不会主动关闭已经建立的 DBX Client 会话，所以安全事件必须重启 Main。重启会中断全部活动隧道，应在安全处置优先级下安排。确认旧 identity 无法发现或打开任何路由后，再删除桌面端旧身份。

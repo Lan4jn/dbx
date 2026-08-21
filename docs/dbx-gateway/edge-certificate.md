@@ -162,4 +162,4 @@ sudo -u dbx-gateway-pki dbx-gateway-pki enrollment create \
   --replace --yes
 ```
 
-然后在新 Edge 主机重复“写入令牌”和“启动并自动领证”两节。不要把旧主机的 `edge.key` 复制到新主机。
+`--replace` 不会自动更新 Main 的 `revoked_edge_serials`。先把旧证书的规范化 serial 加入 Main 配置，执行 `check-config` 并向 Main 发送 HUP；确认旧会话关闭后，再在新 Edge 主机重复“写入令牌”和“启动并自动领证”两节。不要把旧主机的 `edge.key` 复制到新主机。

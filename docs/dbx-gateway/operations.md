@@ -76,11 +76,13 @@ Edge 默认提前 30 天自动续期。监控日志中持续的 renewal 失败�
 PKI 主机检查 CRL 和状态：
 
 ```bash
-openssl crl -in /var/lib/dbx-gateway-pki/edge/crl.pem -noout -lastupdate -nextupdate -crlnumber
-sqlite3 /var/lib/dbx-gateway-pki/gateway-state.sqlite3 'PRAGMA integrity_check;'
+sudo -u dbx-gateway-pki openssl crl -in /var/lib/dbx-gateway-pki/edge/crl.pem -noout -lastupdate -nextupdate -crlnumber
+sudo -u dbx-gateway-pki sqlite3 /var/lib/dbx-gateway-pki/gateway-state.sqlite3 'PRAGMA integrity_check;'
 ```
 
 CRL 尚未生成时第一条可不存在；SQLite 预期输出 `ok`。不要直接修改表内容。
+
+Main 当前不会自动读取 `edge/crl.pem`；Edge 吊销必须同步加入 Main 的 `revoked_edge_serials` 并成功重载。Main 当前不读取 Client CRL，也没有 Client serial 吊销列表；Client 私钥遗失时应删除旧 identity 的 ACL、使用新 identity 签发替代证书，并重启 Main 终止既有会话。不要把“已生成 CRL”当成访问已经被阻断。
 
 ## 故障排查
 
@@ -140,4 +142,4 @@ userdel dbx-gateway-pki 2>/dev/null || true
 groupdel dbx-gateway 2>/dev/null || true
 ```
 
-不要删除唯一的离线 Root/CA 备份。卸载 Edge 前吊销其证书；卸载 DBX Client 前吊销遗失或不再授权的客户端证书。
+不要删除唯一的离线 Root/CA 备份。卸载 Edge 前生成 CRL 并把 serial 加入 Main blocklist；卸载 DBX Client 前按上面的 Client ACL 流程移除访问，不要只运行未被 Main 消费的 Client CRL 命令。

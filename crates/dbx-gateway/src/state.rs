@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::enrollment::EnrollmentStore;
 use crate::protocol::RegisteredTarget;
@@ -94,6 +94,47 @@ impl GatewayState {
                 params![edge_id, serial_hex],
                 |row| row.get(0),
             )
+        })
+        .await
+    }
+
+    pub async fn revoke_issued_certificate(&self, serial_hex: &str, reason: &str) -> Result<(), GatewayError> {
+        let serial_hex = normalized_serial(serial_hex);
+        let reason = reason.to_string();
+        run_db(self.path.clone(), move |connection| {
+            let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let record = transaction
+                .query_row(
+                    "SELECT edge_id, revoked_at FROM issued_certificates WHERE lower(serial_hex) = ?1",
+                    [&serial_hex],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?;
+            let Some((edge_id, revoked_at)) = record else {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            };
+            if revoked_at.is_some() {
+                let existing_reason = transaction
+                    .query_row("SELECT reason FROM revocations WHERE serial_hex = ?1", [&serial_hex], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?;
+                if existing_reason.as_deref() == Some(reason.as_str()) {
+                    return transaction.commit();
+                }
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+
+            let revoked_at = unix_now();
+            transaction.execute(
+                "UPDATE issued_certificates SET revoked_at = ?2 WHERE lower(serial_hex) = ?1 AND revoked_at IS NULL",
+                params![serial_hex, revoked_at],
+            )?;
+            transaction.execute(
+                "INSERT INTO revocations (serial_hex, edge_id, revoked_at, reason) VALUES (?1, ?2, ?3, ?4)",
+                params![serial_hex, edge_id, revoked_at, reason],
+            )?;
+            transaction.commit()
         })
         .await
     }
@@ -207,4 +248,28 @@ pub(crate) fn state_error(message: impl Into<String>) -> GatewayError {
 
 fn normalized_serial(serial: &str) -> String {
     serial.chars().filter(|character| character.is_ascii_hexdigit()).flat_map(char::to_lowercase).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GatewayState;
+
+    #[tokio::test]
+    async fn revoking_an_issued_certificate_disables_renewal_and_is_idempotent() {
+        let directory = std::env::temp_dir().join(format!(
+            "dbx-gateway-state-revoke-test-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = GatewayState::open(directory.join("state.sqlite3")).await.unwrap();
+        state.record_issued_certificate("edge-prod-01", "a1b2").await.unwrap();
+
+        state.revoke_issued_certificate("a1b2", "key_compromise").await.unwrap();
+
+        assert!(!state.certificate_is_active("edge-prod-01", "A1:B2").await.unwrap());
+        assert!(state.certificate_is_revoked("a1b2").await.unwrap());
+        state.revoke_issued_certificate("A1:B2", "key_compromise").await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

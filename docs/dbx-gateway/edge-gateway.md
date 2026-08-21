@@ -47,7 +47,7 @@ openssl x509 -in /etc/dbx-gateway/certs/main.pem -pubkey -noout \
 在 PKI 主机以 `dbx-gateway-pki` 用户创建一次性令牌：
 
 ```bash
-dbx-gateway-pki enrollment create \
+sudo -u dbx-gateway-pki dbx-gateway-pki enrollment create \
   --data-dir /var/lib/dbx-gateway-pki \
   --edge-id edge-prod-01 \
   --ttl 10m
@@ -87,14 +87,14 @@ journalctl -u dbx-gateway-edge.service -f
 令牌过期、已消费、Edge ID 不匹配或响应中断后不能重放。确认旧证书不可恢复时，在 PKI 主机执行：
 
 ```bash
-dbx-gateway-pki enrollment create \
+sudo -u dbx-gateway-pki dbx-gateway-pki enrollment create \
   --data-dir /var/lib/dbx-gateway-pki \
   --edge-id edge-prod-01 \
   --ttl 10m \
   --replace --yes
 ```
 
-`--replace` 会撤销该 Edge 的现有活动证书并发新令牌。只在确认私钥丢失、孤儿证书或主机替换后使用；普通续期不需要 replace。
+`--replace` 会在在线 PKI 状态中撤销该 Edge 的现有活动证书并发新令牌。`--replace` 不会自动更新 Main 的 `revoked_edge_serials`；旧证书可能继续连接 Main，直到把旧 serial 加入 Main 配置并成功重载。只在确认私钥丢失、孤儿证书或主机替换后使用；普通续期不需要 replace。
 
 ## 本地目标
 

@@ -19,10 +19,12 @@ flowchart LR
     Edge -->|"TCP 或 Unix Socket"| DB["postgres-primary"]
     Browser["普通 HTTPS 访问"] -->|"TLS 1.3"| Main
     Main -->|"固定上游代理"| Site["普通网站上游"]
-    Main -->|"Unix Socket 或 RA mTLS"| PKI["在线受限 PKI"]
+    Main -->|"同机 Unix Socket"| PKI["在线受限 PKI"]
 ```
 
 Main 不需要访问数据库地址。Edge 只向 Main 注册逻辑目标 ID，Main 的状态库不保存数据库真实地址。DBX 客户端选择 `edge-prod-01 / postgres-primary` 后，Main 才要求对应 Edge 建立一次性数据通道。
+
+本文档的可直接执行部署流程要求 Main 与在线 PKI 同机，通过 Unix Socket 通信。程序保留远程 RA mTLS 高级配置能力，但当前文档不提供其证书体系和部署流程，不能仅凭字段参考直接用于生产分机部署。
 
 ## 信任边界
 
