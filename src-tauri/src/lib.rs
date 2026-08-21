@@ -982,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_single_instance_for_release_builds_only() {
+    fn keeps_single_instance_disabled_for_all_builds() {
         assert!(!should_enable_single_instance(true));
         assert!(!should_enable_single_instance(false));
     }
@@ -1472,8 +1472,9 @@ pub fn run() {
             } else {
                 AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
-            let state =
-                state.with_gateway_identity_provider(Arc::new(gateway_identity::KeyringGatewayIdentityProvider));
+            let gateway_identity_provider =
+                Arc::new(gateway_identity::StorageGatewayIdentityProvider::new(state.storage.clone()));
+            let state = state.with_gateway_identity_provider(gateway_identity_provider.clone());
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
             let state = Arc::new(state);
@@ -1483,7 +1484,7 @@ pub fn run() {
                 mode: data_dir_resolution.mode.clone(),
             });
             app.manage(state.clone());
-            app.manage(commands::gateway::GatewayIdentityState::default());
+            app.manage(commands::gateway::GatewayIdentityState(gateway_identity_provider));
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());

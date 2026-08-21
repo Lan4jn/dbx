@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::warn;
-use rusqlite::{params, params_from_iter, types::Value, Connection, DatabaseName, OpenFlags, OptionalExtension, ToSql};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, DatabaseName, ErrorCode, OpenFlags, OptionalExtension, ToSql,
+    TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -144,6 +147,22 @@ pub struct Storage {
     /// Path to the SQLite database file (`dbx.db`). Its parent directory is the
     /// application data dir where dbx-managed state (e.g. `known_hosts`) lives.
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayIdentityEncryptedRecord {
+    pub identity_id: String,
+    pub format_version: u8,
+    pub key_version: u32,
+    pub key_fingerprint_sha256: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayIdentityKeyState {
+    pub key_version: u32,
+    pub key_fingerprint_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,9 +446,83 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
     )",
+    "CREATE TABLE IF NOT EXISTS gateway_identity_secrets (
+        identity_id TEXT PRIMARY KEY,
+        format_version INTEGER NOT NULL,
+        key_version INTEGER NOT NULL,
+        key_fingerprint_sha256 TEXT NOT NULL,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS gateway_identity_key_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        key_version INTEGER NOT NULL,
+        key_fingerprint_sha256 TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
 ];
 
 impl Storage {
+    pub async fn save_gateway_identity_bundle_with_key_initialization<F>(
+        &self,
+        metadata: &crate::db::dbx_gateway::GatewayIdentityMetadata,
+        initialize: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Option<GatewayIdentityKeyState>) -> Result<GatewayIdentityEncryptedRecord, String> + Send + 'static,
+    {
+        let metadata = metadata.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(gateway_storage_error)?;
+            let state = load_gateway_identity_key_state_in_tx(&tx)?;
+            let record = initialize(state.clone())?;
+            validate_gateway_identity_key_state(&metadata.id, &record, state.as_ref())?;
+            save_gateway_identity_key_state_in_tx(&tx, &record)?;
+            save_gateway_identity_bundle_in_tx(&tx, metadata, record)?;
+            tx.commit().map_err(gateway_storage_error)
+        })
+        .await
+    }
+
+    pub async fn migrate_gateway_identity_bundle_with_key_initialization<T, F>(
+        &self,
+        identity_id: &str,
+        initialize: F,
+    ) -> Result<Option<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                crate::db::dbx_gateway::GatewayIdentityMetadata,
+                Option<GatewayIdentityKeyState>,
+            ) -> Result<(GatewayIdentityEncryptedRecord, T), String>
+            + Send
+            + 'static,
+    {
+        let identity_id = identity_id.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(gateway_storage_error)?;
+            if gateway_identity_record_exists_in_tx(&tx, &identity_id)? {
+                tx.commit().map_err(gateway_storage_error)?;
+                return Ok(None);
+            }
+            let metadata = load_gateway_identity_metadata_in_tx(&tx)?
+                .into_iter()
+                .find(|metadata| metadata.id == identity_id)
+                .ok_or_else(|| {
+                    "Gateway identity metadata is missing; re-import the Gateway client certificate".to_string()
+                })?;
+            let state = load_gateway_identity_key_state_in_tx(&tx)?;
+            let (record, value) = initialize(metadata.clone(), state.clone())?;
+            validate_gateway_identity_key_state(&identity_id, &record, state.as_ref())?;
+            save_gateway_identity_key_state_in_tx(&tx, &record)?;
+            save_gateway_identity_bundle_in_tx(&tx, metadata, record)?;
+            tx.commit().map_err(gateway_storage_error)?;
+            Ok(Some(value))
+        })
+        .await
+    }
+
     pub async fn save_gateway_identity_metadata(
         &self,
         identities: &[crate::db::dbx_gateway::GatewayIdentityMetadata],
@@ -462,6 +555,67 @@ impl Storage {
             return Ok(Vec::new());
         };
         serde_json::from_value(value.clone()).map_err(|error| format!("invalid Gateway identity metadata: {error}"))
+    }
+
+    pub async fn save_gateway_identity_bundle(
+        &self,
+        metadata: &crate::db::dbx_gateway::GatewayIdentityMetadata,
+        record: &GatewayIdentityEncryptedRecord,
+    ) -> Result<(), String> {
+        if metadata.id != record.identity_id {
+            return Err("Gateway identity metadata and encrypted record do not match".to_string());
+        }
+        let metadata = metadata.clone();
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(gateway_storage_error)?;
+            save_gateway_identity_bundle_in_tx(&tx, metadata, record)?;
+            tx.commit().map_err(gateway_storage_error)
+        })
+        .await
+    }
+
+    pub async fn load_gateway_identity_record(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<GatewayIdentityEncryptedRecord>, String> {
+        let identity_id = identity_id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT identity_id, format_version, key_version, key_fingerprint_sha256, nonce, ciphertext
+                 FROM gateway_identity_secrets WHERE identity_id = ?1",
+                [&identity_id],
+                |row| {
+                    let format_version: i64 = row.get(1)?;
+                    let key_version: i64 = row.get(2)?;
+                    Ok(GatewayIdentityEncryptedRecord {
+                        identity_id: row.get(0)?,
+                        format_version: u8::try_from(format_version).unwrap_or_default(),
+                        key_version: u32::try_from(key_version).unwrap_or_default(),
+                        key_fingerprint_sha256: row.get(3)?,
+                        nonce: row.get(4)?,
+                        ciphertext: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn delete_gateway_identity_bundle(&self, identity_id: &str) -> Result<(), String> {
+        let identity_id = identity_id.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(gateway_storage_error)?;
+            let mut identities = load_gateway_identity_metadata_in_tx(&tx)?;
+            identities.retain(|identity| identity.id != identity_id);
+            save_gateway_identity_metadata_in_tx(&tx, &identities)?;
+            tx.execute("DELETE FROM gateway_identity_secrets WHERE identity_id = ?1", [&identity_id])
+                .map_err(gateway_storage_error)?;
+            tx.commit().map_err(gateway_storage_error)
+        })
+        .await
     }
 
     pub async fn open(db_path: &Path) -> Result<Self, String> {
@@ -501,6 +655,139 @@ impl Storage {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.with_connection(f)).await.map_err(|e| e.to_string())?
     }
+}
+
+fn gateway_storage_error(error: rusqlite::Error) -> String {
+    match error {
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) =>
+        {
+            "Gateway identity storage is being modified by another DBX instance; try again".to_string()
+        }
+        error => error.to_string(),
+    }
+}
+
+fn load_gateway_identity_key_state_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<Option<GatewayIdentityKeyState>, String> {
+    tx.query_row("SELECT key_version, key_fingerprint_sha256 FROM gateway_identity_key_state WHERE id = 1", [], |row| {
+        let key_version: i64 = row.get(0)?;
+        Ok(GatewayIdentityKeyState {
+            key_version: u32::try_from(key_version).unwrap_or_default(),
+            key_fingerprint_sha256: row.get(1)?,
+        })
+    })
+    .optional()
+    .map_err(gateway_storage_error)
+}
+
+fn validate_gateway_identity_key_state(
+    identity_id: &str,
+    record: &GatewayIdentityEncryptedRecord,
+    state: Option<&GatewayIdentityKeyState>,
+) -> Result<(), String> {
+    if record.identity_id != identity_id {
+        return Err("Gateway identity metadata and encrypted record do not match".to_string());
+    }
+    if let Some(state) = state {
+        if state.key_version != record.key_version || state.key_fingerprint_sha256 != record.key_fingerprint_sha256 {
+            return Err("Gateway identity master key does not match this database".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn save_gateway_identity_key_state_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &GatewayIdentityEncryptedRecord,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR REPLACE INTO gateway_identity_key_state
+            (id, key_version, key_fingerprint_sha256, updated_at)
+         VALUES (1, ?1, ?2, ?3)",
+        params![i64::from(record.key_version), record.key_fingerprint_sha256, unix_timestamp_millis()],
+    )
+    .map(|_| ())
+    .map_err(gateway_storage_error)
+}
+
+fn gateway_identity_record_exists_in_tx(tx: &rusqlite::Transaction<'_>, identity_id: &str) -> Result<bool, String> {
+    tx.query_row("SELECT EXISTS(SELECT 1 FROM gateway_identity_secrets WHERE identity_id = ?1)", [identity_id], |row| {
+        row.get(0)
+    })
+    .map_err(gateway_storage_error)
+}
+
+fn save_gateway_identity_bundle_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    metadata: crate::db::dbx_gateway::GatewayIdentityMetadata,
+    record: GatewayIdentityEncryptedRecord,
+) -> Result<(), String> {
+    if metadata.id != record.identity_id {
+        return Err("Gateway identity metadata and encrypted record do not match".to_string());
+    }
+    let mut identities = load_gateway_identity_metadata_in_tx(tx)?;
+    identities.retain(|identity| identity.id != metadata.id);
+    identities.push(metadata);
+    save_gateway_identity_metadata_in_tx(tx, &identities)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO gateway_identity_secrets
+            (identity_id, format_version, key_version, key_fingerprint_sha256, nonce, ciphertext, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            record.identity_id,
+            i64::from(record.format_version),
+            i64::from(record.key_version),
+            record.key_fingerprint_sha256,
+            record.nonce,
+            record.ciphertext,
+            unix_timestamp_millis()
+        ],
+    )
+    .map(|_| ())
+    .map_err(gateway_storage_error)
+}
+
+fn load_gateway_identity_metadata_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<Vec<crate::db::dbx_gateway::GatewayIdentityMetadata>, String> {
+    let current: Option<String> = tx
+        .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(json) = current else {
+        return Ok(Vec::new());
+    };
+    let settings = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+        .map_err(|error| format!("invalid app settings JSON: {error}"))?;
+    let Some(value) = settings.get(GATEWAY_IDENTITIES_KEY) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(value.clone()).map_err(|error| format!("invalid Gateway identity metadata: {error}"))
+}
+
+fn save_gateway_identity_metadata_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    identities: &[crate::db::dbx_gateway::GatewayIdentityMetadata],
+) -> Result<(), String> {
+    let current: Option<String> = tx
+        .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let mut settings = match current {
+        Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+            .map_err(|error| format!("invalid app settings JSON: {error}"))?,
+        None => serde_json::Map::new(),
+    };
+    settings.insert(
+        GATEWAY_IDENTITIES_KEY.to_string(),
+        serde_json::to_value(identities).map_err(|error| error.to_string())?,
+    );
+    let json = serde_json::Value::Object(settings).to_string();
+    tx.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [json])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn inspect_sqlite_db_file(path: &Path) -> Result<SqliteDbFileState, String> {
@@ -4123,8 +4410,8 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings, McpGlobalPolicy,
-        McpGlobalPolicyState, Storage, MCP_GLOBAL_POLICY_KEY,
+        maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings,
+        GatewayIdentityEncryptedRecord, McpGlobalPolicy, McpGlobalPolicyState, Storage, MCP_GLOBAL_POLICY_KEY,
     };
     use crate::ai::{
         AiActiveModelSelection, AiAssistantMode, AiChatSelectionState, AiEffortSelection, AiModelEffortPreference,
@@ -4133,6 +4420,7 @@ mod tests {
     use crate::connection_secrets::{
         MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
     };
+    use crate::db::dbx_gateway::GatewayIdentityMetadata;
     use crate::history::{HistoryConnectionFilter, HistoryDatabaseFilter, HistoryEntry, HistorySearchRequest};
     use crate::models::connection::{
         ConnectionConfig, DatabaseConnectionInfo, DatabaseType, SshTunnelConfig, TransportLayerConfig,
@@ -4149,6 +4437,179 @@ mod tests {
     fn temp_data_dir(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("dbx-storage-{name}-{}-{stamp}", std::process::id()))
+    }
+
+    fn gateway_identity_metadata(id: &str) -> GatewayIdentityMetadata {
+        GatewayIdentityMetadata {
+            id: id.to_string(),
+            name: "Gateway Client".to_string(),
+            subject: "CN=gateway-client".to_string(),
+            expires_at: "2026-08-20T00:00:00Z".to_string(),
+            fingerprint_sha256: "f".repeat(64),
+        }
+    }
+
+    fn gateway_identity_record(id: &str) -> GatewayIdentityEncryptedRecord {
+        GatewayIdentityEncryptedRecord {
+            identity_id: id.to_string(),
+            format_version: 1,
+            key_version: 1,
+            key_fingerprint_sha256: "a".repeat(64),
+            nonce: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            ciphertext: vec![13, 14, 15, 16],
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_record_round_trip_preserves_ciphertext_and_metadata() {
+        let path = temp_db_path("gateway-identity-record");
+        let storage = Storage::open(&path).await.unwrap();
+        let metadata = gateway_identity_metadata("identity-1");
+        let record = gateway_identity_record("identity-1");
+
+        storage.save_gateway_identity_bundle(&metadata, &record).await.unwrap();
+
+        assert_eq!(storage.load_gateway_identity_metadata().await.unwrap(), vec![metadata]);
+        assert_eq!(storage.load_gateway_identity_record("identity-1").await.unwrap(), Some(record));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_bundle_delete_removes_metadata_and_ciphertext() {
+        let path = temp_db_path("gateway-identity-delete");
+        let storage = Storage::open(&path).await.unwrap();
+        let metadata = gateway_identity_metadata("identity-1");
+        let record = gateway_identity_record("identity-1");
+        storage.save_gateway_identity_bundle(&metadata, &record).await.unwrap();
+
+        storage.delete_gateway_identity_bundle("identity-1").await.unwrap();
+
+        assert!(storage.load_gateway_identity_metadata().await.unwrap().is_empty());
+        assert_eq!(storage.load_gateway_identity_record("identity-1").await.unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_master_key_initialization_is_serialized_across_storage_connections() {
+        let path = temp_db_path("gateway-master-key-lock");
+        let first_storage = Storage::open(&path).await.unwrap();
+        let second_storage = Storage::open(&path).await.unwrap();
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+
+        let first = tokio::spawn(async move {
+            first_storage
+                .save_gateway_identity_bundle_with_key_initialization(
+                    &gateway_identity_metadata("identity-1"),
+                    move |_| {
+                        first_entered_tx.send(()).unwrap();
+                        release_first_rx.recv().unwrap();
+                        let mut record = gateway_identity_record("identity-1");
+                        record.key_fingerprint_sha256 = "first".to_string();
+                        Ok(record)
+                    },
+                )
+                .await
+        });
+        first_entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let second = tokio::spawn(async move {
+            second_storage
+                .save_gateway_identity_bundle_with_key_initialization(
+                    &gateway_identity_metadata("identity-2"),
+                    move |state| {
+                        second_entered_tx.send(()).unwrap();
+                        assert_eq!(state.map(|state| state.key_fingerprint_sha256), Some("first".to_string()));
+                        let mut record = gateway_identity_record("identity-2");
+                        record.key_fingerprint_sha256 = "first".to_string();
+                        Ok(record)
+                    },
+                )
+                .await
+        });
+
+        assert!(second_entered_rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        release_first_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second_entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        second.await.unwrap().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_migration_does_not_restore_deleted_metadata() {
+        let path = temp_db_path("gateway-identity-migration-delete");
+        let storage = Storage::open(&path).await.unwrap();
+        storage.save_gateway_identity_metadata(&[gateway_identity_metadata("identity-1")]).await.unwrap();
+        storage.delete_gateway_identity_bundle("identity-1").await.unwrap();
+        let initializer_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let initializer_called_in_closure = initializer_called.clone();
+
+        let result = storage
+            .migrate_gateway_identity_bundle_with_key_initialization("identity-1", move |_, _| {
+                initializer_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok((gateway_identity_record("identity-1"), ()))
+            })
+            .await;
+
+        assert!(result.unwrap_err().contains("metadata"));
+        assert!(!initializer_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(storage.load_gateway_identity_metadata().await.unwrap().is_empty());
+        assert_eq!(storage.load_gateway_identity_record("identity-1").await.unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_initialization_failure_rolls_back_all_database_state() {
+        let path = temp_db_path("gateway-identity-init-rollback");
+        let storage = Storage::open(&path).await.unwrap();
+        let metadata = gateway_identity_metadata("identity-1");
+
+        let result = storage
+            .save_gateway_identity_bundle_with_key_initialization(&metadata, |_| {
+                Err("simulated initialization failure".to_string())
+            })
+            .await;
+
+        assert_eq!(result.unwrap_err(), "simulated initialization failure");
+        assert!(storage.load_gateway_identity_metadata().await.unwrap().is_empty());
+        assert_eq!(storage.load_gateway_identity_record("identity-1").await.unwrap(), None);
+
+        storage
+            .save_gateway_identity_bundle_with_key_initialization(&metadata, |state| {
+                assert!(state.is_none());
+                Ok(gateway_identity_record("identity-1"))
+            })
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_existing_key_state_rejects_different_fingerprint() {
+        let path = temp_db_path("gateway-identity-key-mismatch");
+        let storage = Storage::open(&path).await.unwrap();
+        let first_metadata = gateway_identity_metadata("identity-1");
+        storage
+            .save_gateway_identity_bundle_with_key_initialization(&first_metadata, |_| {
+                Ok(gateway_identity_record("identity-1"))
+            })
+            .await
+            .unwrap();
+        let second_metadata = gateway_identity_metadata("identity-2");
+
+        let result = storage
+            .save_gateway_identity_bundle_with_key_initialization(&second_metadata, |_| {
+                let mut record = gateway_identity_record("identity-2");
+                record.key_fingerprint_sha256 = "b".repeat(64);
+                Ok(record)
+            })
+            .await;
+
+        assert!(result.unwrap_err().contains("master key"));
+        assert_eq!(storage.load_gateway_identity_record("identity-2").await.unwrap(), None);
+        let _ = std::fs::remove_file(path);
     }
 
     fn history_entry(

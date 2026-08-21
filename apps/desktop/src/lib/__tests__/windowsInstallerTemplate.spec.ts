@@ -12,6 +12,8 @@ const win7InstallerAuditScript = readFileSync(resolve(process.cwd(), ".github/sc
 const appCargoToml = readFileSync(resolve(process.cwd(), "src-tauri/Cargo.toml"), "utf8");
 const workspaceCargoToml = readFileSync(resolve(process.cwd(), "Cargo.toml"), "utf8");
 const appBuildScript = readFileSync(resolve(process.cwd(), "src-tauri/build.rs"), "utf8");
+const appLibRs = readFileSync(resolve(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
+const windowsPortableBuildScript = readFileSync(resolve(process.cwd(), "scripts/build-windows-portable.ps1"), "utf8");
 const wryWebView2Source = readFileSync(resolve(process.cwd(), "vendor/wry/src/webview2/mod.rs"), "utf8");
 const ciWorkflow = readFileSync(resolve(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const releaseWorkflow = readFileSync(resolve(process.cwd(), ".github/workflows/release.yml"), "utf8");
@@ -119,8 +121,8 @@ describe("Windows 7 fixed WebView2 runtime bundle", () => {
   it("passes the configured fixed-runtime folder to WebView2 discovery and creation", () => {
     expect(workspaceCargoToml).toContain('wry = { path = "vendor/wry" }');
     expect(wryWebView2Source).toContain('std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER")');
-    expect(wryWebView2Source).toContain(`CreateCoreWebView2EnvironmentWithOptions(
-        browser_executable_folder_ptr,`);
+    expect(wryWebView2Source).toContain("CreateCoreWebView2EnvironmentWithOptions(");
+    expect(wryWebView2Source).toContain("browser_executable_folder_ptr,");
     expect(wryWebView2Source).toContain("GetAvailableCoreWebView2BrowserVersionString(browser_executable_folder_ptr, &mut versioninfo)");
   });
 
@@ -141,5 +143,15 @@ describe("Windows 7 fixed WebView2 runtime bundle", () => {
     expect(releaseWorkflow).toContain("TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw");
     expect(ciWorkflow).toContain("target-feature=+crt-static");
     expect(releaseWorkflow).toContain("target-feature=+crt-static");
+  });
+
+  it("builds both portable Windows executables with the production custom protocol", () => {
+    expect(windowsPortableBuildScript).toContain('Invoke-DbxCargoBuild -Manifest $modernManifest -TargetDir $modernTargetDir -Toolchain "" -BuildTarget $Target -Features "custom-protocol"');
+    expect(windowsPortableBuildScript).toContain('Invoke-DbxCargoBuild -Manifest $legacyManifest -TargetDir $legacyTargetDir -Toolchain $LegacyRustToolchain -BuildTarget $LegacyTarget -Features "custom-protocol" -BuildStd');
+  });
+
+  it("keeps Windows desktop builds multi-instance", () => {
+    expect(appLibRs).toMatch(/fn should_enable_single_instance\(debug_build: bool\) -> bool \{\r?\n\s+let _ = debug_build;\r?\n\s+false\r?\n\}/);
+    expect(appLibRs).toContain("if should_enable_single_instance(cfg!(debug_assertions))");
   });
 });

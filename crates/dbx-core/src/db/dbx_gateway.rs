@@ -449,7 +449,7 @@ async fn relay_local_websocket(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;

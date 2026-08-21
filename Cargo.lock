@@ -2187,6 +2187,7 @@ dependencies = [
 name = "dbx"
 version = "0.5.86"
 dependencies = [
+ "aes-gcm 0.10.3",
  "anyhow",
  "async-trait",
  "axum",

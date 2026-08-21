@@ -54,6 +54,7 @@ function Invoke-DbxCargoBuild {
     [string]$TargetDir,
     [string]$Toolchain,
     [string]$BuildTarget = $Target,
+    [string[]]$Features = @(),
     [switch]$BuildStd
   )
 
@@ -62,14 +63,15 @@ function Invoke-DbxCargoBuild {
     $env:CARGO_TARGET_DIR = $TargetDir
     $env:CXXFLAGS = "/utf-8 /EHsc"
     $env:CXXFLAGS_x86_64_pc_windows_msvc = "/utf-8 /EHsc"
+    $featureArgs = if ($Features.Count -gt 0) { @("--features", ($Features -join ",")) } else { @() }
     if ($Toolchain) {
       if ($BuildStd) {
-        cargo "+$Toolchain" build --manifest-path $Manifest --target $BuildTarget --release -Z build-std=std,panic_abort
+        cargo "+$Toolchain" build --manifest-path $Manifest --target $BuildTarget --release @featureArgs -Z build-std=std,panic_abort
       } else {
-        cargo "+$Toolchain" build --manifest-path $Manifest --target $BuildTarget --release
+        cargo "+$Toolchain" build --manifest-path $Manifest --target $BuildTarget --release @featureArgs
       }
     } else {
-      cargo build --manifest-path $Manifest --target $BuildTarget --release
+      cargo build --manifest-path $Manifest --target $BuildTarget --release @featureArgs
     }
   } finally {
     Pop-Location
@@ -298,7 +300,7 @@ if ($buildModern) {
   $modernManifest = Join-Path $repoRoot "src-tauri\Cargo.toml"
   $modernTargetDir = Join-Path $repoRoot "src-tauri\target-win-x64"
   if (-not $SkipRustBuild) {
-    Invoke-DbxCargoBuild -Manifest $modernManifest -TargetDir $modernTargetDir -Toolchain "" -BuildTarget $Target
+    Invoke-DbxCargoBuild -Manifest $modernManifest -TargetDir $modernTargetDir -Toolchain "" -BuildTarget $Target -Features "custom-protocol"
   }
   $modernReleaseDir = Join-Path $modernTargetDir "$Target\release"
   $modernExePath = Join-Path $modernReleaseDir "dbx.exe"
@@ -317,7 +319,7 @@ if ($buildLegacy) {
   $legacyManifest = Join-Path $repoRoot "src-tauri\Cargo.toml"
   $legacyTargetDir = Join-Path $repoRoot "src-tauri\target-win7-x64"
   if (-not $SkipRustBuild) {
-    Invoke-DbxCargoBuild -Manifest $legacyManifest -TargetDir $legacyTargetDir -Toolchain $LegacyRustToolchain -BuildTarget $LegacyTarget -BuildStd
+    Invoke-DbxCargoBuild -Manifest $legacyManifest -TargetDir $legacyTargetDir -Toolchain $LegacyRustToolchain -BuildTarget $LegacyTarget -Features "custom-protocol" -BuildStd
   }
   $legacyReleaseDir = Join-Path $legacyTargetDir "$LegacyTarget\release"
   $legacyExePath = Join-Path $legacyReleaseDir "dbx.exe"

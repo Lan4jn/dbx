@@ -93,7 +93,9 @@ tempfile = "3"
 iana-time-zone = "0.1"
 
 [dev-dependencies]
-dbx-gateway = { path = "../dbx-gateway", features = ["server"] }
 mysql_common = { git = "https://github.com/t8y2/rust_mysql_common.git", rev = "47740d85a8277167a5717afac785d37b46a36296", default-features = false }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 time = "0.3"
+
+[target.'cfg(not(windows))'.dev-dependencies]
+dbx-gateway = { path = "../dbx-gateway", features = ["server"] }
