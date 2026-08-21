@@ -8,13 +8,18 @@ import type { MongoCreateIndexForm, MongoIndexRow } from "@/lib/sidebar/mongoCol
 
 export type DuplicateStructureSource = TreeNode & { connectionId: string; database: string };
 type ConnectionDeleteTarget = TreeNode & { connectionId: string };
+type ConnectionGroupDeleteTarget = TreeNode & { type: "connection-group" };
 
 export const fallbackCreateDatabaseCharset = fallbackCreateDatabaseCharsetMetadata();
 
 export const sidebarTreeDialogOwner = shallowRef<symbol | null>(null);
 export const sidebarDangerTarget = shallowRef<TreeNode | null>(null);
+export const sidebarDangerRunningExecutionId = ref<string>("");
+export const sidebarDangerRunningCancel = ref<(() => void | Promise<void>) | null>(null);
 export const sidebarFormTarget = shallowRef<TreeNode | null>(null);
 export const connectionDeleteTargetSnapshot = ref<ConnectionDeleteTarget[]>([]);
+export const connectionGroupDeleteTargetSnapshot = ref<ConnectionGroupDeleteTarget[]>([]);
+export const deleteConnectionsWithGroup = ref(false);
 export const showDeleteConfirm = ref(false);
 export const showDropTableConfirm = ref(false);
 export const showDropTableChildObjectConfirm = ref(false);
@@ -32,6 +37,7 @@ export const structureDocCopyTitle = ref("");
 export const isLoadingStructurePreview = ref(false);
 export const showEmptyTableConfirm = ref(false);
 export const showTruncateTableConfirm = ref(false);
+export const showVacuumTableConfirm = ref(false);
 export const showMysqlAutoIncrementConfirm = ref(false);
 export const showRenameObjectDialog = ref(false);
 export const renameObjectName = ref("");
@@ -43,6 +49,11 @@ export const batchDropCascade = ref(false);
 export const emptyTablePreviewSql = ref("");
 export const truncateTablePreviewSql = ref("");
 export const truncateTableCascade = ref(false);
+export const vacuumTableFull = ref(false);
+export const vacuumTableAnalyze = ref(false);
+export const vacuumTablePreviewSql = ref("");
+export const vacuumTablePreviewKey = ref("");
+export const vacuumTableExecuting = ref(false);
 export const mysqlAutoIncrementValue = ref("1");
 export const mysqlAutoIncrementPreviewSql = ref("");
 export const mysqlAutoIncrementPreviewKey = ref("");
@@ -85,6 +96,8 @@ export const showEditNacosNamespaceDialog = ref(false);
 export const editNacosNamespaceName = ref("");
 export const editNacosNamespaceDesc = ref("");
 export const editNacosNamespaceLoading = ref(false);
+export const showDeleteNacosNamespaceConfirm = ref(false);
+export const deleteNacosNamespaceLoading = ref(false);
 export const createDatabaseCharsetOptions = ref<string[]>(fallbackCreateDatabaseCharset.charsets);
 export const createDatabaseCollationsByCharset = ref<Record<string, string[]>>(fallbackCreateDatabaseCharset.collationsByCharset);
 export const createDatabaseCharsetLoading = ref(false);
@@ -182,6 +195,7 @@ const openFlags = [
   showStructureDocCopyDialog,
   showEmptyTableConfirm,
   showTruncateTableConfirm,
+  showVacuumTableConfirm,
   showMysqlAutoIncrementConfirm,
   showDropObjectConfirm,
   showRenameObjectDialog,
@@ -225,8 +239,13 @@ export function resetSidebarTreeDialogState() {
   cloneMongoCollectionLoading.value = false;
   resetMongoCreateIndexForm();
   resetMongoIndexManager();
+  vacuumTableExecuting.value = false;
   sidebarTreeDialogOwner.value = null;
   sidebarDangerTarget.value = null;
   sidebarFormTarget.value = null;
+  sidebarDangerRunningExecutionId.value = "";
+  sidebarDangerRunningCancel.value = null;
   connectionDeleteTargetSnapshot.value = [];
+  connectionGroupDeleteTargetSnapshot.value = [];
+  deleteConnectionsWithGroup.value = false;
 }

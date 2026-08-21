@@ -23,6 +23,10 @@ const {
   moveToNewGroupName,
   confirmMoveToNewGroup,
   showDeleteGroupConfirm,
+  deleteConnectionsWithGroup,
+  connectionGroupDeleteConfirmMessage,
+  connectionGroupDeleteMenuLabel,
+  deletingConnectionGroups,
   confirmDeleteGroup,
   showRenameObjectDialog,
   renameObjectName,
@@ -91,6 +95,9 @@ const {
   editNacosNamespaceDesc,
   editNacosNamespaceLoading,
   confirmEditNacosNamespace,
+  showDeleteNacosNamespaceConfirm,
+  deleteNacosNamespaceLoading,
+  confirmDeleteNacosNamespace,
   showRenameMongoCollectionDialog,
   renameMongoCollectionName,
   renameMongoCollectionError,
@@ -159,6 +166,15 @@ function closeCreateDatabaseResult() {
   showCreateDatabasePreviewDialog.value = false;
 }
 
+function updateDeleteGroupDialogOpen(open: boolean) {
+  if (!open && deletingConnectionGroups.value) return;
+  showDeleteGroupConfirm.value = open;
+}
+
+function preventDeleteGroupDialogDismiss(event: Event) {
+  if (deletingConnectionGroups.value) event.preventDefault();
+}
+
 const mongoIndexCollectionName = computed(() => node.value.tableName || node.value.label);
 
 function mongoIndexTypeLabel(type: string): string {
@@ -182,6 +198,7 @@ watch(
     showEditDatabasePropertiesDialog,
     showCreateNacosNamespaceDialog,
     showEditNacosNamespaceDialog,
+    showDeleteNacosNamespaceConfirm,
     showRenameMongoCollectionDialog,
     showCloneMongoCollectionDialog,
     showCreateMongoIndexDialog,
@@ -232,17 +249,24 @@ watch(
     </DialogContent>
   </Dialog>
 
-  <Dialog v-model:open="showDeleteGroupConfirm">
-    <DialogContent class="sm:max-w-[400px]">
+  <Dialog :open="showDeleteGroupConfirm" @update:open="updateDeleteGroupDialogOpen">
+    <DialogContent class="sm:max-w-[400px]" :show-close-button="!deletingConnectionGroups" @escape-key-down="preventDeleteGroupDialogDismiss" @interact-outside="preventDeleteGroupDialogDismiss">
       <DialogHeader>
         <DialogTitle>{{ t("connectionGroup.deleteGroupConfirmTitle") }}</DialogTitle>
       </DialogHeader>
       <p class="text-sm text-muted-foreground">
-        {{ t("connectionGroup.deleteGroupConfirmMessage", { name: node.label }) }}
+        {{ connectionGroupDeleteConfirmMessage() }}
       </p>
+      <label class="flex items-start gap-2 rounded-md border border-border/70 px-3 py-2 text-sm" :class="deletingConnectionGroups ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'">
+        <input v-model="deleteConnectionsWithGroup" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-primary" :disabled="deletingConnectionGroups" />
+        <span>{{ t("connectionGroup.deleteConnectionsWithGroup") }}</span>
+      </label>
       <DialogFooter>
-        <Button variant="outline" @click="showDeleteGroupConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
-        <Button variant="destructive" @click="confirmDeleteGroup">{{ t("connectionGroup.deleteGroup") }}</Button>
+        <Button variant="outline" :disabled="deletingConnectionGroups" @click="showDeleteGroupConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button variant="destructive" :disabled="deletingConnectionGroups" @click="confirmDeleteGroup">
+          <Loader2 v-if="deletingConnectionGroups" class="mr-2 h-4 w-4 animate-spin" />
+          {{ connectionGroupDeleteMenuLabel() }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
@@ -716,6 +740,26 @@ watch(
         <Button variant="outline" :disabled="editNacosNamespaceLoading" @click="showEditNacosNamespaceDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="!editNacosNamespaceName.trim() || editNacosNamespaceLoading" @click="confirmEditNacosNamespace">
           {{ editNacosNamespaceLoading ? t("nacos.updatingNamespace") : t("dangerDialog.confirm") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showDeleteNacosNamespaceConfirm">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("nacos.deleteNamespace") }}</DialogTitle>
+      </DialogHeader>
+      <div class="flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+        <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        <p class="min-w-0 break-words text-muted-foreground [overflow-wrap:anywhere]">
+          {{ t("nacos.deleteNamespaceDescription", { name: node.nacosNamespaceName || node.label, id: node.nacosNamespace || "public" }) }}
+        </p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="deleteNacosNamespaceLoading" @click="showDeleteNacosNamespaceConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button variant="destructive" :disabled="deleteNacosNamespaceLoading" @click="confirmDeleteNacosNamespace">
+          {{ deleteNacosNamespaceLoading ? t("nacos.deletingNamespace") : t("dangerDialog.confirm") }}
         </Button>
       </DialogFooter>
     </DialogContent>

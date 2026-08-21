@@ -880,6 +880,11 @@ impl PooledAgentClient {
         self.shared_runtime.as_ref().is_none_or(|runtime| !runtime.is_failed())
     }
 
+    /// True when this client is attached to a multi-session shared agent process.
+    pub fn uses_shared_runtime(&self) -> bool {
+        self.shared_runtime.is_some()
+    }
+
     /// Terminates a protocol-v2 shared runtime without waiting for the logical session lock.
     /// Legacy single-session clients can only be killed immediately when they are not busy.
     pub fn fail_stop(&self) -> bool {
@@ -1151,12 +1156,15 @@ pub enum AgentMethod {
     GetExplainInfo,
     ExecuteBatch,
     ExecuteTransaction,
+    BeginManualTransaction,
+    CommitManualTransaction,
+    RollbackManualTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 39] = [
         Self::Handshake,
         Self::Connect,
         Self::OpenSession,
@@ -1191,6 +1199,9 @@ impl AgentMethod {
         Self::GetExplainInfo,
         Self::ExecuteBatch,
         Self::ExecuteTransaction,
+        Self::BeginManualTransaction,
+        Self::CommitManualTransaction,
+        Self::RollbackManualTransaction,
         Self::Disconnect,
         Self::Shutdown,
     ];
@@ -1232,6 +1243,9 @@ impl AgentMethod {
             Self::GetExplainInfo => "get_explain_info",
             Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
+            Self::BeginManualTransaction => "begin_manual_transaction",
+            Self::CommitManualTransaction => "commit_manual_transaction",
+            Self::RollbackManualTransaction => "rollback_manual_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
         }
@@ -2051,9 +2065,21 @@ impl AgentDriverClient {
         object_type: &K,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.get_object_source_for_relation(database, schema, name, object_type, None, timeout_duration).await
+    }
+
+    pub async fn get_object_source_for_relation<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        relation_name: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
         self.call_method_with_timeout(
             AgentMethod::GetObjectSource,
-            agent_object_source_params(database, schema, name, object_type),
+            agent_object_source_params_with_relation(database, schema, name, object_type, relation_name),
             timeout_duration,
         )
         .await
@@ -2203,12 +2229,20 @@ impl AgentDriverClient {
         table: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method_with_timeout(
-            AgentMethod::GetTableDdl,
-            agent_schema_table_params(database, schema, table),
-            timeout_duration,
-        )
-        .await
+        self.get_table_ddl_with_options(database, schema, table, false, timeout_duration).await
+    }
+
+    pub async fn get_table_ddl_with_options<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        portable: bool,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_table_params(database, schema, table);
+        params["portable"] = serde_json::json!(portable);
+        self.call_method_with_timeout(AgentMethod::GetTableDdl, params, timeout_duration).await
     }
 
     pub async fn execute_query<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
@@ -2426,6 +2460,24 @@ impl AgentDriverClient {
         self.invalidate_cached_query();
         self.call_method_typed(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema))
             .await
+    }
+
+    pub async fn begin_manual_transaction<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method(AgentMethod::BeginManualTransaction, agent_manual_transaction_params(schema)).await
+    }
+
+    pub async fn commit_manual_transaction<T: DeserializeOwned + Send + 'static>(&mut self) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method(AgentMethod::CommitManualTransaction, serde_json::json!({})).await
+    }
+
+    pub async fn rollback_manual_transaction<T: DeserializeOwned + Send + 'static>(&mut self) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method(AgentMethod::RollbackManualTransaction, serde_json::json!({})).await
     }
 
     pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
@@ -2798,7 +2850,22 @@ pub fn agent_schema_table_params(database: &str, schema: &str, table: &str) -> V
 }
 
 pub fn agent_object_source_params<K: Serialize>(database: &str, schema: &str, name: &str, object_type: &K) -> Value {
-    serde_json::json!({ "database": database, "schema": schema, "name": name, "object_type": object_type })
+    agent_object_source_params_with_relation(database, schema, name, object_type, None)
+}
+
+pub fn agent_object_source_params_with_relation<K: Serialize>(
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &K,
+    relation_name: Option<&str>,
+) -> Value {
+    let mut params =
+        serde_json::json!({ "database": database, "schema": schema, "name": name, "object_type": object_type });
+    if let Some(relation_name) = relation_name.map(str::trim).filter(|value| !value.is_empty()) {
+        params["relation_name"] = Value::String(relation_name.to_string());
+    }
+    params
 }
 
 pub fn agent_type_details_params(database: &str, schema: &str, name: &str) -> Value {
@@ -2816,6 +2883,14 @@ pub fn agent_transaction_params(database: Option<&str>, statements: &[String], s
         "statements": statements,
         "schema": schema,
     })
+}
+
+pub fn agent_manual_transaction_params(schema: Option<&str>) -> Value {
+    let schema = schema.map(str::trim).filter(|schema| !schema.is_empty());
+    match schema {
+        Some(schema) => serde_json::json!({ "schema": schema }),
+        None => serde_json::json!({}),
+    }
 }
 
 pub fn mongo_database_params(database: &str) -> Value {
@@ -2887,6 +2962,23 @@ fn agent_java_args_with_extra_opts(
 
     if agent_jar_path_matches_key(jar_path, "informix") {
         args.push("-Djava.net.preferIPv4Stack=true".to_string());
+    }
+
+    // Ignite's GridUnsafe/BinaryContext reflect into JDK internals; without these
+    // opens every connect fails with ExceptionInInitializerError on JDK 9+.
+    if agent_jar_path_matches_key(jar_path, "ignite") {
+        args.extend(
+            [
+                "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+                "--add-opens=java.base/java.nio=ALL-UNNAMED",
+                "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+                "--add-opens=java.base/java.util=ALL-UNNAMED",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED",
+                "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
     }
 
     // Hive/Kerberos JDBC drivers read JAAS and krb5 settings during JVM startup,
@@ -3179,16 +3271,16 @@ impl Drop for AgentDriverClient {
 mod tests {
     use super::{
         agent_close_query_session_params, agent_error_from_legacy, agent_handshake_params, agent_java_args,
-        agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars,
-        agent_schema_params, agent_schema_table_params, agent_supports_capability, agent_transaction_params,
-        append_legacy_error_context, decode_agent_response, format_agent_process_error, format_agent_startup_error,
-        is_agent_rpc_response_error, is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params,
-        mongo_database_params, mongo_document_id_params, parse_agent_java_opts, read_agent_line,
-        start_stderr_collector, validate_dameng_java_system_properties, AgentCallError, AgentCapability,
-        AgentDriverClient, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentHandshake, AgentKvMethod,
-        AgentLaunchSpec, AgentMethod, AgentOperationOutcome, AgentRuntimeClient, AgentSessionDisposition,
-        AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail,
-        AGENT_PROTOCOL_VERSION,
+        agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params,
+        agent_object_source_params_with_relation, agent_proxy_env_vars, agent_schema_params, agent_schema_table_params,
+        agent_supports_capability, agent_transaction_params, append_legacy_error_context, decode_agent_response,
+        format_agent_process_error, format_agent_startup_error, is_agent_rpc_response_error,
+        is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params, mongo_database_params,
+        mongo_document_id_params, parse_agent_java_opts, read_agent_line, start_stderr_collector,
+        validate_dameng_java_system_properties, AgentCallError, AgentCapability, AgentDriverClient, AgentErrorCategory,
+        AgentErrorContext, AgentErrorStage, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod,
+        AgentOperationOutcome, AgentRuntimeClient, AgentSessionDisposition, AgentTableReadCloseParams,
+        AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
     use std::io::Cursor;
@@ -3615,6 +3707,22 @@ mod tests {
         let args = agent_java_args("/tmp/dbx/drivers/highgo/agent.jar");
 
         assert!(!args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
+    }
+
+    #[test]
+    fn agent_java_args_open_jdk_internals_for_ignite() {
+        let args = agent_java_args("/tmp/dbx/drivers/ignite/agent.jar");
+
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.nio=ALL-UNNAMED"));
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.util=ALL-UNNAMED"));
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.lang=ALL-UNNAMED"));
+    }
+
+    #[test]
+    fn agent_java_args_do_not_open_jdk_internals_for_other_agents() {
+        let args = agent_java_args("/tmp/dbx/drivers/kylin/agent.jar");
+
+        assert!(!args.iter().any(|arg| arg == "--add-opens=java.base/java.nio=ALL-UNNAMED"));
     }
 
     #[test]
@@ -4408,6 +4516,9 @@ for line in sys.stdin:
         assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
         assert_eq!(AgentMethod::ExecuteBatch.as_str(), "execute_batch");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
+        assert_eq!(AgentMethod::BeginManualTransaction.as_str(), "begin_manual_transaction");
+        assert_eq!(AgentMethod::CommitManualTransaction.as_str(), "commit_manual_transaction");
+        assert_eq!(AgentMethod::RollbackManualTransaction.as_str(), "rollback_manual_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
     }
@@ -4652,6 +4763,16 @@ for line in sys.stdin:
                 "schema": "public",
                 "name": "active_users",
                 "object_type": "VIEW",
+            })
+        );
+        assert_eq!(
+            agent_object_source_params_with_relation("sales", "public", "audit_before", &"TRIGGER", Some("orders")),
+            serde_json::json!({
+                "database": "sales",
+                "schema": "public",
+                "name": "audit_before",
+                "object_type": "TRIGGER",
+                "relation_name": "orders",
             })
         );
         assert_eq!(agent_close_query_session_params("session-1"), serde_json::json!({ "sessionId": "session-1" }));

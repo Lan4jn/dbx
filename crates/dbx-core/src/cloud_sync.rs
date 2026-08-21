@@ -588,7 +588,8 @@ impl WebDavClient {
     async fn ensure_parent_collections(&self, remote_path: &str) -> Result<(), String> {
         let method = Method::from_bytes(b"MKCOL").map_err(|e| e.to_string())?;
         for parent in parent_collection_paths(remote_path) {
-            let response = self.request(method.clone(), &parent)?.send().await.map_err(|e| e.to_string())?;
+            let collection_path = format!("{parent}/");
+            let response = self.request(method.clone(), &collection_path)?.send().await.map_err(|e| e.to_string())?;
             let status = response.status();
             if status.is_success() || status == StatusCode::METHOD_NOT_ALLOWED {
                 continue;
@@ -1045,7 +1046,9 @@ async fn build_sensitive_payload(
             push_secret(&mut connection_secrets, &config.id, "connection_string", connection_string);
         }
         push_mq_external_config_secrets(&mut connection_secrets, config);
-        push_nacos_external_config_secrets(&mut connection_secrets, config);
+        if config.save_password {
+            push_nacos_external_config_secrets(&mut connection_secrets, config);
+        }
     }
 
     Ok(SensitiveSyncPayload {
@@ -1192,7 +1195,7 @@ async fn apply_sensitive_payload(
         }
         // Metadata is applied before secrets. Never let an older encrypted snapshot
         // restore a password after the user chose not to retain it locally.
-        if secret.key == "password"
+        if matches!(secret.key.as_str(), "password" | NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY)
             && connections.iter().any(|config| config.id == secret.connection_id && !config.save_password)
         {
             continue;
@@ -1603,18 +1606,19 @@ fn parent_collection_paths(remote_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_sensitive_payload, apply_sync_snapshot, build_sync_snapshot, build_sync_snapshot_with_saved_secrets,
-        decrypt_sensitive_payload, encrypt_sensitive_payload, encrypt_snippet_snapshot, finalize_snippet_migration,
-        forget_webdav_sync_secrets_passphrase, gitee_snippet_payload, is_legacy_dbx_snapshot, normalized_remote_path,
-        parent_collection_paths, parse_legacy_dbx_snapshot, parse_snippet_snapshot, prepare_legacy_snippet_snapshot,
+        apply_sensitive_payload, apply_sync_snapshot, build_sensitive_payload, build_sync_snapshot,
+        build_sync_snapshot_with_saved_secrets, decrypt_sensitive_payload, encrypt_sensitive_payload,
+        encrypt_snippet_snapshot, finalize_snippet_migration, forget_webdav_sync_secrets_passphrase,
+        gitee_snippet_payload, is_legacy_dbx_snapshot, normalized_remote_path, parent_collection_paths,
+        parse_legacy_dbx_snapshot, parse_snippet_snapshot, prepare_legacy_snippet_snapshot,
         resolve_webdav_sync_secrets_passphrase, retry_pending_snippet_cleanup, save_snippet_sync_id,
         save_webdav_sync_secrets_preference, scrub_connection_secrets, snapshot_for_snippet_upload,
         snippet_file_content, snippet_response_id, snippet_sync_settings, webdav_endpoint_uses_direct_connection,
         webdav_sync_secrets_status, ApplySnapshotOptions, ConnectionSecretSnapshot, SensitiveSyncPayload,
-        SnippetProvider, SnippetSyncClient, SnippetSyncConfig, DEFAULT_SNIPPET_FILE_NAME,
+        SnippetProvider, SnippetSyncClient, SnippetSyncConfig, WebDavClient, WebDavConfig, DEFAULT_SNIPPET_FILE_NAME,
     };
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiConfigItem};
-    use crate::connection_secrets::NACOS_AUTH_PASSWORD_KEY;
+    use crate::connection_secrets::{NACOS_AUTH_PASSWORD_KEY, NACOS_RNACOS_CONSOLE_PASSWORD_KEY};
     use crate::models::connection::{
         default_redis_key_separator, ConnectionConfig, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
@@ -1691,6 +1695,48 @@ mod tests {
             methods
         });
         (format!("http://{address}"), server)
+    }
+
+    async fn spawn_webdav_server(
+        responses: Vec<u16>,
+        reject_non_collection_mkcol: bool,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_lines = Vec::new();
+            for configured_status in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "request ended before headers were complete");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let request_line = request.lines().next().unwrap().to_string();
+                let invalid_nginx_collection_uri = reject_non_collection_mkcol
+                    && request_line.starts_with("MKCOL ")
+                    && request_line.split_whitespace().nth(1).is_some_and(|target| !target.ends_with('/'));
+                let status = if invalid_nginx_collection_uri { 409 } else { configured_status };
+                let reason = match status {
+                    200 => "OK",
+                    201 => "Created",
+                    207 => "Multi-Status",
+                    405 => "Method Not Allowed",
+                    409 => "Conflict",
+                    _ => "Test Response",
+                };
+                request_lines.push(request_line);
+                let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            request_lines
+        });
+        (format!("http://{address}/"), server)
     }
 
     fn github_snippet_response(content: &str) -> String {
@@ -1898,6 +1944,104 @@ mod tests {
             parent_collection_paths(&normalized_remote_path(Some(r"\DBX\sync\snapshot.json"))),
             vec!["DBX".to_string(), "DBX/sync".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn webdav_upload_terminates_collection_request_paths() {
+        let storage = Storage::open(&temp_db_path("webdav-collection-paths")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, None).await.unwrap();
+        let (endpoint, server) = spawn_webdav_server(vec![201, 201, 200], true).await;
+        let client = WebDavClient::new(WebDavConfig {
+            endpoint,
+            username: None,
+            password: None,
+            remote_path: Some("DBX-home/sync/snapshot.json".to_string()),
+        });
+
+        client.put_snapshot(&snapshot).await.unwrap();
+
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "MKCOL /DBX-home/ HTTP/1.1",
+                "MKCOL /DBX-home/sync/ HTTP/1.1",
+                "PUT /DBX-home/sync/snapshot.json HTTP/1.1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_upload_accepts_existing_collections() {
+        let storage = Storage::open(&temp_db_path("webdav-existing-collections")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, None).await.unwrap();
+        let (endpoint, server) = spawn_webdav_server(vec![405, 405, 200], false).await;
+        let client = WebDavClient::new(WebDavConfig {
+            endpoint,
+            username: None,
+            password: None,
+            remote_path: Some("DBX-home/sync/snapshot.json".to_string()),
+        });
+
+        client.put_snapshot(&snapshot).await.unwrap();
+
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "MKCOL /DBX-home/ HTTP/1.1",
+                "MKCOL /DBX-home/sync/ HTTP/1.1",
+                "PUT /DBX-home/sync/snapshot.json HTTP/1.1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_upload_preserves_collection_conflicts() {
+        let storage = Storage::open(&temp_db_path("webdav-collection-conflict")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, None).await.unwrap();
+        let (endpoint, server) = spawn_webdav_server(vec![409], false).await;
+        let client = WebDavClient::new(WebDavConfig {
+            endpoint,
+            username: None,
+            password: None,
+            remote_path: Some("DBX-home/sync/snapshot.json".to_string()),
+        });
+
+        let error = client.put_snapshot(&snapshot).await.unwrap_err();
+
+        assert_eq!(error, "Failed to create WebDAV collection 'DBX-home' with HTTP 409 Conflict");
+        assert_eq!(server.await.unwrap(), vec!["MKCOL /DBX-home/ HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn webdav_upload_skips_collection_requests_for_single_file() {
+        let storage = Storage::open(&temp_db_path("webdav-single-file")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, None).await.unwrap();
+        let (endpoint, server) = spawn_webdav_server(vec![200], false).await;
+        let client = WebDavClient::new(WebDavConfig {
+            endpoint,
+            username: None,
+            password: None,
+            remote_path: Some("snapshot.json".to_string()),
+        });
+
+        client.put_snapshot(&snapshot).await.unwrap();
+
+        assert_eq!(server.await.unwrap(), vec!["PUT /snapshot.json HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn webdav_test_keeps_propfind_request() {
+        let (endpoint, server) = spawn_webdav_server(vec![207], false).await;
+        let client = WebDavClient::new(WebDavConfig {
+            endpoint,
+            username: None,
+            password: None,
+            remote_path: Some("DBX-home/sync/snapshot.json".to_string()),
+        });
+
+        client.test().await.unwrap();
+
+        assert_eq!(server.await.unwrap(), vec!["PROPFIND / HTTP/1.1"]);
     }
 
     #[test]
@@ -2469,6 +2613,39 @@ mod tests {
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "nacos" && secret.key == NACOS_AUTH_PASSWORD_KEY && secret.secret == "nacos-secret"
         }));
+    }
+
+    #[tokio::test]
+    async fn sync_never_snapshots_or_restores_nacos_passwords_when_saving_is_disabled() {
+        let source = Storage::open(&temp_db_path("sync-no-save-nacos-source")).await.unwrap();
+        let mut config = nacos_connection("nacos", "transient-secret");
+        config.save_password = false;
+        let payload = build_sensitive_payload(&source, std::slice::from_ref(&config), &[]).await.unwrap();
+        assert!(!payload.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "nacos"
+                && matches!(secret.key.as_str(), NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY)
+        }));
+
+        let legacy_payload = SensitiveSyncPayload {
+            connection_secrets: vec![
+                ConnectionSecretSnapshot {
+                    connection_id: "nacos".to_string(),
+                    key: NACOS_AUTH_PASSWORD_KEY.to_string(),
+                    secret: "legacy-primary-secret".to_string(),
+                },
+                ConnectionSecretSnapshot {
+                    connection_id: "nacos".to_string(),
+                    key: NACOS_RNACOS_CONSOLE_PASSWORD_KEY.to_string(),
+                    secret: "legacy-console-secret".to_string(),
+                },
+            ],
+            ai_configs: None,
+            ai_config: None,
+            tunnel_profiles: None,
+        };
+        apply_sensitive_payload(&source, &legacy_payload, &[config]).await.unwrap();
+        assert_eq!(source.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(source.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -62,7 +62,10 @@ export type DatabaseType =
   | "neo4j"
   | "cassandra"
   | "bigquery"
+  | "spanner"
   | "kylin"
+  | "ignite"
+  | "ignite3"
   | "sundb"
   | "oscar"
   | "tdengine"
@@ -504,7 +507,7 @@ export interface ObjectStatistics {
   total_bytes?: number | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -572,6 +575,7 @@ export interface CustomTypeDetails {
 export interface ColumnInfo {
   name: string;
   data_type: string;
+  resolved_schema?: string;
   is_nullable: boolean;
   column_default: string | null;
   is_primary_key: boolean;
@@ -944,6 +948,7 @@ export type TreeNodeType =
   | "group-indexes"
   | "group-fkeys"
   | "group-triggers"
+  | "group-events"
   | "group-constraints"
   | "group-table-partitions"
   | "group-table-subpartitions"
@@ -978,6 +983,7 @@ export type TreeNodeType =
   | "index"
   | "fkey"
   | "trigger"
+  | "event"
   | "constraint"
   | "partition"
   | "subpartition"
@@ -1135,6 +1141,8 @@ export interface QueryTab {
   forceWordWrap?: boolean;
   connectionId: string;
   database: string;
+  /** Optional branch context for a driver-profile database workspace. */
+  workspaceBranch?: string;
   schema?: string;
   /** Doris / StarRocks multi-catalog: the external catalog this tab's
    * database belongs to (undefined for internal/default catalog). */
@@ -1215,6 +1223,7 @@ export interface QueryTab {
     | "redis"
     | "redis-dashboard"
     | "mongo"
+    | "meilisearch"
     | "mongo-gridfs"
     | "mongo-bucket"
     | "vector"
@@ -1240,7 +1249,8 @@ export interface QueryTab {
     | "processlist"
     | "sqlserver-trace"
     | "mysql-dashboard"
-    | "postgres-dashboard";
+    | "postgres-dashboard"
+    | "dolt-version-control";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
   hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
@@ -1279,6 +1289,9 @@ export interface QueryTab {
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
+  /** 该 tab 的 tableMeta 是哪个连接元数据代次下写入的：disconnect / 关闭数据库 /
+   * 死池重连等生命周期边界会让该代次递增，代次失配视同冷缓存（issue #6623 / PR #6640）。 */
+  tableMetaGeneration?: number;
   pendingDataChangeCount?: number;
   /** Ephemeral editor draft that has not yet been applied to the data grid. */
   hasPendingDataEditorDraft?: boolean;
@@ -1313,6 +1326,15 @@ export interface QueryTab {
       alias?: string;
     }[];
     columns: {
+      sourceName?: string;
+      sourceNameQuoted?: boolean;
+      sourceQualifier?: string;
+      sourceKey?: string;
+      star?: boolean;
+      resultName: string;
+      expression: string;
+    }[];
+    groupByColumns?: {
       sourceName?: string;
       sourceNameQuoted?: boolean;
       sourceQualifier?: string;

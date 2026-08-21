@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -621,6 +622,64 @@ func TestGetTableDDLAppendsIndexesTriggersAndComments(t *testing.T) {
 	}
 	if !strings.Contains(got, tableDDL+";\n\nCREATE INDEX") {
 		t.Fatalf("base table DDL should be terminated before dependent DDL:\n%s", got)
+	}
+	if scripted.next != len(scripted.steps) {
+		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
+	}
+}
+
+func TestGetPortableTableDDLDisablesAndRestoresSegmentAttributes(t *testing.T) {
+	const schema = "HR"
+	const table = "ORDERS"
+	const tableDDL = `CREATE TABLE "HR"."ORDERS" ("ID" NUMBER)`
+	const indexDDL = `CREATE INDEX "HR"."IDX_ORDERS" ON "HR"."ORDERS" ("ID")`
+	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+		{
+			queryContains: "'SEGMENT_ATTRIBUTES', FALSE",
+			exec:          true,
+		},
+		{
+			queryContains: "DBMS_METADATA.GET_DDL(:1, :2, :3)",
+			args:          []driver.Value{"TABLE", table, schema},
+			rows:          [][]driver.Value{{tableDDL}},
+		},
+		{
+			queryContains: "FROM ALL_INDEXES",
+			args:          []driver.Value{schema, table, schema, table},
+			rows:          [][]driver.Value{{indexDDL}},
+		},
+		{
+			queryContains: "'SEGMENT_ATTRIBUTES', TRUE",
+			exec:          true,
+		},
+		{
+			queryContains: "FROM ALL_TRIGGERS",
+			args:          []driver.Value{schema, table},
+			rows:          nil,
+		},
+		{
+			queryContains: "FROM ALL_TAB_COMMENTS",
+			args:          []driver.Value{schema, table},
+			rows:          nil,
+		},
+		{
+			queryContains: "FROM ALL_COL_COMMENTS",
+			args:          []driver.Value{schema, table},
+			rows:          nil,
+		},
+	})
+	s := newServer()
+	s.db = db
+
+	got, err := s.getTableDDLWithOptions(schema, table, "TABLE", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, tableDDL) || !strings.Contains(got, indexDDL) {
+		t.Fatalf("portable DDL should include table and index definitions:\n%s", got)
+	}
+	if strings.Contains(got, "TABLESPACE") || strings.Contains(got, "STORAGE") {
+		t.Fatalf("portable DDL should omit physical storage attributes:\n%s", got)
 	}
 	if scripted.next != len(scripted.steps) {
 		t.Fatalf("expected %d queries, got %d", len(scripted.steps), scripted.next)
@@ -1686,6 +1745,61 @@ func TestListTablesSQLUsesSplitDictionaryQuery(t *testing.T) {
 	}
 }
 
+func TestOracleMetadataQueriesClassifyMaterializedViews(t *testing.T) {
+	tests := []struct {
+		name       string
+		sqlText    string
+		tableView  string
+		objectView string
+		ownerMatch string
+	}{
+		{
+			name:       "all list tables",
+			sqlText:    oracleListTablesBaseSQL,
+			tableView:  "ALL_TABLES",
+			objectView: "ALL_OBJECTS",
+			ownerMatch: "MV.OWNER = T.OWNER",
+		},
+		{
+			name:       "user list tables",
+			sqlText:    oracleListTablesSessionUserBaseSQL,
+			tableView:  "USER_TABLES",
+			objectView: "USER_OBJECTS",
+		},
+		{
+			name:       "all list objects",
+			sqlText:    oracleListObjectsBaseSQL,
+			tableView:  "ALL_TABLES",
+			objectView: "ALL_OBJECTS",
+			ownerMatch: "MV.OWNER = T.OWNER",
+		},
+		{
+			name:       "user list objects",
+			sqlText:    oracleListObjectsSessionUserBaseSQL,
+			tableView:  "USER_TABLES",
+			objectView: "USER_OBJECTS",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sqlText := strings.ToUpper(test.sqlText)
+			if !strings.Contains(sqlText, "FROM "+test.tableView+" T") || !strings.Contains(sqlText, "FROM "+test.objectView+" MV") {
+				t.Fatalf("metadata query should classify tables against materialized-view objects: %s", test.sqlText)
+			}
+			if !strings.Contains(sqlText, "NOT EXISTS") || !strings.Contains(sqlText, "MV.OBJECT_NAME = T.TABLE_NAME") || !strings.Contains(sqlText, "MV.OBJECT_TYPE = 'MATERIALIZED VIEW'") {
+				t.Fatalf("metadata query should exclude materialized-view storage tables: %s", test.sqlText)
+			}
+			if test.ownerMatch != "" && !strings.Contains(sqlText, test.ownerMatch) {
+				t.Fatalf("cross-schema metadata query should keep materialized-view classification owner-scoped: %s", test.sqlText)
+			}
+			if !strings.Contains(sqlText, "'MATERIALIZED_VIEW'") || !strings.Contains(sqlText, "'MATERIALIZED VIEW'") {
+				t.Fatalf("metadata query should return the normalized materialized-view type: %s", test.sqlText)
+			}
+		})
+	}
+}
+
 func TestListTablesQueryAppliesMetadataConstraints(t *testing.T) {
 	query := oracleListTablesQuery("APP", metadataListConstraints{
 		Filter:      "u_r",
@@ -2461,6 +2575,7 @@ type oracleViewSourceQueryStep struct {
 	columns       []string
 	rows          [][]driver.Value
 	err           error
+	exec          bool
 }
 
 type oracleViewSourceDriver struct {
@@ -2498,6 +2613,9 @@ func (c *oracleViewSourceConn) QueryContext(
 	}
 	step := c.driver.steps[c.driver.next]
 	c.driver.next++
+	if step.exec {
+		return nil, errors.New("expected ExecContext call: " + query)
+	}
 	if !strings.Contains(query, step.queryContains) {
 		return nil, errors.New("unexpected query: " + query)
 	}
@@ -2516,6 +2634,32 @@ func (c *oracleViewSourceConn) QueryContext(
 		columns = []string{"SOURCE"}
 	}
 	return &oracleViewSourceRows{columns: columns, values: step.rows}, nil
+}
+
+func (c *oracleViewSourceConn) ExecContext(
+	_ context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Result, error) {
+	if c.driver.next >= len(c.driver.steps) {
+		return nil, errors.New("unexpected extra exec: " + query)
+	}
+	step := c.driver.steps[c.driver.next]
+	c.driver.next++
+	if !step.exec || !strings.Contains(query, step.queryContains) {
+		return nil, errors.New("unexpected exec: " + query)
+	}
+	values := make([]driver.Value, len(args))
+	for index, arg := range args {
+		values[index] = arg.Value
+	}
+	if (len(values) > 0 || len(step.args) > 0) && !reflect.DeepEqual(values, step.args) {
+		return nil, errors.New("unexpected exec arguments")
+	}
+	if step.err != nil {
+		return nil, step.err
+	}
+	return driver.RowsAffected(0), nil
 }
 
 type oracleViewSourceRows struct {
@@ -2702,4 +2846,312 @@ func TestOracleCursorSurvivesDeadlineWindow(t *testing.T) {
 	if rowCount != 3 {
 		t.Fatalf("expected 3 rows, got %d", rowCount)
 	}
+}
+
+func TestManualTransactionBeginCommitRollback(t *testing.T) {
+	db, driver := openOracleManualTxTestDB(t)
+	s := newServer()
+	s.db = db
+
+	if err := s.beginManualTransaction(""); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if !s.hasManualTransaction() {
+		t.Fatal("expected open manual transaction")
+	}
+	if err := s.beginManualTransaction(""); err == nil {
+		t.Fatal("second begin should fail")
+	}
+
+	result, err := s.executeQuery(queryOptions{SQL: "UPDATE t SET a = 1", MaxRows: 10})
+	if err != nil {
+		t.Fatalf("update in txn: %v", err)
+	}
+	if result.AffectedRows != 1 {
+		t.Fatalf("expected 1 affected row, got %d", result.AffectedRows)
+	}
+
+	selectResult, err := s.executeQuery(queryOptions{SQL: "SELECT a FROM t", MaxRows: 10})
+	if err != nil {
+		t.Fatalf("select in txn: %v", err)
+	}
+	if len(selectResult.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(selectResult.Rows))
+	}
+
+	if err := s.commitManualTransaction(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if s.hasManualTransaction() {
+		t.Fatal("transaction should be closed after commit")
+	}
+	if !driver.committed {
+		t.Fatal("expected driver commit")
+	}
+	if driver.rolledBack {
+		t.Fatal("commit path should not rollback")
+	}
+
+	if err := s.beginManualTransaction(""); err != nil {
+		t.Fatalf("re-begin: %v", err)
+	}
+	if _, err := s.executeQuery(queryOptions{SQL: "DELETE FROM t", MaxRows: 10}); err != nil {
+		t.Fatalf("delete in txn: %v", err)
+	}
+	if err := s.rollbackManualTransaction(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if !driver.rolledBack {
+		t.Fatal("expected driver rollback")
+	}
+	if err := s.commitManualTransaction(); err == nil {
+		t.Fatal("commit without open txn should fail")
+	}
+	if err := s.rollbackManualTransaction(); err == nil {
+		t.Fatal("rollback without open txn should fail")
+	}
+}
+
+// TestManualTransactionSkipsPerStatementSetSchema guards against Oracle's
+// implicit COMMIT before+after DDL (ALTER SESSION SET CURRENT_SCHEMA is DDL).
+// Once a manual transaction is open and the schema is pinned at BEGIN time,
+// executeQuery/executeQueryPage/startTableRead must NOT re-issue ALTER SESSION
+// per statement, otherwise prior DML in the same transaction is silently
+// committed and Rollback can no longer undo it.
+func TestManualTransactionSkipsPerStatementSetSchema(t *testing.T) {
+	db, driver := openOracleManualTxTestDB(t)
+	s := newServer()
+	s.db = db
+
+	if err := s.beginManualTransaction("APP_TEST"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	// Run a couple of statements with a non-empty schema; before the fix each
+	// call would issue an extra ALTER SESSION SET CURRENT_SCHEMA inside the tx.
+	if _, err := s.executeQuery(queryOptions{SQL: "UPDATE t SET a = 1", Schema: "APP_TEST", MaxRows: 10}); err != nil {
+		t.Fatalf("update in txn: %v", err)
+	}
+	if _, err := s.executeQuery(queryOptions{SQL: "DELETE FROM t", Schema: "APP_TEST", MaxRows: 10}); err != nil {
+		t.Fatalf("delete in txn: %v", err)
+	}
+
+	alterSessionCount := 0
+	for _, q := range driver.execs {
+		if strings.Contains(strings.ToUpper(q), "ALTER SESSION SET CURRENT_SCHEMA") {
+			alterSessionCount++
+		}
+	}
+	// Exactly one ALTER SESSION is expected: the one issued by
+	// beginManualTransaction when pinning the schema. Any additional one would
+	// mean per-statement setSchema ran inside the open transaction and would
+	// trigger an implicit COMMIT of the preceding DML.
+	if alterSessionCount != 1 {
+		t.Fatalf("expected exactly 1 ALTER SESSION (from begin), got %d; per-statement setSchema must be skipped during manual tx", alterSessionCount)
+	}
+
+	if err := s.rollbackManualTransaction(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+}
+
+func TestManualTransactionDisconnectRollsBack(t *testing.T) {
+	db, driver := openOracleManualTxTestDB(t)
+	s := newServer()
+	s.db = db
+	if err := s.beginManualTransaction(""); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := s.disconnect(); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	if s.hasManualTransaction() {
+		t.Fatal("disconnect should clear manual transaction")
+	}
+	if !driver.rolledBack {
+		t.Fatal("disconnect should rollback open manual transaction")
+	}
+}
+
+func TestManualTransactionBlocksOneShotTransaction(t *testing.T) {
+	db, _ := openOracleManualTxTestDB(t)
+	s := newServer()
+	s.db = db
+	if err := s.beginManualTransaction(""); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, err := s.executeTransaction(map[string]json.RawMessage{
+		"statements": json.RawMessage(`["UPDATE t SET a = 1"]`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "manual transaction") {
+		t.Fatalf("expected manual transaction conflict, got %v", err)
+	}
+}
+
+func TestRuntimeHandshakeAdvertisesTransactionCapability(t *testing.T) {
+	runtime := newRuntimeServer()
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":7,"method":"handshake","params":{"appVersion":"dev"}}`)
+	if shutdown || resp.Error != nil {
+		t.Fatalf("unexpected handshake response: shutdown=%v error=%v", shutdown, resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(result.Capabilities, "transaction") {
+		t.Fatalf("expected transaction capability, got %v", result.Capabilities)
+	}
+}
+
+func TestManualTransactionRPCDispatch(t *testing.T) {
+	db, driver := openOracleManualTxTestDB(t)
+	s := newServer()
+	s.db = db
+
+	resp, _ := s.handleLine(`{"jsonrpc":"2.0","id":1,"method":"begin_manual_transaction","params":{}}`)
+	if resp.Error != nil {
+		t.Fatalf("begin rpc: %v", resp.Error)
+	}
+	resp, _ = s.handleLine(`{"jsonrpc":"2.0","id":2,"method":"execute_query","params":{"sql":"UPDATE t SET a = 2","maxRows":10}}`)
+	if resp.Error != nil {
+		t.Fatalf("execute rpc: %v", resp.Error)
+	}
+	resp, _ = s.handleLine(`{"jsonrpc":"2.0","id":3,"method":"commit_manual_transaction","params":{}}`)
+	if resp.Error != nil {
+		t.Fatalf("commit rpc: %v", resp.Error)
+	}
+	if !driver.committed {
+		t.Fatal("expected commit via RPC")
+	}
+}
+
+type oracleManualTxDriver struct {
+	mu         sync.Mutex
+	committed  bool
+	rolledBack bool
+	execs      []string
+	queries    []string
+}
+
+func openOracleManualTxTestDB(t *testing.T) (*sql.DB, *oracleManualTxDriver) {
+	t.Helper()
+	driverName := "oracle-test-manual-tx-" + strings.ReplaceAll(t.Name(), "/", "-") + "-" + time.Now().Format("150405.000000000")
+	drv := &oracleManualTxDriver{}
+	sql.Register(driverName, drv)
+	db, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db, drv
+}
+
+func (d *oracleManualTxDriver) Open(string) (driver.Conn, error) {
+	return &oracleManualTxConn{driver: d}, nil
+}
+
+type oracleManualTxConn struct {
+	driver *oracleManualTxDriver
+	closed bool
+}
+
+func (c *oracleManualTxConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("use Query/Exec context APIs")
+}
+
+func (c *oracleManualTxConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+func (c *oracleManualTxConn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+func (c *oracleManualTxConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	c.driver.mu.Lock()
+	defer c.driver.mu.Unlock()
+	c.driver.committed = false
+	c.driver.rolledBack = false
+	return &oracleManualTx{driver: c.driver}, nil
+}
+
+var (
+	_ driver.ConnBeginTx    = (*oracleManualTxConn)(nil)
+	_ driver.ExecerContext  = (*oracleManualTxConn)(nil)
+	_ driver.QueryerContext = (*oracleManualTxConn)(nil)
+)
+
+func (c *oracleManualTxConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.driver.mu.Lock()
+	defer c.driver.mu.Unlock()
+	c.driver.execs = append(c.driver.execs, query)
+	return driver.RowsAffected(1), nil
+}
+
+func (c *oracleManualTxConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.driver.mu.Lock()
+	defer c.driver.mu.Unlock()
+	c.driver.queries = append(c.driver.queries, query)
+	return &oracleManualTxRows{
+		columns: []string{"A"},
+		values:  [][]driver.Value{{int64(1)}},
+	}, nil
+}
+
+type oracleManualTx struct {
+	driver *oracleManualTxDriver
+	done   bool
+}
+
+func (t *oracleManualTx) Commit() error {
+	t.driver.mu.Lock()
+	defer t.driver.mu.Unlock()
+	if t.done {
+		return errors.New("transaction already finished")
+	}
+	t.done = true
+	t.driver.committed = true
+	return nil
+}
+
+func (t *oracleManualTx) Rollback() error {
+	t.driver.mu.Lock()
+	defer t.driver.mu.Unlock()
+	if t.done {
+		return errors.New("transaction already finished")
+	}
+	t.done = true
+	t.driver.rolledBack = true
+	return nil
+}
+
+// database/sql routes Exec/Query on *sql.Tx through the underlying conn while the
+// transaction is open when the driver implements ExecerContext/QueryerContext.
+// Keep explicit Tx methods unused; Conn methods above serve sticky TX execution.
+
+type oracleManualTxRows struct {
+	columns []string
+	values  [][]driver.Value
+	next    int
+}
+
+func (r *oracleManualTxRows) Columns() []string { return r.columns }
+func (r *oracleManualTxRows) Close() error      { return nil }
+func (r *oracleManualTxRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.values) {
+		return io.EOF
+	}
+	copy(dest, r.values[r.next])
+	r.next++
+	return nil
 }

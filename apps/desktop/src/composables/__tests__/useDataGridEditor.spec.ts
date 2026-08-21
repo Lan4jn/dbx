@@ -1,24 +1,36 @@
-import { computed, ref } from "vue";
+import { computed, ref, type Ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { clearDataGridPendingSnapshot, DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDataGridEditor } from "@/composables/useDataGridEditor";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
 
 const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
+  prepareDataGridSave: vi.fn(),
+  executeBatch: vi.fn(),
+  executeConditionalUpdate: vi.fn(),
+  cancelConditionalUpdate: vi.fn(),
+  executeInTransaction: vi.fn(),
+  addHistory: vi.fn(),
 }));
 
-vi.mock("@/lib/backend/api", () => ({}));
+vi.mock("@/lib/backend/api", () => ({
+  prepareDataGridSave: mocks.prepareDataGridSave,
+  executeBatch: mocks.executeBatch,
+  executeConditionalUpdate: mocks.executeConditionalUpdate,
+  cancelConditionalUpdate: mocks.cancelConditionalUpdate,
+  executeInTransaction: mocks.executeInTransaction,
+}));
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({ getConfig: mocks.getConfig }),
 }));
 vi.mock("@/stores/historyStore", () => ({
-  useHistoryStore: () => ({}),
+  useHistoryStore: () => ({ add: mocks.addHistory }),
 }));
 vi.mock("@/stores/productionSafetyStore", () => ({
   useProductionSafetyStore: () => ({}),
 }));
 
-function createEditor(sourceColumns?: Array<string | undefined>, confirmDangerousRowDeletion = true, cacheKey?: string) {
+function createEditor(sourceColumns?: Array<string | undefined>, confirmDangerousRowDeletion = true, cacheKey?: string, readonlyColumnIndexes?: number[]) {
   let editor: ReturnType<typeof useDataGridEditor>;
   const result = ref<{ columns: string[]; rows: CellValue[][] }>({
     columns: ["first", "hidden", "last"],
@@ -41,6 +53,7 @@ function createEditor(sourceColumns?: Array<string | undefined>, confirmDangerou
       primaryKeys: [],
     })),
     sourceColumns: computed(() => sourceColumns),
+    readonlyColumnIndexes: computed(() => (readonlyColumnIndexes ? new Set(readonlyColumnIndexes) : undefined)),
     onExecuteSql: computed(() => undefined),
     sql: computed(() => undefined),
     searchText: ref(""),
@@ -145,6 +158,56 @@ describe("useDataGridEditor row deletion confirmation", () => {
     expect(editor.showDeleteRowConfirm.value).toBe(false);
     expect(editor.newRows.value).toHaveLength(0);
   });
+
+  it("populates pendingDeleteRowIds for a single-row delete request", () => {
+    const editor = createEditor(undefined, true);
+
+    editor.requestDeleteRow(-1);
+
+    expect(editor.pendingDeleteRowIds.value).toEqual([-1]);
+  });
+
+  it("populates pendingDeleteRowIds for a multi-row delete request and clears it on confirm", () => {
+    const editor = createEditor(undefined, true);
+    editor.newRows.value = [
+      [null, null, null],
+      [null, null, null],
+    ];
+
+    editor.requestDeleteRows([-1, -2]);
+
+    expect(editor.pendingDeleteRowIds.value).toEqual([-1, -2]);
+
+    editor.confirmDeleteRow();
+
+    expect(editor.pendingDeleteRowIds.value).toEqual([]);
+    expect(editor.newRows.value).toHaveLength(0);
+  });
+
+  it("clears pendingDeleteRowIds when the confirmation dialog is closed without confirming", () => {
+    const editor = createEditor(undefined, true);
+
+    editor.requestDeleteRow(-1);
+    expect(editor.pendingDeleteRowIds.value).toEqual([-1]);
+
+    editor.showDeleteRowConfirm.value = false;
+
+    expect(editor.pendingDeleteRowIds.value).toEqual([]);
+    expect(editor.newRows.value).toHaveLength(1); // row itself was never actually deleted
+  });
+
+  it("confirmDeleteRow deletes the row and closes the dialog itself, without racing the cancel watcher", () => {
+    const editor = createEditor(undefined, true);
+
+    editor.requestDeleteRow(-1);
+    expect(editor.newRows.value).toHaveLength(1);
+
+    editor.confirmDeleteRow();
+
+    expect(editor.newRows.value).toHaveLength(0); // the row must actually be deleted
+    expect(editor.showDeleteRowConfirm.value).toBe(false); // and the dialog closes on its own
+    expect(editor.pendingDeleteRowIds.value).toEqual([]);
+  });
 });
 
 describe("useDataGridEditor appendPastedRowsToNewRow", () => {
@@ -170,6 +233,14 @@ describe("useDataGridEditor appendPastedRowsToNewRow", () => {
       ["Grace", null, "Hopper"],
     ]);
     expect(editor.hasPendingChanges.value).toBe(true);
+  });
+
+  it("keeps explicitly read-only mapped columns out of editing and paste", () => {
+    const editor = createEditor(["first", "hidden", "last"], true, undefined, [0]);
+
+    expect(editor.canEditColumn(0)).toBe(false);
+    expect(editor.canEditColumn(2)).toBe(true);
+    expect(editor.appendPastedRowsToNewRow(-1, [["Ada"]], [0])).toEqual({ ok: false, reason: "readonly-column" });
   });
 
   it("fills following blank new rows before adding more rows", () => {
@@ -292,5 +363,253 @@ describe("useDataGridEditor appendPastedRowsToNewRow", () => {
     editor.cloneRow(-1, new Map([[1, "full payload"]]));
 
     expect(editor.newRows.value[1]).toEqual(["Ada", "full payload", "Lovelace"]);
+  });
+});
+
+describe("useDataGridEditor saveChanges reload", () => {
+  beforeEach(() => {
+    mocks.prepareDataGridSave.mockReset();
+    mocks.executeBatch.mockReset();
+    mocks.executeConditionalUpdate.mockReset();
+    mocks.cancelConditionalUpdate.mockReset();
+    mocks.executeInTransaction.mockReset();
+    mocks.addHistory.mockReset();
+    mocks.getConfig.mockReset();
+  });
+
+  function createSaveTestEditor(options: { currentPage?: Ref<number>; prepareFullReload?: () => void; customSaveHandler?: { save: ReturnType<typeof vi.fn> } } = {}) {
+    const emit = vi.fn();
+    const currentPage = options.currentPage ?? ref(1);
+    const result = ref<{ columns: string[]; rows: CellValue[][] }>({
+      columns: ["id", "status"],
+      rows: [
+        [1, "pending"],
+        [2, "pending"],
+      ],
+    });
+    const editor = useDataGridEditor({
+      result: computed(() => result.value),
+      editable: computed(() => true),
+      databaseType: computed(() => "mysql"),
+      connectionId: computed(() => "connection-1"),
+      database: computed(() => "app"),
+      tableMeta: computed(() => ({
+        tableName: "orders_test",
+        columns: [
+          { name: "id", data_type: "int" },
+          { name: "status", data_type: "varchar" },
+        ],
+        primaryKeys: ["id"],
+      })),
+      sourceColumns: computed(() => undefined),
+      onExecuteSql: computed(() => undefined),
+      customSaveHandler: computed(() => options.customSaveHandler),
+      sql: computed(() => undefined),
+      searchText: ref(""),
+      whereFilterInput: ref(""),
+      currentWhereInput: computed(() => undefined),
+      orderByInput: ref(""),
+      rowStatusFilter: ref("all"),
+      confirmDangerousRowDeletion: computed(() => true),
+      pageSize: ref(100),
+      currentPage,
+      cacheKey: computed(() => undefined),
+      getRowItem: () => undefined,
+      prepareFullReload: options.prepareFullReload,
+      emit,
+    });
+    return { editor, emit, currentPage };
+  }
+
+  it("reloads after a pure row update, so database-computed columns (e.g. ON UPDATE CURRENT_TIMESTAMP) refresh without a manual page reload", async () => {
+    mocks.prepareDataGridSave.mockResolvedValue({ statements: ["UPDATE orders_test SET status='shipped' WHERE id=1"], rollbackStatements: [] });
+    mocks.executeBatch.mockResolvedValue({ affected_rows: 1 });
+
+    const { editor, emit } = createSaveTestEditor();
+    editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+
+    await editor.saveChanges();
+
+    expect(mocks.executeBatch).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("executes a conditional update immediately, records affected rows, and reloads", async () => {
+    mocks.getConfig.mockReturnValue({ id: "connection-1", name: "Local MySQL", db_type: "mysql" });
+    mocks.executeConditionalUpdate.mockResolvedValue({ affected_rows: 7 });
+    const prepareFullReload = vi.fn();
+    const { editor, emit } = createSaveTestEditor({ prepareFullReload });
+    const statement = "UPDATE `app`.`orders_test` SET `status` = 'shipped' WHERE (`status` = 'pending');";
+
+    await expect(editor.executeConditionalUpdate(statement)).resolves.toEqual({ affectedRows: 7 });
+
+    expect(mocks.executeConditionalUpdate).toHaveBeenCalledWith("connection-1", "app", statement, undefined, expect.any(String));
+    expect(mocks.addHistory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connection_id: "connection-1",
+        connection_name: "Local MySQL",
+        sql: statement,
+        success: true,
+        operation: "UPDATE",
+        affected_rows: 7,
+      }),
+    );
+    expect(JSON.parse(mocks.addHistory.mock.calls[0][0].details_json)).toMatchObject({ conditional_update: true, statement_count: 1 });
+    expect(prepareFullReload).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("unlocks, records, and reloads after a terminal conditional update failure", async () => {
+    const sqlError = Object.assign(new Error("Duplicate entry '1' for key 'PRIMARY'"), {
+      backendError: {
+        version: 1,
+        code: "DBX-JDBC-4001",
+        messageKey: "backendErrors.jdbc.sqlFailed",
+        messageParams: { stage: "execute" },
+        source: "jdbc_agent",
+        operationOutcome: "unknown",
+        diagnostics: { category: "sql", stage: "execute" },
+      },
+    });
+    mocks.executeConditionalUpdate.mockRejectedValue(sqlError);
+    const prepareFullReload = vi.fn();
+    const { editor, emit } = createSaveTestEditor({ prepareFullReload });
+    const statement = "UPDATE `app`.`orders_test` SET `id` = 1 WHERE (`status` = 'pending');";
+
+    await expect(editor.executeConditionalUpdate(statement)).resolves.toBeNull();
+
+    expect(editor.isConditionalUpdateActive.value).toBe(false);
+    expect(editor.saveError.value).toBe("Duplicate entry '1' for key 'PRIMARY'");
+    expect(mocks.cancelConditionalUpdate).not.toHaveBeenCalled();
+    expect(mocks.addHistory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sql: statement,
+        success: false,
+        error: "Duplicate entry '1' for key 'PRIMARY'",
+        affected_rows: undefined,
+      }),
+    );
+    expect(JSON.parse(mocks.addHistory.mock.calls[0][0].details_json)).toMatchObject({ conditional_update: true, execution_outcome: "failed" });
+    expect(prepareFullReload).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("refuses a conditional update while row edits are pending", async () => {
+    const { editor, emit } = createSaveTestEditor();
+    editor.dirtyRows.value = new Map([[0, new Map([[1, "shipped"]])]]);
+
+    await expect(editor.executeConditionalUpdate("UPDATE orders_test SET status = 'shipped' WHERE id > 0;")).resolves.toBeNull();
+
+    expect(mocks.executeConditionalUpdate).not.toHaveBeenCalled();
+    expect(mocks.addHistory).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(editor.saveError.value).not.toBe("");
+  });
+
+  it("keeps a timed-out conditional update cancellable without recording a failed update", async () => {
+    mocks.executeConditionalUpdate.mockRejectedValue(new Error("Query timed out after 30 seconds"));
+    mocks.cancelConditionalUpdate.mockResolvedValue({ requested: true, terminal: true });
+    const { editor, emit } = createSaveTestEditor();
+
+    await expect(editor.executeConditionalUpdate("UPDATE orders_test SET status = 'shipped' WHERE id > 0;")).resolves.toBeNull();
+
+    expect(editor.isConditionalUpdateActive.value).toBe(true);
+    expect(mocks.addHistory).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    await expect(editor.cancelConditionalUpdate()).resolves.toBe(true);
+    expect(editor.isConditionalUpdateActive.value).toBe(false);
+    expect(mocks.cancelConditionalUpdate).toHaveBeenCalledWith(expect.any(String));
+    expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("keeps a timed-out conditional update locked until cancellation reports a terminal state", async () => {
+    vi.useFakeTimers();
+    mocks.executeConditionalUpdate.mockRejectedValue(new Error("Query timed out after 30 seconds"));
+    mocks.cancelConditionalUpdate.mockResolvedValue({ requested: true, terminal: false });
+    const { editor, emit } = createSaveTestEditor();
+
+    try {
+      await expect(editor.executeConditionalUpdate("UPDATE orders_test SET status = 'shipped' WHERE id > 0;")).resolves.toBeNull();
+      await expect(editor.cancelConditionalUpdate()).resolves.toBe(false);
+
+      expect(editor.isConditionalUpdateActive.value).toBe(true);
+      expect(emit).not.toHaveBeenCalled();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reloads a timed-out conditional update after a later terminal confirmation", async () => {
+    vi.useFakeTimers();
+    mocks.executeConditionalUpdate.mockRejectedValue(new Error("Query timed out after 30 seconds"));
+    mocks.cancelConditionalUpdate.mockResolvedValueOnce({ requested: true, terminal: false }).mockResolvedValueOnce({ requested: false, terminal: true });
+    const { editor, emit } = createSaveTestEditor();
+
+    try {
+      await expect(editor.executeConditionalUpdate("UPDATE orders_test SET status = 'shipped' WHERE id > 0;")).resolves.toBeNull();
+      await expect(editor.cancelConditionalUpdate()).resolves.toBe(false);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(editor.isConditionalUpdateActive.value).toBe(false);
+      expect(mocks.cancelConditionalUpdate).toHaveBeenCalledTimes(2);
+      expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reload when there are no pending changes to save", async () => {
+    const { editor, emit } = createSaveTestEditor();
+
+    await editor.saveChanges();
+
+    expect(mocks.prepareDataGridSave).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalledWith("reload", expect.anything());
+  });
+
+  it("prepares one first-page reload after saving edits from three accumulated infinite-scroll pages", async () => {
+    mocks.prepareDataGridSave.mockResolvedValue({
+      statements: ["UPDATE orders_test SET status='shipped' WHERE id=1", "UPDATE orders_test SET status='cancelled' WHERE id=2"],
+      rollbackStatements: [],
+    });
+    mocks.executeInTransaction.mockResolvedValue({ affected_rows: 2 });
+    const infiniteScrollState = {
+      lastPage: 3,
+      requestedOffset: 200 as number | undefined,
+      requestedLimit: 100 as number | undefined,
+    };
+    const currentPage = ref(3);
+    const prepareFullReload = vi.fn(() => {
+      currentPage.value = 1;
+      infiniteScrollState.lastPage = 0;
+      infiniteScrollState.requestedOffset = undefined;
+      infiniteScrollState.requestedLimit = undefined;
+    });
+    const created = createSaveTestEditor({ currentPage, prepareFullReload });
+    created.editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+    created.editor.dirtyRows.value.set(1, new Map([[1, "cancelled"]]));
+
+    await created.editor.saveChanges();
+
+    expect(mocks.executeInTransaction).toHaveBeenCalledTimes(1);
+    expect(prepareFullReload).toHaveBeenCalledTimes(1);
+    expect(infiniteScrollState).toEqual({ lastPage: 0, requestedOffset: undefined, requestedLimit: undefined });
+    expect(created.emit).toHaveBeenCalledTimes(1);
+    expect(created.emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("keeps the custom save path from reloading after a pure update", async () => {
+    const customSave = vi.fn().mockResolvedValue(undefined);
+    const prepareFullReload = vi.fn();
+    const { editor, emit } = createSaveTestEditor({ customSaveHandler: { save: customSave }, prepareFullReload });
+    editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+
+    await editor.saveChanges();
+
+    expect(customSave).toHaveBeenCalledTimes(1);
+    expect(prepareFullReload).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalledWith("reload", expect.anything());
   });
 });

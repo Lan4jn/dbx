@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,9 @@ SELECT VERSION
 FROM PRODUCT_COMPONENT_VERSION
 WHERE PRODUCT LIKE 'Oracle Database%'
   AND ROWNUM = 1`
+
+const oracleDisableSegmentAttributesSQL = `BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE); END;`
+const oracleEnableSegmentAttributesSQL = `BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', TRUE); END;`
 
 var (
 	oraclePlSQLBlockStartRegexp          = regexp.MustCompile(`(?is)^\s*(?:DECLARE|BEGIN|CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:EDITIONABLE|NONEDITIONABLE)\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?))\b`)
@@ -99,13 +103,20 @@ SELECT t.TABLE_NAME AS OBJECT_NAME,
 FROM ALL_TABLES t
 WHERE t.OWNER = :1
   AND t.NESTED = 'NO'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ALL_OBJECTS mv
+    WHERE mv.OWNER = t.OWNER
+      AND mv.OBJECT_NAME = t.TABLE_NAME
+      AND mv.OBJECT_TYPE = 'MATERIALIZED VIEW'
+  )
 UNION ALL
 SELECT o.OBJECT_NAME,
-       'VIEW' AS TABLE_TYPE,
+       CASE o.OBJECT_TYPE WHEN 'MATERIALIZED VIEW' THEN 'MATERIALIZED_VIEW' ELSE o.OBJECT_TYPE END AS TABLE_TYPE,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM ALL_OBJECTS o
 WHERE o.OWNER = :2
-  AND o.OBJECT_TYPE = 'VIEW'
+  AND o.OBJECT_TYPE IN ('VIEW', 'MATERIALIZED VIEW')
 )`
 const oracleListTablesSessionUserBaseSQL = `
 SELECT OBJECT_NAME, TABLE_TYPE, COMMENTS
@@ -115,12 +126,18 @@ SELECT t.TABLE_NAME AS OBJECT_NAME,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM USER_TABLES t
 WHERE t.NESTED = 'NO'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM USER_OBJECTS mv
+    WHERE mv.OBJECT_NAME = t.TABLE_NAME
+      AND mv.OBJECT_TYPE = 'MATERIALIZED VIEW'
+  )
 UNION ALL
 SELECT o.OBJECT_NAME,
-       'VIEW' AS TABLE_TYPE,
+       CASE o.OBJECT_TYPE WHEN 'MATERIALIZED VIEW' THEN 'MATERIALIZED_VIEW' ELSE o.OBJECT_TYPE END AS TABLE_TYPE,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM USER_OBJECTS o
-WHERE o.OBJECT_TYPE = 'VIEW'
+WHERE o.OBJECT_TYPE IN ('VIEW', 'MATERIALIZED VIEW')
 )`
 const oracleListTablesOrderSQL = `ORDER BY OBJECT_NAME`
 const oracleListTablesSQL = oracleListTablesBaseSQL + "\n" + oracleListTablesOrderSQL
@@ -133,13 +150,24 @@ SELECT t.TABLE_NAME AS OBJECT_NAME,
 FROM ALL_TABLES t
 WHERE t.OWNER = :1
   AND t.NESTED = 'NO'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ALL_OBJECTS mv
+    WHERE mv.OWNER = t.OWNER
+      AND mv.OBJECT_NAME = t.TABLE_NAME
+      AND mv.OBJECT_TYPE = 'MATERIALIZED VIEW'
+  )
 UNION ALL
 SELECT o.OBJECT_NAME,
-       CASE o.OBJECT_TYPE WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE o.OBJECT_TYPE END AS OBJECT_TYPE,
+       CASE o.OBJECT_TYPE
+         WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY'
+         WHEN 'MATERIALIZED VIEW' THEN 'MATERIALIZED_VIEW'
+         ELSE o.OBJECT_TYPE
+       END AS OBJECT_TYPE,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM ALL_OBJECTS o
 WHERE o.OWNER = :2
-  AND o.OBJECT_TYPE IN ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY')
+  AND o.OBJECT_TYPE IN ('VIEW', 'MATERIALIZED VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY')
 UNION ALL
 SELECT s.SYNONYM_NAME AS OBJECT_NAME,
        'SYNONYM' AS OBJECT_TYPE,
@@ -155,12 +183,22 @@ SELECT t.TABLE_NAME AS OBJECT_NAME,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM USER_TABLES t
 WHERE t.NESTED = 'NO'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM USER_OBJECTS mv
+    WHERE mv.OBJECT_NAME = t.TABLE_NAME
+      AND mv.OBJECT_TYPE = 'MATERIALIZED VIEW'
+  )
 UNION ALL
 SELECT o.OBJECT_NAME,
-       CASE o.OBJECT_TYPE WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE o.OBJECT_TYPE END AS OBJECT_TYPE,
+       CASE o.OBJECT_TYPE
+         WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY'
+         WHEN 'MATERIALIZED VIEW' THEN 'MATERIALIZED_VIEW'
+         ELSE o.OBJECT_TYPE
+       END AS OBJECT_TYPE,
        CAST(NULL AS VARCHAR2(4000)) AS COMMENTS
 FROM USER_OBJECTS o
-WHERE o.OBJECT_TYPE IN ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY')
+WHERE o.OBJECT_TYPE IN ('VIEW', 'MATERIALIZED VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY')
 UNION ALL
 SELECT s.SYNONYM_NAME AS OBJECT_NAME,
        'SYNONYM' AS OBJECT_TYPE,
@@ -170,11 +208,12 @@ FROM USER_SYNONYMS s
 const oracleListObjectsOrderSQL = `ORDER BY CASE OBJECT_TYPE
   WHEN 'TABLE' THEN 0
   WHEN 'VIEW' THEN 1
-  WHEN 'PROCEDURE' THEN 2
-  WHEN 'FUNCTION' THEN 3
-  WHEN 'SYNONYM' THEN 4
-  WHEN 'PACKAGE' THEN 5
-  ELSE 6
+  WHEN 'MATERIALIZED_VIEW' THEN 2
+  WHEN 'PROCEDURE' THEN 3
+  WHEN 'FUNCTION' THEN 4
+  WHEN 'SYNONYM' THEN 5
+  WHEN 'PACKAGE' THEN 6
+  ELSE 7
 END, OBJECT_NAME`
 const oracleListObjectsSQL = oracleListObjectsBaseSQL + "\n" + oracleListObjectsOrderSQL
 const oracleListTriggersSQL = `
@@ -489,6 +528,10 @@ type server struct {
 	db                     *sql.DB
 	params                 connectParams
 	legacyLOBFetchDeferred bool
+	// manualConn + manualTx pin one physical Oracle session for interactive
+	// commit/rollback control across multiple execute_query RPCs.
+	manualConn             *sql.Conn
+	manualTx               *sql.Tx
 	sessions               map[string]*querySession
 	tableReadSessions      map[string]*querySession
 	nextSessionID          int64
@@ -592,7 +635,7 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 		return map[string]any{
 			"protocolVersion":      multiSessionProtocolVersion,
 			"agentProtocolVersion": multiSessionProtocolVersion,
-			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "ddl", "multi_session"},
+			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "transaction", "ddl", "multi_session"},
 		}, false, nil
 	case "open_session":
 		agentSessionID := stringParam(params, "agentSessionId")
@@ -778,7 +821,7 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		return map[string]any{
 			"protocolVersion":      protocolVersion,
 			"agentProtocolVersion": protocolVersion,
-			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "ddl"},
+			"capabilities":         []string{"connect", "test_connection", "metadata", "query", "transaction", "ddl"},
 		}, false, nil
 	case "connect":
 		var cp connectParams
@@ -843,7 +886,7 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 		schema := stringParam(params, "schema")
 		table := stringParam(params, "table")
 		objectType := stringParam(params, "object_type")
-		ddl, err := s.getTableDDL(schema, table, objectType)
+		ddl, err := s.getTableDDLWithOptions(schema, table, objectType, boolParam(params, "portable"))
 		return ddl, false, err
 	case "execute_query":
 		var opts queryOptions
@@ -908,6 +951,12 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 	case "execute_transaction":
 		result, err := s.executeTransaction(params)
 		return result, false, err
+	case "begin_manual_transaction":
+		return map[string]bool{"ok": true}, false, s.beginManualTransaction(stringParam(params, "schema"))
+	case "commit_manual_transaction":
+		return map[string]bool{"ok": true}, false, s.commitManualTransaction()
+	case "rollback_manual_transaction":
+		return map[string]bool{"ok": true}, false, s.rollbackManualTransaction()
 	case "disconnect":
 		return map[string]bool{"ok": true}, false, s.disconnect()
 	case "shutdown":
@@ -1088,6 +1137,7 @@ func withOracleLOBFetchPost(params connectParams) connectParams {
 
 func (s *server) disconnect() error {
 	s.closeAllQuerySessions()
+	_ = s.rollbackManualTransactionQuiet()
 	s.legacyLOBFetchDeferred = false
 	if s.db == nil {
 		return nil
@@ -1095,6 +1145,75 @@ func (s *server) disconnect() error {
 	err := s.db.Close()
 	s.db = nil
 	return err
+}
+
+func (s *server) beginManualTransaction(schema string) error {
+	if s.manualTx != nil {
+		return errors.New("manual transaction already open")
+	}
+	db, err := s.requireDB()
+	if err != nil {
+		return err
+	}
+	// Hold one exclusive physical connection so DML/SELECT/schema stay on the
+	// same Oracle session for the life of the interactive transaction.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("reserve connection for manual transaction: %w", err)
+	}
+	if strings.TrimSpace(schema) != "" {
+		if _, err := conn.ExecContext(context.Background(), "ALTER SESSION SET CURRENT_SCHEMA = "+quoteIdentifier(schema)); err != nil {
+			_ = conn.Close()
+			return err
+		}
+	}
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("begin manual transaction: %w", err)
+	}
+	s.manualConn = conn
+	s.manualTx = tx
+	return nil
+}
+
+func (s *server) commitManualTransaction() error {
+	if s.manualTx == nil {
+		return errors.New("no manual transaction open")
+	}
+	err := s.manualTx.Commit()
+	s.clearManualTransaction()
+	return err
+}
+
+func (s *server) rollbackManualTransaction() error {
+	if s.manualTx == nil {
+		return errors.New("no manual transaction open")
+	}
+	err := s.manualTx.Rollback()
+	s.clearManualTransaction()
+	return err
+}
+
+func (s *server) rollbackManualTransactionQuiet() error {
+	if s.manualTx == nil {
+		return nil
+	}
+	err := s.manualTx.Rollback()
+	s.clearManualTransaction()
+	return err
+}
+
+func (s *server) clearManualTransaction() {
+	s.manualTx = nil
+	if s.manualConn != nil {
+		_ = s.manualConn.Close()
+		s.manualConn = nil
+	}
+}
+
+func (s *server) hasManualTransaction() bool {
+	return s.manualTx != nil
 }
 
 func openDB(params connectParams) (*sql.DB, error) {
@@ -2881,6 +3000,10 @@ func (s *server) normalizeSchemaForIdentity(schema string) (string, error) {
 }
 
 func (s *server) getTableDDL(schema, table, objectType string) (string, error) {
+	return s.getTableDDLWithOptions(schema, table, objectType, false)
+}
+
+func (s *server) getTableDDLWithOptions(schema, table, objectType string, portable bool) (string, error) {
 	var err error
 	schema, err = s.normalizeSchema(schema)
 	if err != nil {
@@ -2898,9 +3021,32 @@ func (s *server) getTableDDL(schema, table, objectType string) (string, error) {
 		return s.buildViewDDL(schema, table)
 	}
 	var ddl string
-	err = db.QueryRow("SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL", objectType, table, schema).Scan(&ddl)
+	var indexDDLs []string
+	if portable && objectType == "TABLE" {
+		var metadataErr error
+		err = withOraclePortableMetadataSession(db, func(conn *sql.Conn) error {
+			metadataErr = conn.QueryRowContext(
+				context.Background(),
+				"SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL",
+				objectType,
+				table,
+				schema,
+			).Scan(&ddl)
+			indexDDLs, _ = loadTableIndexDDLsFromConn(conn, schema, table)
+			return nil
+		})
+		if err != nil {
+			return "", err
+		}
+		err = metadataErr
+	} else {
+		err = db.QueryRow("SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL", objectType, table, schema).Scan(&ddl)
+	}
 	if err == nil && strings.TrimSpace(ddl) != "" {
 		if objectType == "TABLE" {
+			if portable {
+				return s.appendTableDependentDDLWithIndexes(schema, table, ddl, indexDDLs), nil
+			}
 			return s.appendTableDependentDDL(schema, table, ddl), nil
 		}
 		return ddl, nil
@@ -2910,12 +3056,41 @@ func (s *server) getTableDDL(schema, table, objectType string) (string, error) {
 		if fallbackErr != nil {
 			return "", fallbackErr
 		}
+		if portable {
+			return s.appendTableDependentDDLWithIndexes(schema, table, fallback, indexDDLs), nil
+		}
 		return s.appendTableDependentDDL(schema, table, fallback), nil
 	}
 	return "", err
 }
 
+func withOraclePortableMetadataSession(db *sql.DB, operation func(*sql.Conn) error) (err error) {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(context.Background(), oracleDisableSegmentAttributesSQL); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("failed to disable Oracle segment attributes: %w", err)
+	}
+	defer func() {
+		if _, resetErr := conn.ExecContext(context.Background(), oracleEnableSegmentAttributesSQL); resetErr != nil {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			if err == nil {
+				err = fmt.Errorf("failed to restore Oracle segment attributes: %w", resetErr)
+			}
+		}
+		_ = conn.Close()
+	}()
+	return operation(conn)
+}
+
 func (s *server) appendTableDependentDDL(schema, table, tableDDL string) string {
+	indexDDLs, _ := s.loadTableIndexDDLs(schema, table)
+	return s.appendTableDependentDDLWithIndexes(schema, table, tableDDL, indexDDLs)
+}
+
+func (s *server) appendTableDependentDDLWithIndexes(schema, table, tableDDL string, indexDDLs []string) string {
 	var builder strings.Builder
 	baseDDL := strings.TrimSpace(tableDDL)
 	builder.WriteString(baseDDL)
@@ -2931,10 +3106,8 @@ func (s *server) appendTableDependentDDL(schema, table, tableDDL string) string 
 		dependentAppended = true
 	}
 
-	if indexDDLs, err := s.loadTableIndexDDLs(schema, table); err == nil {
-		for _, ddl := range indexDDLs {
-			appendDependent(ddl)
-		}
+	for _, ddl := range indexDDLs {
+		appendDependent(ddl)
 	}
 	if triggerDDLs, err := s.loadTableTriggerDDLs(schema, table); err == nil {
 		for _, ddl := range triggerDDLs {
@@ -2949,8 +3122,7 @@ func (s *server) appendTableDependentDDL(schema, table, tableDDL string) string 
 	return builder.String()
 }
 
-func (s *server) loadTableIndexDDLs(schema, table string) ([]string, error) {
-	rows, err := s.queryRows(`
+const oracleTableIndexDDLsSQL = `
 SELECT DBMS_METADATA.GET_DDL('INDEX', i.INDEX_NAME, i.OWNER)
 FROM ALL_INDEXES i
 WHERE i.TABLE_OWNER = :1
@@ -2964,11 +3136,27 @@ WHERE i.TABLE_OWNER = :1
       AND c.CONSTRAINT_TYPE IN ('P', 'U')
       AND c.INDEX_NAME IS NOT NULL
   )
-ORDER BY i.INDEX_NAME`, []any{schema, table, schema, table})
+ORDER BY i.INDEX_NAME`
+
+func (s *server) loadTableIndexDDLs(schema, table string) ([]string, error) {
+	rows, err := s.queryRows(oracleTableIndexDDLsSQL, []any{schema, table, schema, table})
 	if err != nil {
 		return nil, err
 	}
 	defer s.closeRows(rows)
+	return scanOracleDDLs(rows)
+}
+
+func loadTableIndexDDLsFromConn(conn *sql.Conn, schema, table string) ([]string, error) {
+	rows, err := conn.QueryContext(context.Background(), oracleTableIndexDDLsSQL, schema, table, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOracleDDLs(rows)
+}
+
+func scanOracleDDLs(rows *sql.Rows) ([]string, error) {
 	var result []string
 	for rows.Next() {
 		var ddl sql.NullString
@@ -3444,6 +3632,9 @@ func restoreOracleCurrentSchema(conn *sql.Conn, schema string) {
 }
 
 func (s *server) executeTransaction(params map[string]json.RawMessage) (queryResult, error) {
+	if s.hasManualTransaction() {
+		return queryResult{}, errors.New("cannot start a one-shot transaction while a manual transaction is open")
+	}
 	var payload struct {
 		Statements []string `json:"statements"`
 		Schema     string   `json:"schema"`
@@ -3493,7 +3684,7 @@ func (s *server) executeTransaction(params map[string]json.RawMessage) (queryRes
 
 func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageResult, error) {
 	start := time.Now()
-	if strings.TrimSpace(opts.Schema) != "" {
+	if strings.TrimSpace(opts.Schema) != "" && !s.hasManualTransaction() {
 		if err := s.setSchema(opts.Schema); err != nil {
 			return queryPageResult{}, err
 		}
@@ -3569,7 +3760,7 @@ func (s *server) storeQuerySession(session *querySession) string {
 
 func (s *server) startTableRead(opts queryOptions, pageSize int) (queryPageResult, error) {
 	start := time.Now()
-	if strings.TrimSpace(opts.Schema) != "" {
+	if strings.TrimSpace(opts.Schema) != "" && !s.hasManualTransaction() {
 		if err := s.setSchema(opts.Schema); err != nil {
 			return queryPageResult{}, err
 		}
@@ -3702,7 +3893,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 
 func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 	start := time.Now()
-	if strings.TrimSpace(opts.Schema) != "" {
+	if strings.TrimSpace(opts.Schema) != "" && !s.hasManualTransaction() {
 		if err := s.setSchema(opts.Schema); err != nil {
 			return queryResult{}, err
 		}
@@ -3717,8 +3908,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 		result.ExecutionTimeMS = time.Since(start).Milliseconds()
 		return result, err
 	}
-	db, err := s.requireDB()
-	if err != nil {
+	if _, err := s.requireDB(); err != nil {
 		return queryResult{}, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3748,12 +3938,23 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 		}
 		s.activeCancelMu.Unlock()
 	}()
-	execResult, err := db.ExecContext(ctx, sqlText)
+	execResult, err := s.execContext(ctx, sqlText)
 	if err != nil {
 		return queryResult{}, err
 	}
 	affected, _ := execResult.RowsAffected()
 	return queryResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, AffectedRows: affected, ExecutionTimeMS: time.Since(start).Milliseconds()}, nil
+}
+
+func (s *server) execContext(ctx context.Context, sqlText string) (sql.Result, error) {
+	if s.manualTx != nil {
+		return s.manualTx.ExecContext(ctx, sqlText)
+	}
+	db, err := s.requireDB()
+	if err != nil {
+		return nil, err
+	}
+	return db.ExecContext(ctx, sqlText)
 }
 
 func (s *server) executeSelect(sqlText string, maxRows int, timeoutSecs int, deferLOBs bool) (queryResult, error) {
@@ -4617,11 +4818,20 @@ func skipBlockCommentSQL(value string, pos int) int {
 }
 
 func (s *server) setSchema(schema string) error {
+	sqlText := "ALTER SESSION SET CURRENT_SCHEMA = " + quoteIdentifier(schema)
+	if s.manualTx != nil {
+		_, err := s.manualTx.Exec(sqlText)
+		return err
+	}
+	if s.manualConn != nil {
+		_, err := s.manualConn.ExecContext(context.Background(), sqlText)
+		return err
+	}
 	db, err := s.requireDB()
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec("ALTER SESSION SET CURRENT_SCHEMA = " + quoteIdentifier(schema))
+	_, err = db.Exec(sqlText)
 	return err
 }
 
@@ -4630,8 +4840,7 @@ func (s *server) queryRows(sqlText string, args []any) (*sql.Rows, error) {
 }
 
 func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs int) (*sql.Rows, error) {
-	db, err := s.requireDB()
-	if err != nil {
+	if _, err := s.requireDB(); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4653,7 +4862,18 @@ func (s *server) queryRowsWithTimeout(sqlText string, args []any, timeoutSecs in
 	s.activeTimer = timer
 	s.activeTimedOut = false
 	s.activeCancelMu.Unlock()
-	rows, queryErr := db.QueryContext(ctx, sqlText, args...)
+	var rows *sql.Rows
+	var queryErr error
+	if s.manualTx != nil {
+		rows, queryErr = s.manualTx.QueryContext(ctx, sqlText, args...)
+	} else {
+		db, err := s.requireDB()
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		rows, queryErr = db.QueryContext(ctx, sqlText, args...)
+	}
 	s.activeCancelMu.Lock()
 	s.activeCancel = nil
 	if s.activeTimer != nil {
@@ -4741,6 +4961,15 @@ func intParam(params map[string]json.RawMessage, key string) int {
 		return 0
 	}
 	var value int
+	_ = json.Unmarshal(params[key], &value)
+	return value
+}
+
+func boolParam(params map[string]json.RawMessage, key string) bool {
+	if params == nil || len(params[key]) == 0 {
+		return false
+	}
+	var value bool
 	_ = json.Unmarshal(params[key], &value)
 	return value
 }
