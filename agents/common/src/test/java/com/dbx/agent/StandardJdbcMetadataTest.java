@@ -44,6 +44,37 @@ class StandardJdbcMetadataTest {
     }
 
     @Test
+    void scopesSchemasToTheConnectionCatalog() {
+        AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        DatabaseMetaData meta = proxy(DatabaseMetaData.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getSchemas".equals(method.getName())) {
+                    capturedArgs.set(args);
+                    return rows(row("TABLE_SCHEM", "APP"));
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+        Connection conn = proxy(Connection.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getMetaData".equals(method.getName())) {
+                    return meta;
+                }
+                if ("getCatalog".equals(method.getName())) {
+                    return "regular_catalog";
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+
+        assertEquals(List.of("APP"), StandardJdbcMetadata.INSTANCE.listSchemas(conn, profile, "initial_catalog"));
+        assertEquals("regular_catalog", capturedArgs.get()[0]);
+        assertEquals(null, capturedArgs.get()[1]);
+    }
+
+    @Test
     void listsSchemasWhenConnectionGetSchemaIsUnsupported() {
         Connection conn = connection(
             rows(row("TABLE_SCHEM", "APP"), row("TABLE_SCHEM", "PUBLIC")),
@@ -277,6 +308,38 @@ class StandardJdbcMetadataTest {
 
         assertEquals(1, tables.size());
         assertEquals("SALES", capturedArgs.get()[1]);
+    }
+
+    @Test
+    void listTablesSkipsEscapeWhenProfileDisablesWildcards() {
+        // databend 等驱动的 getSearchStringEscape() 返回 "\\"，但 getTables 把 _ 当字面量且忽略转义，
+        // 转义含 _ 的库名（如 my_db）会返回 0 行（#8114）。profile.escapeSchemaWildcards=false 时应原样传入。
+        JdbcAgentProfile noEscapeProfile = new JdbcAgentProfile(
+            "example.Driver",
+            "jdbc:example://{host}:{port}/{database}",
+            0,
+            false,
+            Collections.emptySet(),
+            Arrays.asList("TABLE", "VIEW", "BASE TABLE"),
+            "\"",
+            "USE",
+            true,
+            false,
+            false,
+            false,
+            false
+        );
+        AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        Connection conn = schemaEscapeConnection("\\", rows(
+            row("TABLE_NAME", "A", "TABLE_TYPE", "TABLE", "REMARKS", null)
+        ), capturedArgs);
+
+        List<TableInfo> tables = StandardJdbcMetadata.INSTANCE.listTables(conn, noEscapeProfile, "", "my_db");
+
+        assertEquals(1, tables.size());
+        assertEquals("A", tables.get(0).getName());
+        // 关闭转义：schemaPattern 应为原始 "my_db"，而非 "my\\_db"
+        assertEquals("my_db", capturedArgs.get()[1]);
     }
 
     private static Connection schemaEscapeConnection(String searchEscape, ResultSet tables, AtomicReference<Object[]> capturedArgs) {

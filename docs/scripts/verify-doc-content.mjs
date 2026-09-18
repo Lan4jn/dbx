@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { LANGUAGES, languageOfFile, metaFile, slugOfFile } from "./languages.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const docsDir = path.resolve(scriptDir, "../content/docs");
@@ -15,17 +16,15 @@ const files = fs
 const pages = new Map();
 
 for (const file of files) {
-  const chinese = file.endsWith(".cn.mdx");
-  const slug = file.replace(/\.cn\.mdx$|\.mdx$/, "");
+  const slug = slugOfFile(file);
   const page = pages.get(slug) ?? {};
-  page[chinese ? "cn" : "en"] = file;
+  page[languageOfFile(file)] = file;
   pages.set(slug, page);
 }
 
 for (const [slug, page] of pages) {
-  if (!page.cn || !page.en) {
-    errors.push(`${slug}: missing ${page.cn ? "English" : "Chinese"} page`);
-  }
+  const missing = LANGUAGES.filter((language) => !page[language]);
+  if (missing.length > 0) errors.push(`${slug}: missing ${missing.join(", ")} page`);
 }
 
 function navigationPages(file) {
@@ -33,13 +32,10 @@ function navigationPages(file) {
   return navigation.pages.filter((entry) => !entry.startsWith("---"));
 }
 
-const chineseNavigation = navigationPages("meta.cn.json");
-const englishNavigation = navigationPages("meta.json");
+const navigationByLanguage = new Map(LANGUAGES.map((language) => [language, navigationPages(metaFile(language))]));
 
-for (const [name, entries] of [
-  ["meta.cn.json", chineseNavigation],
-  ["meta.json", englishNavigation],
-]) {
+for (const [language, entries] of navigationByLanguage) {
+  const name = metaFile(language);
   const duplicates = entries.filter((entry, index) => entries.indexOf(entry) !== index);
   for (const slug of new Set(duplicates)) errors.push(`${name}: duplicate page ${slug}`);
 
@@ -52,8 +48,11 @@ for (const [name, entries] of [
   }
 }
 
-if (JSON.stringify(chineseNavigation) !== JSON.stringify(englishNavigation)) {
-  errors.push("Chinese and English navigation page order differs");
+const referenceNavigation = JSON.stringify(navigationByLanguage.get("en"));
+for (const [language, entries] of navigationByLanguage) {
+  if (JSON.stringify(entries) !== referenceNavigation) {
+    errors.push(`${metaFile(language)}: navigation page order differs from meta.json`);
+  }
 }
 
 const knownSlugs = new Set(pages.keys());
@@ -61,7 +60,7 @@ const knownSlugs = new Set(pages.keys());
 for (const file of files) {
   const fullPath = path.join(docsDir, file);
   const content = fs.readFileSync(fullPath, "utf8");
-  const expectedLanguage = file.endsWith(".cn.mdx") ? "cn" : "en";
+  const expectedLanguage = languageOfFile(file);
   const frontmatter = content.match(/^---\n([\s\S]*?)\n---/);
 
   if (!frontmatter) {
@@ -78,9 +77,10 @@ for (const file of files) {
     if (count > 1) errors.push(`${file}: duplicate heading "${heading}"`);
   }
 
+  const languagePattern = LANGUAGES.join("|");
   const links = [
-    ...content.matchAll(/\]\(\/(cn|en)\/docs\/([^)#?]+)(?:#[^)]*)?\)/g),
-    ...content.matchAll(/href="\/(cn|en)\/docs\/([^"#?]+)(?:#[^"]*)?"/g),
+    ...content.matchAll(new RegExp(`\\]\\(/(${languagePattern})/docs/([^)#?]+)(?:#[^)]*)?\\)`, "g")),
+    ...content.matchAll(new RegExp(`href="/(${languagePattern})/docs/([^"#?]+)(?:#[^"]*)?"`, "g")),
   ];
 
   for (const link of links) {
@@ -91,13 +91,15 @@ for (const file of files) {
 }
 
 const databaseSupportSource = fs.readFileSync(path.join(repositoryDir, "docs/data/databaseSupport.ts"), "utf8");
-const connectionDialogSource = fs.readFileSync(path.join(repositoryDir, "apps/desktop/src/components/connection/ConnectionDialog.vue"), "utf8");
+const connectionProfilesSource = fs.readFileSync(path.join(repositoryDir, "apps/desktop/src/types/generated/connectionProfiles.ts"), "utf8");
 const jdbcProductProfilesSource = fs.readFileSync(path.join(repositoryDir, "apps/desktop/src/lib/database/jdbcProductProfiles.ts"), "utf8");
-const connectionOptionsMatch = connectionDialogSource.match(/const dbOptions: DbOption\[\] = \[([\s\S]*?)\n\];/);
+const connectionOptionsMatch = connectionProfilesSource.match(
+  /export const CONNECTION_PICKER_OPTIONS = \[([\s\S]*?)\n\] as const satisfies readonly ConnectionPickerOption\[\];/,
+);
 const jdbcProductProfilesMatch = jdbcProductProfilesSource.match(/JDBC_PRODUCT_PROFILES = \[([^\]]*)\]/);
 
 if (!connectionOptionsMatch) {
-  errors.push("Unable to read database options from ConnectionDialog.vue");
+  errors.push("Unable to read database options from connectionProfiles.ts");
 } else {
   const connectionModeIds = new Set(["custom_mysql", "custom_postgres"]);
   const connectionIds = [...connectionOptionsMatch[1].matchAll(/value: "([^"]+)"/g)]
@@ -132,7 +134,7 @@ if (!connectionOptionsMatch) {
     .filter((id) => id !== "request");
 
   for (const [label, ids] of [
-    ["ConnectionDialog.vue", connectionIds],
+    ["connectionProfiles.ts", connectionIds],
     ["databaseSupport.ts", websiteIds],
   ]) {
     const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
@@ -161,4 +163,4 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-console.log(`Verified ${pages.size} bilingual documentation pages.`);
+console.log(`Verified ${pages.size} documentation pages across ${LANGUAGES.length} languages.`);

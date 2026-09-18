@@ -35,6 +35,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         database: Some(database.to_string()),
         default_schema: None,
         visible_databases: None,
+        visible_database_patterns: None,
         visible_schemas: None,
         attached_databases: Vec::new(),
         init_script: None,
@@ -61,10 +62,16 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
         redis_scan_page_size: None,
         redis_database_aliases: Default::default(),
+        redis_key_templates: Vec::new(),
+        redis_key_grouping: None,
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
         informix_server: String::new(),
         external_config: None,
+        plugin_id: None,
+        plugin_connection_provider: None,
+        plugin_connection_type: None,
+        connection_secrets: Default::default(),
         jdbc_driver_class: None,
         jdbc_driver_paths: Vec::new(),
         one_time: false,
@@ -997,6 +1004,7 @@ async fn live_sqlserver_table_structure_default_changes_drop_existing_constraint
     active.original_position = Some(1);
     let result = build_table_structure_change_sql(TableStructureSqlOptions {
         database_type: Some(DatabaseType::SqlServer),
+        driver_profile: None,
         schema: Some(schema.clone()),
         table_name: table.to_string(),
         columns: vec![sku, active],
@@ -1005,8 +1013,10 @@ async fn live_sqlserver_table_structure_default_changes_drop_existing_constraint
         triggers: Vec::new(),
         table_comment: None,
         original_table_comment: None,
+        mysql_engine: None,
         partitioned: false,
         is_gaussdb_m_mode: false,
+        table_collation: None,
     });
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements.len(), 4);
@@ -1164,10 +1174,11 @@ async fn live_sqlserver_query_result_export_streams_cte_query_to_csv() {
     let connection_id = "live-sqlserver-export";
     let pool_key = format!("{connection_id}:{database}");
     state
-        .connections
-        .write()
-        .await
-        .insert(pool_key, PoolKind::SqlServer(std::sync::Arc::new(tokio::sync::Mutex::new(export_client))));
+        .update_connection_pools(|connections| {
+            connections
+                .insert(pool_key, PoolKind::SqlServer(std::sync::Arc::new(tokio::sync::Mutex::new(export_client))));
+        })
+        .await;
 
     let file_path = dir.join("result.csv");
     let sql = format!(
@@ -1190,6 +1201,7 @@ async fn live_sqlserver_query_result_export_streams_cte_query_to_csv() {
         use_agent_cursor: false,
         file_path: file_path.to_string_lossy().to_string(),
         format: "csv".to_string(),
+        insert_mode: Default::default(),
         include_sql_sheet: false,
         page_size: 1,
         row_limit: None,
@@ -1199,11 +1211,15 @@ async fn live_sqlserver_query_result_export_streams_cte_query_to_csv() {
         client_session_id: None,
         execution_id: Some(format!("live-sqlserver-export-{suffix}")),
         date_time_format: None,
+        csv_quote_mode: Default::default(),
         export_table_name: None,
         export_column_types: None,
         column_comments: None,
+        auto_filter: None,
         identifier_quote: None,
         numeric_column_right_align: false,
+        exclude_primary_keys: false,
+        primary_keys: Vec::new(),
     };
     let done_seen = AtomicBool::new(false);
     let result = export_query_result_core(&state, &request, None, |progress| {
@@ -1254,10 +1270,14 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
     config.username = user;
     config.password = password;
     state.configs.write().await.insert(connection_id.to_string(), config);
-    state.connections.write().await.insert(
-        format!("{connection_id}:{database}"),
-        PoolKind::SqlServer(std::sync::Arc::new(tokio::sync::Mutex::new(client))),
-    );
+    state
+        .update_connection_pools(|connections| {
+            connections.insert(
+                format!("{connection_id}:{database}"),
+                PoolKind::SqlServer(std::sync::Arc::new(tokio::sync::Mutex::new(client))),
+            );
+        })
+        .await;
 
     let script = format!(
         "CREATE TABLE [dbo].[{table}] (id INT NOT NULL);\n\
@@ -1276,6 +1296,9 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
         database: database.clone(),
         file_path: "fixture.sql".to_string(),
         continue_on_error: false,
+        selected_tables: None,
+        part_cooldown_ms: 0,
+        skip_relational_constraints: false,
     };
     let done_seen = AtomicBool::new(false);
 
@@ -1288,8 +1311,7 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
     .expect("execute SQL Server file with GO batches");
 
     let pool_key = format!("{connection_id}:{database}");
-    let connections = state.connections.read().await;
-    let PoolKind::SqlServer(client) = connections.get(&pool_key).expect("SQL Server pool") else {
+    let PoolKind::SqlServer(client) = state.pool_handle(&pool_key).await.expect("SQL Server pool") else {
         panic!("expected SQL Server pool");
     };
     let mut client = client.lock().await;
@@ -1297,7 +1319,6 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
     let cleanup = format!("DROP PROCEDURE [dbo].[{procedure}]; DROP TABLE [dbo].[{table}];");
     let _ = dbx_core::db::sqlserver::execute_batch(&mut client, &cleanup).await;
     drop(client);
-    drop(connections);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(done_seen.load(Ordering::Relaxed));
@@ -1347,7 +1368,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
     let dir = std::env::temp_dir().join(format!("dbx-live-sqlserver-rowversion-{suffix}"));
     std::fs::create_dir_all(&dir).unwrap();
     let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let state = Arc::new(AppState::new(storage));
     let config = live_sqlserver_config("live-sqlserver-rowversion", &database);
     state.configs.write().await.insert(config.id.clone(), config);
     let source_pool_key =
@@ -1368,10 +1389,13 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         target_catalog: None,
         tables: vec![source_table.clone()],
         create_table: true,
+        drop_target_before_create: false,
+        drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
         objects: Vec::new(),
         mode: dbx_core::transfer::TransferMode::Append,
         target_table_name_case: dbx_core::transfer::TransferTableNameCase::Upper,
+        quote_target_column_names: true,
         ownership_policy: dbx_core::transfer::TransferOwnershipPolicy::Preserve,
         batch_size: 100,
     };
@@ -1386,6 +1410,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         &target_pool_key,
         &std::collections::HashMap::new(),
         &mut Vec::new(),
+        None,
         |_| {},
     )
     .await;

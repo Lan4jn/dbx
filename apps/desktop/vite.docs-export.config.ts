@@ -4,8 +4,10 @@ import path from "node:path";
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import tailwindcss from "@tailwindcss/vite";
+import { connectionTypesPlugin } from "./viteConnectionTypesPlugin.ts";
 
 const repoRoot = path.resolve(__dirname, "../..");
+const normalizedRepoRoot = repoRoot.replaceAll(path.sep, "/");
 const assetsDir = path.join(repoRoot, "crates/dbx-core/assets");
 const fontPath = path.join(__dirname, "public/fonts/geist-latin-wght-normal.woff2");
 
@@ -85,25 +87,26 @@ function exportBundlePlugin() {
         // Vite tags CSS the same way. The file on disk is the part before the
         // query; without stripping it every SFC would be missing from the
         // manifest, which is the failure this whole derivation exists to avoid.
-        const id = rawId.split("?")[0];
+        const id = path.resolve(rawId.split("?")[0]);
         if (!path.isAbsolute(id)) return;
+        const normalizedId = id.replaceAll(path.sep, "/");
 
         // `lastIndexOf`: under pnpm a real path is
         // `<root>/node_modules/.pnpm/marked@18.0.4/node_modules/marked/…`, and
         // the FIRST occurrence yields the package name `.pnpm`.
-        const nodeModules = id.lastIndexOf("/node_modules/");
+        const nodeModules = normalizedId.lastIndexOf("/node_modules/");
         if (nodeModules !== -1) {
-          const after = id.slice(nodeModules + "/node_modules/".length);
+          const after = normalizedId.slice(nodeModules + "/node_modules/".length);
           const name = after.startsWith("@") ? after.split("/").slice(0, 2).join("/") : after.split("/")[0];
           if (name in deps) return;
-          const manifest = path.join(id.slice(0, nodeModules), "node_modules", name, "package.json");
+          const manifest = path.join(normalizedId.slice(0, nodeModules), "node_modules", name, "package.json");
           if (!isFile(manifest)) return;
           deps[name] = JSON.parse(readFileSync(manifest, "utf8")).version;
           return;
         }
 
-        if (!id.startsWith(repoRoot) || !isFile(id)) return;
-        sources[path.relative(repoRoot, id)] = sha256(readFileSync(id));
+        if (!normalizedId.startsWith(normalizedRepoRoot) || !isFile(id)) return;
+        sources[path.relative(repoRoot, id).replaceAll(path.sep, "/")] = sha256(readFileSync(id));
       };
 
       const stylesheets = new Set<string>();
@@ -128,10 +131,7 @@ function exportBundlePlugin() {
         if (name.endsWith(".css") && typeof chunk.source === "string") chunk.source = fontFace + chunk.source;
       }
 
-      writeFileSync(
-        path.join(assetsDir, "docs-export.manifest.json"),
-        `${JSON.stringify({ sources: Object.fromEntries(Object.entries(sources).sort()), deps: Object.fromEntries(Object.entries(deps).sort()) }, null, 2)}\n`,
-      );
+      writeFileSync(path.join(assetsDir, "docs-export.manifest.json"), `${JSON.stringify({ sources: Object.fromEntries(Object.entries(sources).sort()), deps: Object.fromEntries(Object.entries(deps).sort()) }, null, 2)}\n`);
     },
   };
 }
@@ -141,7 +141,7 @@ export default defineConfig({
   // The app's public/ holds the font files this build inlines. Left on, Vite
   // would copy all of them into crates/dbx-core/assets beside the bundle.
   publicDir: false,
-  plugins: [vue(), tailwindcss(), exportBundlePlugin()],
+  plugins: [connectionTypesPlugin(), vue(), tailwindcss(), exportBundlePlugin()],
   resolve: { alias: { "@": path.resolve(__dirname, "src") } },
   build: {
     outDir: assetsDir,

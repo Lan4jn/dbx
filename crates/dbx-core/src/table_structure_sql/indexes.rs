@@ -1,7 +1,7 @@
-use super::comments::build_sqlserver_index_comment_sql;
+use super::comments::build_sqlserver_index_comment_sql_for_profile;
 use super::dialect::{capabilities_for, database_label, database_type_for_dialect, dialect_label, StructureDialect};
-use super::types::{EditableStructureIndex, TableStructureSqlOptions};
-use super::util::{clean, qualified_table, quote_ident, quote_string};
+use super::types::{EditableStructureIndex, IndexInfo, TableStructureSqlOptions};
+use super::util::{clean, qualified_table, quote_ident, quote_new_ident, quote_string};
 use crate::models::connection::DatabaseType;
 
 pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut Vec<String>) -> Vec<String> {
@@ -12,7 +12,7 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
         capabilities = caps;
         dialect = StructureDialect::GaussdbM;
     } else {
-        let caps = capabilities_for(options.database_type);
+        let caps = capabilities_for(options.database_type, options.driver_profile.as_deref());
         capabilities = caps;
         dialect = caps.dialect;
     }
@@ -31,6 +31,10 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
             }
             if original.is_primary {
                 warnings.push(format!("Primary index \"{}\" cannot be dropped from this editor.", original.name));
+                continue;
+            }
+            if is_dameng_constraint_backed(options.database_type, original) {
+                statements.push(build_dameng_drop_constraint_sql(dialect, &table, &original.name));
                 continue;
             }
             statements.push(build_drop_index_sql(
@@ -56,6 +60,18 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
                 warnings.push(format!("Primary index \"{}\" cannot be edited from this editor.", original.name));
                 continue;
             }
+            if is_dameng_constraint_backed(options.database_type, original) {
+                statements.extend(build_dameng_constraint_index_edit(
+                    options,
+                    dialect,
+                    &table,
+                    index,
+                    original,
+                    capabilities.index_concurrent,
+                    warnings,
+                ));
+                continue;
+            }
             let or_replace =
                 options.database_type == Some(DatabaseType::Dameng) && clean(&index.name) == clean(&original.name);
             if !or_replace {
@@ -68,6 +84,7 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
                 ));
             }
             statements.extend(build_create_index_statements(
+                options.database_type,
                 dialect,
                 &table,
                 index,
@@ -76,6 +93,8 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
                 &options.table_name,
                 or_replace,
                 capabilities.index_concurrent,
+                false,
+                options.driver_profile.as_deref(),
             ));
             continue;
         }
@@ -85,6 +104,7 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
             continue;
         }
         statements.extend(build_create_index_statements(
+            options.database_type,
             dialect,
             &table,
             index,
@@ -93,9 +113,83 @@ pub(super) fn build_index_sql(options: &TableStructureSqlOptions, warnings: &mut
             &options.table_name,
             false,
             capabilities.index_concurrent,
+            false,
+            options.driver_profile.as_deref(),
         ));
     }
 
+    statements
+}
+
+/// Dameng builds the index behind a PRIMARY KEY / UNIQUE constraint as a "virtual" index
+/// owned by that constraint. Index-level DDL against such an index — `DROP INDEX` as much as
+/// `CREATE OR REPLACE INDEX` — is rejected with a misleading "no permission to drop index"
+/// error even for the owning user (#7959); it can only be changed through
+/// `ALTER TABLE ... ADD/DROP CONSTRAINT`, the same way Dameng primary keys are already
+/// handled in `columns.rs`.
+///
+/// A "real" unique index (`CREATE UNIQUE INDEX`, which is also what this editor emits for a
+/// newly created unique index) has no constraint behind it, is not reported as
+/// constraint-backed by introspection, and keeps the index-level path — constraint DDL would
+/// fail on it with "constraint does not exist".
+fn is_dameng_constraint_backed(database_type: Option<DatabaseType>, original: &IndexInfo) -> bool {
+    database_type == Some(DatabaseType::Dameng) && original.constraint_backed
+}
+
+fn build_dameng_drop_constraint_sql(dialect: StructureDialect, table: &str, constraint_name: &str) -> String {
+    format!("ALTER TABLE {table} DROP CONSTRAINT {};", quote_ident(dialect, constraint_name))
+}
+
+/// Rewrites an edit of a constraint-backed Dameng index as constraint DDL: drop the
+/// constraint, then re-add it as `UNIQUE` (still unique) or replace it with an ordinary
+/// index (downgraded to a plain index, where index-level DDL is fine again because the
+/// constraint is gone).
+fn build_dameng_constraint_index_edit(
+    options: &TableStructureSqlOptions,
+    dialect: StructureDialect,
+    table: &str,
+    index: &EditableStructureIndex,
+    original: &IndexInfo,
+    concurrently_supported: bool,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let name = clean(&index.name);
+    let columns: Vec<String> =
+        index.columns.iter().map(|column| clean(column)).filter(|column| !column.is_empty()).collect();
+    // Same guard as `build_create_index_statements`: an empty name or an empty column list
+    // cannot produce a valid replacement (`validate_draft` already reports it as a warning).
+    // Emitting only the DROP would silently delete the constraint, so skip the edit entirely.
+    if name.is_empty() || columns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut statements = vec![build_dameng_drop_constraint_sql(dialect, table, &original.name)];
+    if !index.is_unique {
+        statements.extend(build_create_index_statements(
+            options.database_type,
+            dialect,
+            table,
+            index,
+            warnings,
+            options.schema.as_deref(),
+            &options.table_name,
+            false,
+            concurrently_supported,
+            false,
+            options.driver_profile.as_deref(),
+        ));
+        return statements;
+    }
+
+    // `build_create_index_statements` would honor BITMAP for Dameng, but a unique constraint
+    // always builds a normal index behind itself, so the type cannot be carried over.
+    if normalized_index_type(index) == "BITMAP" {
+        warnings.push(format!(
+            "Index type BITMAP is ignored for unique index \"{name}\": Dameng enforces it with a unique constraint, whose index cannot be a bitmap index."
+        ));
+    }
+    let cols = columns.iter().map(|column| quote_ident(dialect, column)).collect::<Vec<_>>().join(", ");
+    statements.push(format!("ALTER TABLE {table} ADD CONSTRAINT {} UNIQUE ({cols});", quote_ident(dialect, &name)));
     statements
 }
 
@@ -110,6 +204,45 @@ pub(super) fn has_existing_index_change(index: &EditableStructureIndex) -> bool 
         || index_list_changed(&index.included_columns, original.included_columns.as_ref())
         || clean(&index.filter) != clean(original.filter.as_deref().unwrap_or(""))
         || clean(&index.comment) != clean(original.comment.as_deref().unwrap_or(""))
+        || index_opclasses_changed(
+            &index.column_opclasses,
+            &original.column_opclasses,
+            &index.columns,
+            &original.columns,
+        )
+}
+
+/// Compare opclass arrays positionally, skipping expression columns.
+/// When the column list has changed we already detect that above; here we only
+/// compare opclasses for columns that exist in both the edited and original lists.
+fn index_opclasses_changed(
+    next: &[Option<String>],
+    previous: &[Option<String>],
+    next_cols: &[String],
+    prev_cols: &[String],
+) -> bool {
+    // If the edited side has explicit opclasses, compare positionally.
+    if !next.is_empty() {
+        // Length mismatch (shouldn't happen when columns are in lockstep, but
+        // defend against it): any difference in length is a change.
+        if next.len() != previous.len() {
+            return true;
+        }
+        return next.iter().zip(previous.iter()).any(|(n, p)| {
+            let n_flat = n.as_deref().map(clean).filter(|v| !v.is_empty());
+            let p_flat = p.as_deref().map(clean).filter(|v| !v.is_empty());
+            n_flat != p_flat
+        });
+    }
+    // If the edited side has no opclasses, check whether the original side
+    // had any non-default opclasses for columns still present.
+    if previous.iter().any(|o| o.as_deref().map(|v| !clean(v).is_empty()).unwrap_or(false)) {
+        let prev_set: std::collections::HashSet<_> = prev_cols.iter().map(|c| clean(c)).collect();
+        return next_cols.iter().zip(previous.iter()).any(|(nc, po)| {
+            po.as_deref().map(|v| !clean(v).is_empty()).unwrap_or(false) && prev_set.contains(&clean(nc))
+        });
+    }
+    false
 }
 
 pub(super) fn index_list_changed(next: &[String], previous: Option<&Vec<String>>) -> bool {
@@ -166,14 +299,19 @@ fn mysql_index_column_sql(column: &str) -> String {
     }
 }
 
-fn postgres_index_column_sql(column: &str, is_expression: bool) -> String {
-    // Expression/functional index key parts arrive as raw expression text, not a plain
-    // column name; quoting the whole expression as an identifier turns it into a literal
-    // column reference that doesn't exist (#6295).
-    if is_expression {
-        column.trim().to_string()
-    } else {
-        quote_ident(StructureDialect::Postgres, column)
+fn postgres_index_column_sql(column: &str, is_expression: bool, opclass: Option<&str>) -> String {
+    // The base key text: a real column is quoted as an identifier; an expression/functional
+    // key part arrives as raw expression text (from the per-column `pg_get_indexdef`, which
+    // omits the opclass — see `list_indexes_with_sql`), so quoting the whole thing as an
+    // identifier would turn it into a nonexistent column reference (#6295).
+    let base =
+        if is_expression { column.trim().to_string() } else { quote_ident(StructureDialect::Postgres, column.trim()) };
+    // The opclass is read separately from `pg_index.indclass` for every key position
+    // (including expression keys) and appended uniformly — it never lives inside the
+    // expression text, so there is no duplication risk.
+    match opclass.filter(|o| !o.is_empty()) {
+        Some(opc) => format!("{} {}", base, opc),
+        None => base,
     }
 }
 
@@ -215,6 +353,49 @@ fn key_expression_flags(index: &EditableStructureIndex, columns: &[String]) -> V
         .collect()
 }
 
+/// Per-key operator class provenance for `columns` (the edited/current key list).
+///
+/// Honors explicit per-key opclasses (`index.column_opclasses`) positionally when
+/// they are aligned to `columns` (non-empty, same length) and represent a genuine
+/// edit: either there is no `original` (a newly created index, where the UI
+/// authors `column_opclasses` in lockstep with `columns`), or the edited
+/// opclasses differ from the round-tripped `original.column_opclasses`. A stale
+/// copy left behind by a column toggle/reorder — still equal to the original —
+/// falls through to the order-independent text-matching below, so opclasses are
+/// never misassigned positionally before the editor maintains `column_opclasses`
+/// in lockstep with `columns`. Once that lockstep is in place the guard always
+/// passes and the honor branch is authoritative.
+fn key_opclasses(index: &EditableStructureIndex, columns: &[String]) -> Vec<Option<String>> {
+    if !index.column_opclasses.is_empty()
+        && index.column_opclasses.len() == columns.len()
+        && index.original.as_ref().is_none_or(|original| original.column_opclasses != index.column_opclasses)
+    {
+        return index.column_opclasses.to_vec();
+    }
+    let original = match &index.original {
+        Some(original) if !original.column_opclasses.is_empty() => original,
+        _ => return vec![None; columns.len()],
+    };
+    let mut consumed = vec![false; original.columns.len()];
+    columns
+        .iter()
+        .map(|column| {
+            let claimed = original
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(i, original_column)| !consumed[*i] && *original_column == column);
+            match claimed {
+                Some((i, _)) => {
+                    consumed[i] = true;
+                    original.column_opclasses.get(i).cloned().flatten()
+                }
+                None => None,
+            }
+        })
+        .collect()
+}
+
 pub(super) fn build_drop_index_sql(
     database_type: Option<DatabaseType>,
     dialect: StructureDialect,
@@ -243,7 +424,9 @@ pub(super) fn build_drop_index_sql(
     format!("DROP INDEX {};", quote_ident(dialect, index_name))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_create_index_statements(
+    database_type: Option<DatabaseType>,
     dialect: StructureDialect,
     table: &str,
     index: &EditableStructureIndex,
@@ -252,8 +435,10 @@ pub(super) fn build_create_index_statements(
     table_name: &str,
     or_replace: bool,
     concurrently_supported: bool,
+    for_new_table: bool,
+    driver_profile: Option<&str>,
 ) -> Vec<String> {
-    let capabilities = capabilities_for(database_type_for_dialect(dialect));
+    let capabilities = capabilities_for(database_type_for_dialect(dialect), None);
     let name = clean(&index.name);
     let columns: Vec<String> =
         index.columns.iter().map(|column| clean(column)).filter(|column| !column.is_empty()).collect();
@@ -272,6 +457,7 @@ pub(super) fn build_create_index_statements(
     let unique = if index.is_unique { "UNIQUE " } else { "" };
     let replace = if or_replace { "OR REPLACE " } else { "" };
     let key_is_expression = key_expression_flags(index, &columns);
+    let key_opclasses = key_opclasses(index, &columns);
     let cols = columns
         .iter()
         .enumerate()
@@ -281,7 +467,9 @@ pub(super) fn build_create_index_statements(
             } else if dialect == StructureDialect::GaussdbM {
                 gaussdbm_index_column_sql(column, key_is_expression[i])
             } else if dialect == StructureDialect::Postgres {
-                postgres_index_column_sql(column, key_is_expression[i])
+                postgres_index_column_sql(column, key_is_expression[i], key_opclasses[i].as_deref())
+            } else if for_new_table {
+                quote_new_ident(database_type, dialect, column)
             } else {
                 quote_ident(dialect, column)
             }
@@ -321,7 +509,17 @@ pub(super) fn build_create_index_statements(
     {
         format!(
             " INCLUDE ({})",
-            included_columns.iter().map(|column| quote_ident(dialect, column)).collect::<Vec<_>>().join(", ")
+            included_columns
+                .iter()
+                .map(|column| {
+                    if for_new_table {
+                        quote_new_ident(database_type, dialect, column)
+                    } else {
+                        quote_ident(dialect, column)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     } else {
         String::new()
@@ -339,10 +537,12 @@ pub(super) fn build_create_index_statements(
     let supports_where = capabilities.index_filter
         && matches!(dialect, StructureDialect::Postgres | StructureDialect::SqlServer | StructureDialect::Sqlite);
     let where_clause = if !filter.is_empty() && supports_where { format!(" WHERE {filter}") } else { String::new() };
+    let quoted_index_name =
+        if for_new_table { quote_new_ident(database_type, dialect, &name) } else { quote_ident(dialect, &name) };
     let index_name = if dialect == StructureDialect::Sqlite && schema.is_some_and(|schema| !schema.trim().is_empty()) {
-        format!("{}.{}", quote_ident(dialect, schema.unwrap()), quote_ident(dialect, &name))
+        format!("{}.{}", quote_ident(dialect, schema.unwrap()), quoted_index_name)
     } else {
-        quote_ident(dialect, &name)
+        quoted_index_name
     };
     // SQLite assigns an index to the database named by the qualified index.
     // Its CREATE INDEX grammar does not allow a qualified table name.
@@ -363,7 +563,14 @@ pub(super) fn build_create_index_statements(
     if !comment.is_empty() && capabilities.index_comment && dialect == StructureDialect::Postgres {
         statements.push(format!("COMMENT ON INDEX {} IS {};", quote_ident(dialect, &name), quote_string(&comment)));
     } else if !comment.is_empty() && capabilities.index_comment && dialect == StructureDialect::SqlServer {
-        statements.extend(build_sqlserver_index_comment_sql(table, schema, table_name, &name, &comment));
+        statements.extend(build_sqlserver_index_comment_sql_for_profile(
+            table,
+            schema,
+            table_name,
+            &name,
+            &comment,
+            driver_profile,
+        ));
     } else if !comment.is_empty()
         && capabilities.index_comment
         && matches!(dialect, StructureDialect::Mysql | StructureDialect::GaussdbM)

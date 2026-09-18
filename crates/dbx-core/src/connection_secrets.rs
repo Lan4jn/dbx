@@ -24,6 +24,20 @@ pub const NACOS_AUTH_PASSWORD_KEY: &str = "nacos.auth.password";
 pub const NACOS_RNACOS_CONSOLE_PASSWORD_KEY: &str = "nacos.auth.rnacos_console_password";
 pub const MQTT_AUTH_SECRET_PREFIX: &str = "mqtt.auth.";
 pub const MQTT_AUTH_PASSWORD_KEY: &str = "mqtt.auth.password";
+pub const CASSANDRA_TLS_SECRET_PREFIX: &str = "cassandra.tls.";
+pub const CASSANDRA_TRUSTSTORE_PASSWORD_KEY: &str = "cassandra.tls.truststore_password";
+pub const CASSANDRA_KEYSTORE_PASSWORD_KEY: &str = "cassandra.tls.keystore_password";
+pub const PLUGIN_CONNECTION_SECRET_PREFIX: &str = "plugin_connection.";
+
+/// Storage-level secret key for one plugin connection field: namespaced under
+/// [`PLUGIN_CONNECTION_SECRET_PREFIX`] so plugin keys never collide with the
+/// fixed driver keys and can be scrubbed with a single prefix delete.
+pub fn plugin_connection_secret_key(key: &str) -> Result<String, String> {
+    if key.is_empty() {
+        return Err("Plugin connection secret key must not be empty".to_string());
+    }
+    Ok(format!("{PLUGIN_CONNECTION_SECRET_PREFIX}{key}"))
+}
 
 pub trait ConnectionSecretStore {
     fn set_secret(&self, connection_id: &str, key: &str, secret: &str) -> Result<(), String>;
@@ -112,6 +126,11 @@ pub fn save_connections_to_file(
         persist_mq_auth_secrets(store, config)?;
         persist_mq_token_signing_secret(store, config)?;
         persist_mqtt_auth_secrets(store, config)?;
+        persist_cassandra_tls_secrets(store, config)?;
+        delete_secret_prefix(store, &config.id, PLUGIN_CONNECTION_SECRET_PREFIX)?;
+        for (key, secret) in &config.connection_secrets {
+            persist_secret(store, &config.id, &plugin_connection_secret_key(key)?, secret)?;
+        }
 
         // New configs persist transport-layer secrets only. Remove legacy transport secret slots after the
         // migrated layer values have been written so old configs do not keep two sources of truth.
@@ -181,6 +200,20 @@ pub fn load_connections_from_file(
         hydrate_mq_auth_secrets(store, config, &mut needs_rewrite)?;
         hydrate_mq_token_signing_secret(store, config, &mut needs_rewrite)?;
         hydrate_mqtt_auth_secrets(store, config, &mut needs_rewrite)?;
+        hydrate_cassandra_tls_secrets(store, config, &mut needs_rewrite)?;
+        let plugin_secret_keys = config.connection_secrets.keys().cloned().collect::<Vec<_>>();
+        for key in plugin_secret_keys {
+            let storage_key = plugin_connection_secret_key(&key)?;
+            let current = config.connection_secrets.get(&key).cloned().unwrap_or_default();
+            if current.is_empty() {
+                if let Some(secret) = store.get_secret(&config.id, &storage_key)? {
+                    config.connection_secrets.insert(key, secret);
+                }
+            } else {
+                store.set_secret(&config.id, &storage_key, &current)?;
+                needs_rewrite = true;
+            }
+        }
     }
 
     if needs_rewrite {
@@ -362,6 +395,7 @@ fn delete_removed_connection_secrets(
         delete_secret_prefix(store, &config.id, MQ_AUTH_SECRET_PREFIX)?;
         delete_secret_prefix(store, &config.id, MQ_TOKEN_SIGNING_SECRET_PREFIX)?;
         delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
+        delete_secret_prefix(store, &config.id, CASSANDRA_TLS_SECRET_PREFIX)?;
     }
     Ok(())
 }
@@ -556,6 +590,71 @@ fn scrub_mq_token_signing_secret(config: &mut ConnectionConfig) {
     scrub_json_secret(signing, "key");
 }
 
+fn persist_cassandra_tls_secrets(store: &dyn ConnectionSecretStore, config: &ConnectionConfig) -> Result<(), String> {
+    if config.db_type != DatabaseType::Cassandra {
+        return delete_secret_prefix(store, &config.id, CASSANDRA_TLS_SECRET_PREFIX);
+    }
+    let Some(tls) = cassandra_tls_object(config.external_config.as_ref()) else {
+        return delete_secret_prefix(store, &config.id, CASSANDRA_TLS_SECRET_PREFIX);
+    };
+    persist_secret(
+        store,
+        &config.id,
+        CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
+        tls.get("truststore_password").and_then(serde_json::Value::as_str).unwrap_or(""),
+    )?;
+    persist_secret(
+        store,
+        &config.id,
+        CASSANDRA_KEYSTORE_PASSWORD_KEY,
+        tls.get("keystore_password").and_then(serde_json::Value::as_str).unwrap_or(""),
+    )
+}
+
+fn hydrate_cassandra_tls_secrets(
+    store: &dyn ConnectionSecretStore,
+    config: &mut ConnectionConfig,
+    needs_rewrite: &mut bool,
+) -> Result<(), String> {
+    if config.db_type != DatabaseType::Cassandra {
+        return Ok(());
+    }
+    let connection_id = config.id.clone();
+    let Some(tls) = cassandra_tls_object_mut(config.external_config.as_mut()) else {
+        return Ok(());
+    };
+    hydrate_json_secret(
+        store,
+        &connection_id,
+        CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
+        tls,
+        "truststore_password",
+        needs_rewrite,
+    )?;
+    hydrate_json_secret(store, &connection_id, CASSANDRA_KEYSTORE_PASSWORD_KEY, tls, "keystore_password", needs_rewrite)
+}
+
+fn scrub_cassandra_tls_secrets(config: &mut ConnectionConfig) {
+    if config.db_type != DatabaseType::Cassandra {
+        return;
+    }
+    let Some(tls) = cassandra_tls_object_mut(config.external_config.as_mut()) else {
+        return;
+    };
+    scrub_json_secret(tls, "truststore_password");
+    scrub_json_secret(tls, "keystore_password");
+}
+
+fn cassandra_tls_object(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value?.get("tls")?.as_object()
+}
+
+fn cassandra_tls_object_mut(
+    value: Option<&mut serde_json::Value>,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    value?.get_mut("tls")?.as_object_mut()
+}
+
 // ── MQTT 密钥持久化 ──────────────────────────────────────────────
 
 fn persist_mqtt_auth_secrets(store: &dyn ConnectionSecretStore, config: &ConnectionConfig) -> Result<(), String> {
@@ -748,9 +847,17 @@ fn sanitize_connections(configs: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
             scrub_mq_auth_secrets(&mut config);
             scrub_mq_token_signing_secret(&mut config);
             scrub_mqtt_auth_secrets(&mut config);
+            scrub_cassandra_tls_secrets(&mut config);
+            scrub_plugin_connection_secrets(&mut config);
             config
         })
         .collect()
+}
+
+fn scrub_plugin_connection_secrets(config: &mut ConnectionConfig) {
+    for secret in config.connection_secrets.values_mut() {
+        secret.clear();
+    }
 }
 
 pub fn secret_account(connection_id: &str, key: &str) -> String {
@@ -760,9 +867,10 @@ pub fn secret_account(connection_id: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_connections_from_file, save_connections_to_file, ConnectionSecretStore, CONNECTION_STRING_KEY,
-        INIT_SCRIPT_KEY, MAIN_PASSWORD_KEY, MQTT_AUTH_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
-        MQ_TOKEN_SIGNING_KEY, REDIS_SENTINEL_PASSWORD_KEY, SSH_PASSWORD_KEY,
+        load_connections_from_file, save_connections_to_file, ConnectionSecretStore, CASSANDRA_KEYSTORE_PASSWORD_KEY,
+        CASSANDRA_TRUSTSTORE_PASSWORD_KEY, CONNECTION_STRING_KEY, INIT_SCRIPT_KEY, MAIN_PASSWORD_KEY,
+        MQTT_AUTH_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY,
+        PLUGIN_CONNECTION_SECRET_PREFIX, REDIS_SENTINEL_PASSWORD_KEY, SSH_PASSWORD_KEY,
     };
     use crate::models::connection::{
         ConnectionConfig, DatabaseType, HttpTunnelConfig, SshTunnelConfig, TransportLayerConfig,
@@ -843,6 +951,7 @@ mod tests {
             database: Some("postgres".to_string()),
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -870,10 +979,16 @@ mod tests {
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -1125,6 +1240,35 @@ mod tests {
         let loaded = load_connections_from_file(&path, &store).unwrap();
         let auth = loaded[0].external_config.as_ref().and_then(|value| value.get("auth")).expect("restored MQ auth");
         assert_eq!(auth.get("token").and_then(serde_json::Value::as_str), Some("mq-token-secret"));
+    }
+
+    #[test]
+    fn save_connections_moves_cassandra_store_passwords_to_secret_store_and_restores_them() {
+        let path = temp_connections_file("cassandra-tls");
+        let store = MemorySecretStore::default();
+        let mut config = connection("cassandra", "", "");
+        config.db_type = DatabaseType::Cassandra;
+        config.external_config = Some(serde_json::json!({
+            "tls": {
+                "truststore_path": "/certs/client.truststore",
+                "truststore_password": "trust-secret",
+                "keystore_path": "/certs/client.keystore",
+                "keystore_password": "key-secret"
+            }
+        }));
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        assert_eq!(store.get_existing("cassandra", CASSANDRA_TRUSTSTORE_PASSWORD_KEY).as_deref(), Some("trust-secret"));
+        assert_eq!(store.get_existing("cassandra", CASSANDRA_KEYSTORE_PASSWORD_KEY).as_deref(), Some("key-secret"));
+        let persisted_json = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted_json.contains("trust-secret"));
+        assert!(!persisted_json.contains("key-secret"));
+
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        let tls = loaded[0].external_config.as_ref().and_then(|value| value.get("tls")).unwrap();
+        assert_eq!(tls.get("truststore_password").and_then(serde_json::Value::as_str), Some("trust-secret"));
+        assert_eq!(tls.get("keystore_password").and_then(serde_json::Value::as_str), Some("key-secret"));
     }
 
     #[test]
@@ -1435,5 +1579,34 @@ mod tests {
         save_connections_to_file(&path, &[config], &store).unwrap();
 
         assert_eq!(store.get_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY), None);
+    }
+
+    #[test]
+    fn save_connections_moves_plugin_secrets_to_secret_store_and_restores_them() {
+        let path = temp_connections_file("plugin-connection-secret");
+        let store = MemorySecretStore::default();
+        let mut config = connection("plugin-connection", "", "");
+        config.db_type = DatabaseType::Plugin;
+        config.plugin_id = Some("dbx.example.hello".to_string());
+        config.plugin_connection_provider = Some("hello.connection".to_string());
+        config.plugin_connection_type = Some("hello".to_string());
+        config.external_config = Some(serde_json::json!({ "greeting": "Hello" }));
+        config.connection_secrets.insert("access_token".to_string(), "plugin-secret".to_string());
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("plugin-secret"));
+        let persisted: Vec<ConnectionConfig> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted[0].connection_secrets.get("access_token").map(String::as_str), Some(""));
+        assert_eq!(
+            store
+                .get_existing("plugin-connection", &format!("{PLUGIN_CONNECTION_SECRET_PREFIX}access_token"))
+                .as_deref(),
+            Some("plugin-secret")
+        );
+
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        assert_eq!(loaded[0].connection_secrets.get("access_token").map(String::as_str), Some("plugin-secret"));
     }
 }

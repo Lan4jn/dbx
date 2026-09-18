@@ -337,6 +337,62 @@ export function buildConnectionGroupPathMap(layout: SidebarLayout): Map<string, 
   return paths;
 }
 
+/** Build root-to-leaf stable group-id paths for permission inheritance. */
+export function buildConnectionGroupIdPathMap(layout: SidebarLayout): Map<string, string[]> {
+  const paths = new Map<string, string[]>();
+
+  const visit = (entries: SidebarOrderEntry[], path: string[]) => {
+    for (const entry of entries) {
+      if (entry.type === "connection") {
+        paths.set(entry.id, path);
+        continue;
+      }
+      visit(entryChildren(entry), [...path, entry.id]);
+    }
+  };
+
+  visit(layout.order, []);
+  return paths;
+}
+
+export interface ConnectionGroupDestinationRow {
+  id: string;
+  name: string;
+  depth: number;
+  path: string[];
+}
+
+/** Build selectable connection-group destinations in the same tree order as the sidebar. */
+export function connectionGroupDestinationRows(layout: SidebarLayout): ConnectionGroupDestinationRow[] {
+  const groupMap = new Map(layout.groups.map((group) => [group.id, group]));
+  const rows: ConnectionGroupDestinationRow[] = [];
+  const seen = new Set<string>();
+
+  const visit = (entries: SidebarOrderEntry[], parentPath: string[]) => {
+    for (const entry of entries) {
+      if (entry.type !== "group" || seen.has(entry.id)) continue;
+      const group = groupMap.get(entry.id);
+      if (!group) continue;
+
+      seen.add(entry.id);
+      const path = [...parentPath, group.name];
+      rows.push({ id: group.id, name: group.name, depth: parentPath.length, path });
+      visit(entryChildren(entry), path);
+    }
+  };
+
+  visit(layout.order, []);
+  return rows;
+}
+
+/** Resolve the group implied by a selected group, connection, or descendant node. */
+export function connectionGroupIdForSelection(layout: SidebarLayout, selectedNodeId?: string | null, selectedConnectionId?: string | null): string | null {
+  if (selectedNodeId && connectionGroupDestinationRows(layout).some((group) => group.id === selectedNodeId)) return selectedNodeId;
+  const connectionId = selectedConnectionId || selectedNodeId;
+  if (!connectionId) return null;
+  return findConnectionLocation(layout, connectionId)?.groupId ?? null;
+}
+
 function findGroupEntry(entries: SidebarOrderEntry[], groupId: string): Extract<SidebarOrderEntry, { type: "group" }> | null {
   for (const entry of entries) {
     if (entry.type !== "group") continue;

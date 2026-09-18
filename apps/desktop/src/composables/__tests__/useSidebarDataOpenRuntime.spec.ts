@@ -118,7 +118,10 @@ vi.mock("@/lib/backend/debugLog", () => ({ appendDebugLog: vi.fn(), isDebugLoggi
 // dataTabOpenPolicy 使用真实实现，覆盖设置开关对应的复用范围
 vi.mock("@/lib/sidebar/treeNodeContext", () => ({ hasTreeNodeDatabaseContext: () => true }));
 vi.mock("@/lib/table/tableSelectSql", () => ({ buildTableSelectSql: mocks.buildTableSelectSql }));
-vi.mock("@/lib/table/tableEditing", () => ({ usesSyntheticRowIdKey: () => false }));
+vi.mock("@/lib/table/tableEditing", () => ({
+  usesSyntheticRowIdKey: () => false,
+  shouldIncludeSyntheticRowId: () => false,
+}));
 vi.mock("@/lib/table/tableOpenPageLimit", () => ({ tableOpenPageLimit: () => 100 }));
 vi.mock("@/lib/tabs/dataTabActivation", () => ({ canActivateExistingDataTableTab: () => false }));
 
@@ -202,16 +205,24 @@ describe("useSidebarDataOpenRuntime", () => {
   it("reuses a sidebar tab for the same table in same-table mode", async () => {
     mocks.openDataTabsNextToActive = true;
 
-    await useSidebarDataOpenRuntime().openData(tableNode);
-    await useSidebarDataOpenRuntime().openData(tableNode);
+    await useSidebarDataOpenRuntime().openData({ ...tableNode, comment: "Old comment" });
+    await useSidebarDataOpenRuntime().openData({ ...tableNode, comment: "Updated comment" });
 
     expect(mocks.tabs).toHaveLength(1);
+    expect(mocks.tabs[0]?.tableComment).toBe("Updated comment");
+  });
+
+  it("copies the existing sidebar table comment without another metadata request", async () => {
+    await useSidebarDataOpenRuntime().openData({ ...tableNode, comment: "Application users" });
+
+    expect(mocks.tabs[0]?.tableComment).toBe("Application users");
+    expect(mocks.loadTableMetadata).toHaveBeenCalledTimes(1);
   });
 
   it("keeps different sidebar tables independent in same-table mode", async () => {
     const ordersNode = { ...tableNode, id: "table-orders", label: "orders" };
 
-    await useSidebarDataOpenRuntime().openData(tableNode);
+    await useSidebarDataOpenRuntime().openData({ ...tableNode, comment: "User table" });
     await useSidebarDataOpenRuntime().openData(ordersNode);
 
     expect(mocks.tabs).toHaveLength(2);
@@ -270,6 +281,7 @@ describe("useSidebarDataOpenRuntime", () => {
 
     expect(mocks.tabs).toHaveLength(1);
     expect(mocks.tabs[0]?.title).toBe("orders");
+    expect(mocks.tabs[0]?.tableComment).toBeUndefined();
     expect(mocks.tabs[0]?.tableMeta?.tableName).toBe("orders");
     expect(mocks.tabs[0]?.resultLocalSortOriginalLargeValueCells).toBeUndefined();
   });
@@ -357,6 +369,31 @@ describe("useSidebarDataOpenRuntime", () => {
       expect(mocks.callOrder).toEqual(["query", "metadata"]);
       expect(mocks.tabs[0]?.tableMeta?.primaryKeys).toEqual(["id"]);
     });
+  });
+
+  it("preserves JDBC table schema through the table-data request", async () => {
+    mocks.databaseType = "jdbc";
+    mocks.loadTableMetadata.mockImplementation(async (request: { database: string; schema?: string; tableName: string; tableType?: string }) => ({
+      metadata: {
+        schema: request.schema,
+        tableName: request.tableName,
+        tableType: request.tableType,
+        database: request.database,
+        columns: [{ name: "id", data_type: "bigint", is_nullable: false, column_default: null, is_primary_key: true, extra: null }],
+        indexes: [],
+        primaryKeys: ["id"],
+        cachedAt: Date.now(),
+      },
+      cacheStatus: "miss",
+      ageMs: 0,
+    }));
+
+    await useSidebarDataOpenRuntime().openData(tableNode);
+
+    await vi.waitFor(() => expect(mocks.tabs[0]?.tableMeta?.primaryKeys).toEqual(["id"]));
+    expect(mocks.loadTableMetadata).toHaveBeenCalledWith(expect.objectContaining({ database: "app", schema: "public" }));
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ database: "app", schema: "public", tableName: "users" }));
+    expect(mocks.tabs[0]?.tableMeta).toMatchObject({ database: "app", schema: "public", tableName: "users" });
   });
 
   it("keeps MySQL data-tab identity unqualified after metadata loads", async () => {
@@ -526,6 +563,58 @@ describe("useSidebarDataOpenRuntime", () => {
     expect(mocks.cancelTabExecution).not.toHaveBeenCalled();
     expect(mocks.executeTabSql).not.toHaveBeenCalled();
     expect(mocks.loadTableMetadata).not.toHaveBeenCalled();
+  });
+
+  it("repairs a restored Oracle view tab that was persisted as a table", async () => {
+    mocks.databaseType = "oracle";
+    const viewNode = { ...tableNode, id: "view-users", type: "view" as const, tableType: undefined };
+    mocks.tabs.push({
+      id: "existing-view-tab",
+      connectionId: "connection-1",
+      database: "app",
+      title: "users",
+      mode: "data",
+      schema: "public",
+      sql: "SELECT * FROM users",
+      isDirty: false,
+      isExecuting: true,
+      executionId: "running-query",
+      isCancelling: false,
+      isExplaining: false,
+      tableMeta: {
+        schema: "public",
+        tableName: "users",
+        tableType: "TABLE",
+        columns: [{ name: "id", data_type: "bigint", is_nullable: false, column_default: null, is_primary_key: false, extra: null }],
+        primaryKeys: ["__DBX_ROWID"],
+      },
+      tableMetaUpdatedAt: Date.now(),
+      tableMetaGeneration: 0,
+    } as QueryTab);
+    mocks.loadTableMetadata.mockImplementationOnce(async (request: { database: string; schema?: string; tableName: string; tableType?: string }) => ({
+      metadata: {
+        schema: request.schema,
+        tableName: request.tableName,
+        tableType: request.tableType,
+        database: request.database,
+        columns: [{ name: "id", data_type: "bigint", is_nullable: false, column_default: null, is_primary_key: false, extra: null }],
+        indexes: [],
+        primaryKeys: [],
+        cachedAt: Date.now(),
+      },
+      cacheStatus: "miss",
+      ageMs: 0,
+    }));
+
+    await useSidebarDataOpenRuntime().openData(viewNode);
+
+    expect(mocks.tabs[0]?.tableMeta?.tableType).toBe("VIEW");
+    expect(mocks.cancelTabExecution).not.toHaveBeenCalled();
+    expect(mocks.executeTabSql).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(mocks.loadTableMetadata).toHaveBeenCalledWith(expect.objectContaining({ tableName: "users", tableType: "VIEW" }));
+      expect(mocks.tabs[0]?.tableMeta?.primaryKeys).toEqual([]);
+    });
   });
 
   it("does not mark row identity pending on a warm metadata cache", async () => {

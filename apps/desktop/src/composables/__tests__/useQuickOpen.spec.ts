@@ -2,7 +2,7 @@ import { nextTick } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { matchQuickOpenText, useQuickOpen } from "@/composables/useQuickOpen";
 import * as api from "@/lib/backend/api";
-import { getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
+import { getSqlFileFilter, getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 
@@ -22,6 +22,7 @@ vi.mock("@/lib/backend/api", () => ({
 vi.mock("@/lib/sqlFile/sqlFileFolders", async () => {
   const { ref } = await import("vue");
   return {
+    getSqlFileFilter: vi.fn(() => "*.sql"),
     getSqlFileFolderPaths: vi.fn(),
     sqlFileFoldersVersion: ref(0),
   };
@@ -68,7 +69,7 @@ describe("useQuickOpen", () => {
 
       const { filteredItems, loadExternalSqlFiles, setQuery } = useQuickOpen();
       const initialLoad = loadExternalSqlFiles();
-      expect(api.listSqlFilesInFolder).toHaveBeenCalledWith("/old");
+      expect(api.listSqlFilesInFolder).toHaveBeenCalledWith("/old", getSqlFileFilter());
 
       sqlFileFoldersVersion.value++;
       await nextTick();
@@ -76,7 +77,7 @@ describe("useQuickOpen", () => {
       await initialLoad;
 
       expect(api.listSqlFilesInFolder).toHaveBeenCalledTimes(2);
-      expect(api.listSqlFilesInFolder).toHaveBeenLastCalledWith("/new");
+      expect(api.listSqlFilesInFolder).toHaveBeenLastCalledWith("/new", getSqlFileFilter());
       setQuery(".sql");
       expect(filteredItems.value.map((item) => item.label)).toContain("new.sql");
       expect(filteredItems.value.map((item) => item.label)).not.toContain("old.sql");
@@ -112,6 +113,30 @@ describe("useQuickOpen", () => {
       expect(matchQuickOpenText("define", label)?.kind).toBe("substring");
       expect(matchQuickOpenText("shop", label)?.kind).toBe("substring");
       expect(matchQuickOpenText("cardshoplog", label)?.kind).toBe("fuzzy");
+    });
+
+    it("matches Chinese table names by pinyin initials (issue #7912)", () => {
+      // Reported: 全局搜索中文表名输入首字母模糊搜索搜不出来
+      expect(matchQuickOpenText("zzj", "总租金")?.kind).toBe("initials");
+      expect(matchQuickOpenText("yhmx", "用户明细")?.kind).toBe("initials");
+    });
+
+    it("matches Chinese table names by a non-contiguous pinyin-initials subsequence", () => {
+      const match = matchQuickOpenText("zj", "总租金");
+      expect(match?.kind).toBe("fuzzy");
+      expect(match?.indices.map((index) => "总租金"[index]).join("")).toBe("总租金".slice(0, 1) + "总租金".slice(2, 3));
+    });
+
+    it("keeps pinyin-initials highlight indices aligned across unmapped supplementary-plane characters", () => {
+      const match = matchQuickOpenText("bx", "𠮷表x");
+      expect(match?.kind).toBe("fuzzy");
+      expect(match?.indices).toEqual([2, 3]);
+    });
+
+    it("prefers a literal prefix match over pinyin-initials for mixed Han+Latin names", () => {
+      const literal = matchQuickOpenText("abc", "abc表");
+      expect(literal?.kind).toBe("prefix");
+      expect(literal?.score).toBeLessThan(250);
     });
 
     it("puts the exact shop result before prefixed and containing names", () => {

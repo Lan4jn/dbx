@@ -125,6 +125,11 @@ pub struct BackendError {
     diagnostics: Option<BackendErrorDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     help_url: Option<String>,
+    /// Driver-reported SQL error position, when the adapter provides one
+    /// (currently native PostgreSQL). Optional field, added without bumping the
+    /// envelope version; clients that do not understand it simply ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_position: Option<crate::sql_error_position::SqlErrorPosition>,
 }
 
 impl BackendError {
@@ -234,6 +239,24 @@ impl BackendError {
         )
     }
 
+    /// Create a retryable envelope for a manual transaction session that DBX
+    /// already rolled back before the requested SQL was executed.
+    pub fn from_manual_transaction_session_expired(timeout_secs: u64) -> Self {
+        let entry = catalog_entry(CatalogCode::TransactionSessionExpired);
+        let mut params = BTreeMap::new();
+        params
+            .insert("timeoutSecs".to_string(), BackendMessageParam::Integer(timeout_secs.min(i64::MAX as u64) as i64));
+        Self::new(
+            entry,
+            BackendErrorSource::LegacyBackend,
+            BackendErrorOrigin::database(BackendErrorAdapter::Native),
+            BackendOperationOutcome::NotStarted,
+            params,
+            None,
+            Some(diagnostics_for_local("transaction", AgentErrorStage::Execute)),
+        )
+    }
+
     /// Create a SQL failure envelope while retaining bounded native driver detail.
     ///
     /// The caller must pass a typed SQL execution error, not a connection or
@@ -250,6 +273,14 @@ impl BackendError {
             bounded_native_detail(message),
             Some(diagnostics_for_local("sql", AgentErrorStage::Execute)),
         )
+    }
+
+    /// Create a SQL failure envelope while retaining bounded native driver detail
+    /// and a driver-reported error position.
+    pub fn from_sql_detail_with_position(message: &str, position: crate::sql_error_position::SqlErrorPosition) -> Self {
+        let mut error = Self::from_sql_detail(message);
+        error.error_position = Some(position);
+        error
     }
 
     /// Adapt a DuckDB worker error while retaining both the native detail and
@@ -332,6 +363,10 @@ impl BackendError {
         self.diagnostics.as_ref()
     }
 
+    pub fn error_position(&self) -> Option<crate::sql_error_position::SqlErrorPosition> {
+        self.error_position
+    }
+
     fn new(
         entry: &'static CatalogEntry,
         source: BackendErrorSource,
@@ -354,6 +389,7 @@ impl BackendError {
             detail,
             diagnostics,
             help_url: entry.help_url.map(str::to_string),
+            error_position: None,
         }
     }
 }
@@ -364,6 +400,7 @@ enum CatalogCode {
     ConnectionInterrupted,
     TimeoutNotStarted,
     TimeoutUnknown,
+    TransactionSessionExpired,
     Canceled,
     BusyRetryLater,
     RuntimeReplaced,
@@ -396,6 +433,7 @@ struct CatalogEntry {
 }
 
 const STAGE_PARAM: &[ParamSpec] = &[ParamSpec { name: "stage", kind: ParamKind::String }];
+const TRANSACTION_TIMEOUT_PARAM: &[ParamSpec] = &[ParamSpec { name: "timeoutSecs", kind: ParamKind::Integer }];
 const NO_PARAMS: &[ParamSpec] = &[];
 
 fn catalog_entry(code: CatalogCode) -> &'static CatalogEntry {
@@ -433,6 +471,15 @@ fn catalog_entry(code: CatalogCode) -> &'static CatalogEntry {
                 code: "DBX-JDBC-2002",
                 message_key: "backendErrors.jdbc.operationTimedOut",
                 params: STAGE_PARAM,
+                help_url: None,
+            },
+        ),
+        (
+            CatalogCode::TransactionSessionExpired,
+            CatalogEntry {
+                code: "DBX-TXN-1001",
+                message_key: "backendErrors.transaction.sessionExpired",
+                params: TRANSACTION_TIMEOUT_PARAM,
                 help_url: None,
             },
         ),
@@ -644,6 +691,8 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
 }
 
 fn bounded_detail(message: &str) -> Option<String> {
+    let stripped = crate::sql_error_position::strip_marker(message);
+    let message = stripped.as_str();
     if message.trim().is_empty() {
         return None;
     }
@@ -655,7 +704,10 @@ fn bounded_detail(message: &str) -> Option<String> {
 fn bounded_native_detail(message: &str) -> Option<String> {
     // This path is only for typed native SQL failures. Do not infer or rewrite
     // SQL content here; preserving the driver's diagnostic is the contract.
-    let trimmed = message.trim();
+    // The position transport suffix is stripped because it is surfaced through
+    // the structured `errorPosition` field, not as message text.
+    let stripped = crate::sql_error_position::strip_marker(message);
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -1031,6 +1083,7 @@ mod tests {
             (CatalogCode::ConnectionInterrupted, "DBX-JDBC-1002", "backendErrors.jdbc.connectionInterrupted"),
             (CatalogCode::TimeoutNotStarted, "DBX-JDBC-2001", "backendErrors.jdbc.operationTimedOut"),
             (CatalogCode::TimeoutUnknown, "DBX-JDBC-2002", "backendErrors.jdbc.operationTimedOut"),
+            (CatalogCode::TransactionSessionExpired, "DBX-TXN-1001", "backendErrors.transaction.sessionExpired"),
             (CatalogCode::Canceled, "DBX-JDBC-2003", "backendErrors.jdbc.operationCanceled"),
             (CatalogCode::BusyRetryLater, "DBX-JDBC-3001", "backendErrors.jdbc.busyRetryLater"),
             (CatalogCode::RuntimeReplaced, "DBX-JDBC-3002", "backendErrors.jdbc.runtimeReplaced"),
@@ -1047,6 +1100,18 @@ mod tests {
             assert_eq!(entry.message_key, expected_key);
             assert!(codes.insert(entry.code), "duplicate catalog code: {}", entry.code);
         }
+    }
+
+    #[test]
+    fn manual_transaction_session_expiry_is_retryable_before_execution() {
+        let error = BackendError::from_manual_transaction_session_expired(300);
+        let payload = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(error.code(), "DBX-TXN-1001");
+        assert_eq!(error.operation_outcome(), BackendOperationOutcome::NotStarted);
+        assert_eq!(payload["messageKey"], "backendErrors.transaction.sessionExpired");
+        assert_eq!(payload["messageParams"]["timeoutSecs"], 300);
+        assert_eq!(payload["diagnostics"]["category"], "transaction");
     }
 
     #[test]
@@ -1097,6 +1162,34 @@ mod tests {
         assert_eq!(payload["source"], "jdbcAgent");
         assert_eq!(payload["origin"]["subsystem"], "database");
         assert_eq!(payload["origin"]["adapter"], "native");
+    }
+
+    #[test]
+    fn sql_error_with_position_exposes_typed_error_position_and_keeps_v1_detail() {
+        let position = crate::sql_error_position::SqlErrorPosition { line: 2, column: 6, offset: 12 };
+        let payload = serde_json::to_value(BackendError::from_sql_detail_with_position(
+            "ERROR: relation \"missing\" does not exist",
+            position,
+        ))
+        .unwrap();
+
+        assert_eq!(payload["code"], "DBX-JDBC-4001");
+        assert_eq!(payload["detail"], "ERROR: relation \"missing\" does not exist");
+        assert_eq!(payload["errorPosition"]["line"], 2);
+        assert_eq!(payload["errorPosition"]["column"], 6);
+        assert_eq!(payload["errorPosition"]["offset"], 12);
+        assert_eq!(payload["origin"]["adapter"], "native");
+
+        // SQL errors without a position must not emit the optional field.
+        let plain = serde_json::to_value(BackendError::from_sql_detail("ERROR: nope")).unwrap();
+        assert!(plain.get("errorPosition").is_none());
+    }
+
+    #[test]
+    fn detail_sanitizers_strip_the_position_transport_marker() {
+        let message = format!("ERROR: relation does not exist{}", crate::sql_error_position::encode_marker(15));
+        assert_eq!(bounded_native_detail(&message).as_deref(), Some("ERROR: relation does not exist"));
+        assert_eq!(bounded_detail(&message).as_deref(), Some("ERROR: relation does not exist"));
     }
 
     #[test]

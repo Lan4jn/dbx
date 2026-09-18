@@ -93,6 +93,8 @@ pub struct AiAgentStreamRequest {
     pub connection_id: String,
     pub database: String,
     #[serde(default)]
+    pub selected_databases: Vec<String>,
+    #[serde(default)]
     pub schema: Option<String>,
     pub db_type: String,
     /// Agent mode: "ask" (read-only tools) or "agent" (all tools including execute_query).
@@ -369,10 +371,17 @@ pub async fn ai_stream(
         })
         .await;
 
-        if let Err(_e) = result {
-            let error_chunk =
-                AiStreamChunk { session_id: sid.clone(), delta: String::new(), reasoning_delta: None, done: true };
-            let _ = tx.send(serde_json::to_string(&error_chunk).unwrap_or_default());
+        if let Err(error) = result {
+            // Preserve the existing POST/SSE lifecycle, but make failure an
+            // explicit terminal payload so Web cannot mistake it for a
+            // successful empty response.
+            let error_chunk = serde_json::json!({
+                "session_id": sid.clone(),
+                "delta": "",
+                "done": true,
+                "error": error,
+            });
+            let _ = tx.send(error_chunk.to_string());
         }
 
         dbx_core::ai::unregister_stream(&sid).await;
@@ -445,11 +454,13 @@ pub async fn ai_agent_stream(
         state: state.app.clone(),
         connection_id: body.connection_id,
         database: body.database,
+        selected_databases: body.selected_databases,
         schema: body.schema,
         db_type: parsed_db_type,
         cli_mcp_server_command: None,
         sql_permissions,
         max_agent_turns,
+        prompt_cache_key: request.prompt_cache_key.clone(),
     };
 
     let sid = session_id.clone();
@@ -514,10 +525,13 @@ mod tests {
             model: "test".to_string(),
             models: vec![],
             api_style: AiApiStyle::Completions,
+            custom_headers: Default::default(),
             proxy_enabled: false,
             proxy_url: String::new(),
+            skip_tls_verify: false,
             enable_thinking: true,
             reasoning_level: AiReasoningLevel::Default,
+            max_output_tokens: None,
             runtime_effort: None,
             context_window: None,
             max_retries: None,
@@ -620,10 +634,13 @@ mod tests {
             model: "claude-sonnet-4".to_string(),
             models: vec![],
             api_style: AiApiStyle::AnthropicMessages,
+            custom_headers: Default::default(),
             proxy_enabled: false,
             proxy_url: String::new(),
+            skip_tls_verify: false,
             enable_thinking: false,
             reasoning_level: AiReasoningLevel::Default,
+            max_output_tokens: None,
             runtime_effort: None,
             context_window: None,
             max_retries: None,

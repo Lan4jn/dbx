@@ -25,6 +25,11 @@ describe("data grid type visual kind", () => {
     ["UUID", "identifier"],
     ["BYTEA", "binary"],
     ["SDO_GEOMETRY", "spatial"],
+    ["keyword", "string"],
+    ["unsigned_long", "integer"],
+    ["scaled_float", "numeric"],
+    ["date_nanos", "temporal"],
+    ["nested", "structured"],
     ["inet", "unknown"],
   ])("maps %s to %s", (dataType, expected) => {
     expect(resolveDataGridTypeVisualKind(dataType)).toBe(expected);
@@ -40,6 +45,10 @@ describe("data grid type visual kind", () => {
     ["rowversion", "sqlserver", "binary"],
     ["bit(8)", "postgres", "binary"],
     ["bit varying(8)", "postgres", "binary"],
+    ["long", "elasticsearch", "integer"],
+    ["long", "easysearch", "integer"],
+    ["byte", "elasticsearch", "integer"],
+    ["short", "elasticsearch", "integer"],
   ] as const)("maps %s for %s to %s", (dataType, databaseType, expected) => {
     expect(resolveDataGridTypeVisualKind(dataType, databaseType)).toBe(expected);
   });
@@ -49,6 +58,10 @@ describe("data grid type visual kind", () => {
     expect(resolveDataGridTypeVisualKind("timestamp", "postgres")).toBe("temporal");
     expect(resolveDataGridTypeVisualKind("bit")).toBe("boolean");
     expect(resolveDataGridTypeVisualKind("bit", "sqlserver")).toBe("boolean");
+    expect(resolveDataGridTypeVisualKind("long")).toBe("string");
+    expect(resolveDataGridTypeVisualKind("long", "oracle")).toBe("string");
+    expect(resolveDataGridTypeVisualKind("byte")).toBe("unknown");
+    expect(resolveDataGridTypeVisualKind("short")).toBe("unknown");
   });
 });
 
@@ -85,14 +98,20 @@ describe("data grid cell text visual priority", () => {
     expect(resolveDataGridCellTextRole({ ...ordinaryInteger, ...override })).toBe("muted");
   });
 
+  it("keeps NULL muted when type colors are disabled", () => {
+    expect(resolveDataGridCellTextRole({ ...ordinaryInteger, colorizeTypes: false, isNull: true })).toBe("muted");
+  });
+
   it("uses a neutral foreground on editable DOM hover surfaces", () => {
     expect(dataGridSource).toContain("'hover:bg-gray-200 hover:text-foreground dark:hover:bg-gray-800':");
     expect(dataGridSource).toContain("'cursor-text hover:bg-gray-200 hover:text-foreground dark:hover:bg-gray-800':");
   });
 
-  it("returns before reading cell state when type colors are disabled", () => {
-    expect(dataGridSource).toContain('function gridCellTextColorClass(item: RowItem, actualColIdx: number, visibleColIdx: number): string {\n  if (!colorizeDataGridCellTypes.value) return "text-foreground";\n  const value = item.data[actualColIdx];');
-    expect(dataGridSource).toContain('function transposeCellTextColorClass(recordIndex: number, actualColIdx: number): string {\n  if (!colorizeDataGridCellTypes.value) return "text-foreground";\n  const item = displayItems.value[recordIndex];');
+  it("checks NULL before applying the optional type-color setting", () => {
+    expect(dataGridSource).toContain("function gridCellTextColorClass(item: RowItem, actualColIdx: number, visibleColIdx: number): string {\n  const value = item.data[actualColIdx];");
+    expect(dataGridSource).toContain("function transposeCellTextColorClass(recordIndex: number, actualColIdx: number): string {\n  const item = displayItems.value[recordIndex];");
+    expect(dataGridSource).not.toContain('function gridCellTextColorClass(item: RowItem, actualColIdx: number, visibleColIdx: number): string {\n  if (!colorizeDataGridCellTypes.value) return "text-foreground";');
+    expect(dataGridSource).not.toContain('function transposeCellTextColorClass(recordIndex: number, actualColIdx: number): string {\n  if (!colorizeDataGridCellTypes.value) return "text-foreground";');
   });
 
   it("places data-grid type selectors in the components layer", () => {

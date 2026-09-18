@@ -126,7 +126,13 @@ type querySession struct {
 	pending        []any
 	pendingSpatial []*uint32
 	remaining      int
+	timeoutSecs    int
 	cancel         context.CancelFunc
+}
+
+type queryPageTimeout struct {
+	timer *time.Timer
+	fired chan struct{}
 }
 
 type rowScanner struct {
@@ -136,24 +142,27 @@ type rowScanner struct {
 }
 
 type server struct {
-	db                         *sql.DB
-	openDatabase               agentDBOpener
-	params                     connectParams
-	mode                       vastbaseMode
-	usePgDefaultExpression     bool
-	catalogIdentityUnsupported bool
-	infoColumnTypeUnsupported  bool
-	infoUdtNameUnsupported     bool
-	listTablesStatement        *sql.Stmt
-	connectionRuntime          *connectionRuntime
-	sessionAffinity            bool
-	currentSchema              string
-	schemaInitialized          bool
-	schemaConnectionID         uintptr
-	sessions                   map[string]*querySession
-	nextSessionID              uint64
-	activeCancelMu             sync.Mutex
-	activeCancel               context.CancelFunc
+	db                              *sql.DB
+	openDatabase                    agentDBOpener
+	params                          connectParams
+	mode                            vastbaseMode
+	usePgDefaultExpression          bool
+	catalogIdentityUnsupported      bool
+	infoColumnTypeUnsupported       bool
+	infoUdtNameUnsupported          bool
+	constraintDefinitionUnsupported bool
+	constraintValidatedUnsupported  bool
+	constraintEnabledUnsupported    bool
+	listTablesStatement             *sql.Stmt
+	connectionRuntime               *connectionRuntime
+	sessionAffinity                 bool
+	currentSchema                   string
+	schemaInitialized               bool
+	schemaConnectionID              uintptr
+	sessions                        map[string]*querySession
+	nextSessionID                   uint64
+	activeCancelMu                  sync.Mutex
+	activeCancel                    context.CancelFunc
 }
 
 type agentSession struct {
@@ -433,6 +442,9 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 	case "list_foreign_keys":
 		result, err := s.listForeignKeys(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
+	case "list_constraints":
+		result, err := s.listConstraints(stringParam(params, "schema"), stringParam(params, "table"))
+		return result, false, err
 	case "list_triggers":
 		result, err := s.listTriggers(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
@@ -489,6 +501,9 @@ func (s *server) connect(cp connectParams) error {
 	s.catalogIdentityUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintEnabledUnsupported = false
 	s.sessionAffinity = false
 	return nil
 }
@@ -505,11 +520,14 @@ func (s *server) connectWithRuntime(cp connectParams, connectionRuntime *connect
 	s.db = db
 	s.connectionRuntime = connectionRuntime
 	s.params = cp
-	s.mode = detectAgentMode(db, cp.MySQLCompatMode)
+	s.mode = detectAgentMode(connectionRuntime.database(), cp.MySQLCompatMode)
 	s.usePgDefaultExpression = false
 	s.catalogIdentityUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintEnabledUnsupported = false
 	s.sessionAffinity = false
 	return nil
 }
@@ -584,6 +602,9 @@ func (s *server) disconnect() error {
 	s.catalogIdentityUnsupported = false
 	s.infoColumnTypeUnsupported = false
 	s.infoUdtNameUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintEnabledUnsupported = false
 	s.connectionRuntime = nil
 	s.sessionAffinity = false
 	s.resetSchemaCache()
@@ -704,6 +725,55 @@ func (s *server) queryRows(sqlText string, schema string, timeoutSecs int) (*sql
 	return rows, conn, cancel, nil
 }
 
+func (s *server) queryRowsForPage(sqlText string, schema string, timeoutSecs int) (*sql.Rows, *sql.Conn, context.CancelFunc, *queryPageTimeout, error) {
+	ctx, cancel := s.beginOperation(0)
+	timeout := startQueryPageTimeout(timeoutSecs, cancel)
+	conn, err := s.schemaConn(ctx, schema)
+	if err != nil {
+		timedOut := timeout.stop()
+		s.endOperation(cancel)
+		if timedOut {
+			return nil, nil, nil, nil, context.DeadlineExceeded
+		}
+		return nil, nil, nil, nil, err
+	}
+	rows, err := conn.QueryContext(ctx, sqlText)
+	if err != nil {
+		timedOut := timeout.stop()
+		_ = conn.Close()
+		s.endOperation(cancel)
+		if timedOut {
+			return nil, nil, nil, nil, context.DeadlineExceeded
+		}
+		return nil, nil, nil, nil, err
+	}
+	return rows, conn, cancel, timeout, nil
+}
+
+func startQueryPageTimeout(timeoutSecs int, cancel context.CancelFunc) *queryPageTimeout {
+	if timeoutSecs <= 0 {
+		return nil
+	}
+	fired := make(chan struct{})
+	timeout := &queryPageTimeout{fired: fired}
+	timeout.timer = time.AfterFunc(time.Duration(timeoutSecs)*time.Second, func() {
+		cancel()
+		close(fired)
+	})
+	return timeout
+}
+
+func (timeout *queryPageTimeout) stop() bool {
+	if timeout == nil {
+		return false
+	}
+	if timeout.timer.Stop() {
+		return false
+	}
+	<-timeout.fired
+	return true
+}
+
 func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageResult, error) {
 	start := time.Now()
 	sqlText := trimStatementSQL(opts.SQL)
@@ -712,15 +782,19 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		result, err := s.executeQuery(opts)
 		return queryPageResult{Columns: result.Columns, ColumnTypes: result.ColumnTypes, SpatialColumns: result.SpatialColumns, SpatialValues: result.SpatialValues, Rows: result.Rows, AffectedRows: result.AffectedRows, ExecutionTimeMS: result.ExecutionTimeMS, Truncated: result.Truncated}, err
 	}
-	rows, conn, cancel, err := s.queryRows(sqlText, opts.Schema, opts.TimeoutSecs)
+	rows, conn, cancel, timeout, err := s.queryRowsForPage(sqlText, opts.Schema, opts.TimeoutSecs)
 	if err != nil {
 		return queryPageResult{}, err
 	}
 	columns, err := rows.Columns()
 	if err != nil {
+		timedOut := timeout.stop()
 		_ = rows.Close()
 		_ = conn.Close()
 		s.endOperation(cancel)
+		if timedOut {
+			return queryPageResult{}, context.DeadlineExceeded
+		}
 		return queryPageResult{}, err
 	}
 	maxRows := opts.MaxRows
@@ -728,9 +802,13 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 		maxRows = defaultMaxRows
 	}
 	columnTypes := columnTypeNames(rows)
-	session := &querySession{rows: rows, conn: conn, columns: columns, columnTypes: columnTypes, scanner: newRowScanner(len(columns), newSpatialDecoder(columnTypes)), remaining: maxRows, cancel: cancel}
+	session := &querySession{rows: rows, conn: conn, columns: columns, columnTypes: columnTypes, scanner: newRowScanner(len(columns), newSpatialDecoder(columnTypes)), remaining: maxRows, timeoutSecs: opts.TimeoutSecs, cancel: cancel}
 	result, err := readQuerySessionPage(session, pageSize)
+	timedOut := timeout.stop()
 	result.ExecutionTimeMS = time.Since(start).Milliseconds()
+	if timedOut {
+		err = context.DeadlineExceeded
+	}
 	if err != nil {
 		_ = rows.Close()
 		_ = conn.Close()
@@ -755,7 +833,11 @@ func (s *server) fetchQueryPage(id string, pageSize int) (queryPageResult, error
 	if session == nil {
 		return queryPageResult{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}}, nil
 	}
+	timeout := startQueryPageTimeout(session.timeoutSecs, session.cancel)
 	result, err := readQuerySessionPage(session, pageSize)
+	if timeout.stop() {
+		err = context.DeadlineExceeded
+	}
 	if err != nil {
 		s.closeQuerySession(id)
 		return queryPageResult{}, err

@@ -8,6 +8,7 @@ import {
   middleEllipsis,
   nextExecutionSummaryView,
   resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
   resultRunItems,
   resultSourceRange,
   resultSqlForGrid,
@@ -324,6 +325,7 @@ test("result run items expose ordered labels and active state", () => {
         sequence: 1,
         sql: "select 1",
         createdAt: 10,
+        pinned: true,
         result: result(["one"]),
       },
       {
@@ -338,8 +340,8 @@ test("result run items expose ordered labels and active state", () => {
   });
 
   assert.deepEqual(resultRunItems(tab), [
-    { id: "run-1", title: "Run 1", sequence: 1, active: false },
-    { id: "run-2", title: "Run 2", sequence: 2, active: true },
+    { id: "run-1", title: "Run 1", sequence: 1, active: false, pinned: true },
+    { id: "run-2", title: "Run 2", sequence: 2, active: true, pinned: false },
   ]);
   assert.equal(activeResultRun(tab)?.id, "run-2");
   assert.deepEqual(
@@ -353,6 +355,15 @@ test("result grid cache key includes result run id and statement result index", 
 
   assert.equal(resultGridCacheKey(tab), "tab-1-run-7-3");
   assert.equal(resultGridCacheKey(queryTab({ activeResultIndex: undefined })), "tab-1-current-0");
+});
+
+test("result grid column width cache key ignores result run id and isolates result indexes", () => {
+  const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2 });
+  const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2 });
+
+  assert.equal(resultGridColumnWidthCacheKey(first), "result-column-width-tab-1-2");
+  assert.equal(resultGridColumnWidthCacheKey(rerun), resultGridColumnWidthCacheKey(first));
+  assert.notEqual(resultGridColumnWidthCacheKey(queryTab({ activeResultIndex: 1 })), resultGridColumnWidthCacheKey(first));
 });
 
 test("execution summary items include table and non-table statement results", () => {

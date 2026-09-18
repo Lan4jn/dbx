@@ -4,13 +4,14 @@ use std::ops::ControlFlow;
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
-use crate::sql::find_statement_at_cursor;
+use crate::sql::{find_statement_at_cursor, find_statement_at_cursor_for_database};
 use crate::sql_dialect::{
-    firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
+    firebird_rows_clause, pagination_strategy, quote_iris_identifier, quote_table_identifier, PaginationContext,
+    TablePaginationStrategy,
 };
 use sqlparser::ast::{
-    visit_expressions, Expr, GroupByExpr, LimitClause, OrderByKind, Select, SelectItem, SetExpr, Statement, Value,
-    ValueWithSpan,
+    visit_expressions, Expr, GroupByExpr, LimitClause, ObjectNamePart, OrderByKind, Select, SelectItem,
+    SelectModifiers, SetExpr, Statement, TableFactor, Value, ValueWithSpan,
 };
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MsSqlDialect, MySqlDialect};
 use sqlparser::parser::Parser;
@@ -128,7 +129,15 @@ pub fn build_query_pagination_execution_plan(
     // standard LIMIT/OFFSET dialects (MySQL, Postgres, etc.) since they use
     // different clause syntax.
     let exact_query_row_bound = match pagination_strategy(options.database_type, PaginationContext::UserQuery) {
-        TablePaginationStrategy::SqlServerTop => top_level_top_row_count(&options.query_base_sql),
+        TablePaginationStrategy::SqlServerTop => {
+            // TOP bounds input rows, while FOR JSON/XML emit chunked output
+            // rows — a TOP bound would misreport the result total.
+            if has_top_level_for_output_clause(&options.query_base_sql) {
+                None
+            } else {
+                top_level_top_row_count(&options.query_base_sql)
+            }
+        }
         TablePaginationStrategy::LimitOffset => top_level_limit_row_count(&options.query_base_sql),
         _ => None,
     };
@@ -167,7 +176,18 @@ pub fn build_query_pagination_execution_plan(
     }
 
     let can_use_first_page_cursor = options.use_agent_cursor && options.pagination.offset == 0;
-    let prefer_server_pagination = options.database_type == Some(DatabaseType::Kingbase);
+    // HighGo's PostgreSQL-compatible JDBC driver can buffer an unbounded result
+    // before the Agent has a chance to expose its cursor page. Prefer an actual
+    // LIMIT/OFFSET query whenever it can be rewritten safely. For an unordered
+    // query, independent pages are not guaranteed to preserve row order; this is
+    // an intentional tradeoff to keep HighGo execution bounded. Kingbase keeps
+    // the cursor for unordered queries because separate executions may not
+    // preserve row order there.
+    let prefer_server_pagination = match options.database_type {
+        Some(DatabaseType::Highgo) => true,
+        Some(DatabaseType::Kingbase) => kingbase_server_pagination_is_stable(&options.query_base_sql),
+        _ => false,
+    };
     if can_use_first_page_cursor && !prefer_server_pagination {
         if !options.first_page_uses_actual_sql && options.sql == options.query_base_sql {
             plan.sql_to_execute = options.query_base_sql;
@@ -189,11 +209,28 @@ pub fn build_query_pagination_execution_plan(
         plan.page_sql = paginated.sql;
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
-    } else if can_use_first_page_cursor {
+        if options.use_agent_cursor
+            && matches!(
+                pagination_strategy(options.database_type, PaginationContext::UserQuery),
+                TablePaginationStrategy::AgentMaxRows | TablePaginationStrategy::Unbounded
+            )
+        {
+            // The dialect cannot rewrite the statement with server-side
+            // pagination (Oracle user queries, generic JDBC), so the page
+            // metadata alone cannot reach a non-zero offset. Keep the Agent
+            // result session enabled and let the client consume through to
+            // the requested offset (#8993).
+            plan.use_agent_result_session = true;
+        }
+    } else if can_use_first_page_cursor && options.database_type != Some(DatabaseType::Highgo) {
         // Kingbase JDBC may buffer an entire result in auto-commit mode, so use
         // LIMIT/OFFSET whenever the statement can be rewritten safely. Keep the
         // Agent cursor as a bounded fallback for multi-statement or dialect-
-        // specific SQL that the pagination parser cannot transform.
+        // specific SQL that the pagination parser cannot transform. HighGo does
+        // not take this fallback: its JDBC driver may materialize the unbounded
+        // result before cursor paging starts. Leaving the page metadata unset
+        // routes it through regular execution and the configured JDBC maxRows
+        // safeguard instead.
         if !options.first_page_uses_actual_sql && options.sql == options.query_base_sql {
             plan.sql_to_execute = options.query_base_sql;
         }
@@ -201,7 +238,7 @@ pub fn build_query_pagination_execution_plan(
         plan.page_offset = Some(options.pagination.offset);
         plan.use_agent_result_session = true;
     } else if options.database_type == Some(DatabaseType::Kingbase)
-        && single_selectable_statement(&options.sql).is_ok()
+        && single_selectable_statement(&options.sql, options.database_type).is_ok()
         && has_top_level_top(&options.sql)
     {
         // Kingbase SQL Server compatibility mode rejects a statement that mixes a
@@ -216,7 +253,7 @@ pub fn build_query_pagination_execution_plan(
 }
 
 pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlBuildResult {
-    let Ok(statement) = single_selectable_statement(&options.original_sql) else {
+    let Ok(statement) = single_selectable_statement(&options.original_sql, options.database_type) else {
         return err(single_statement_error_reason(&options.original_sql));
     };
     if unsupported_pagination_type(options.database_type) {
@@ -259,20 +296,20 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
             if options.database_type == Some(DatabaseType::Kingbase) && has_top_level_top(&statement) {
                 return err("unsupported");
             }
-            let dedup_count = dedup_projection_count_without_order_by(&options.original_sql);
-            ok(add_standard_limit(&statement, options.database_type, safe_limit, safe_offset, dedup_count))
+            let dedup_order_by = dedup_projection_count_without_order_by(&options.original_sql);
+            ok(add_standard_limit(&statement, options.database_type, safe_limit, safe_offset, dedup_order_by))
         }
     }
 }
 
 pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResult {
-    let Ok(statement) = single_selectable_statement(&options.original_sql) else {
+    let Ok(statement) = single_selectable_statement(&options.original_sql, options.database_type) else {
         return err(single_statement_error_reason(&options.original_sql));
     };
     if unsupported_pagination_type(options.database_type) {
         return err("unsupported");
     }
-    let (execution_hint, statement) = split_leading_execution_hint(&statement);
+    let (execution_hint, statement) = split_leading_execution_hint(&statement, options.database_type);
     // A locking clause does not affect cardinality and cannot appear inside
     // every dialect's derived-table count query. PostgreSQL permits pagination
     // after the lock clause; decline counting that uncommon order rather than
@@ -301,6 +338,26 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
             .map(|sql| ok(format!("{execution_hint}{sql}")))
             .unwrap_or_else(|| err("unsupported"));
     }
+    if options.database_type == Some(DatabaseType::Iotdb) {
+        // IoTDB Tree Model does not support derived tables. Count the selected
+        // time series directly when doing so is guaranteed to preserve the
+        // result cardinality; decline complex queries instead of issuing SQL
+        // that IoTDB cannot parse or returning a misleading total.
+        return iotdb_tree_count_sql(&statement)
+            .map(|sql| ok(format!("{execution_hint}{sql}")))
+            .unwrap_or_else(|| err("unsupported"));
+    }
+
+    if options.database_type == Some(DatabaseType::Iris) {
+        // IRIS JDBC can parameterize a derived-table alias as `:%qpar` during
+        // prepare, even when the alias is unquoted.  A simple single-table
+        // query does not need a derived table to count rows, so inject COUNT
+        // directly and leave the wrapper fallback for queries whose row
+        // cardinality depends on the original projection.
+        if let Some(sql) = iris_count_sql(&statement) {
+            return ok(format!("{execution_hint}{sql}"));
+        }
+    }
 
     let alias = if options.database_type == Some(DatabaseType::Iris) {
         // With delimited identifiers disabled, Caché 2016 can parameterize a
@@ -309,6 +366,19 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
     } else {
         quote_table_identifier(options.database_type, "dbx_count")
     };
+    if options.database_type == Some(DatabaseType::Hive) && starts_with_cte(&statement) {
+        if let Some(main_query_start) = top_level_sql_tokens(&statement)
+            .into_iter()
+            .find(|token| matches!(token.text.as_str(), "SELECT" | "FROM"))
+            .map(|token| token.start)
+        {
+            let (with_clause, main_query) = statement.split_at(main_query_start);
+            return ok(format!(
+                "{execution_hint}{with_clause}{}",
+                derived_table_sql("SELECT COUNT(*) AS dbx_total_rows FROM", main_query, &format!("{alias};"))
+            ));
+        }
+    }
     let wrapped_sql = match options.database_type {
         Some(DatabaseType::Iris) => iris_statement_for_derived_table(&statement),
         _ => statement,
@@ -325,13 +395,29 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
         return err("empty");
     }
 
-    let statement = find_statement_at_cursor(base_sql, 0).trim().trim_end_matches(';').trim().to_string();
+    let mut statement = find_query_result_statement_at_cursor(base_sql, 0, options.database_type)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
     if statement.is_empty() {
         return err("empty");
     }
-    if statement.len() != base_sql.trim_end_matches(';').trim().len() {
-        return err("multi");
+    let normalized_base_len = base_sql.trim_end_matches(';').trim().len();
+    if statement.len() != normalized_base_len {
+        if options.database_type != Some(DatabaseType::Mysql) {
+            return err("multi");
+        }
+        statement = restore_leading_execution_hint(base_sql, &statement, options.database_type);
+        if statement.len() != normalized_base_len {
+            return err("multi");
+        }
     }
+    let (execution_hint, statement) = if options.database_type == Some(DatabaseType::Mysql) {
+        split_leading_execution_hint(&statement, options.database_type)
+    } else {
+        ("", statement.as_str())
+    };
     if statement.trim_start().to_ascii_uppercase().starts_with("WITH") {
         return err("with");
     }
@@ -340,6 +426,8 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     }
 
     let aliases = build_derived_column_aliases(&options.result_columns);
+    // Caché/IRIS rejects derived-table column alias lists (`t(col, col)`)
+    // outright (SQLCODE -25), regardless of delimited-identifier support.
     let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql)
         && options.database_type != Some(DatabaseType::ClickHouse)
         // Doris accepts the derived-table alias but not its column-name list.
@@ -348,7 +436,9 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
         && options.database_type != Some(DatabaseType::DuckDb)
         && options.database_type != Some(DatabaseType::Dameng)
         && options.database_type != Some(DatabaseType::Oracle)
-        && options.database_type != Some(DatabaseType::OceanbaseOracle);
+        && options.database_type != Some(DatabaseType::OceanbaseOracle)
+        && options.database_type != Some(DatabaseType::SapHana)
+        && options.database_type != Some(DatabaseType::Iris);
     let sort_alias = if use_derived_column_aliases {
         aliases
             .get(options.column_index)
@@ -370,20 +460,31 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     let use_sort_ordinal = !use_derived_column_aliases
         && matches!(
             options.database_type,
-            Some(DatabaseType::Dameng | DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+            Some(
+                DatabaseType::Dameng
+                    | DatabaseType::Oracle
+                    | DatabaseType::OceanbaseOracle
+                    | DatabaseType::SapHana
+                    | DatabaseType::Iris
+            )
         )
         && options.result_columns.get(options.column_index).is_some_and(|column| {
             options.result_columns.iter().filter(|candidate| candidate.eq_ignore_ascii_case(column)).count() > 1
         });
     let sort_reference = if use_sort_ordinal {
         (options.column_index + 1).to_string()
+    } else if options.database_type == Some(DatabaseType::Iris) {
+        // With delimited identifiers disabled, a quoted ORDER BY name becomes
+        // a string literal on Caché and the sort silently degrades to a
+        // constant. Ordinary names must be sent unquoted.
+        quote_iris_identifier(&sort_alias, None)
     } else {
         quote_table_identifier(options.database_type, &sort_alias)
     };
     let wrapped_statement = if options.database_type == Some(DatabaseType::SqlServer) {
-        sql_server_statement_for_derived_table(&statement)
+        sql_server_statement_for_derived_table(statement)
     } else {
-        statement
+        statement.to_string()
     };
 
     if use_derived_column_aliases {
@@ -393,11 +494,14 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
             .collect::<Vec<_>>()
             .join(", ");
         ok(format!(
-            "SELECT * FROM ({wrapped_statement}) t({alias_list}) ORDER BY {sort_reference} {};",
+            "{execution_hint}SELECT * FROM ({wrapped_statement}) t({alias_list}) ORDER BY {sort_reference} {};",
             options.direction.as_sql()
         ))
     } else {
-        ok(format!("SELECT * FROM ({wrapped_statement}) t ORDER BY {sort_reference} {};", options.direction.as_sql()))
+        ok(format!(
+            "{execution_hint}SELECT * FROM ({wrapped_statement}) t ORDER BY {sort_reference} {};",
+            options.direction.as_sql()
+        ))
     }
 }
 
@@ -413,20 +517,48 @@ fn unsupported_pagination_type(database_type: Option<DatabaseType>) -> bool {
     matches!(database_type, Some(DatabaseType::Neo4j | DatabaseType::MongoDb | DatabaseType::Redis))
 }
 
-fn single_selectable_statement(original_sql: &str) -> Result<String, ()> {
+fn find_query_result_statement_at_cursor(sql: &str, cursor_pos: usize, database_type: Option<DatabaseType>) -> String {
+    if database_type == Some(DatabaseType::Mysql) {
+        find_statement_at_cursor_for_database(sql, cursor_pos, DatabaseType::Mysql)
+    } else {
+        find_statement_at_cursor(sql, cursor_pos)
+    }
+}
+
+fn kingbase_server_pagination_is_stable(sql: &str) -> bool {
+    let has_order_by = Parser::parse_sql(&GenericDialect {}, sql)
+        .ok()
+        .and_then(|statements| {
+            let [Statement::Query(query)] = statements.as_slice() else {
+                return None;
+            };
+            Some(query.order_by.as_ref().is_some_and(
+                |order_by| !matches!(&order_by.kind, OrderByKind::Expressions(expressions) if expressions.is_empty()),
+            ))
+        })
+        .unwrap_or(false);
+
+    has_order_by || dedup_projection_count_without_order_by(sql).is_some()
+}
+
+fn single_selectable_statement(original_sql: &str, database_type: Option<DatabaseType>) -> Result<String, ()> {
     let base_sql = original_sql.trim();
     if base_sql.is_empty() {
         return Err(());
     }
 
-    let extracted = find_statement_at_cursor(base_sql, 0).trim().trim_end_matches(';').trim().to_string();
+    let extracted = find_query_result_statement_at_cursor(base_sql, 0, database_type)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
     if extracted.is_empty() {
         return Err(());
     }
     if !single_statement_matches_base_sql(&extracted, base_sql) {
         return Err(());
     }
-    let statement = restore_leading_execution_hint(base_sql, &extracted);
+    let statement = restore_leading_execution_hint(base_sql, &extracted, database_type);
     let statement_without_leading_comments =
         strip_leading_statement_comments(statement.trim_start_matches(';').trim_start());
     let upper = statement_without_leading_comments.to_ascii_uppercase();
@@ -522,6 +654,11 @@ fn has_top_level_select_into(sql: &str) -> bool {
 }
 
 fn add_sql_server_offset_fetch(statement: &str, limit: usize, offset: usize) -> Option<String> {
+    // FOR JSON/XML produces an unnamed result value and cannot be projected
+    // from a derived table used by DBX pagination.
+    if has_top_level_for_output_clause(statement) {
+        return None;
+    }
     // 用户已写 OFFSET/FETCH 时必须原样保留，不能再注入 TOP（两者同块会被 SQL Server 拒绝）。
     // 词法检测与 AST 检测任一命中即视为已有分页：词法扫描器在 # 临时表、
     // 反斜杠字符串等场景会漏检，AST 检测负责把这些情况补上。
@@ -545,13 +682,18 @@ fn add_sql_server_offset_fetch(statement: &str, limit: usize, offset: usize) -> 
         return Some(inject_sql_server_top(statement, limit));
     }
 
-    let statement_without_order = order_by_index.map(|index| statement[..index].trim_end()).unwrap_or(statement);
+    // The inner query may end with a line comment after removing ORDER BY.
+    // Keep the derived-table closing parenthesis on a new line so it is not
+    // swallowed by `--` / `#` comments.
+    let statement_without_order = order_by_index
+        .map(|index| statement_for_sql_suffix(statement[..index].trim_end()))
+        .unwrap_or_else(|| statement_for_sql_suffix(statement));
     if !sql_server_row_number_pagination_safe(statement) {
         return Some(add_sql_server_rowcount_pagination(statement, limit, offset));
     }
 
     let row_number_order = order_by_index
-        .map(|index| statement[index..].trim().to_string())
+        .map(|index| statement_for_sql_suffix(statement[index..].trim()))
         .unwrap_or_else(|| "ORDER BY (SELECT NULL)".to_string());
     let end = offset + limit;
     Some(format!(
@@ -635,12 +777,14 @@ fn add_sql_server_existing_top_pagination(statement: &str, limit: usize, offset:
     let row_number_order = sql_server_derived_pagination_order(statement)
         .unwrap_or_else(|| format!("ORDER BY {}", sql_server_default_pagination_order(statement)));
     if offset == 0 {
-        return format!("SELECT TOP ({limit}) * FROM ({statement}) [dbx_page] {row_number_order};");
+        let derived_statement = statement_for_sql_suffix(statement);
+        return format!("SELECT TOP ({limit}) * FROM ({derived_statement}) [dbx_page] {row_number_order};");
     }
 
     let end = offset + limit;
+    let derived_statement = statement_for_sql_suffix(statement);
     format!(
-        "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER ({row_number_order}) AS [__dbx_row_num] FROM ({statement}) dbx_page_source) dbx_page WHERE [__dbx_row_num] > {offset} AND [__dbx_row_num] <= {end} ORDER BY [__dbx_row_num];"
+        "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER ({row_number_order}) AS [__dbx_row_num] FROM ({derived_statement}) dbx_page_source) dbx_page WHERE [__dbx_row_num] > {offset} AND [__dbx_row_num] <= {end} ORDER BY [__dbx_row_num];"
     )
 }
 
@@ -769,22 +913,35 @@ fn skip_leading_sql_comments(sql: &str, mut index: usize) -> usize {
     }
 }
 
-fn restore_leading_execution_hint(original_sql: &str, statement: &str) -> String {
-    if leading_execution_hint_prefix(statement).is_some() {
+fn restore_leading_execution_hint(original_sql: &str, statement: &str, database_type: Option<DatabaseType>) -> String {
+    if leading_execution_hint_prefix_for_database(statement, database_type).is_some() {
         return statement.to_string();
     }
     let normalized = original_sql.trim().trim_end_matches(';').trim();
-    match leading_execution_hint_prefix(normalized) {
+    match leading_execution_hint_prefix_for_database(normalized, database_type) {
         Some(prefix) => format!("{prefix}{statement}"),
         None => statement.to_string(),
     }
 }
 
-fn split_leading_execution_hint(sql: &str) -> (&str, &str) {
-    match leading_execution_hint_prefix(sql) {
+fn split_leading_execution_hint(sql: &str, database_type: Option<DatabaseType>) -> (&str, &str) {
+    match leading_execution_hint_prefix_for_database(sql, database_type) {
         Some(prefix) => (prefix, sql[prefix.len()..].trim_start()),
         None => ("", sql),
     }
+}
+
+fn leading_execution_hint_prefix_for_database(sql: &str, database_type: Option<DatabaseType>) -> Option<&str> {
+    if let Some(prefix) = leading_execution_hint_prefix(sql) {
+        return Some(prefix);
+    }
+    if database_type != Some(DatabaseType::Mysql) {
+        return None;
+    }
+
+    let executable_start = skip_leading_sql_comments(sql, 0);
+    let directive_start = crate::db::tdsql_mysql::leading_directive_start(sql, executable_start)?;
+    (directive_start < executable_start).then(|| &sql[directive_start..executable_start])
 }
 
 fn leading_execution_hint_prefix(sql: &str) -> Option<&str> {
@@ -1101,6 +1258,161 @@ fn mysql_wrapped_count_sql(statement: &str) -> String {
     derived_table_sql("SELECT COUNT(*) AS dbx_total_rows FROM", statement, &format!("{alias};"))
 }
 
+fn iotdb_tree_count_sql(statement: &str) -> Option<String> {
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, statement).ok()?;
+    let [Statement::Query(query)] = statements.as_mut_slice() else {
+        return None;
+    };
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    let group_by_is_empty = matches!(&select.group_by, GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty());
+    let tree_path = match select.from.as_slice() {
+        [source] if source.joins.is_empty() => match &source.relation {
+            TableFactor::Table { name, .. } => name,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let tree_path_parts = tree_path.0.iter().map(ObjectNamePart::as_ident).collect::<Option<Vec<_>>>()?;
+    if tree_path_parts.len() < 3 || !tree_path_parts[0].value.eq_ignore_ascii_case("root") {
+        return None;
+    }
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.prewhere.is_some()
+        || select.into.is_some()
+        || !group_by_is_empty
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || !select.lateral_views.is_empty()
+        || !select.optimizer_hints.is_empty()
+        || select.select_modifiers.as_ref().is_some_and(SelectModifiers::is_any_set)
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.value_table_mode.is_some()
+    {
+        return None;
+    }
+
+    let measurement = match select.projection.as_slice() {
+        [SelectItem::UnnamedExpr(expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)))] => expr.to_string(),
+        [SelectItem::ExprWithAlias { expr: expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)), .. }] => {
+            expr.to_string()
+        }
+        _ => return None,
+    };
+    // IoTDB's value-filter mode allows WHERE to reference a series that is
+    // not in the SELECT list; `COUNT(<measurement>)` would then count only
+    // the selected series' non-null points and understate the row total, so
+    // only count when every WHERE reference is `time` or the measurement
+    // itself (bare or full-path form).
+    if let Some(selection) = select.selection.as_ref() {
+        let allowed = |expr: &Expr| match expr {
+            Expr::Identifier(identifier) => {
+                identifier.value.eq_ignore_ascii_case("time") || identifier.value == measurement
+            }
+            Expr::CompoundIdentifier(parts) => {
+                parts.iter().map(|part| part.value.as_str()).collect::<Vec<_>>().join(".") == measurement
+            }
+            _ => true,
+        };
+        if visit_expressions(
+            selection,
+            |expr| {
+                if allowed(expr) {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
+            },
+        )
+        .is_break()
+        {
+            return None;
+        }
+    }
+    let count_projection =
+        match Parser::parse_sql(&dialect, &format!("SELECT COUNT({measurement}) AS dbx_total_rows")).ok()?.pop()? {
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Select(select) => select.projection.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+    select.projection = count_projection;
+    query.order_by = None;
+    Some(format!("{query};"))
+}
+
+fn iris_count_sql(statement: &str) -> Option<String> {
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, statement).ok()?;
+    let [Statement::Query(query)] = statements.as_mut_slice() else {
+        return None;
+    };
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    let group_by_is_empty = matches!(&select.group_by, GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty());
+    if select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || !matches!(&select.from[0].relation, TableFactor::Table { .. })
+        || !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)] | [SelectItem::QualifiedWildcard(_, _)])
+        || select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.prewhere.is_some()
+        || select.into.is_some()
+        || !group_by_is_empty
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || !select.lateral_views.is_empty()
+        || !select.optimizer_hints.is_empty()
+        || select.select_modifiers.as_ref().is_some_and(SelectModifiers::is_any_set)
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.value_table_mode.is_some()
+    {
+        return None;
+    }
+
+    let count_projection = match Parser::parse_sql(&dialect, "SELECT COUNT(*) AS dbx_total_rows").ok()?.pop()? {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(select) => select.projection.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    select.projection = count_projection;
+    query.order_by = None;
+    Some(format!("{query};"))
+}
+
 fn mysql_derived_table_set_projection_safety(set_expr: &SetExpr) -> MysqlDerivedProjectionSafety {
     match set_expr {
         SetExpr::Select(select) => mysql_derived_table_select_projection_safety(select),
@@ -1159,6 +1471,11 @@ fn mysql_projection_item_is_row_preserving(item: &SelectItem) -> bool {
 }
 
 fn sql_server_count_sql(statement: &str) -> Option<String> {
+    // FOR JSON/XML produces an unnamed result value that cannot be projected
+    // from the derived table used by the count wrapper.
+    if has_top_level_for_output_clause(statement) {
+        return None;
+    }
     let dialect = MsSqlDialect {};
     let mut statements = Parser::parse_sql(&dialect, statement).ok()?;
     let derived_table_projection_safe = {
@@ -1268,7 +1585,7 @@ fn strip_sql_server_select_modifier<'a>(rest: &'a str, modifier: &str) -> Option
 }
 
 fn sql_server_statement_for_derived_table(statement: &str) -> String {
-    if has_top_level_select_top(statement) || has_top_level_for_xml(statement) {
+    if has_top_level_select_top(statement) || has_top_level_for_output_clause(statement) {
         return statement.to_string();
     }
     statement_for_order_insensitive_derived_table(statement)
@@ -1554,9 +1871,9 @@ fn add_standard_limit(
     database_type: Option<DatabaseType>,
     limit: usize,
     offset: usize,
-    dedup_projection_count: Option<usize>,
+    dedup_order_by: Option<Vec<usize>>,
 ) -> String {
-    let order_sql = dedup_projection_count.map_or(String::new(), format_positional_order_by);
+    let order_sql = dedup_order_by.as_deref().map_or(String::new(), format_positional_order_by);
 
     if has_top_level_limit(statement) {
         if !order_sql.is_empty() {
@@ -1736,17 +2053,20 @@ fn line_has_open_line_comment(line: &str) -> bool {
 /// returns deterministic results across pages.  This is especially important for
 /// distributed databases (e.g. Doris, StarRocks) where tablet scan order varies
 /// between independent query executions.
-fn format_positional_order_by(column_count: usize) -> String {
-    if column_count == 0 {
+fn format_positional_order_by(positions: &[usize]) -> String {
+    if positions.is_empty() {
         return String::new();
     }
-    let cols: Vec<String> = (1..=column_count).map(|i| i.to_string()).collect();
+    let cols: Vec<String> = positions.iter().map(|position| position.to_string()).collect();
     format!(" ORDER BY {}", cols.join(", "))
 }
 
 /// Detect dedup queries (SELECT DISTINCT, GROUP BY, HAVING) that lack a
-/// top-level ORDER BY clause.  Returns the number of projection items so that
-/// a positional ORDER BY can be injected for deterministic pagination.
+/// top-level ORDER BY clause.  Returns the 1-based projection positions to sort
+/// on so that a positional ORDER BY can be injected for deterministic pagination.
+///
+/// A GROUP BY query sorts on its grouping keys alone: the keys already identify
+/// an output row uniquely, and some engines reject sorting on aggregate outputs.
 ///
 /// Returns `None` for:
 ///   - Non-SELECT queries
@@ -1754,7 +2074,7 @@ fn format_positional_order_by(column_count: usize) -> String {
 ///   - Queries that already specify ORDER BY
 ///   - Wildcard projections (`SELECT *`)
 ///   - Parse failures
-fn dedup_projection_count_without_order_by(sql: &str) -> Option<usize> {
+fn dedup_projection_count_without_order_by(sql: &str) -> Option<Vec<usize>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql).ok()?;
     let [Statement::Query(query)] = statements.as_slice() else {
@@ -1777,7 +2097,55 @@ fn dedup_projection_count_without_order_by(sql: &str) -> Option<usize> {
     if select.projection.len() == 1 && matches!(select.projection.first(), Some(SelectItem::Wildcard(_))) {
         return None;
     }
-    Some(select.projection.len())
+    let all_positions: Vec<usize> = (1..=select.projection.len()).collect();
+    if has_distinct {
+        return Some(all_positions);
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        if let Some(positions) = group_by_key_positions(exprs, &select.projection) {
+            return Some(positions);
+        }
+    }
+    Some(all_positions)
+}
+
+/// Map every GROUP BY key onto the 1-based position of the output column that
+/// exposes it.  Returns `None` when a key is not projected (sorting on the keys
+/// alone is then impossible) or when a wildcard hides which position is which,
+/// so callers fall back to sorting on the full projection.
+fn group_by_key_positions(group_by: &[Expr], projection: &[SelectItem]) -> Option<Vec<usize>> {
+    if group_by.is_empty() {
+        return None;
+    }
+    if !projection.iter().all(|item| matches!(item, SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. })) {
+        return None;
+    }
+    let mut positions: Vec<usize> = Vec::with_capacity(group_by.len());
+    for key in group_by {
+        let position = group_by_key_position(key, projection)?;
+        if !positions.contains(&position) {
+            positions.push(position);
+        }
+    }
+    positions.sort_unstable();
+    Some(positions)
+}
+
+fn group_by_key_position(key: &Expr, projection: &[SelectItem]) -> Option<usize> {
+    // `GROUP BY 1` is already a projection position.
+    if let Expr::Value(ValueWithSpan { value: Value::Number(number, _), .. }) = key {
+        let position = number.parse::<usize>().ok()?;
+        return (1..=projection.len()).contains(&position).then_some(position);
+    }
+    let key_sql = key.to_string();
+    projection
+        .iter()
+        .position(|item| match item {
+            SelectItem::UnnamedExpr(expr) => expr.to_string() == key_sql,
+            SelectItem::ExprWithAlias { expr, alias } => alias.value == key_sql || expr.to_string() == key_sql,
+            _ => false,
+        })
+        .map(|index| index + 1)
 }
 
 fn find_top_level_trailing_order_by(sql: &str) -> Option<usize> {
@@ -1812,12 +2180,11 @@ fn top_level_select_tokens_before_from(sql: &str) -> Vec<SqlToken> {
     tokens[select_index + 1..from_index].to_vec()
 }
 
-fn has_top_level_for_xml(sql: &str) -> bool {
+fn has_top_level_for_output_clause(sql: &str) -> bool {
     let tokens = top_level_sql_tokens(sql);
-    tokens
-        .iter()
-        .enumerate()
-        .any(|(index, token)| token.text == "FOR" && tokens.get(index + 1).is_some_and(|next| next.text == "XML"))
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.text == "FOR" && tokens.get(index + 1).is_some_and(|next| next.text == "XML" || next.text == "JSON")
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2032,6 +2399,64 @@ fn fallback_alias(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Query shape from issue #7832: a MySQL GROUP BY over a LEFT JOIN with an
+    /// aggregated derived table, COUNT(DISTINCT IF(...)) in the projection, and
+    /// inline `-- 中文` line comments. Locks in the invariants that keep DBX's
+    /// derived page/count SQL row-count-identical to the user's statement:
+    /// the statement splitter must keep it a single statement, the page SQL
+    /// must preserve the GROUP BY while injecting deterministic pagination,
+    /// and the count wrap must count the grouped result, not the raw join.
+    #[test]
+    fn mysql_group_by_with_distinct_if_and_comments_keeps_grouping_in_page_and_count_sql() {
+        let sql = "SELECT\n  base.brand_name\n ,base.stall_id\n ,base.floor\n ,COUNT(1) total_invite -- 邀约数量\n ,SUM(IFNULL(base.ver_status, 0)) sign_num -- 签到数量\n ,SUM(IFNULL(dr.draw_count, 0)) draw_num -- 抽奖次数\n ,SUM(IFNULL(dr.draw_user_num, 0)) draw_user_num -- 抽奖人数\n ,COUNT(distinct IF(base.ver_status = 1, base.mobile, null)) sign_and_draw_user_num\nFROM v_form_data_1786326962 base\nLEFT JOIN (\n  SELECT id, SUM(IFNULL(hx_status, 0)) draw_count, COUNT(distinct IF(hx_status = 1, mobile, null)) draw_user_num\n  FROM v_form_data_1786326962_coupon\n  GROUP BY id\n) dr ON base.id = dr.id\nGROUP BY base.brand_name, base.stall_id, base.floor";
+
+        let statements = crate::sql::split_sql_statements_for_database(sql, DatabaseType::Mysql);
+        assert_eq!(statements.len(), 1, "inline comments must not split the statement");
+
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        let page_sql = plan.page_sql.expect("pagination plan provides page SQL");
+        assert!(page_sql.to_uppercase().contains("GROUP BY"));
+        assert!(
+            page_sql.contains("ORDER BY 1, 2, 3 LIMIT 500;"),
+            "dedup pagination must be appended after the GROUP BY, got: {page_sql}"
+        );
+
+        let count_sql = plan.count_sql.expect("pagination plan provides count SQL");
+        assert!(count_sql.starts_with("SELECT COUNT(*) AS dbx_total_rows FROM ("));
+        assert_eq!(
+            count_sql.matches("GROUP BY").count(),
+            2,
+            "the count wrap must keep both the outer and derived-table GROUP BY, got: {count_sql}"
+        );
+
+        let mut variants = vec![
+            ("crlf", sql.replace('\n', "\r\n")),
+            ("trailing semicolon", format!("{sql};")),
+            ("trailing GROUP BY comment", format!("{sql} -- 分组")),
+        ];
+        if let Some(stripped) = sql.strip_prefix("SELECT") {
+            variants.push(("leading comment", format!("-- header\nSELECT{stripped}")));
+        }
+        for (name, variant) in variants {
+            let counted = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: variant.clone(),
+                database_type: Some(DatabaseType::Mysql),
+            });
+            let counted = counted.sql.unwrap_or_default();
+            assert_eq!(counted.matches("GROUP BY").count(), 2, "{name}: count wrap kept both GROUP BYs");
+            let statements = crate::sql::split_sql_statements_for_database(&variant, DatabaseType::Mysql);
+            assert_eq!(statements.len(), 1, "{name}: still a single statement");
+        }
+    }
 
     #[test]
     fn easysearch_uses_elasticsearch_sql_pagination_rules() {
@@ -2562,6 +2987,79 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_json_output_executes_original_sql_without_wrappers() {
+        let sql = "SELECT TOP 10 * FROM [sales].[orders_10k] FOR JSON AUTO".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql.clone(),
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.count_sql.is_none());
+        assert_eq!(plan.page_limit, None);
+        assert_eq!(plan.page_offset, None);
+        assert_eq!(plan.exact_query_row_bound, None);
+        assert!(!plan.single_execution);
+        assert_eq!(
+            build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: "SELECT TOP 10 * FROM [sales].[orders_10k] FOR JSON AUTO".to_string(),
+                database_type: Some(DatabaseType::SqlServer),
+                limit: 100,
+                offset: 0,
+            }),
+            err("unsupported")
+        );
+        assert_eq!(
+            build_count_query_sql(CountQuerySqlOptions {
+                original_sql: sql,
+                database_type: Some(DatabaseType::SqlServer),
+            }),
+            err("unsupported")
+        );
+    }
+
+    #[test]
+    fn sqlserver_json_output_without_top_also_skips_wrappers() {
+        let sql = "SELECT id, name FROM users FOR JSON PATH".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql.clone(),
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.count_sql.is_none());
+        assert_eq!(plan.exact_query_row_bound, None);
+    }
+
+    #[test]
+    fn sqlserver_nested_json_output_in_subquery_still_paginates() {
+        // FOR JSON nested inside a scalar subquery is not a top-level output
+        // clause; the outer query is a normal projection and paginates.
+        let sql = "SELECT id, (SELECT name FROM tags FOR JSON PATH) AS tags FROM users".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql,
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert!(plan.page_sql.is_some());
+        assert!(plan.count_sql.is_some());
+    }
+
+    #[test]
     fn paginates_sqlserver_top_parenthesized_projection_query_by_first_column() {
         let sql = "SELECT TOP (500) [id], [order_no], [store_id], [product_id], [customer_name], [quantity], [amount], [order_status], [created_at] FROM [sales].[orders_10k]";
         let first_page = build_paginated_query_sql(PaginatedQuerySqlOptions {
@@ -2648,6 +3146,36 @@ mod tests {
             result.sql.unwrap(),
             "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY [id]) AS [__dbx_row_num] FROM (SELECT TOP (500) [id], [order_no], [store_id], [product_id], [customer_name], [quantity], [amount], [order_status], [created_at] FROM [sales].[orders_10k]) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
         );
+    }
+
+    #[test]
+    fn sqlserver_later_page_keeps_derived_table_closing_after_comment_before_order_by() {
+        let sql = "SELECT\n*\nFROM\ncode\n-- WHERE\n-- ccode = '1002'\nORDER BY\nccode;";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+
+        let generated = result.sql.expect("build SQL Server page SQL");
+        assert!(generated.contains("FROM (SELECT\n*\nFROM\ncode\n-- WHERE\n-- ccode = '1002'\n) dbx_page_source"));
+        assert!(!generated.contains("-- ccode = '1002') dbx_page_source"));
+    }
+
+    #[test]
+    fn sqlserver_later_page_keeps_row_number_window_after_comment_after_order_by() {
+        let sql = "SELECT\n*\nFROM\ncode\nORDER BY\nccode -- sort";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+
+        let generated = result.sql.expect("build SQL Server page SQL");
+        assert!(generated.contains("ROW_NUMBER() OVER (ORDER BY\nccode -- sort\n) AS [__dbx_row_num]"));
+        assert!(!generated.contains("-- sort) AS [__dbx_row_num]"));
     }
 
     #[test]
@@ -3370,6 +3898,62 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn mysql_pagination_preserves_same_line_tdsql_directives() {
+        for directive in ["/*sets:allsets*/", "/*master*/", "/*slave:set_1781591902_7*/", "/*future-route:anywhere*/"] {
+            let first_page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: format!("{directive}select @@server_id;"),
+                database_type: Some(DatabaseType::Mysql),
+                limit: 100,
+                offset: 0,
+            });
+            let later_page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: format!("{directive}select @@server_id;"),
+                database_type: Some(DatabaseType::Mysql),
+                limit: 100,
+                offset: 100,
+            });
+
+            assert_eq!(first_page.sql.unwrap(), format!("{directive}select @@server_id LIMIT 100;"));
+            assert_eq!(later_page.sql.unwrap(), format!("{directive}select @@server_id LIMIT 100 OFFSET 100;"));
+        }
+    }
+
+    #[test]
+    fn mysql_pagination_preserves_exact_proxy_directive() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "/*proxy*/\nSELECT id FROM users".to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            limit: 50,
+            offset: 0,
+        });
+
+        assert_eq!(result.sql.unwrap(), "/*proxy*/\nSELECT id FROM users LIMIT 50;");
+    }
+
+    #[test]
+    fn native_mysql_pagination_plan_preserves_exact_issue_directive() {
+        let original_sql = "/*sets:allsets*/select @@server_id;";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: original_sql.to_string(),
+            query_base_sql: original_sql.to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, "/*sets:allsets*/select @@server_id LIMIT 100;");
+        assert_eq!(plan.page_sql.as_deref(), Some(plan.sql_to_execute.as_str()));
+        assert_eq!(plan.page_limit, Some(100));
+        assert_eq!(plan.page_offset, Some(0));
+        assert_eq!(
+            plan.count_sql.as_deref(),
+            Some("/*sets:allsets*/SELECT COUNT(*) AS dbx_total_rows FROM (select @@server_id) `dbx_count`;")
+        );
+        assert!(!plan.use_agent_result_session);
+    }
+
+    #[test]
     fn mysql_count_preserves_leading_ampersand_routing_hint() {
         let result = build_count_query_sql(CountQuerySqlOptions {
             original_sql: "/*& tenant:'test' */\nSELECT id FROM users".to_string(),
@@ -3380,6 +3964,108 @@ WHERE u.id = picked.id;
             result.sql.unwrap(),
             "/*& tenant:'test' */\nSELECT COUNT(*) AS dbx_total_rows FROM (SELECT id FROM users) `dbx_count`;"
         );
+    }
+
+    #[test]
+    fn mysql_count_preserves_directives_at_outermost_start() {
+        for prefix in [
+            "/*sets:allsets*/",
+            "/*master*/",
+            "/*slave:set_1781591902_7*/",
+            "/*future-route:anywhere*/",
+            "/*proxy*/\n",
+            "/*+ MAX_EXECUTION_TIME(1000) */\n",
+            "/*@global:true*/\n",
+            "/*& tenant:'test' */\n",
+        ] {
+            let result = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: format!("{prefix}select @@server_id;"),
+                database_type: Some(DatabaseType::Mysql),
+            });
+
+            assert_eq!(
+                result.sql.unwrap(),
+                format!("{prefix}SELECT COUNT(*) AS dbx_total_rows FROM (select @@server_id) `dbx_count`;")
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_generated_queries_keep_standalone_comments_non_executable() {
+        for original_sql in ["/* report query */\nSELECT id FROM users", "-- report query\nSELECT id FROM users"] {
+            let page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: original_sql.to_string(),
+                database_type: Some(DatabaseType::Mysql),
+                limit: 50,
+                offset: 0,
+            });
+            let count = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: original_sql.to_string(),
+                database_type: Some(DatabaseType::Mysql),
+            });
+            let sort = build_sorted_query_sql(SortedQuerySqlOptions {
+                original_sql: original_sql.to_string(),
+                database_type: Some(DatabaseType::Mysql),
+                result_columns: vec!["id".to_string()],
+                column_index: 0,
+                column: "id".to_string(),
+                direction: QuerySortDirection::Asc,
+            });
+
+            assert_eq!(page.sql.unwrap(), "SELECT id FROM users LIMIT 50;");
+            assert_eq!(
+                count.sql.unwrap(),
+                "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT id FROM users) `dbx_count`;"
+            );
+            assert_eq!(sort, err("multi"));
+        }
+    }
+
+    #[test]
+    fn tdsql_directives_remain_mysql_only_in_generated_queries() {
+        let original_sql = "/*sets:allsets*/SELECT id FROM users";
+        let page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: original_sql.to_string(),
+            database_type: Some(DatabaseType::Postgres),
+            limit: 50,
+            offset: 0,
+        });
+        let count = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: original_sql.to_string(),
+            database_type: Some(DatabaseType::Postgres),
+        });
+
+        assert_eq!(page.sql.unwrap(), "SELECT id FROM users LIMIT 50;");
+        assert_eq!(count.sql.unwrap(), "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT id FROM users) \"dbx_count\";");
+    }
+
+    #[test]
+    fn mysql_generated_queries_reject_non_executable_and_multi_statement_inputs() {
+        for original_sql in ["/*sets:allsets*/", "/*sets:allsets SELECT id FROM users"] {
+            let page = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: original_sql.to_string(),
+                database_type: Some(DatabaseType::Mysql),
+                limit: 50,
+                offset: 0,
+            });
+            let count = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: original_sql.to_string(),
+                database_type: Some(DatabaseType::Mysql),
+            });
+
+            assert!(!page.ok, "{original_sql}");
+            assert!(page.sql.is_none(), "{original_sql}");
+            assert!(!count.ok, "{original_sql}");
+            assert!(count.sql.is_none(), "{original_sql}");
+        }
+
+        let multi = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "/*sets:allsets*/SELECT 1; SELECT 2".to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            limit: 50,
+            offset: 0,
+        });
+        assert_eq!(multi, err("multi"));
     }
 
     #[test]
@@ -3527,6 +4213,32 @@ WHERE u.id = picked.id;
         assert_eq!(
             result.sql.unwrap(),
             "SELECT COUNT(*) AS dbx_total_rows FROM (WITH cte AS (SELECT 1 AS id) SELECT * FROM cte) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn hive_count_keeps_cte_outside_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH cte AS (SELECT 1 AS id) SELECT * FROM cte".to_string(),
+            database_type: Some(DatabaseType::Hive),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH cte AS (SELECT 1 AS id) SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM cte) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn hive_count_keeps_from_style_query_inside_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH cte AS (SELECT 1 AS id) FROM cte SELECT *".to_string(),
+            database_type: Some(DatabaseType::Hive),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH cte AS (SELECT 1 AS id) SELECT COUNT(*) AS dbx_total_rows FROM (FROM cte SELECT *) `dbx_count`;"
         );
     }
 
@@ -3720,6 +4432,74 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn iotdb_tree_count_rewrites_single_series_without_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT WGEN_GnTmpSta1 FROM root.dbx_time_preview.device WHERE time >= 1 ORDER BY time DESC"
+                .to_string(),
+            database_type: Some(DatabaseType::Iotdb),
+        });
+
+        assert_eq!(
+            result.sql.as_deref(),
+            Some("SELECT COUNT(WGEN_GnTmpSta1) AS dbx_total_rows FROM root.dbx_time_preview.device WHERE time >= 1;")
+        );
+    }
+
+    #[test]
+    fn iotdb_count_allows_value_filters_on_selected_series() {
+        for sql in [
+            "SELECT s1 FROM root.db.device WHERE s1 > 10",
+            "SELECT root.db.device.s1 FROM root.db.device WHERE root.db.device.s1 > 10",
+        ] {
+            let result = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: sql.to_string(),
+                database_type: Some(DatabaseType::Iotdb),
+            });
+
+            assert!(result.sql.is_some(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn iotdb_count_declines_queries_without_safe_tree_row_semantics() {
+        for sql in [
+            "SELECT * FROM root.db.device",
+            "SELECT s1, s2 FROM root.db.device",
+            "SELECT COUNT(s1) FROM root.db.device",
+            "SELECT s1 FROM root.db.device GROUP BY ([0, 100), 10ms)",
+            "SELECT s1 FROM root.db.device WHERE s2 > 10",
+            "SELECT s1 FROM root.db.device WHERE root.db.device.s2 > 10",
+            "SELECT s1 FROM root.db.device LIMIT 10",
+            "SELECT s1 FROM root.db.device, root.db.other",
+            "SELECT value FROM metrics",
+        ] {
+            let result = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: sql.to_string(),
+                database_type: Some(DatabaseType::Iotdb),
+            });
+
+            assert_eq!(result, err("unsupported"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn iotdb_pagination_plan_uses_tree_model_count_query() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT WGEN_GnTmpSta1 FROM root.dbx_time_preview.device".to_string(),
+            query_base_sql: "SELECT WGEN_GnTmpSta1 FROM root.dbx_time_preview.device".to_string(),
+            database_type: Some(DatabaseType::Iotdb),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(
+            plan.count_sql.as_deref(),
+            Some("SELECT COUNT(WGEN_GnTmpSta1) AS dbx_total_rows FROM root.dbx_time_preview.device;")
+        );
+    }
+
+    #[test]
     fn iris_count_query_removes_top_level_order_by() {
         let result = build_count_query_sql(CountQuerySqlOptions {
             original_sql: "SELECT id, appointment_time FROM patients WHERE status = ? ORDER BY appointment_time DESC"
@@ -3761,7 +4541,7 @@ WHERE u.id = picked.id;
     }
 
     #[test]
-    fn iris_count_query_uses_unquoted_alias_for_legacy_cache() {
+    fn iris_count_query_injects_count_for_legacy_cache_table() {
         let result = build_count_query_sql(CountQuerySqlOptions {
             original_sql: "SELECT * FROM TATFY WHERE UpdateDate = '2026-07-30' AND UpdateTime > '08:00:00'".to_string(),
             database_type: Some(DatabaseType::Iris),
@@ -3769,7 +4549,55 @@ WHERE u.id = picked.id;
 
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM TATFY WHERE UpdateDate = '2026-07-30' AND UpdateTime > '08:00:00') dbx_count;"
+            "SELECT COUNT(*) AS dbx_total_rows FROM TATFY WHERE UpdateDate = '2026-07-30' AND UpdateTime > '08:00:00';"
+        );
+    }
+
+    #[test]
+    fn iris_count_query_injects_count_for_simple_select() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "select * from PA_Adm".to_string(),
+            database_type: Some(DatabaseType::Iris),
+        });
+
+        assert_eq!(result.sql.as_deref(), Some("SELECT COUNT(*) AS dbx_total_rows FROM PA_Adm;"));
+    }
+
+    #[test]
+    fn iris_count_query_preserves_simple_select_predicates_without_derived_alias() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT * FROM PA_Adm WHERE status = ? ORDER BY id DESC".to_string(),
+            database_type: Some(DatabaseType::Iris),
+        });
+
+        assert_eq!(result.sql.as_deref(), Some("SELECT COUNT(*) AS dbx_total_rows FROM PA_Adm WHERE status = ?;"));
+    }
+
+    #[test]
+    fn iris_count_query_keeps_wrapper_for_top_limited_select() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT TOP 10 * FROM PA_Adm ORDER BY id DESC".to_string(),
+            database_type: Some(DatabaseType::Iris),
+        });
+
+        assert_eq!(
+            result.sql.as_deref(),
+            Some("SELECT COUNT(*) AS dbx_total_rows FROM (SELECT TOP 10 * FROM PA_Adm) dbx_count;")
+        );
+    }
+
+    #[test]
+    fn iris_count_query_keeps_derived_wrapper_for_complex_selects() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::Iris),
+        });
+
+        assert_eq!(
+            result.sql.as_deref(),
+            Some(
+                "SELECT COUNT(*) AS dbx_total_rows FROM (SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id) dbx_count;"
+            )
         );
     }
 
@@ -3792,7 +4620,126 @@ WHERE u.id = picked.id;
     }
 
     #[test]
-    fn kingbase_prefers_server_pagination_over_agent_cursor() {
+    fn oracle_offset_jump_keeps_agent_result_session() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        // Oracle user queries are Unbounded: the SQL stays unchanged, so the
+        // client must consume the agent result session through to the offset.
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM events;");
+        assert_eq!(plan.page_limit, Some(100));
+        assert_eq!(plan.page_offset, Some(200));
+        assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn jdbc_offset_jump_keeps_agent_result_session() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Jdbc),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert!(plan.use_agent_result_session);
+        assert_eq!(plan.page_offset, Some(200));
+    }
+
+    #[test]
+    fn rewritten_offset_jump_does_not_use_agent_result_session() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Postgres),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert!(plan.sql_to_execute.contains("LIMIT"));
+        assert!(!plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn highgo_prefers_server_pagination_over_agent_cursor() {
+        let first_page = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Highgo),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(first_page.sql_to_execute, "SELECT * FROM events LIMIT 500;");
+        assert_eq!(first_page.page_sql, Some(first_page.sql_to_execute.clone()));
+        assert_eq!(first_page.page_limit, Some(500));
+        assert_eq!(first_page.page_offset, Some(0));
+        assert!(!first_page.use_agent_result_session);
+
+        let second_page = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Highgo),
+            pagination: QueryPagination { limit: 500, offset: 500, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(second_page.sql_to_execute, "SELECT * FROM events LIMIT 500 OFFSET 500;");
+        assert_eq!(second_page.page_sql, Some(second_page.sql_to_execute.clone()));
+        assert_eq!(second_page.page_limit, Some(500));
+        assert_eq!(second_page.page_offset, Some(500));
+        assert!(!second_page.use_agent_result_session);
+    }
+
+    #[test]
+    fn highgo_avoids_agent_cursor_for_unrewritable_queries() {
+        let sql = "SELECT * FROM events; SELECT 1";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Highgo),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.page_limit.is_none());
+        assert!(plan.page_offset.is_none());
+        assert!(!plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn kingbase_prefers_server_pagination_for_ordered_query() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events ORDER BY id".to_string(),
+            query_base_sql: "SELECT * FROM events ORDER BY id".to_string(),
+            database_type: Some(DatabaseType::Kingbase),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM events ORDER BY id LIMIT 500;");
+        assert_eq!(plan.page_sql, Some(plan.sql_to_execute.clone()));
+        assert_eq!(plan.page_limit, Some(500));
+        assert_eq!(plan.page_offset, Some(0));
+        assert!(!plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn kingbase_uses_agent_cursor_for_unordered_query() {
         let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
             sql: "SELECT * FROM events".to_string(),
             query_base_sql: "SELECT * FROM events".to_string(),
@@ -3802,11 +4749,11 @@ WHERE u.id = picked.id;
             first_page_uses_actual_sql: false,
         });
 
-        assert_eq!(plan.sql_to_execute, "SELECT * FROM events LIMIT 500;");
-        assert_eq!(plan.page_sql, Some(plan.sql_to_execute.clone()));
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM events");
+        assert!(plan.page_sql.is_none());
         assert_eq!(plan.page_limit, Some(500));
         assert_eq!(plan.page_offset, Some(0));
-        assert!(!plan.use_agent_result_session);
+        assert!(plan.use_agent_result_session);
     }
 
     #[test]
@@ -3856,9 +4803,7 @@ WHERE u.id = picked.id;
     }
 
     #[test]
-    fn kingbase_subquery_top_still_uses_server_pagination() {
-        // A TOP inside a derived table is not a top-level clause, so the outer
-        // statement can still be paginated with LIMIT/OFFSET.
+    fn kingbase_unordered_subquery_top_uses_agent_cursor() {
         let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
             sql: "SELECT * FROM (SELECT TOP 100 * FROM events) t".to_string(),
             query_base_sql: "SELECT * FROM (SELECT TOP 100 * FROM events) t".to_string(),
@@ -3868,11 +4813,11 @@ WHERE u.id = picked.id;
             first_page_uses_actual_sql: false,
         });
 
-        assert_eq!(plan.sql_to_execute, "SELECT * FROM (SELECT TOP 100 * FROM events) t LIMIT 500;");
-        assert_eq!(plan.page_sql, Some(plan.sql_to_execute.clone()));
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM (SELECT TOP 100 * FROM events) t");
+        assert!(plan.page_sql.is_none());
         assert_eq!(plan.page_limit, Some(500));
         assert_eq!(plan.page_offset, Some(0));
-        assert!(!plan.use_agent_result_session);
+        assert!(plan.use_agent_result_session);
     }
 
     #[test]
@@ -4099,6 +5044,88 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn builds_saphana_sorted_query_without_derived_column_alias_list() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT ID, NAME, AMOUNT FROM DBX_ISSUE_7274_SORT".to_string(),
+            database_type: Some(DatabaseType::SapHana),
+            result_columns: vec!["ID".to_string(), "NAME".to_string(), "AMOUNT".to_string()],
+            column_index: 1,
+            column: "NAME".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT ID, NAME, AMOUNT FROM DBX_ISSUE_7274_SORT) t ORDER BY \"NAME\" ASC;"
+        );
+    }
+
+    #[test]
+    fn builds_iris_sorted_query_without_derived_column_alias_list() {
+        // Caché/IRIS rejects `t(col, col)` derived alias lists (SQLCODE -25) and
+        // a quoted ORDER BY name becomes a string literal when delimited
+        // identifiers are disabled, so the wrap must stay alias-free and
+        // unquoted (#8340).
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT ID, Name FROM SQLUser.CT_Country".to_string(),
+            database_type: Some(DatabaseType::Iris),
+            result_columns: vec!["ID".to_string(), "Name".to_string()],
+            column_index: 1,
+            column: "Name".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+        let sql = result.sql.unwrap();
+        assert!(!sql.contains(") t("), "derived column alias list must not be emitted: {sql}");
+        assert_eq!(sql, "SELECT * FROM (SELECT ID, Name FROM SQLUser.CT_Country) t ORDER BY Name ASC;");
+    }
+
+    #[test]
+    fn builds_iris_sorted_query_by_ordinal_for_duplicate_columns() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::Iris),
+            result_columns: vec!["ID".to_string(), "id".to_string()],
+            column_index: 1,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Desc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id) t ORDER BY 2 DESC;"
+        );
+    }
+
+    #[test]
+    fn mysql_sort_preserves_directives_at_outermost_start() {
+        for prefix in [
+            "/*sets:allsets*/",
+            "/*master*/",
+            "/*slave:set_1781591902_7*/",
+            "/*future-route:anywhere*/",
+            "/*proxy*/\n",
+            "/*+ MAX_EXECUTION_TIME(1000) */\n",
+            "/*@global:true*/\n",
+            "/*& tenant:'test' */\n",
+        ] {
+            let result = build_sorted_query_sql(SortedQuerySqlOptions {
+                original_sql: format!("{prefix}select @@server_id;"),
+                database_type: Some(DatabaseType::Mysql),
+                result_columns: vec!["@@server_id".to_string()],
+                column_index: 0,
+                column: "@@server_id".to_string(),
+                direction: QuerySortDirection::Asc,
+            });
+
+            assert!(result.ok, "{prefix}: {result:?}");
+            assert_eq!(
+                result.sql.unwrap(),
+                format!("{prefix}SELECT * FROM (select @@server_id) t ORDER BY `@@server_id` ASC;")
+            );
+        }
+    }
+
+    #[test]
     fn builds_clickhouse_sorted_query_without_alias_list() {
         let result = build_sorted_query_sql(SortedQuerySqlOptions {
             original_sql: "SELECT id, part_day, hid FROM events LIMIT 100".to_string(),
@@ -4212,6 +5239,23 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn builds_saphana_sorted_query_by_ordinal_for_duplicate_columns() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::SapHana),
+            result_columns: vec!["ID".to_string(), "ID".to_string()],
+            column_index: 1,
+            column: "ID".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id) t ORDER BY 2 ASC;"
+        );
+    }
+
+    #[test]
     fn preserves_derived_column_aliases_for_generic_jdbc() {
         let result = build_sorted_query_sql(SortedQuerySqlOptions {
             original_sql: "SELECT id, name FROM users".to_string(),
@@ -4245,12 +5289,15 @@ WHERE u.id = picked.id;
 
     #[test]
     fn dedup_count_detects_distinct_query_without_order_by() {
-        assert_eq!(dedup_projection_count_without_order_by("SELECT DISTINCT a, b, c FROM t"), Some(3));
+        assert_eq!(dedup_projection_count_without_order_by("SELECT DISTINCT a, b, c FROM t"), Some(vec![1, 2, 3]));
     }
 
     #[test]
     fn dedup_count_detects_group_by_query() {
-        assert_eq!(dedup_projection_count_without_order_by("SELECT city, COUNT(*) FROM users GROUP BY city"), Some(2));
+        assert_eq!(
+            dedup_projection_count_without_order_by("SELECT city, COUNT(*) FROM users GROUP BY city"),
+            Some(vec![1])
+        );
     }
 
     #[test]
@@ -4306,10 +5353,7 @@ WHERE u.id = picked.id;
         });
 
         assert!(result.ok);
-        assert_eq!(
-            result.sql.unwrap(),
-            "SELECT dept, SUM(salary) FROM employees GROUP BY dept ORDER BY 1, 2 LIMIT 50;"
-        );
+        assert_eq!(result.sql.unwrap(), "SELECT dept, SUM(salary) FROM employees GROUP BY dept ORDER BY 1 LIMIT 50;");
     }
 
     #[test]
@@ -4389,7 +5433,10 @@ WHERE u.id = picked.id;
 
     #[test]
     fn dedup_count_handles_aliases() {
-        assert_eq!(dedup_projection_count_without_order_by("SELECT DISTINCT a AS x, b AS y, c AS z FROM t"), Some(3));
+        assert_eq!(
+            dedup_projection_count_without_order_by("SELECT DISTINCT a AS x, b AS y, c AS z FROM t"),
+            Some(vec![1, 2, 3])
+        );
     }
 
     #[test]
@@ -4398,7 +5445,7 @@ WHERE u.id = picked.id;
             dedup_projection_count_without_order_by(
                 "SELECT DISTINCT a + b AS sum_col, CASE WHEN c > 0 THEN 'Y' ELSE 'N' END AS flag FROM t"
             ),
-            Some(2)
+            Some(vec![1, 2])
         );
     }
 
@@ -4408,7 +5455,7 @@ WHERE u.id = picked.id;
             dedup_projection_count_without_order_by(
                 "SELECT city, COUNT(*) AS cnt, AVG(salary) AS avg_sal FROM users GROUP BY city"
             ),
-            Some(3)
+            Some(vec![1])
         );
     }
 
@@ -4444,7 +5491,7 @@ WHERE u.id = picked.id;
         assert!(result.ok);
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT dept, SUM(salary) AS total, COUNT(*) AS head_count FROM emp GROUP BY dept ORDER BY 1, 2, 3 LIMIT 50 OFFSET 100;"
+            "SELECT dept, SUM(salary) AS total, COUNT(*) AS head_count FROM emp GROUP BY dept ORDER BY 1 LIMIT 50 OFFSET 100;"
         );
     }
 
@@ -4463,6 +5510,60 @@ WHERE u.id = picked.id;
         assert_eq!(
             result.sql.unwrap(),
             "SELECT DISTINCT name, (SELECT MAX(score) FROM scores s WHERE s.uid = u.id) AS max_score FROM users u ORDER BY 1, 2 LIMIT 100;"
+        );
+    }
+
+    #[test]
+    fn group_by_order_by_skips_clickhouse_aggregate_states() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql:
+                "SELECT city, dept, argMaxState(name, hired_at) AS latest_hire, sumState(salary) AS payroll FROM employees GROUP BY city, dept"
+                    .to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT city, dept, argMaxState(name, hired_at) AS latest_hire, sumState(salary) AS payroll FROM employees GROUP BY city, dept ORDER BY 1, 2 LIMIT 100;"
+        );
+    }
+
+    #[test]
+    fn group_by_order_by_matches_key_by_output_alias() {
+        assert_eq!(
+            dedup_projection_count_without_order_by(
+                "SELECT SUM(salary) AS total, dept AS team FROM employees GROUP BY team"
+            ),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn group_by_order_by_accepts_positional_keys() {
+        assert_eq!(
+            dedup_projection_count_without_order_by("SELECT city, dept, COUNT(*) FROM employees GROUP BY 1, 2"),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn group_by_order_by_falls_back_when_key_is_not_projected() {
+        assert_eq!(
+            dedup_projection_count_without_order_by(
+                "SELECT COUNT(*) AS cnt, SUM(salary) AS total FROM employees GROUP BY city"
+            ),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn group_by_order_by_falls_back_for_wildcard_projection() {
+        assert_eq!(
+            dedup_projection_count_without_order_by("SELECT e.*, COUNT(*) FROM employees e GROUP BY city"),
+            Some(vec![1, 2])
         );
     }
 

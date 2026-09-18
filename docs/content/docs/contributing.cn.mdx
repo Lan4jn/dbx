@@ -15,6 +15,10 @@ description: 从零搭建 DBX 开发环境，运行桌面版，完成第一次�
   第一次贡献推荐从文档、翻译、小型 UI 问题或你熟悉的数据库问题开始。一个 PR 只解决一个明确问题，会更容易验证和合并。
 </Callout>
 
+<Callout type="warn">
+  本页的 PR 目标仓库是 `t8y2/dbx`，适用于 DBX 主应用、插件框架、SDK、CLI、文档和 Agent。普通插件源码保留在插件自己的仓库；插件上架 PR 应提交到 `t8y2/dbx-store`。完整流程见[开发和提交 DBX 插件](/cn/docs/plugin-development)。
+</Callout>
+
 ## 1. 选择并认领任务
 
 打开 [DBX Issues](https://github.com/t8y2/dbx/issues)，选择一个尚未分配、评论中也没有人正在处理的 Issue。第一次贡献优先考虑：
@@ -161,7 +165,7 @@ make
 
 `make` 会使用锁文件安装依赖，然后启动 Tauri 桌面开发环境。第一次编译 Rust 依赖需要较长时间，后续启动会明显更快。
 
-如需轻量桌面开发构建，可以关闭默认 Rust feature，仅启用 DuckDB sidecar 和 DynamoDB：
+如需轻量桌面开发构建，可以关闭默认 Rust feature，仅启用 DuckDB sidecar、DynamoDB 和 bundled SQLite：
 
 ```bash
 make dev-fast
@@ -183,7 +187,7 @@ pnpm dev:tauri
 使用相同的轻量构建：
 
 ```powershell
-pnpm tauri dev -- --no-default-features --features duckdb-sidecar
+pnpm tauri dev -- --no-default-features --features duckdb-sidecar,dynamodb,sqlite-bundled
 ```
 
 ### 判断是否启动成功
@@ -238,6 +242,7 @@ rg "要查找的文字" apps/desktop/src crates src-tauri packages
 ```text
 docs/content/docs/example.mdx
 docs/content/docs/example.cn.mdx
+docs/content/docs/example.tr.mdx
 ```
 
 启动文档站：
@@ -259,6 +264,7 @@ pnpm dev
 ```text
 docs/content/docs/meta.json
 docs/content/docs/meta.cn.json
+docs/content/docs/meta.tr.json
 ```
 
 提交前先运行快速内容检查，再执行完整文档构建：

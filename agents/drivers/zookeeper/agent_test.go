@@ -13,6 +13,20 @@ import (
 	"github.com/go-zookeeper/zk"
 )
 
+func TestParseServerVersionTrimsBuiltOnSuffix(t *testing.T) {
+	srvr := "Zookeeper version: 3.6.1--104dcb3dcae0bf1bca4b4a00b2d76f2b5f6d79c, built on 04/21/2020 15:01 GMT\n"
+	if got := parseServerVersion(srvr); got != "3.6.1--104dcb3dcae0bf1bca4b4a00b2d76f2b5f6d79c" {
+		t.Fatalf("srvr version = %q", got)
+	}
+	envi := "zookeeper.version=3.8.4-9a6b1d5e9c0f, built on 2024-01-01 00:00 GMT\n"
+	if got := parseServerVersion(envi); got != "3.8.4-9a6b1d5e9c0f" {
+		t.Fatalf("envi version = %q", got)
+	}
+	if got := parseServerVersion("Latency min/avg/max: 0/0/0\n"); got != "" {
+		t.Fatalf("unrelated line parsed as version %q", got)
+	}
+}
+
 func TestHandshakeAndRPCFailures(t *testing.T) {
 	service := newServer()
 	response, shutdown := service.handleRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"handshake","params":{}}`))
@@ -20,7 +34,7 @@ func TestHandshakeAndRPCFailures(t *testing.T) {
 		t.Fatalf("handshake response = %#v, shutdown=%v", response, shutdown)
 	}
 	handshake, ok := response.Result.(handshakeResult)
-	if !ok || handshake.ProtocolVersion != 1 || handshake.AgentProtocolVersion != 1 || strings.Join(handshake.Capabilities, ",") != "connect,test_connection,kv" {
+	if !ok || handshake.ProtocolVersion != 1 || handshake.AgentProtocolVersion != 1 || strings.Join(handshake.Capabilities, ",") != "connect,test_connection,connection_info,kv" {
 		t.Fatalf("unexpected handshake: %#v", response.Result)
 	}
 
@@ -83,7 +97,7 @@ func TestConnectionConfiguration(t *testing.T) {
 			}
 		})
 	}
-	if !hasTLSOptions(connectionConfig{CACertPath: "/tmp/ca.pem"}) {
+	if !tlsOptionsPresent(connectionConfig{CACertPath: "/tmp/ca.pem"}) {
 		t.Fatal("TLS path was not detected")
 	}
 	for input, expected := range map[string]int{"": 16, "bad": 16, "0": 1, "32": 32, "100": 64} {
@@ -99,7 +113,9 @@ func TestConnectionValidationHappensBeforeNetwork(t *testing.T) {
 		config  connectionConfig
 		message string
 	}{
-		{"tls", connectionConfig{SSL: true}, "ZooKeeper TLS is not supported"},
+		{"tls client cert without key", connectionConfig{ClientCertPath: "/tmp/client.crt"}, "client key (client_key_path) is required"},
+		{"tls client key without cert", connectionConfig{ClientKeyPath: "/tmp/client.key"}, "client certificate (client_cert_path) is required"},
+		{"tls missing CA file", connectionConfig{CACertPath: "/tmp/missing-ca.pem"}, "load ZooKeeper CA certificate"},
 		{"auth", connectionConfig{AuthScheme: "sasl"}, `Unsupported auth_scheme "sasl"`},
 		{"sasl username", connectionConfig{AuthScheme: saslDigestAuthScheme, Password: "secret"}, `username is required when auth_scheme = "sasl_digest"`},
 		{"sasl password", connectionConfig{AuthScheme: saslDigestAuthScheme, Username: "user"}, `password is required when auth_scheme = "sasl_digest"`},
@@ -208,9 +224,17 @@ func TestKVOperationsAndPagination(t *testing.T) {
 		t.Fatalf("continuation mismatch error=%v", err)
 	}
 
-	deleted, err := service.delete(json.RawMessage(`{"key":"/app","recursive":true}`))
+	if _, err := service.delete(json.RawMessage(`{"key":"/app","recursive":false}`)); err != zk.ErrNotEmpty {
+		t.Fatalf("non-recursive delete error=%v", err)
+	}
+	deleted, err := service.delete(json.RawMessage(`{"key":"/app"}`))
 	if err != nil || deleted["deleted"].(int) < 4 {
 		t.Fatalf("delete=%#v err=%v", deleted, err)
+	}
+	put(`{"key":"/recursive/child","value":{"data":"v"}}`)
+	deleted, err = service.delete(json.RawMessage(`{"key":"/recursive","recursive":true}`))
+	if err != nil || deleted["deleted"] != 2 {
+		t.Fatalf("explicit recursive delete=%#v err=%v", deleted, err)
 	}
 	missing, err := service.delete(json.RawMessage(`{"key":"/app","recursive":true}`))
 	if err != nil || missing["deleted"] != 0 {

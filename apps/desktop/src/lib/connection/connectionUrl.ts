@@ -1,6 +1,7 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { h2JdbcUrlHasPasswordParam, h2JdbcUrlHasUserParam, parseH2JdbcUrl } from "@/lib/database/h2Connection";
 import { damengSslFormConfig } from "@/lib/database/damengSslOptions";
+import { normalizeRedisDatabaseValue } from "@/lib/redis/redisDatabaseIndex";
 
 export interface ParsedConnectionUrl {
   name?: string;
@@ -31,6 +32,7 @@ export type ConnectionProfile = {
 
 const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   mysql: { type: "mysql", profile: "mysql", label: "MySQL", defaultPort: 3306 },
+  oceanbase: { type: "mysql", profile: "oceanbase", label: "OceanBase", defaultPort: 2883 },
   mariadb: { type: "mysql", profile: "mariadb", label: "MariaDB", defaultPort: 3306 },
   postgres: { type: "postgres", profile: "postgres", label: "PostgreSQL", defaultPort: 5432 },
   postgresql: { type: "postgres", profile: "postgres", label: "PostgreSQL", defaultPort: 5432 },
@@ -80,6 +82,13 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   iotdb: { type: "iotdb", profile: "iotdb", label: "Apache IoTDB", defaultPort: 6667 },
   iris: { type: "iris", profile: "iris", label: "IRIS", defaultPort: 1972 },
   victoriametrics: { type: "victoriametrics", profile: "victoriametrics", label: "VictoriaMetrics", defaultPort: 8428 },
+};
+
+const OCEANBASE_ORACLE_PROFILE: ConnectionProfile = {
+  type: "oceanbase-oracle",
+  profile: "oceanbase-oracle",
+  label: "OceanBase Oracle Mode",
+  defaultPort: 2883,
 };
 
 const HTTP_SELECTED_PROFILES: Record<string, ConnectionProfile> = {
@@ -192,6 +201,29 @@ function databaseFromPath(pathname: string): string | undefined {
   return decodeUrlPart(value.split("/")[0]);
 }
 
+interface RedisUrlPathParts {
+  database: string | undefined;
+  tls: boolean;
+  insecure: boolean;
+}
+
+// Users paste redis-cli invocations into the URL field (e.g.
+// "redis://host:6379/0 --tls --insecure"); WHATWG URL folds the flags into the
+// path. Salvage them: the first non-flag token is the numeric db index, --tls
+// enables TLS (like the rediss:// scheme) and --insecure skips certificate
+// verification (like the #insecure fragment).
+function parseRedisUrlPath(rawPath: string): RedisUrlPathParts {
+  const parts: RedisUrlPathParts = { database: undefined, tls: false, insecure: false };
+  for (const token of rawPath.split(/\s+/)) {
+    if (!token) continue;
+    const flag = token.toLowerCase();
+    if (flag === "--tls") parts.tls = true;
+    else if (flag === "--insecure") parts.insecure = true;
+    else if (parts.database === undefined) parts.database = normalizeRedisDatabaseValue(token);
+  }
+  return parts;
+}
+
 function dynamodbRegionFromHost(hostname: string): string | undefined {
   return hostname.toLowerCase().match(/^dynamodb(?:-fips)?\.([a-z0-9-]+)\.(?:amazonaws\.com(?:\.cn)?|api\.aws)$/)?.[1];
 }
@@ -255,6 +287,18 @@ function queryParamValue(params: string, key: string): string | undefined {
     }
   }
   return undefined;
+}
+
+function queryParamLastValue(params: string, key: string): string | undefined {
+  let result: string | undefined;
+  for (const part of params.split(/[&;]/)) {
+    if (!part) continue;
+    const [rawKey, ...rest] = part.split("=");
+    if (decodeUrlPart(rawKey).toLowerCase() === key.toLowerCase()) {
+      result = decodeUrlPart(rest.join("=")).trim();
+    }
+  }
+  return result;
 }
 
 function extractHiveStructuredParams(params: string): { username?: string; password?: string; ssl: boolean; urlParams: string } {
@@ -334,10 +378,16 @@ function urlParamsRequireTls(dbType: DatabaseType, params: string): boolean {
   }
 
   if (dbType === "mysql") {
-    const requireSsl = queryParamValue(params, "require_ssl")?.toLowerCase();
+    const requireSsl = queryParamLastValue(params, "require_ssl")?.toLowerCase();
     if (requireSsl === "true" || requireSsl === "1" || requireSsl === "yes") return true;
-    const sslMode = (queryParamValue(params, "ssl-mode") || queryParamValue(params, "sslmode") || "").toLowerCase().replace("-", "_");
-    return sslMode === "required" || sslMode === "require" || sslMode === "verify_ca" || sslMode === "verify_identity";
+    const sslMode = (queryParamLastValue(params, "ssl-mode") || queryParamLastValue(params, "sslmode") || "").toLowerCase().replace("-", "_");
+    if (sslMode === "required" || sslMode === "require" || sslMode === "verify_ca" || sslMode === "verify_identity") return true;
+    if (requireSsl !== undefined || sslMode) return false;
+    const jdbcUseSsl = (queryParamLastValue(params, "useSSL") || "").toLowerCase();
+    const jdbcRequireSsl = (queryParamLastValue(params, "requireSSL") || "").toLowerCase();
+    const jdbcVerifyServerCertificate = (queryParamLastValue(params, "verifyServerCertificate") || "").toLowerCase();
+    if (["false", "0", "no", "off"].includes(jdbcUseSsl)) return false;
+    return ["true", "1", "yes", "on"].includes(jdbcRequireSsl) || ["true", "1", "yes", "on"].includes(jdbcVerifyServerCertificate);
   }
 
   if (dbType === "postgres" || dbType === "redshift" || dbType === "kwdb") {
@@ -357,6 +407,9 @@ export function connectionProfileForScheme(scheme: string, preferredProfile?: st
   const normalizedPreferredProfile = preferredProfile?.trim().toLowerCase();
   if ((normalizedScheme === "http" || normalizedScheme === "https") && normalizedPreferredProfile) {
     return HTTP_SELECTED_PROFILES[normalizedPreferredProfile];
+  }
+  if (normalizedScheme === "oceanbase" && normalizedPreferredProfile === "oceanbase-oracle") {
+    return OCEANBASE_ORACLE_PROFILE;
   }
   // PostgreSQL-compatible products use standard PostgreSQL URLs, so keep the
   // selected product profile when parsing a pasted URL.
@@ -639,6 +692,9 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   if (!input) {
     throw new Error("Connection URL is empty");
   }
+  if (/^jdbc:oceanbase:(?:oracle:)?loadbalance:\/\//i.test(input)) {
+    throw new Error("Unsupported OceanBase JDBC URL variant: loadbalance");
+  }
   const jdbcHive = parseJdbcHiveUrl(input);
   if (jdbcHive) return jdbcHive;
   const jdbcH2 = parseH2JdbcUrl(input);
@@ -658,7 +714,8 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   const jdbcSqlServer = parseJdbcSqlServerUrl(input);
   if (jdbcSqlServer) return jdbcSqlServer;
   const isJdbcUrl = /^jdbc:/i.test(input);
-  const source = isJdbcUrl ? input.replace(/^jdbc:/i, "") : input;
+  const isOceanBaseOracleJdbc = /^jdbc:oceanbase:oracle:\/\//i.test(input);
+  const source = isOceanBaseOracleJdbc ? input.replace(/^jdbc:oceanbase:oracle:/i, "oceanbase:") : isJdbcUrl ? input.replace(/^jdbc:/i, "") : input;
 
   const mongoResult = parseMongoUrl(source);
   if (mongoResult) return mongoResult;
@@ -674,7 +731,7 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   }
 
   const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
-  const profile = connectionProfileForScheme(scheme, preferredProfile);
+  const profile = connectionProfileForScheme(scheme, isOceanBaseOracleJdbc ? "oceanbase-oracle" : preferredProfile);
   if (!profile) {
     throw new Error(`Unsupported connection URL scheme: ${scheme}`);
   }
@@ -683,9 +740,13 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   const name = connectionNameParam(parsed);
   const urlParamsWithoutName = stripConnectionNameParam(urlParams);
   const normalizedFragment = decodeUrlPart(parsed.hash.replace(/^#/, "")).trim().toLowerCase();
-  const parsedUrlParams = profile.type === "redis" && normalizedFragment === "insecure" ? [urlParamsWithoutName, "insecure=true"].filter(Boolean).join("&") : urlParamsWithoutName;
-  const mysqlCredentials = isJdbcUrl && profile.type === "mysql" ? extractMysqlCredentialParams(parsedUrlParams) : undefined;
-  const effectiveUrlParams = mysqlCredentials?.urlParams ?? parsedUrlParams;
+  // A Redis path can carry pasted redis-cli flags ("…/0 --tls --insecure");
+  // salvage the db index plus the TLS/insecure intent before they are dropped.
+  const redisPath = profile.type === "redis" ? parseRedisUrlPath(databaseFromPath(parsed.pathname) || "") : null;
+  const redisInsecure = redisPath?.insecure || normalizedFragment === "insecure";
+  const parsedUrlParams = profile.type === "redis" && redisInsecure && !/(^|&)insecure=/i.test(urlParamsWithoutName) ? [urlParamsWithoutName, "insecure=true"].filter(Boolean).join("&") : urlParamsWithoutName;
+  const jdbcCredentials = isJdbcUrl && (profile.type === "mysql" || profile.profile === "oceanbase-oracle") ? extractMysqlCredentialParams(parsedUrlParams) : undefined;
+  const effectiveUrlParams = jdbcCredentials?.urlParams ?? parsedUrlParams;
   if (profile.type === "mongodb") {
     return {
       dbType: profile.type,
@@ -720,7 +781,9 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   }
 
   const isMeilisearch = profile.type === "meilisearch";
-  const defaultPort = isMeilisearch && scheme === "http" ? 80 : isMeilisearch && scheme === "https" ? 443 : profile.defaultPort;
+  const defaultPort = isJdbcUrl && scheme === "oceanbase" ? 3306 : isMeilisearch && scheme === "http" ? 80 : isMeilisearch && scheme === "https" ? 443 : profile.defaultPort;
+  // A Redis URL path is a numeric db index; redis-cli flags salvaged above.
+  const pathDatabase = redisPath ? redisPath.database : databaseFromPath(parsed.pathname);
 
   return {
     ...(name ? { name } : {}),
@@ -730,11 +793,11 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
     host: parsed.hostname,
     port: parsed.port ? Number(parsed.port) : defaultPort,
     ...(profile.type === "sqlserver" && parsed.port ? { portExplicit: true } : {}),
-    username: mysqlCredentials?.username ?? decodeUrlPart(parsed.username),
-    password: mysqlCredentials?.password ?? decodeUrlPart(parsed.password),
-    database: profile.type === "victoriametrics" ? "metrics" : profile.type === "dynamodb" ? dynamodbRegionFromHost(parsed.hostname) : isMeilisearch ? undefined : databaseFromPath(parsed.pathname),
+    username: jdbcCredentials?.username ?? decodeUrlPart(parsed.username),
+    password: jdbcCredentials?.password ?? decodeUrlPart(parsed.password),
+    database: profile.type === "victoriametrics" ? "metrics" : profile.type === "dynamodb" ? dynamodbRegionFromHost(parsed.hostname) : isMeilisearch ? undefined : pathDatabase,
     urlParams: effectiveUrlParams,
-    ssl: scheme === "rediss" || scheme === "https" || urlParamsRequireTls(profile.type, effectiveUrlParams) || (profile.type === "mysql" && isTidbCloudHost(parsed.hostname)),
+    ssl: scheme === "rediss" || scheme === "https" || (redisPath?.tls ?? false) || urlParamsRequireTls(profile.type, effectiveUrlParams) || (profile.type === "mysql" && isTidbCloudHost(parsed.hostname)),
     ...(profile.type === "victoriametrics" ? { apiPath: parsed.pathname.replace(/\/+$/, "") } : {}),
     ...(isMeilisearch ? { basePath: parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "") } : {}),
   };

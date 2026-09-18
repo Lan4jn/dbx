@@ -29,6 +29,8 @@ struct DriverManifestEntry {
     #[serde(default)]
     skip_tcp_probe: bool,
     #[serde(default)]
+    specialized_surface: bool,
+    #[serde(default)]
     driver_profiles: Vec<DriverProfileEntry>,
 }
 
@@ -99,6 +101,7 @@ fn maps_agent_database_types_to_driver_keys() {
     assert_eq!(agent_key(&DatabaseType::Hive, None), Some("hive"));
     assert_eq!(agent_key(&DatabaseType::Kyuubi, None), Some("hive"));
     assert_eq!(agent_key(&DatabaseType::Impala, None), Some("hive"));
+    assert_eq!(agent_key(&DatabaseType::Argo, None), Some("argo"));
     assert_eq!(agent_key(&DatabaseType::Tdengine, None), Some("tdengine"));
     assert_eq!(agent_key(&DatabaseType::Iotdb, None), Some("iotdb"));
     assert_eq!(agent_key(&DatabaseType::Yashandb, None), Some("yashandb"));
@@ -144,6 +147,7 @@ fn classifies_agent_database_types() {
     assert!(is_agent_type(&DatabaseType::Hive));
     assert!(is_agent_type(&DatabaseType::Kyuubi));
     assert!(is_agent_type(&DatabaseType::Impala));
+    assert!(is_agent_type(&DatabaseType::Argo));
     assert!(is_agent_type(&DatabaseType::Tdengine));
     assert!(is_agent_type(&DatabaseType::Iotdb));
     assert!(is_agent_type(&DatabaseType::Yashandb));
@@ -235,18 +239,14 @@ fn driver_manifest_matches_core_database_capabilities() {
     let support_levels = ["connect", "browse", "understand", "operate"];
 
     for driver in &manifest.drivers {
-        // MQ is a message queue, not a database — skip database capability checks
-        if driver.db_type == DatabaseType::MessageQueue {
-            continue;
-        }
         assert!(
             support_levels.contains(&driver.support_level.as_str()),
             "invalid support level for {:?}",
             driver.db_type
         );
         assert!(
-            driver.capabilities.any_enabled(),
-            "database {:?} should declare at least one product capability",
+            driver.capabilities.any_enabled() || driver.specialized_surface,
+            "database {:?} should declare a product capability or a specialized surface",
             driver.db_type
         );
         assert_eq!(
@@ -336,7 +336,11 @@ fn driver_manifest_declares_expected_product_capabilities() {
     assert_eq!(zookeeper.runtime_mode, "agent");
     assert_eq!(zookeeper.agent_key.as_deref(), Some("zookeeper"));
     assert_eq!(zookeeper.support_level, "connect");
-    assert!(zookeeper.capabilities.query_execution);
+    // ZooKeeper has no SQL engine and its agent implements only kv_* operations;
+    // claiming query execution or schema search made "new query" call
+    // list-databases on an agent that does not support it (issue #8215).
+    assert!(!zookeeper.capabilities.query_execution);
+    assert!(!zookeeper.capabilities.schema_search);
     assert!(zookeeper.capabilities.driver_management);
     assert!(!zookeeper.capabilities.metadata_browse);
 
@@ -450,4 +454,14 @@ fn goldendb_declares_data_transfer_support() {
 
     assert!(goldendb.capabilities.table_import);
     assert!(goldendb.capabilities.data_transfer);
+}
+
+#[test]
+fn highgo_declares_data_transfer_support() {
+    let manifest = driver_manifest();
+    let highgo =
+        manifest.drivers.iter().find(|driver| driver.db_type == DatabaseType::Highgo).expect("HighGo manifest entry");
+
+    assert!(highgo.capabilities.table_import);
+    assert!(highgo.capabilities.data_transfer);
 }

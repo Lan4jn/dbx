@@ -51,6 +51,7 @@ describe("tableStructureEditorState", () => {
     expect(canEditStructuredTriggerDraft("oracle", existing)).toBe(false);
     expect(canEditStructuredTriggerDraft(undefined, existing)).toBe(false);
     expect(canEditStructuredTriggerDraft("mysql", existing)).toBe(true);
+    expect(canEditStructuredTriggerDraft("sqlserver", existing)).toBe(true);
     expect(
       canEditStructuredTriggerDraft("oracle", {
         id: "new:trigger",
@@ -74,6 +75,15 @@ describe("tableStructureEditorState", () => {
           is_primary_key: false,
           extra: null,
           character_maximum_length: 255,
+        },
+        {
+          name: "fixed_code",
+          data_type: "bpchar",
+          is_nullable: true,
+          column_default: null,
+          is_primary_key: false,
+          extra: null,
+          character_maximum_length: 32,
         },
         {
           name: "amount",
@@ -108,9 +118,10 @@ describe("tableStructureEditorState", () => {
       "kingbase",
     );
 
-    expect(columns.map((column) => column.dataType)).toEqual(["varchar(255)", "numeric(12,2)", "integer", "character varying(64)"]);
-    expect(columns.map((column) => column.original?.data_type)).toEqual(["varchar(255)", "numeric(12,2)", "integer", "character varying(64)"]);
+    expect(columns.map((column) => column.dataType)).toEqual(["varchar(255)", "bpchar(32)", "numeric(12,2)", "integer", "character varying(64)"]);
+    expect(columns.map((column) => column.original?.data_type)).toEqual(["varchar(255)", "bpchar(32)", "numeric(12,2)", "integer", "character varying(64)"]);
     expect(dataTypeLengthInputValue("kingbase", columns[0]?.dataType ?? "")).toBe("255");
+    expect(dataTypeLengthInputValue("kingbase", columns[1]?.dataType ?? "")).toBe("32");
   });
 
   it("turns copied metadata into new column drafts instead of existing columns", () => {

@@ -4,6 +4,7 @@ import { useToast } from "@/composables/useToast";
 import { useConnectionStore } from "@/stores/connectionStore";
 import type { DatabaseType, TreeNode } from "@/types/database";
 import { supportsTableTruncate, supportsTableVacuum } from "@/lib/database/databaseCapabilities";
+import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 import {
   buildDropTableSql,
   buildEmptyTableSql,
@@ -18,6 +19,7 @@ import {
   type VacuumTableSqlOptions,
 } from "@/lib/database/dbAdminSql";
 import { isSqlServerLinkedNode } from "@/lib/database/sqlServerLinkedServers";
+import { connectionTableSqlSchema } from "@/lib/database/jdbcDialect";
 import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
 import { uuid } from "@/lib/common/utils";
 import * as api from "@/lib/backend/api";
@@ -66,16 +68,17 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
   const supportsTruncate = computed(() => supportsTableTruncate(currentDatabaseType()));
   const supportsVacuum = computed(() => {
     const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
-    return activeNode.value.type === "table" && !config?.read_only && supportsTableVacuum(currentDatabaseType());
+    return activeNode.value.type === "table" && !connectionIsEffectivelyReadOnly(config) && supportsTableVacuum(currentDatabaseType());
   });
   const canDropTableCascade = computed(() => activeNode.value.type === "table" && supportsDropTableCascade(currentDatabaseType()));
   const canTruncateTableCascade = computed(() => activeNode.value.type === "table" && supportsTruncateTableCascade(currentDatabaseType()));
   const supportsMysqlAutoIncrement = computed(() => activeNode.value.type === "table" && supportsNativeMysqlAutoIncrement(activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined));
 
   function tableAdminSqlOptions(optionsOverride?: { cascade?: boolean }): TableAdminSqlOptions {
+    const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
     const result: TableAdminSqlOptions = {
       databaseType: currentDatabaseType(),
-      schema: activeNode.value.schema,
+      schema: connectionTableSqlSchema(config, activeNode.value.schema),
       tableName: activeNode.value.label,
       // Cloud Spanner's two dialects quote differently, so admin SQL needs the quote the connected
       // agent reported rather than the static per-type mapping.
@@ -86,9 +89,10 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
   }
 
   function tableAdminSqlOptionsForNode(node: TreeNode, optionsOverride?: { cascade?: boolean }): TableAdminSqlOptions {
+    const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
     const result: TableAdminSqlOptions = {
       databaseType: databaseTypeForNode(node),
-      schema: node.schema,
+      schema: connectionTableSqlSchema(config, node.schema),
       tableName: node.label,
       identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
     };

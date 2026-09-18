@@ -46,16 +46,6 @@ pub async fn mongo_list_collections(
 }
 
 #[tauri::command]
-pub async fn vector_collection_detail(
-    state: State<'_, Arc<AppState>>,
-    connection_id: String,
-    database: String,
-    collection: String,
-) -> Result<dbx_core::db::vector_driver::CollectionInfo, String> {
-    dbx_core::schema::get_vector_collection_detail_core(&state, &connection_id, &database, &collection).await
-}
-
-#[tauri::command]
 pub async fn mongo_create_database(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -84,27 +74,6 @@ pub async fn mongo_drop_collection(
 ) -> Result<(), String> {
     ensure_connection_writable(&state, &connection_id, "Drop collection").await?;
     dbx_core::mongo_ops::mongo_drop_collection_core(&state, &connection_id, &database, &collection).await
-}
-
-#[tauri::command]
-pub async fn vector_drop_database(
-    state: State<'_, Arc<AppState>>,
-    connection_id: String,
-    database: String,
-) -> Result<(), String> {
-    ensure_connection_writable(&state, &connection_id, "Drop database").await?;
-    dbx_core::schema::drop_vector_database_core(&state, &connection_id, &database).await
-}
-
-#[tauri::command]
-pub async fn vector_drop_collection(
-    state: State<'_, Arc<AppState>>,
-    connection_id: String,
-    database: String,
-    collection: String,
-) -> Result<(), String> {
-    ensure_connection_writable(&state, &connection_id, "Drop collection").await?;
-    dbx_core::schema::drop_vector_collection_core(&state, &connection_id, &database, &collection).await
 }
 
 #[tauri::command]
@@ -168,6 +137,7 @@ pub async fn mongo_find_documents(
         projection,
         sort,
         collation,
+        None,
         None,
         execution_id,
     )
@@ -566,6 +536,71 @@ pub async fn mongo_update_documents(
         &filter_json,
         &update_json,
         many,
+        options_json.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mongo_replace_document(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    filter_json: String,
+    replacement_json: String,
+    options_json: Option<String>,
+    mcp_request: Option<bool>,
+) -> Result<u64, String> {
+    if mcp_request == Some(true) {
+        crate::commands::mcp_bridge::ensure_mcp_mongo_filtered_write_allowed_by_id(
+            state.inner(),
+            &connection_id,
+            &database,
+            "Replace",
+            &filter_json,
+        )
+        .await?;
+    }
+    ensure_connection_writable(&state, &connection_id, "Replace").await?;
+    dbx_core::mongo_ops::mongo_replace_document_core(
+        &state,
+        &connection_id,
+        &database,
+        &collection,
+        &filter_json,
+        &replacement_json,
+        options_json.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mongo_bulk_write(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    operations_json: String,
+    options_json: Option<String>,
+    mcp_request: Option<bool>,
+) -> Result<dbx_core::db::mongo_driver::MongoBulkWriteResult, String> {
+    if mcp_request == Some(true) {
+        crate::commands::mcp_bridge::ensure_mcp_mongo_bulk_write_allowed_by_id(
+            state.inner(),
+            &connection_id,
+            &database,
+            &operations_json,
+        )
+        .await?;
+    }
+    ensure_connection_writable(&state, &connection_id, "BulkWrite").await?;
+    dbx_core::mongo_ops::mongo_bulk_write_core(
+        &state,
+        &connection_id,
+        &database,
+        &collection,
+        &operations_json,
         options_json.as_deref(),
     )
     .await

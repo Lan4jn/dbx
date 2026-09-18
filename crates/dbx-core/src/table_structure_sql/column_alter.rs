@@ -1,9 +1,10 @@
 use super::column_format::{
-    clickhouse_column_type, column_data_type, column_definition, is_mysql_character_data_type,
-    original_is_mysql_generated_column, original_mysql_generated_clause,
+    clickhouse_column_type, column_data_type, column_definition, has_dameng_identity,
+    is_dameng_identity_compatible_type, is_mysql_character_data_type, original_is_mysql_generated_column,
+    original_mysql_generated_clause,
 };
 use super::columns::build_drop_column_sql;
-use super::comments::build_sqlserver_column_comment_sql;
+use super::comments::build_sqlserver_column_comment_sql_for_profile;
 use super::dialect::{capabilities_for, database_label, StructureDialect};
 use super::types::{EditableStructureColumn, SingleColumnAlterSqlOptions, TableStructureSqlResult};
 use super::util::{
@@ -13,7 +14,7 @@ use super::util::{
 use crate::table_structure_sql::ColumnExtra;
 
 pub fn build_single_column_alter_sql(options: SingleColumnAlterSqlOptions) -> TableStructureSqlResult {
-    let capabilities = capabilities_for(options.database_type);
+    let capabilities = capabilities_for(options.database_type, options.driver_profile.as_deref());
     let dialect = capabilities.dialect;
     let table = qualified_table(dialect, options.schema.as_deref(), &options.table_name);
     let database_label = database_label(options.database_type);
@@ -100,7 +101,7 @@ pub fn build_single_column_alter_sql(options: SingleColumnAlterSqlOptions) -> Ta
         StructureDialect::Mysql => statements.extend(build_mysql_existing_column_sql(&table, &options.column, "")),
         StructureDialect::Doris => statements.extend(build_doris_existing_column_sql(&table, &options.column, "")),
         StructureDialect::Postgres => statements.extend(build_postgres_existing_column_sql(&table, &options.column)),
-        StructureDialect::Oracle | StructureDialect::Dameng => {
+        StructureDialect::Oracle => {
             if options.database_type == Some(crate::models::connection::DatabaseType::Iris) {
                 statements.extend(build_iris_existing_column_sql(&table, &options.column));
             } else if options.database_type == Some(crate::models::connection::DatabaseType::Xugu) {
@@ -108,6 +109,9 @@ pub fn build_single_column_alter_sql(options: SingleColumnAlterSqlOptions) -> Ta
             } else {
                 statements.extend(build_oracle_like_existing_column_sql(dialect, &table, &options.column))
             }
+        }
+        StructureDialect::Dameng => {
+            statements.extend(build_dameng_existing_column_sql(&table, &options.column, true, &mut warnings))
         }
         StructureDialect::Oscar => statements.extend(build_oscar_existing_column_sql(dialect, &table, &options.column)),
         StructureDialect::H2 => statements.extend(build_h2_existing_column_sql(&table, &options.column)),
@@ -120,6 +124,7 @@ pub fn build_single_column_alter_sql(options: SingleColumnAlterSqlOptions) -> Ta
             &options.column,
             options.schema.as_deref(),
             &options.table_name,
+            options.driver_profile.as_deref(),
             &mut warnings,
         )),
         StructureDialect::Sqlite => {
@@ -221,6 +226,78 @@ fn identity_matches_original(identity: &super::types::ColumnIdentity, original_e
     sqlserver_identity_matches_original(identity, original_extra)
 }
 
+#[derive(Clone, Copy)]
+enum DamengIdentityTransition {
+    None,
+    Add { seed: i64, increment: i64 },
+    Drop,
+    ParametersChanged,
+}
+
+fn dameng_identity_transition(column: &EditableStructureColumn) -> DamengIdentityTransition {
+    let Some(original) = &column.original else {
+        return DamengIdentityTransition::None;
+    };
+    let original_extra = original.extra.as_deref().unwrap_or("");
+    let original_identity = original_has_identity(original_extra);
+    let current_identity = has_dameng_identity(column);
+    match (original_identity, current_identity) {
+        (false, false) => DamengIdentityTransition::None,
+        (false, true) => {
+            let identity = column.extra.as_ref().and_then(|extra| extra.identity.as_ref());
+            DamengIdentityTransition::Add {
+                seed: identity.and_then(|identity| identity.seed).unwrap_or(1),
+                increment: identity.and_then(|identity| identity.increment).unwrap_or(1),
+            }
+        }
+        (true, false) => DamengIdentityTransition::Drop,
+        (true, true) => match column.extra.as_ref().and_then(|extra| extra.identity.as_ref()) {
+            Some(identity) if !identity_matches_original(identity, original_extra) => {
+                DamengIdentityTransition::ParametersChanged
+            }
+            _ => DamengIdentityTransition::None,
+        },
+    }
+}
+
+pub(super) fn dameng_drops_identity(column: &EditableStructureColumn) -> bool {
+    matches!(dameng_identity_transition(column), DamengIdentityTransition::Drop)
+}
+
+pub(super) fn validate_dameng_existing_identity_change(
+    column: &EditableStructureColumn,
+    warnings: &mut Vec<String>,
+) -> bool {
+    match dameng_identity_transition(column) {
+        DamengIdentityTransition::Add { increment, .. } => {
+            if !is_dameng_identity_compatible_type(&column.data_type) {
+                warnings.push(format!(
+                    "Dameng identity column \"{}\" must use tinyint, smallint, int, integer, bigint, number, numeric, or decimal/dec with scale 0.",
+                    column.name
+                ));
+            } else if column.is_nullable {
+                warnings.push(format!(
+                    "Dameng identity column \"{}\" must be NOT NULL before identity can be enabled.",
+                    column.name
+                ));
+            } else if increment == 0 {
+                warnings.push(format!("Dameng identity column \"{}\" increment cannot be 0.", column.name));
+            } else {
+                return true;
+            }
+            false
+        }
+        DamengIdentityTransition::ParametersChanged => {
+            warnings.push(format!(
+                "Changing Dameng IDENTITY seed or increment for existing column \"{}\" is not supported from this editor.",
+                column.name
+            ));
+            false
+        }
+        DamengIdentityTransition::None | DamengIdentityTransition::Drop => true,
+    }
+}
+
 pub(super) fn has_column_extra_change(column: &EditableStructureColumn) -> bool {
     let Some(original) = &column.original else { return false };
     let current_extra = column.extra.as_ref();
@@ -277,6 +354,11 @@ pub(super) fn build_mysql_existing_column_sql(
     column: &EditableStructureColumn,
     position_clause: &str,
 ) -> Vec<String> {
+    let operation = build_mysql_existing_column_clause(column, position_clause);
+    vec![format!("ALTER TABLE {table} {operation};")]
+}
+
+pub(super) fn build_mysql_existing_column_clause(column: &EditableStructureColumn, position_clause: &str) -> String {
     let original_name = column.original.as_ref().map(|original| original.name.as_str()).unwrap_or(&column.name);
     let operation = if column.name == original_name {
         format!("MODIFY COLUMN {}", column_definition(StructureDialect::Mysql, column))
@@ -287,7 +369,7 @@ pub(super) fn build_mysql_existing_column_sql(
             column_definition(StructureDialect::Mysql, column)
         )
     };
-    vec![format!("ALTER TABLE {table} {operation}{position_clause};")]
+    format!("{operation}{position_clause}")
 }
 
 pub(super) fn build_doris_existing_column_sql(
@@ -497,6 +579,32 @@ pub(super) fn build_oracle_like_existing_column_sql(
     statements
 }
 
+pub(super) fn build_dameng_existing_column_sql(
+    table: &str,
+    column: &EditableStructureColumn,
+    emit_identity_drop: bool,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let transition = dameng_identity_transition(column);
+    if !validate_dameng_existing_identity_change(column, warnings) {
+        return Vec::new();
+    }
+    let mut statements = Vec::new();
+    if emit_identity_drop && matches!(transition, DamengIdentityTransition::Drop) {
+        statements.push(format!("ALTER TABLE {table} DROP IDENTITY;"));
+    }
+
+    statements.extend(build_oracle_like_existing_column_sql(StructureDialect::Dameng, table, column));
+
+    if let DamengIdentityTransition::Add { seed, increment } = transition {
+        statements.push(format!(
+            "ALTER TABLE {table} ADD COLUMN {} IDENTITY({seed}, {increment});",
+            quote_ident(StructureDialect::Dameng, &column.name)
+        ));
+    }
+    statements
+}
+
 pub(super) fn build_iris_existing_column_sql(table: &str, column: &EditableStructureColumn) -> Vec<String> {
     let Some(original) = &column.original else {
         return Vec::new();
@@ -594,6 +702,7 @@ pub(super) fn build_sqlserver_existing_column_sql(
     column: &EditableStructureColumn,
     schema: Option<&str>,
     table_name: &str,
+    driver_profile: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Vec<String> {
     let Some(original) = &column.original else {
@@ -632,7 +741,12 @@ pub(super) fn build_sqlserver_existing_column_sql(
     // SQL Server default constraints are separate objects that can block ALTER COLUMN.
     // Preserve the exact constraint name and expression when the default itself is unchanged.
     if has_column_definition_change && has_old_default && !has_default_change {
-        statements.push(build_sqlserver_alter_column_preserving_default_sql(table, &current_name, column));
+        statements.push(build_sqlserver_alter_column_preserving_default_sql(
+            table,
+            &current_name,
+            &column_data_type(dialect, column),
+            column.is_nullable,
+        ));
     } else {
         if has_column_definition_change && has_old_default {
             statements.push(build_sqlserver_drop_default_constraint_sql(table, &current_name));
@@ -653,15 +767,10 @@ pub(super) fn build_sqlserver_existing_column_sql(
             statements.push(build_sqlserver_drop_default_constraint_sql(table, &current_name));
         }
         if !default_value.is_empty() {
-            let short_table =
-                table.split('.').next_back().unwrap_or(table).trim_matches(|c: char| c == '[' || c == ']');
-            let constraint_name = format!(
-                "DF_{short_table}_{col_name}",
-                short_table = short_table,
-                col_name = current_name.trim_matches(|c: char| c == '[' || c == ']')
-            );
+            let constraint_name = format!("DF_{}_{}", table_name.trim(), current_name.trim());
             statements.push(format!(
-                "ALTER TABLE {table} ADD CONSTRAINT [{constraint_name}] DEFAULT {} FOR {};",
+                "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT {} FOR {};",
+                quote_ident(dialect, &constraint_name),
                 format_default_for_sql(StructureDialect::SqlServer, &column.data_type, &default_value),
                 quote_ident(dialect, &current_name)
             ));
@@ -670,22 +779,24 @@ pub(super) fn build_sqlserver_existing_column_sql(
 
     // Column comment changes via extended properties
     if clean(&column.comment) != original_comment(column) {
-        statements.extend(build_sqlserver_column_comment_sql(
+        statements.extend(build_sqlserver_column_comment_sql_for_profile(
             table,
             schema,
             table_name,
             &current_name,
             &column.comment,
+            driver_profile,
         ));
     }
 
     statements
 }
 
-fn build_sqlserver_alter_column_preserving_default_sql(
+pub(crate) fn build_sqlserver_alter_column_preserving_default_sql(
     table: &str,
     column_name: &str,
-    column: &EditableStructureColumn,
+    data_type: &str,
+    is_nullable: bool,
 ) -> String {
     let dialect = StructureDialect::SqlServer;
     let sql_var = sqlserver_default_constraint_sql_var(table, column_name);
@@ -695,7 +806,7 @@ fn build_sqlserver_alter_column_preserving_default_sql(
     let column_literal = column_name.replace('\'', "''");
     let quoted_column = quote_ident(dialect, column_name);
     let quoted_column_literal = quoted_column.replace('\'', "''");
-    let null_clause = if column.is_nullable { "NULL" } else { "NOT NULL" };
+    let null_clause = if is_nullable { "NULL" } else { "NOT NULL" };
 
     format!(
         "DECLARE {sql_var} NVARCHAR(MAX), {name_var} sysname, {definition_var} NVARCHAR(MAX); \
@@ -705,11 +816,11 @@ fn build_sqlserver_alter_column_preserving_default_sql(
          IF {name_var} IS NOT NULL BEGIN SET {sql_var} = N'ALTER TABLE {table_literal} DROP CONSTRAINT ' + QUOTENAME({name_var}); EXEC sp_executesql {sql_var}; END; \
          ALTER TABLE {table} ALTER COLUMN {quoted_column} {data_type} {null_clause}; \
          IF {name_var} IS NOT NULL BEGIN SET {sql_var} = N'ALTER TABLE {table_literal} ADD CONSTRAINT ' + QUOTENAME({name_var}) + N' DEFAULT ' + {definition_var} + N' FOR {quoted_column_literal}'; EXEC sp_executesql {sql_var}; END;",
-        data_type = column_data_type(dialect, column),
+        data_type = data_type,
     )
 }
 
-fn build_sqlserver_drop_default_constraint_sql(table: &str, column_name: &str) -> String {
+pub(crate) fn build_sqlserver_drop_default_constraint_sql(table: &str, column_name: &str) -> String {
     let sql_var = sqlserver_default_constraint_sql_var(table, column_name);
     let table_literal = table.replace('\'', "''");
     let column_literal = column_name.replace('\'', "''");
@@ -876,10 +987,23 @@ pub(super) fn build_sqlite_existing_column_sql(
         return Vec::new();
     };
     let mut statements = Vec::new();
+    // Tri-state: an unset auto_increment flag inherits the original value; only an
+    // explicit toggle (SQLite cannot add or drop AUTOINCREMENT without a rebuild)
+    // counts as an unsupported change.
+    let original_auto_increment = original.extra.as_deref().is_some_and(|extra| {
+        let lower = extra.to_ascii_lowercase();
+        lower.contains("auto_increment")
+            || lower.contains("autoincrement")
+            || lower.contains("identity")
+            || lower.contains("serial")
+    });
+    let auto_increment_changed =
+        column.extra.as_ref().and_then(|e| e.auto_increment).is_some_and(|value| value != original_auto_increment);
     let unsupported_change = column.data_type.trim() != original.data_type.trim()
         || column.is_nullable != original.is_nullable
         || normalize_default(Some(&column.default_value)) != original_default(column)
-        || clean(&column.comment) != original_comment(column);
+        || clean(&column.comment) != original_comment(column)
+        || auto_increment_changed;
     if column.name != original.name {
         statements.push(format!(
             "ALTER TABLE {table} RENAME COLUMN {} TO {};",

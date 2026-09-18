@@ -30,6 +30,7 @@ const {
   confirmDeleteGroup,
   showRenameObjectDialog,
   renameObjectName,
+  renameObjectDialogTitle,
   renameObjectPreviewSql,
   renameObjectError,
   confirmRenameObject,
@@ -274,12 +275,12 @@ watch(
   <Dialog v-model:open="showRenameObjectDialog">
     <DialogContent class="sm:max-w-[420px]">
       <DialogHeader>
-        <DialogTitle>{{ t("contextMenu.renameObjectTitle") }}</DialogTitle>
+        <DialogTitle>{{ renameObjectDialogTitle }}</DialogTitle>
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameObjectName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" @keydown.enter.prevent="confirmRenameObject" />
-        <pre v-if="renameObjectPreviewSql" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
-        <p v-if="renameObjectError" class="text-sm text-destructive">{{ renameObjectError }}</p>
+        <pre v-if="renameObjectPreviewSql" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
+        <p v-if="renameObjectError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameObjectError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" @click="showRenameObjectDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -297,8 +298,8 @@ watch(
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameMongoCollectionName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" :disabled="renameMongoCollectionLoading" @keydown.enter.prevent="confirmRenameMongoCollection" />
-        <pre v-if="renameMongoCollectionPreview" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
-        <p v-if="renameMongoCollectionError" class="text-sm text-destructive">{{ renameMongoCollectionError }}</p>
+        <pre v-if="renameMongoCollectionPreview" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
+        <p v-if="renameMongoCollectionError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameMongoCollectionError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" :disabled="renameMongoCollectionLoading" @click="showRenameMongoCollectionDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -537,7 +538,9 @@ watch(
             </template>
           </SearchableSelect>
         </div>
-        <div class="grid gap-1.5">
+        <!-- The gbase8s locale path has no collations; only show the picker when the selected
+             charset actually has collation options (MySQL always does). -->
+        <div v-if="createDatabaseCollationOptionsForCharset(createDatabaseCharset, createDatabaseCollationsByCharset).length > 0" class="grid gap-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ t("contextMenu.createDatabaseCollation") }}</label>
           <SearchableSelect
             v-model="createDatabaseCollation"

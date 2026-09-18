@@ -600,6 +600,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         };
         let table = doc_table("orders", vec![col("user_id", "integer")], vec![index]);
 
@@ -623,6 +626,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         };
         let table = doc_table("orders", vec![col("reference", "text")], vec![index]);
         let mut warnings = Vec::new();
@@ -642,6 +648,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         };
         let mut id = col("id", "integer");
         id.is_primary_key = true;
@@ -664,6 +673,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         };
         let table = doc_table("orders", vec![col("status", "text")], vec![index]);
 
@@ -866,6 +878,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         };
         let out =
             to_dbml(&snapshot(vec![doc_table("orders", vec![col("status", "text")], vec![index])], vec!["public"]));

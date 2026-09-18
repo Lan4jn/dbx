@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::with_connection_timeout;
 use crate::document_ops::{MongoGridFsBucketInfo, MongoGridFsFileInfo};
+use crate::models::connection::DatabaseConnectionInfo;
 use crate::types::IndexInfo;
 use futures::{io::AsyncReadExt, io::AsyncWriteExt, TryStreamExt};
 use percent_encoding::percent_decode_str;
@@ -111,7 +112,7 @@ pub async fn connect_with_oidc(
         // set discovery. This is essential when connecting through a TCP proxy
         // or NAT where the driver would otherwise receive internal IPs from
         // the replica set handshake and fail to connect.
-        if !is_multi_host {
+        if !is_multi_host && options.load_balanced != Some(true) && options.direct_connection.is_none() {
             options.direct_connection = Some(true);
         }
         Client::with_options(options).map_err(|e| format!("MongoDB connection failed: {e}"))
@@ -237,6 +238,20 @@ pub async fn server_version(client: &Client, database: &str) -> Result<String, S
     let database = if database.is_empty() { "admin" } else { database };
     let result = client.database(database).run_command(doc! { "buildInfo": 1 }).await.map_err(|e| e.to_string())?;
     server_version_from_build_info(&result)
+}
+
+pub async fn database_connection_info(
+    client: &Client,
+    database: Option<&str>,
+) -> Result<DatabaseConnectionInfo, String> {
+    let version = server_version(client, database.unwrap_or("admin")).await?;
+    Ok(DatabaseConnectionInfo {
+        product_name: Some("MongoDB".to_string()),
+        product_version: Some(version),
+        current_database: database.map(str::to_string),
+        driver_name: Some("MongoDB Rust driver".to_string()),
+        ..Default::default()
+    })
 }
 
 pub async fn run_command(client: &Client, database: &str, command_json: &str) -> Result<MongoDocumentResult, String> {
@@ -889,6 +904,9 @@ fn index_info_from_model(model: IndexModel) -> IndexInfo {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        column_opclasses: vec![],
+        key_options: Vec::new(),
+        constraint_backed: false,
     }
 }
 
@@ -1222,7 +1240,7 @@ async fn find_documents_with_total(
         }
         Some(count.await.map_err(|e| e.to_string()))
     } else {
-        Some(col.estimated_document_count().await.map_err(|e| e.to_string()))
+        Some(estimated_document_count(client, database, collection).await)
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -1343,10 +1361,47 @@ pub async fn count_documents(
 
     if !accurate && filter_doc.is_empty() {
         // Legacy count() permits the metadata-backed fast path; countDocuments() must scan accurately.
-        col.estimated_document_count().await.map_err(|e| e.to_string())
+        estimated_document_count(client, database, collection).await
     } else {
         col.count_documents(filter_doc).await.map_err(|e| e.to_string())
     }
+}
+
+async fn estimated_document_count(client: &Client, database: &str, collection: &str) -> Result<u64, String> {
+    let result = client.database(database).run_command(doc! { "count": collection }).await;
+    match result {
+        Ok(result) => parse_count_command_result(&result),
+        Err(error) => parse_count_command_error(&error.kind).ok_or_else(|| error.to_string()),
+    }
+}
+
+/// Resolves a failed `count` command the way the driver's `estimated_document_count` does:
+/// NamespaceNotFound (code 26) means the collection is missing, i.e. an empty count, while any
+/// other error must propagate. Mirrors mongodb's internal `Error::is_ns_not_found`.
+fn parse_count_command_error(kind: &mongodb::error::ErrorKind) -> Option<u64> {
+    match kind {
+        mongodb::error::ErrorKind::Command(error) if error.code == 26 => Some(0),
+        _ => None,
+    }
+}
+
+fn parse_count_command_result(result: &Document) -> Result<u64, String> {
+    let value = result.get("n").ok_or_else(|| "MongoDB count command response is missing the 'n' field".to_string())?;
+
+    match value {
+        Bson::Int32(value) => u64::try_from(*value),
+        Bson::Int64(value) => u64::try_from(*value),
+        Bson::Double(value)
+            if value.is_finite()
+                && *value >= 0.0
+                && value.fract() == 0.0
+                && *value <= super::JS_MAX_SAFE_INTEGER as f64 =>
+        {
+            Ok(*value as u64)
+        }
+        _ => return Err(format!("MongoDB count command returned an invalid 'n' value: {value:?}")),
+    }
+    .map_err(|_| format!("MongoDB count command returned a negative 'n' value: {value:?}"))
 }
 
 /// Find MongoDB documents in a browser-friendly representation.
@@ -1381,7 +1436,7 @@ pub async fn find_documents_extended_json(
         }
         count.await.map_err(|e| e.to_string())
     } else {
-        col.estimated_document_count().await.map_err(|e| e.to_string())
+        estimated_document_count(client, database, collection).await
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -2065,8 +2120,202 @@ pub async fn update_documents(
     Ok(result.modified_count)
 }
 
+/// Counts reported by `bulkWrite`, mirroring the shell's `BulkWriteResult`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MongoBulkWriteResult {
+    pub inserted_count: u64,
+    pub matched_count: u64,
+    pub modified_count: u64,
+    pub deleted_count: u64,
+    pub upserted_count: u64,
+}
+
 #[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MongoBulkWriteOptions {
+    ordered: Option<bool>,
+}
+
+/// bulkWrite(operations[, { ordered }]).
+///
+/// The Rust driver's `bulk_write` is client-level and needs MongoDB 8.0, so the
+/// operations run here one at a time in order, which is what the shell's
+/// collection-level bulkWrite guarantees anyway (it is not transactional). With
+/// `ordered: true` (the default) the first failure stops the batch; with
+/// `ordered: false` every operation is attempted and the failures are reported together.
+pub async fn bulk_write(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    operations_json: &str,
+    options_json: Option<&str>,
+) -> Result<MongoBulkWriteResult, String> {
+    use crate::mongo_shell::BulkWriteOperation;
+
+    let operations = crate::mongo_shell::parse_bulk_write_operations(operations_json)?;
+    let ordered = match options_json.filter(|value| !value.trim().is_empty()) {
+        Some(raw) => {
+            let options: MongoBulkWriteOptions =
+                serde_json::from_str(raw).map_err(|e| format!("Invalid bulkWrite options: {e}"))?;
+            options.ordered.unwrap_or(true)
+        }
+        None => true,
+    };
+
+    let col = client.database(database).collection::<Document>(collection);
+    let mut result = MongoBulkWriteResult::default();
+    let mut failures = Vec::new();
+
+    for (index, operation) in operations.iter().enumerate() {
+        let outcome: Result<(), String> = async {
+            match operation {
+                BulkWriteOperation::InsertOne { document } => {
+                    let document = json_object_to_document(document).map_err(|e| format!("Invalid document: {e}"))?;
+                    col.insert_one(document).await.map_err(|e| e.to_string())?;
+                    result.inserted_count += 1;
+                }
+                BulkWriteOperation::UpdateOne { filter, update, upsert, array_filters }
+                | BulkWriteOperation::UpdateMany { filter, update, upsert, array_filters } => {
+                    let many = matches!(operation, BulkWriteOperation::UpdateMany { .. });
+                    let filter = json_filter_to_document(filter).map_err(|e| format!("Invalid filter: {e}"))?;
+                    let update = json_update_to_modifications(update).map_err(|e| format!("Invalid update: {e}"))?;
+                    let array_filters = array_filters
+                        .as_ref()
+                        .and_then(serde_json::Value::as_array)
+                        .map(|filters| filters.iter().map(json_filter_to_document).collect::<Result<Vec<_>, _>>())
+                        .transpose()
+                        .map_err(|e| format!("Invalid arrayFilters: {e}"))?;
+                    let update_result = if many {
+                        let mut action = col.update_many(filter, update);
+                        if let Some(upsert) = upsert {
+                            action = action.upsert(*upsert);
+                        }
+                        if let Some(filters) = array_filters {
+                            action = action.array_filters(filters);
+                        }
+                        action.await.map_err(|e| e.to_string())?
+                    } else {
+                        let mut action = col.update_one(filter, update);
+                        if let Some(upsert) = upsert {
+                            action = action.upsert(*upsert);
+                        }
+                        if let Some(filters) = array_filters {
+                            action = action.array_filters(filters);
+                        }
+                        action.await.map_err(|e| e.to_string())?
+                    };
+                    result.matched_count += update_result.matched_count;
+                    result.modified_count += update_result.modified_count;
+                    result.upserted_count += u64::from(update_result.upserted_id.is_some());
+                }
+                BulkWriteOperation::ReplaceOne { filter, replacement, upsert } => {
+                    let filter = json_filter_to_document(filter).map_err(|e| format!("Invalid filter: {e}"))?;
+                    let replacement =
+                        json_object_to_document(replacement).map_err(|e| format!("Invalid replacement: {e}"))?;
+                    let mut action = col.replace_one(filter, replacement);
+                    if let Some(upsert) = upsert {
+                        action = action.upsert(*upsert);
+                    }
+                    let replace_result = action.await.map_err(|e| e.to_string())?;
+                    result.matched_count += replace_result.matched_count;
+                    result.modified_count += replace_result.modified_count;
+                    result.upserted_count += u64::from(replace_result.upserted_id.is_some());
+                }
+                BulkWriteOperation::DeleteOne { filter } | BulkWriteOperation::DeleteMany { filter } => {
+                    let many = matches!(operation, BulkWriteOperation::DeleteMany { .. });
+                    let filter = json_filter_to_document(filter).map_err(|e| format!("Invalid filter: {e}"))?;
+                    let delete_result = if many {
+                        col.delete_many(filter).await.map_err(|e| e.to_string())?
+                    } else {
+                        col.delete_one(filter).await.map_err(|e| e.to_string())?
+                    };
+                    result.deleted_count += delete_result.deleted_count;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = outcome {
+            let message = format!("operation {} ({}): {error}", index + 1, operation.kind());
+            if ordered {
+                return Err(format!(
+                    "bulkWrite stopped at {message}. Completed before it: {}",
+                    describe_bulk_counts(&result)
+                ));
+            }
+            failures.push(message);
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(result)
+    } else {
+        Err(format!(
+            "bulkWrite finished with {} failed operation(s): {}. Completed: {}",
+            failures.len(),
+            failures.join("; "),
+            describe_bulk_counts(&result)
+        ))
+    }
+}
+
+fn describe_bulk_counts(result: &MongoBulkWriteResult) -> String {
+    format!(
+        "inserted {}, matched {}, modified {}, deleted {}, upserted {}",
+        result.inserted_count, result.matched_count, result.modified_count, result.deleted_count, result.upserted_count
+    )
+}
+
+/// replaceOne(filter, replacement[, { upsert }]): the whole document is swapped, so
+/// unlike update there are no array filters to apply.
+pub async fn replace_document(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    filter_json: &str,
+    replacement_json: &str,
+    options_json: Option<&str>,
+) -> Result<u64, String> {
+    let filter_value: serde_json::Value =
+        serde_json::from_str(filter_json).map_err(|e| format!("Invalid filter JSON: {e}"))?;
+    let replacement_value: serde_json::Value =
+        serde_json::from_str(replacement_json).map_err(|e| format!("Invalid replacement JSON: {e}"))?;
+    let filter = json_filter_to_document(&filter_value).map_err(|e| format!("Invalid filter: {e}"))?;
+    let replacement = json_object_to_document(&replacement_value).map_err(|e| format!("Invalid replacement: {e}"))?;
+    if let Some(operator) = replacement.keys().find(|key| key.starts_with('$')) {
+        return Err(format!("Replacement document must not contain update operators such as {operator}"));
+    }
+    let upsert = parse_replace_options(options_json)?;
+    let col = client.database(database).collection::<Document>(collection);
+    let mut action = col.replace_one(filter, replacement);
+    if let Some(upsert) = upsert {
+        action = action.upsert(upsert);
+    }
+    let result = action.await.map_err(|e| e.to_string())?;
+    Ok(result.modified_count)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MongoReplaceOptions {
+    upsert: Option<bool>,
+}
+
+fn parse_replace_options(options_json: Option<&str>) -> Result<Option<bool>, String> {
+    let Some(raw) = options_json.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let options: MongoReplaceOptions =
+        serde_json::from_str(raw).map_err(|e| format!("Invalid replace options: {e}"))?;
+    Ok(options.upsert)
+}
+
+/// Unknown options are rejected rather than dropped, so a `collation` or `hint` the
+/// driver does not apply fails loudly instead of silently changing nothing. This
+/// matches `MongoReplaceOptions` and the legacy agent, which already reject them.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MongoUpdateOptions {
     upsert: Option<bool>,
     array_filters: Option<Vec<serde_json::Value>>,
@@ -2449,11 +2698,172 @@ fn json_update_to_modifications(value: &serde_json::Value) -> Result<UpdateModif
     }
 }
 
-fn json_object_to_document_extended_json(value: &serde_json::Value) -> Result<Document, String> {
+pub fn json_object_to_document_extended_json(value: &serde_json::Value) -> Result<Document, String> {
     match Bson::try_from(value.clone()).map_err(|e| e.to_string())? {
         Bson::Document(doc) => Ok(doc),
         other => Err(format!("Expected a JSON object, got {other:?}")),
     }
+}
+
+pub fn document_to_canonical_extended_json(document: &Document) -> serde_json::Value {
+    Bson::Document(document.clone()).into_canonical_extjson()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MongoBulkWriteError {
+    pub message: String,
+    pub index: Option<usize>,
+    pub code: Option<i32>,
+    pub retryable: bool,
+}
+
+/// What actually happened to a submitted batch. A batch can partly succeed, so the count of
+/// inserted documents and the per-document rejections are reported together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MongoInsertOutcome {
+    pub inserted: u64,
+    /// One entry per document the server rejected, `index` pointing into the submitted batch.
+    pub errors: Vec<MongoBulkWriteError>,
+}
+
+pub async fn insert_bson_documents<T: serde::Serialize + Send + Sync>(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    documents: Vec<T>,
+) -> Result<MongoInsertOutcome, MongoBulkWriteError> {
+    if documents.is_empty() {
+        return Ok(MongoInsertOutcome::default());
+    }
+    let total = documents.len() as u64;
+    let col = client.database(database).collection::<T>(collection);
+    // Unordered: one rejected document must not abandon the rest of the batch, and the server
+    // then reports every rejection instead of stopping at the first.
+    match col.insert_many(documents).ordered(false).await {
+        Ok(result) => Ok(MongoInsertOutcome { inserted: result.inserted_ids.len() as u64, errors: Vec::new() }),
+        Err(error) => {
+            let errors = insert_write_errors(&error);
+            if errors.is_empty() {
+                // No per-document detail means the whole batch failed (network, auth, …).
+                return Err(map_insert_many_error(error));
+            }
+            Ok(MongoInsertOutcome { inserted: total.saturating_sub(errors.len() as u64), errors })
+        }
+    }
+}
+
+/// Per-document rejections, sorted by batch index. Empty when the failure was not per-document.
+fn insert_write_errors(error: &mongodb::error::Error) -> Vec<MongoBulkWriteError> {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    let mut errors = match error.kind.as_ref() {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            vec![write_error_entry(None, write_error.code, &write_error.message)]
+        }
+        ErrorKind::InsertMany(failure) => failure
+            .write_errors
+            .iter()
+            .flatten()
+            .map(|error| write_error_entry(Some(error.index), error.code, &error.message))
+            .collect(),
+        ErrorKind::BulkWrite(failure) => failure
+            .write_errors
+            .iter()
+            .map(|(index, error)| write_error_entry(Some(*index), error.code, &error.message))
+            .collect(),
+        _ => Vec::new(),
+    };
+    errors.sort_by_key(|error| error.index.unwrap_or(0));
+    errors
+}
+
+fn write_error_entry(index: Option<usize>, code: i32, message: &str) -> MongoBulkWriteError {
+    MongoBulkWriteError {
+        message: message.to_string(),
+        index,
+        code: Some(code),
+        retryable: is_retryable_mongo_write_code(code),
+    }
+}
+
+fn map_insert_many_error(error: mongodb::error::Error) -> MongoBulkWriteError {
+    use mongodb::error::ErrorKind;
+    match error.kind.as_ref() {
+        ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. } | ErrorKind::ServerSelection { .. } => {
+            MongoBulkWriteError { message: error.to_string(), index: None, code: None, retryable: true }
+        }
+        _ => MongoBulkWriteError { message: error.to_string(), index: None, code: None, retryable: false },
+    }
+}
+
+fn is_retryable_mongo_write_code(code: i32) -> bool {
+    !matches!(code, 11000 | 11001 | 12582)
+}
+
+/// Reads the `insert_documents` result of a MongoDB legacy agent. The agent reports a partly
+/// applied batch as a success carrying one entry per rejected document, so callers must inspect
+/// [`MongoInsertOutcome::errors`] instead of trusting a bare affected-row count.
+pub fn agent_insert_outcome(result: &serde_json::Value) -> Result<MongoInsertOutcome, String> {
+    let inserted = result
+        .get("affected_rows")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "MongoDB Legacy Agent returned an invalid insertMany result".to_string())?;
+    let errors = result
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(|errors| errors.iter().map(agent_insert_error).collect())
+        .unwrap_or_default();
+    Ok(MongoInsertOutcome { inserted, errors })
+}
+
+/// One rejected document, or a batch-wide rejection the agent could not attribute to a document
+/// (a write concern failure) — those carry no index and keep [`MongoBulkWriteError::index`] `None`.
+fn agent_insert_error(value: &serde_json::Value) -> MongoBulkWriteError {
+    // A rejection is never dropped for lack of a message: dropping it would make a document the
+    // server refused look like a successful insert.
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("MongoDB Legacy Agent rejected a document without a message")
+        .to_string();
+    let code = value.get("code").and_then(serde_json::Value::as_i64).map(|code| code as i32);
+    MongoBulkWriteError {
+        message,
+        index: value.get("index").and_then(serde_json::Value::as_u64).map(|index| index as usize),
+        code,
+        retryable: code.is_some_and(is_retryable_mongo_write_code),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn for_each_find_document(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+    batch_size: u32,
+    mut on_document: impl FnMut(Document) -> Result<(), String>,
+) -> Result<(), String> {
+    let col = client.database(database).collection::<Document>(collection);
+    let filter_doc = parse_optional_filter_document(filter)?.unwrap_or_default();
+    let mut find = col.find(filter_doc).batch_size(batch_size);
+    if let Some(projection) = parse_optional_json_document(projection, "projection")? {
+        find = find.projection(projection);
+    }
+    if let Some(sort) = parse_optional_json_document(sort, "sort")? {
+        find = find.sort(sort);
+    }
+    if let Some(collation) = parse_find_collation(collation)? {
+        find = find.collation(collation);
+    }
+    let mut cursor = find.await.map_err(|error| error.to_string())?;
+    while cursor.advance().await.map_err(|error| error.to_string())? {
+        let document = cursor.deserialize_current().map_err(|error| error.to_string())?;
+        on_document(document)?;
+    }
+    Ok(())
 }
 
 fn json_object_to_document_preserving_existing(
@@ -2640,6 +3050,28 @@ fn json_filter_value_to_bson(value: &serde_json::Value, field_name: Option<&str>
         }
         serde_json::Value::Object(obj) => {
             if obj.len() == 1 {
+                // Shell constructor wrappers (UUID/BinData/Timestamp/MinKey/MaxKey),
+                // $regularExpression, and the numeric type wrappers decode through
+                // the shared extended JSON parser, following the same precedent as
+                // $date below, so typed number literals compare correctly in filters.
+                if obj.keys().next().is_some_and(|key| {
+                    matches!(
+                        key.as_str(),
+                        "$regularExpression"
+                            | "$uuid"
+                            | "$binary"
+                            | "$timestamp"
+                            | "$minKey"
+                            | "$maxKey"
+                            | "$numberInt"
+                            | "$numberDouble"
+                            | "$numberDecimal"
+                    )
+                }) {
+                    if let Ok(Some(value)) = parse_extended_json_value(obj) {
+                        return value;
+                    }
+                }
                 if let Some(serde_json::Value::String(hex)) = obj.get("$oid") {
                     if let Ok(oid) = ObjectId::parse_str(hex) {
                         return Bson::ObjectId(oid);
@@ -2821,6 +3253,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_sharded_mongo_count_returned_as_integral_double() {
+        let response = doc! {
+            "shards": { "shard01": 887_286_174.0, "shard02": 885_925_656.0 },
+            "n": 1_773_211_830.0,
+            "ok": 1.0,
+        };
+
+        assert_eq!(parse_count_command_result(&response), Ok(1_773_211_830));
+    }
+
+    #[test]
+    fn parses_integer_mongo_count_results() {
+        assert_eq!(parse_count_command_result(&doc! { "n": 42_i32 }), Ok(42));
+        assert_eq!(parse_count_command_result(&doc! { "n": 4_294_967_296_i64 }), Ok(4_294_967_296));
+    }
+
+    #[test]
+    fn rejects_invalid_mongo_count_results() {
+        for response in [
+            doc! {},
+            doc! { "n": -1_i32 },
+            doc! { "n": 1.5 },
+            doc! { "n": f64::NAN },
+            doc! { "n": (super::super::JS_MAX_SAFE_INTEGER as f64) + 1.0 },
+            doc! { "n": "10" },
+        ] {
+            assert!(parse_count_command_result(&response).is_err(), "response should be rejected: {response:?}");
+        }
+    }
+
+    /// `CommandError` is `#[non_exhaustive]` with a private field, so tests build it through the
+    /// driver's derived `Deserialize`.
+    fn count_command_error(code: i32, code_name: &str) -> mongodb::error::CommandError {
+        serde_json::from_str(&format!(r#"{{"code": {code}, "codeName": "{code_name}", "errmsg": "count failed"}}"#))
+            .unwrap()
+    }
+
+    #[test]
+    fn maps_mongo_namespace_not_found_count_errors_to_zero() {
+        let kind = mongodb::error::ErrorKind::Command(count_command_error(26, "NamespaceNotFound"));
+
+        assert_eq!(parse_count_command_error(&kind), Some(0));
+    }
+
+    #[test]
+    fn propagates_mongo_count_errors_other_than_namespace_not_found() {
+        for (code, code_name) in [(13, "Unauthorized"), (17405, "CommandNotFound")] {
+            let kind = mongodb::error::ErrorKind::Command(count_command_error(code, code_name));
+
+            assert_eq!(parse_count_command_error(&kind), None, "code {code} should propagate");
+        }
+        assert_eq!(parse_count_command_error(&mongodb::error::ErrorKind::Shutdown), None);
+    }
+
+    #[test]
     fn detects_mongo_secondary_only_list_databases_errors() {
         assert!(list_databases_requires_secondary_fallback("NotWritablePrimary: not master"));
         assert!(list_databases_requires_secondary_fallback("not master and slaveOk=false"));
@@ -2951,6 +3438,16 @@ mod tests {
 
         let value_error = json_update_to_modifications(&serde_json::json!("invalid")).unwrap_err();
         assert!(value_error.contains("object or pipeline array"));
+    }
+
+    #[test]
+    fn update_options_reject_unknown_fields_instead_of_dropping_them() {
+        let error = parse_update_options(Some(r#"{"upsert":true,"collation":{"locale":"en"}}"#)).unwrap_err();
+        assert!(error.contains("collation"), "{error}");
+        // Same rule as replace: an option the driver would not apply must not be silently ignored.
+        assert!(parse_replace_options(Some(r#"{"upsert":true,"collation":{"locale":"en"}}"#)).is_err());
+        assert!(parse_update_options(Some("{}")).is_ok());
+        assert!(parse_update_options(None).is_ok());
     }
 
     #[test]
@@ -3217,6 +3714,130 @@ mod tests {
             panic!("expected operator document");
         };
         assert_eq!(op.get("$gte"), Some(&Bson::DateTime(expected)));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_uuid_binary_timestamp_and_key_constants() {
+        // Equality on shell constructor values must compare against the typed
+        // BSON value, not a raw { "$uuid": ... } document the server rejects
+        // with "unknown operator: $uuid" (or silently matches nothing).
+        let filter = serde_json::json!({
+            "_id": { "$uuid": "3b241101-e2bb-4255-8caf-4136c566a962" },
+            "payload": { "$binary": { "base64": "AQID", "subType": "80" } },
+            "moment": { "$timestamp": { "t": 1735689600, "i": 7 } },
+            "lower": { "$minKey": 1 },
+            "upper": { "$maxKey": 1 },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let expected_uuid = uuid::Uuid::parse_str("3b241101-e2bb-4255-8caf-4136c566a962").unwrap();
+        assert!(matches!(
+            doc.get("_id"),
+            Some(Bson::Binary(binary))
+                if binary.subtype == mongodb::bson::spec::BinarySubtype::Uuid && binary.bytes == expected_uuid.as_bytes()
+        ));
+        assert!(matches!(
+            doc.get("payload"),
+            Some(Bson::Binary(binary))
+                if binary.subtype == mongodb::bson::spec::BinarySubtype::UserDefined(0x80) && binary.bytes == [1, 2, 3]
+        ));
+        assert!(matches!(
+            doc.get("moment"),
+            Some(Bson::Timestamp(timestamp)) if timestamp.time == 1735689600 && timestamp.increment == 7
+        ));
+        assert!(matches!(doc.get("lower"), Some(Bson::MinKey)));
+        assert!(matches!(doc.get("upper"), Some(Bson::MaxKey)));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_key_constants_inside_operators() {
+        // Range operands must be decoded too, exactly like extended JSON dates:
+        // { score: { $gt: MinKey } } and { _id: { $gt: UUID(...) } } would
+        // otherwise compare against a sub-document and silently match nothing.
+        // The _id case also covers the all-$ operator document branch, where
+        // operators like $gt keep recursing through json_filter_value_to_bson.
+        let filter = serde_json::json!({
+            "score": { "$gt": { "$minKey": 1 }, "$lt": { "$maxKey": 1 } },
+            "_id": { "$gt": { "$uuid": "3b241101-e2bb-4255-8caf-4136c566a962" } },
+            "snapshot": { "$gte": { "$timestamp": { "t": 1735689600, "i": 7 } } },
+            "blob": { "$eq": { "$binary": { "base64": "AQID", "subType": "00" } } },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let Some(Bson::Document(score)) = doc.get("score") else {
+            panic!("expected score operator document");
+        };
+        assert_eq!(score.get("$gt"), Some(&Bson::MinKey));
+        assert_eq!(score.get("$lt"), Some(&Bson::MaxKey));
+
+        let Some(Bson::Document(id_filter)) = doc.get("_id") else {
+            panic!("expected _id operator document");
+        };
+        assert!(matches!(
+            id_filter.get("$gt"),
+            Some(Bson::Binary(binary)) if binary.subtype == mongodb::bson::spec::BinarySubtype::Uuid
+        ));
+
+        let Some(Bson::Document(snapshot)) = doc.get("snapshot") else {
+            panic!("expected snapshot operator document");
+        };
+        assert!(matches!(
+            snapshot.get("$gte"),
+            Some(Bson::Timestamp(timestamp)) if timestamp.time == 1735689600 && timestamp.increment == 7
+        ));
+
+        let Some(Bson::Document(blob)) = doc.get("blob") else {
+            panic!("expected blob operator document");
+        };
+        assert!(matches!(
+            blob.get("$eq"),
+            Some(Bson::Binary(binary)) if binary.subtype == mongodb::bson::spec::BinarySubtype::Generic && binary.bytes == [1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_extended_json_number_wrappers() {
+        // Typed number literals must compare against the typed BSON value, not a
+        // raw { "$numberInt": ... } document the server rejects with
+        // "unknown operator" (or that silently matches nothing).
+        let filter = serde_json::json!({
+            "score": { "$numberInt": "5" },
+            "ratio": { "$numberDouble": "1.5" },
+            "price": { "$numberDecimal": "3.14" },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        assert_eq!(doc.get("score"), Some(&Bson::Int32(5)));
+        assert_eq!(doc.get("ratio"), Some(&Bson::Double(1.5)));
+        let expected_decimal: mongodb::bson::Decimal128 = "3.14".parse().unwrap();
+        assert_eq!(doc.get("price"), Some(&Bson::Decimal128(expected_decimal)));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_number_wrappers_inside_operators() {
+        // Range and $in operands must decode too, exactly like extended JSON
+        // dates: { score: { $gte: {"$numberInt": "5"} } } would otherwise
+        // compare against a sub-document and silently match nothing.
+        let filter = serde_json::json!({
+            "score": { "$gte": { "$numberInt": "5" } },
+            "tags": { "$in": [{ "$numberDecimal": "3.14" }, { "$numberDouble": "1.5" }] },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let Some(Bson::Document(score)) = doc.get("score") else {
+            panic!("expected score operator document");
+        };
+        assert_eq!(score.get("$gte"), Some(&Bson::Int32(5)));
+
+        let Some(Bson::Document(tags)) = doc.get("tags") else {
+            panic!("expected tags operator document");
+        };
+        let Some(Bson::Array(values)) = tags.get("$in") else {
+            panic!("expected tags $in array");
+        };
+        let expected_decimal: mongodb::bson::Decimal128 = "3.14".parse().unwrap();
+        assert_eq!(values.first(), Some(&Bson::Decimal128(expected_decimal)));
+        assert_eq!(values.get(1), Some(&Bson::Double(1.5)));
     }
 
     #[test]
@@ -3617,6 +4238,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         });
 
         assert_eq!(spec.name, "email_1");
@@ -3642,6 +4266,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         });
 
         assert_eq!(
@@ -3885,6 +4512,9 @@ mod tests {
                 included_columns: None,
                 comment: None,
                 key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                key_options: Vec::new(),
+                constraint_backed: false,
             },
             IndexInfo {
                 name: "users_email_unique".to_string(),
@@ -3896,6 +4526,9 @@ mod tests {
                 included_columns: None,
                 comment: None,
                 key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                key_options: Vec::new(),
+                constraint_backed: false,
             },
             IndexInfo {
                 name: "users_status_idx".to_string(),
@@ -3907,6 +4540,9 @@ mod tests {
                 included_columns: None,
                 comment: None,
                 key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                key_options: Vec::new(),
+                constraint_backed: false,
             },
         ];
         let after = vec![before[0].clone(), before[2].clone()];
@@ -3951,6 +4587,25 @@ mod tests {
         assert!(matches!(doc.get("_id"), Some(Bson::ObjectId(oid)) if oid.to_hex() == "507f1f77bcf86cd799439011"));
         assert!(matches!(doc.get("created_at"), Some(Bson::DateTime(_))));
         assert!(matches!(doc.get("count"), Some(Bson::Int64(42))));
+    }
+
+    #[test]
+    fn json_filter_to_document_parses_extended_json_regex() {
+        let value = serde_json::json!({
+            "packagingRatio": {
+                "$regularExpression": {
+                    "pattern": "^[^:：]*盒",
+                    "options": "im",
+                }
+            }
+        });
+        let doc = json_filter_to_document(&value).unwrap();
+
+        assert!(matches!(
+            doc.get("packagingRatio"),
+            Some(Bson::RegularExpression(regex))
+                if regex.pattern == "^[^:：]*盒" && regex.options == "im"
+        ));
     }
 
     #[test]

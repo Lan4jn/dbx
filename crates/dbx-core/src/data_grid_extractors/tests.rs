@@ -66,6 +66,18 @@ fn extracts_raw_values_without_escaping_quotes() {
 }
 
 #[test]
+fn raw_exports_null_as_an_empty_value() {
+    let mut request = request(DataGridExtractorId::Raw);
+    request.columns = vec![column("name", 0)];
+    request.selected_column_indexes = vec![0];
+    request.rows = vec![vec![Value::Null]];
+
+    let result = extract_data_grid_selection(request).expect("raw extraction");
+
+    assert_eq!(result.text, "");
+}
+
+#[test]
 fn raw_rejects_multiple_selected_cells() {
     let error =
         extract_data_grid_selection(request(DataGridExtractorId::Raw)).expect_err("raw must reject multiple cells");
@@ -234,6 +246,34 @@ fn sql_in_list_deduplicates_only_identical_rendered_literals() {
     let result = extract_data_grid_selection(request).expect("SQL IN extraction");
 
     assert_eq!(result.text, "(1, '1', NULL, 'O''Reilly')");
+}
+
+#[test]
+fn sql_in_list_honors_kingbase_bit_literals() {
+    let mut request = request(DataGridExtractorId::SqlInList);
+    request.database_type = Some(DatabaseType::Kingbase);
+    request.identifier_quote = Some("`".to_string());
+    request.columns = vec![column("flag", 0)];
+    request.selected_column_indexes = vec![0];
+    request.table_meta = Some(DataGridTableMeta {
+        catalog: None,
+        database: None,
+        schema: None,
+        table_name: "flags".to_string(),
+        primary_keys: vec![],
+        columns: Some(vec![DataGridColumnInfo {
+            name: "flag".to_string(),
+            data_type: "pg_catalog.bit(1)".to_string(),
+            is_nullable: true,
+            is_primary_key: false,
+            column_default: None,
+            extra: None,
+        }]),
+    });
+    request.rows = vec![vec![json!("0")], vec![json!("1")]];
+
+    let result = extract_data_grid_selection(request).expect("Kingbase SQL IN extraction");
+    assert_eq!(result.text, "(b'0', b'1')");
 }
 
 #[test]
@@ -912,7 +952,24 @@ fn sql_insert_honors_primary_key_exclusion_and_row_by_row_mode() {
         schema: Some("public".to_string()),
         table_name: "users".to_string(),
         primary_keys: vec!["id".to_string()],
-        columns: None,
+        columns: Some(vec![
+            DataGridColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                column_default: None,
+                extra: Some("auto_increment".to_string()),
+            },
+            DataGridColumnInfo {
+                name: "name".to_string(),
+                data_type: "text".to_string(),
+                is_nullable: false,
+                is_primary_key: false,
+                column_default: None,
+                extra: None,
+            },
+        ]),
     });
     request.options.sql.exclude_primary_keys_from_insert = true;
     request.options.sql.insert_mode = crate::data_grid_sql::DataGridCopyInsertMode::RowByRow;
@@ -923,6 +980,91 @@ fn sql_insert_honors_primary_key_exclusion_and_row_by_row_mode() {
         result.text,
         "INSERT INTO \"public\".\"users\" (\"name\") VALUES ('Ada');\nINSERT INTO \"public\".\"users\" (\"name\") VALUES ('Grace, Hopper');"
     );
+    assert_eq!(result.omitted_columns, vec!["id"]);
+}
+
+#[test]
+fn sql_insert_primary_key_exclusion_omits_postgres_serial_key() {
+    let mut request = request(DataGridExtractorId::SqlInserts);
+    request.database_type = Some(DatabaseType::Postgres);
+    request.table_meta = Some(DataGridTableMeta {
+        catalog: None,
+        database: None,
+        schema: Some("public".to_string()),
+        table_name: "users".to_string(),
+        primary_keys: vec!["id".to_string()],
+        columns: Some(vec![
+            DataGridColumnInfo {
+                name: "id".to_string(),
+                data_type: "integer".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                column_default: None,
+                extra: Some("serial".to_string()),
+            },
+            DataGridColumnInfo {
+                name: "name".to_string(),
+                data_type: "text".to_string(),
+                is_nullable: false,
+                is_primary_key: false,
+                column_default: None,
+                extra: None,
+            },
+        ]),
+    });
+    request.rows = vec![vec![json!(1), json!("Ada")]];
+    request.options.sql.exclude_primary_keys_from_insert = true;
+
+    let result = extract_data_grid_selection(request).expect("PostgreSQL SQL INSERT extraction");
+
+    assert_eq!(result.text, "INSERT INTO \"public\".\"users\" (\"name\") VALUES ('Ada');");
+    assert_eq!(result.omitted_columns, vec!["id"]);
+}
+
+#[test]
+fn sql_insert_primary_key_exclusion_keeps_manual_composite_key_members() {
+    let mut request = request(DataGridExtractorId::SqlInserts);
+    request.table_meta = Some(DataGridTableMeta {
+        catalog: None,
+        database: None,
+        schema: None,
+        table_name: "daily_stats".to_string(),
+        primary_keys: vec!["id".to_string(), "stat_date".to_string()],
+        columns: Some(vec![
+            DataGridColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                column_default: None,
+                extra: Some("auto_increment".to_string()),
+            },
+            DataGridColumnInfo {
+                name: "stat_date".to_string(),
+                data_type: "date".to_string(),
+                is_nullable: false,
+                is_primary_key: true,
+                column_default: None,
+                extra: None,
+            },
+            DataGridColumnInfo {
+                name: "name".to_string(),
+                data_type: "text".to_string(),
+                is_nullable: false,
+                is_primary_key: false,
+                column_default: None,
+                extra: None,
+            },
+        ]),
+    });
+    request.columns = vec![column("id", 0), column("stat_date", 1), column("name", 2)];
+    request.selected_column_indexes = vec![0, 1, 2];
+    request.rows = vec![vec![json!(1), json!("2026-08-18"), json!("Ada")]];
+    request.options.sql.exclude_primary_keys_from_insert = true;
+
+    let result = extract_data_grid_selection(request).expect("SQL INSERT extraction");
+
+    assert_eq!(result.text, "INSERT INTO \"daily_stats\" (\"stat_date\", \"name\") VALUES ('2026-08-18', 'Ada');");
     assert_eq!(result.omitted_columns, vec!["id"]);
 }
 

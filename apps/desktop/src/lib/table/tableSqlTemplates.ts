@@ -1,12 +1,16 @@
 import type { ColumnInfo, DatabaseType } from "@/types/database";
-import { metricRangeQuery, qualifiedTableName, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
+import { metricRangeQuery, qualifiedTableName, quoteTableDataIdentifier, quoteTableIdentifierIfNeeded } from "@/lib/table/tableSelectSql";
 
 export interface TableSqlTemplateOptions {
   databaseType?: DatabaseType;
+  driverProfile?: string;
   identifierQuote?: string;
   schema?: string;
   catalog?: string;
   database?: string;
+  includeDatabaseName?: boolean;
+  /** Omit optional identifier quotes while retaining quotes required by the dialect. */
+  quoteIdentifiers?: boolean;
   tableName: string;
   columns?: ColumnInfo[];
   tableType?: string;
@@ -100,16 +104,19 @@ export function buildTableDeleteTemplate(options: TableSqlTemplateOptions): stri
 function templateTableName(options: TableSqlTemplateOptions): string {
   return qualifiedTableName({
     databaseType: options.databaseType,
+    driverProfile: options.driverProfile,
     identifierQuote: options.identifierQuote,
     catalog: options.catalog,
     database: options.database,
+    includeDatabaseName: options.includeDatabaseName,
+    quoteIdentifiers: options.quoteIdentifiers,
     schema: options.schema,
     tableName: options.tableName,
   });
 }
 
 function templateIdentifier(options: TableSqlTemplateOptions, name: string): string {
-  return quoteTableDataIdentifier(options.databaseType, name, options.identifierQuote);
+  return options.quoteIdentifiers === false ? quoteTableIdentifierIfNeeded(options.databaseType, name, options.identifierQuote) : quoteTableDataIdentifier(options.databaseType, name, options.identifierQuote);
 }
 
 function buildWhereClause(options: TableSqlTemplateOptions, primaryKeys: ColumnInfo[]): string {

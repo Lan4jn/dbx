@@ -10,7 +10,7 @@ const source = readFileSync(aiAssistantPath, "utf8");
 const zhCnLocaleSource = readFileSync(zhCnLocalePath, "utf8");
 
 test("AI composer keeps templates available without connections", () => {
-  const contextRowStart = source.indexOf('<div class="flex items-center gap-1 mb-1 text-xs text-foreground/80">');
+  const contextRowStart = source.indexOf("data-ai-composer-context-row");
   const contextRowEnd = source.indexOf('v-if="mentionOpen"', contextRowStart);
   const contextRow = source.slice(contextRowStart, contextRowEnd);
 
@@ -19,8 +19,10 @@ test("AI composer keeps templates available without connections", () => {
   assert.match(contextRow, /<template v-if="connectionStore\.connections\.length">/);
   assert.match(contextRow, /<Popover v-model:open="showTemplateSelector">/);
   assert.match(contextRow, /max-w-\[40%\]/);
-  assert.match(contextRow, /<span class="truncate">\{\{ templateSelectorTriggerLabel \}\}<\/span>/);
+  assert.match(contextRow, /<span class="ai-template-selector-label truncate">\{\{ templateSelectorTriggerLabel \}\}<\/span>/);
   assert.match(contextRow, /:aria-label="templateSelectorTriggerLabel"/);
+  assert.doesNotMatch(contextRow, /ai-prompt-context-break/);
+  assert.match(source, /\.ai-prompt-context-row--schema \.ai-template-selector-trigger \{[\s\S]*?flex: 0 0 1\.5rem;[\s\S]*?max-width: 1\.5rem;/);
 });
 
 test("AI composer labels an empty template selection explicitly", () => {
@@ -42,7 +44,7 @@ test("AI composer exposes mode and action as one compact selector", () => {
   assert.match(footer, /selectModeActionItem\(button\.action\)/);
   assert.doesNotMatch(footer, /selectAction\(button\.action\)/);
   assert.match(footer, /<template v-if="showActionButtons">[\s\S]*?<div class="border-t my-1" \/>[\s\S]*?v-for="button in actionButtons"/);
-  assert.match(source, /function selectModeActionItem\(action: AiAction\) \{\s*\/\/ Vector databases[\s\S]*?if \(!showActionButtons\.value\) return;/);
+  assert.match(source, /function selectModeActionItem\(action: AiActionSelection\) \{\s*\/\/ Vector databases[\s\S]*?if \(!showActionButtons\.value\) return;/);
 });
 
 test("AI effort control opens as a hoverable side submenu", () => {

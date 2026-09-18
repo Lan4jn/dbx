@@ -7,7 +7,7 @@ export function normalizeDatabaseObjectName(name: string): string {
   return name.trim();
 }
 
-export function buildTableTreeNodes({ nodeId, connectionId, database, schema, tables, catalog }: { nodeId: string; connectionId: string; database: string; schema?: string; tables: TableInfo[]; catalog?: string }): TreeNode[] {
+export function buildTableTreeNodes({ nodeId, connectionId, database, schema, tables, catalog, includeSchemaInId = false }: { nodeId: string; connectionId: string; database: string; schema?: string; tables: TableInfo[]; catalog?: string; includeSchemaInId?: boolean }): TreeNode[] {
   const entries = tables.flatMap((table) => {
     const name = normalizeDatabaseObjectName(table.name);
     if (!name) return [];
@@ -19,7 +19,7 @@ export function buildTableTreeNodes({ nodeId, connectionId, database, schema, ta
         connectionId,
         database,
         schema: childSchema,
-        includeSchemaInId: false,
+        includeSchemaInId,
         name,
         objectType,
         tableType: table.table_type,
@@ -775,6 +775,13 @@ const groupDefs: Array<{
     childType: "synonym",
   },
   {
+    key: "__jobs",
+    label: "tree.schedulerJobs",
+    objectTypes: ["JOB"],
+    nodeType: "group-jobs",
+    childType: "job",
+  },
+  {
     key: "__packages",
     label: "tree.packages",
     objectTypes: ["PACKAGE", "PACKAGE_BODY"],
@@ -790,7 +797,7 @@ const groupDefs: Array<{
   },
 ];
 
-const objectGroupNodeTypes = new Set<TreeNodeType>(["group-tables", "group-dolt-system-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-triggers", "group-events", "group-sequences", "group-synonyms", "group-packages", "group-types"]);
+const objectGroupNodeTypes = new Set<TreeNodeType>(["group-tables", "group-dolt-system-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-triggers", "group-events", "group-sequences", "group-synonyms", "group-jobs", "group-packages", "group-types"]);
 
 export function buildObjectGroupPlaceholderNodes({
   nodeId,

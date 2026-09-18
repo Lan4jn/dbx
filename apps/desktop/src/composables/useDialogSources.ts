@@ -2,6 +2,7 @@ import { ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
+import { rememberExportPassphrase } from "@/lib/backend/exportPassphraseSession";
 import { hasSidebarLayoutEntries } from "@/lib/sidebar/sidebarLayout";
 import type { ConnectionConfigBundle } from "@/lib/connection/connectionConfigTransfer";
 import type { ConnectionConfig, SidebarLayout } from "@/types/database";
@@ -13,6 +14,11 @@ const showSqlFileDialog = ref(false);
 const showDiagramDialog = ref(false);
 const showDocsDialog = ref(false);
 const showTableImportDialog = ref(false);
+const showMongoImportDialog = ref(false);
+const showMongoDatabaseDumpDialog = ref(false);
+const mongoDatabaseDumpPrefillConnectionId = ref("");
+const mongoDatabaseDumpPrefillDatabase = ref("");
+const mongoDatabaseDumpMode = ref<"dump" | "restore">("dump");
 const showTableDataGenerateDialog = ref(false);
 const showFieldLineageDialog = ref(false);
 const showDatabaseSearchDialog = ref(false);
@@ -22,6 +28,8 @@ const pendingImportLayout = ref<SidebarLayout | null>(null);
 const showConfigPassphraseDialog = ref(false);
 const configPassphraseMode = ref<"export" | "import">("export");
 const configPassphraseError = ref("");
+const showConfigUnencryptedExportConfirm = ref(false);
+const configExportBusy = ref(false);
 const pendingImportContent = ref("");
 const showConfigConnectionSelectDialog = ref(false);
 const configConnectionSelectMode = ref<"export" | "import">("export");
@@ -42,10 +50,14 @@ const transferPrefillTargetSchema = ref("");
 const schemaDiffPrefillConnectionId = ref("");
 const schemaDiffPrefillDatabase = ref("");
 const schemaDiffPrefillSchema = ref("");
+const schemaDiffPrefillSelectedRoutines = ref<string[] | undefined>(undefined);
+const schemaDiffPrefillResultTab = ref<"tables" | "routines" | "">("");
+const schemaDiffSessionId = ref<string | null>(null);
 const dataComparePrefillConnectionId = ref("");
 const dataComparePrefillDatabase = ref("");
 const dataComparePrefillSchema = ref("");
 const dataComparePrefillTable = ref("");
+const dataCompareSessionId = ref<string | null>(null);
 const sqlFilePrefillConnectionId = ref("");
 const sqlFilePrefillDatabase = ref("");
 const sqlFilePrefillFilePath = ref("");
@@ -53,6 +65,7 @@ const diagramPrefillConnectionId = ref("");
 const diagramPrefillDatabase = ref("");
 const diagramPrefillSchema = ref("");
 const diagramFocusTableName = ref("");
+const diagramFocusTableNames = ref<string[]>([]);
 const docsPrefillConnectionId = ref("");
 const docsPrefillDatabase = ref("");
 const docsPrefillSchema = ref("");
@@ -60,6 +73,9 @@ const tableImportPrefillConnectionId = ref("");
 const tableImportPrefillDatabase = ref("");
 const tableImportPrefillSchema = ref("");
 const tableImportPrefillTable = ref("");
+const mongoImportPrefillConnectionId = ref("");
+const mongoImportPrefillDatabase = ref("");
+const mongoImportPrefillCollection = ref("");
 const tableDataGeneratePrefillConnectionId = ref("");
 const tableDataGeneratePrefillDatabase = ref("");
 const tableDataGeneratePrefillSchema = ref("");
@@ -90,6 +106,16 @@ function clearTransferPrefill() {
   transferPrefillTargetConnectionId.value = "";
   transferPrefillTargetDatabase.value = "";
   transferPrefillTargetSchema.value = "";
+}
+
+export function openSchemaDiffSession(sessionId: string): void {
+  schemaDiffSessionId.value = sessionId;
+  showSchemaDiffDialog.value = true;
+}
+
+export function openDataCompareSession(sessionId: string): void {
+  dataCompareSessionId.value = sessionId;
+  showDataCompareDialog.value = true;
 }
 
 export function useDialogSources() {
@@ -130,6 +156,9 @@ export function useDialogSources() {
           schemaDiffPrefillConnectionId.value = v.connectionId;
           schemaDiffPrefillDatabase.value = v.database;
           schemaDiffPrefillSchema.value = v.schema ?? "";
+          schemaDiffPrefillSelectedRoutines.value = v.selectedRoutines;
+          schemaDiffPrefillResultTab.value = v.preferredResultTab ?? "";
+          schemaDiffSessionId.value = null;
           showSchemaDiffDialog.value = true;
           connectionStore.schemaDiffSource = null;
         }
@@ -144,11 +173,20 @@ export function useDialogSources() {
           dataComparePrefillDatabase.value = v.database;
           dataComparePrefillSchema.value = v.schema ?? "";
           dataComparePrefillTable.value = v.tableName ?? "";
+          dataCompareSessionId.value = null;
           showDataCompareDialog.value = true;
           connectionStore.dataCompareSource = null;
         }
       },
     );
+
+    watch(showSchemaDiffDialog, (open) => {
+      if (!open) schemaDiffSessionId.value = null;
+    });
+
+    watch(showDataCompareDialog, (open) => {
+      if (!open) dataCompareSessionId.value = null;
+    });
 
     watch(
       () => connectionStore.sqlFileSource,
@@ -180,6 +218,7 @@ export function useDialogSources() {
           diagramPrefillDatabase.value = v.database;
           diagramPrefillSchema.value = v.schema ?? "";
           diagramFocusTableName.value = v.tableName ?? "";
+          diagramFocusTableNames.value = v.tableNames ?? (v.tableName ? [v.tableName] : []);
           showDiagramDialog.value = true;
           connectionStore.diagramSource = null;
         }
@@ -212,6 +251,31 @@ export function useDialogSources() {
           showTableImportDialog.value = true;
           connectionStore.tableImportSource = null;
         }
+      },
+    );
+
+    watch(
+      () => connectionStore.mongoImportSource,
+      (v) => {
+        if (v) {
+          mongoImportPrefillConnectionId.value = v.connectionId;
+          mongoImportPrefillDatabase.value = v.database;
+          mongoImportPrefillCollection.value = v.collection;
+          showMongoImportDialog.value = true;
+          connectionStore.mongoImportSource = null;
+        }
+      },
+    );
+
+    watch(
+      () => connectionStore.mongoDatabaseDumpSource,
+      (source) => {
+        if (!source) return;
+        mongoDatabaseDumpPrefillConnectionId.value = source.connectionId;
+        mongoDatabaseDumpPrefillDatabase.value = source.database;
+        mongoDatabaseDumpMode.value = source.mode;
+        showMongoDatabaseDumpDialog.value = true;
+        connectionStore.mongoDatabaseDumpSource = null;
       },
     );
 
@@ -330,14 +394,57 @@ export function useDialogSources() {
   }
 
   async function onExportConfirm(passphrase: string) {
+    if (configExportBusy.value) return;
+    configExportBusy.value = true;
     try {
-      await connectionStore.exportConnectionsToFile(passphrase, pendingExportConnectionIds.value);
+      const result = await connectionStore.exportConnectionsToFile({ mode: "encrypted", passphrase }, pendingExportConnectionIds.value);
+      if (result === "cancelled") return;
+      // 仅在文件写入成功后才记住密码短语，供同一会话内下次导出对话框回显（仅内存，不落盘）
+      rememberExportPassphrase(passphrase);
       showConfigPassphraseDialog.value = false;
       clearPendingExportState();
       toast(t("configExport.exportSuccess"), 2000);
     } catch (e: any) {
-      configPassphraseError.value = e?.message === "crypto_unavailable" ? t("configExport.cryptoUnavailable") : e?.message || String(e);
+      configPassphraseError.value = e?.message === "crypto_unavailable" ? t("configExport.cryptoUnavailable") : e?.message === "passphrase_required" ? t("configExport.passphraseRequired") : t("configExport.exportFailed");
+    } finally {
+      configExportBusy.value = false;
     }
+  }
+
+  function onRequestUnencryptedExport() {
+    if (configExportBusy.value) return;
+    showConfigPassphraseDialog.value = false;
+    showConfigUnencryptedExportConfirm.value = true;
+  }
+
+  async function onConfigUnencryptedExportConfirm() {
+    if (configExportBusy.value) return;
+    configExportBusy.value = true;
+    try {
+      const result = await connectionStore.exportConnectionsToFile({ mode: "plaintext" }, pendingExportConnectionIds.value);
+      if (result === "cancelled") return;
+      showConfigUnencryptedExportConfirm.value = false;
+      clearPendingExportState();
+      toast(t("configExport.exportSuccess"), 2000);
+    } catch {
+      showConfigUnencryptedExportConfirm.value = false;
+      configPassphraseError.value = t("configExport.exportFailed");
+      showConfigPassphraseDialog.value = true;
+    } finally {
+      configExportBusy.value = false;
+    }
+  }
+
+  function onConfigUnencryptedExportCancel() {
+    if (configExportBusy.value) return;
+    showConfigUnencryptedExportConfirm.value = false;
+    showConfigPassphraseDialog.value = true;
+  }
+
+  function onConfigUnencryptedExportOpenChange(open: boolean) {
+    if (configExportBusy.value) return;
+    showConfigUnencryptedExportConfirm.value = open;
+    if (!open) showConfigPassphraseDialog.value = true;
   }
 
   async function onImportClick(source: "dbx" | "navicat" | "dbeaver" | "datagrip" = "dbx") {
@@ -414,8 +521,9 @@ export function useDialogSources() {
   function onConfigPassphraseOpenChange(open: boolean) {
     showConfigPassphraseDialog.value = open;
     if (open) return;
-    if (configPassphraseMode.value === "export") clearPendingExportState();
-    else if (!pendingImportPreview.value) clearPendingImportState();
+    if (configPassphraseMode.value === "export") {
+      if (!showConfigUnencryptedExportConfirm.value) clearPendingExportState();
+    } else if (!pendingImportPreview.value) clearPendingImportState();
   }
 
   return {
@@ -426,6 +534,11 @@ export function useDialogSources() {
     showDiagramDialog,
     showDocsDialog,
     showTableImportDialog,
+    showMongoImportDialog,
+    showMongoDatabaseDumpDialog,
+    mongoDatabaseDumpPrefillConnectionId,
+    mongoDatabaseDumpPrefillDatabase,
+    mongoDatabaseDumpMode,
     showTableDataGenerateDialog,
     showFieldLineageDialog,
     showDatabaseSearchDialog,
@@ -435,6 +548,8 @@ export function useDialogSources() {
     showConfigPassphraseDialog,
     configPassphraseMode,
     configPassphraseError,
+    showConfigUnencryptedExportConfirm,
+    configExportBusy,
     pendingImportContent,
     showConfigConnectionSelectDialog,
     applyingImportSelection,
@@ -451,10 +566,14 @@ export function useDialogSources() {
     schemaDiffPrefillConnectionId,
     schemaDiffPrefillDatabase,
     schemaDiffPrefillSchema,
+    schemaDiffPrefillSelectedRoutines,
+    schemaDiffPrefillResultTab,
+    schemaDiffSessionId,
     dataComparePrefillConnectionId,
     dataComparePrefillDatabase,
     dataComparePrefillSchema,
     dataComparePrefillTable,
+    dataCompareSessionId,
     sqlFilePrefillConnectionId,
     sqlFilePrefillDatabase,
     sqlFilePrefillFilePath,
@@ -462,6 +581,7 @@ export function useDialogSources() {
     diagramPrefillDatabase,
     diagramPrefillSchema,
     diagramFocusTableName,
+    diagramFocusTableNames,
     docsPrefillConnectionId,
     docsPrefillDatabase,
     docsPrefillSchema,
@@ -469,6 +589,9 @@ export function useDialogSources() {
     tableImportPrefillDatabase,
     tableImportPrefillSchema,
     tableImportPrefillTable,
+    mongoImportPrefillConnectionId,
+    mongoImportPrefillDatabase,
+    mongoImportPrefillCollection,
     tableDataGeneratePrefillConnectionId,
     tableDataGeneratePrefillDatabase,
     tableDataGeneratePrefillSchema,
@@ -489,6 +612,10 @@ export function useDialogSources() {
     databaseExportAllDatabases,
     onExportClick,
     onExportConfirm,
+    onRequestUnencryptedExport,
+    onConfigUnencryptedExportConfirm,
+    onConfigUnencryptedExportCancel,
+    onConfigUnencryptedExportOpenChange,
     onImportClick,
     onImportConfirm,
     onConfigConnectionSelectConfirm,

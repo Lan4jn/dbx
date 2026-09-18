@@ -10,6 +10,7 @@ import {
   shouldAutoOpenSqlCompletion,
   extractCteDefinitions,
   getSqlCompletionContext,
+  prepareSqlCompletionReplacement,
   recordCompletionSelection,
   shouldChainSqlCompletionAfterAccept,
   type SqlCompletionColumn,
@@ -46,6 +47,18 @@ const columnsByTable = new Map<string, SqlCompletionColumn[]>([
     ],
   ],
 ]);
+
+function buildSemanticSqlCompletionItems(sql: string, options: { columns?: Map<string, SqlCompletionColumn[]>; databaseType?: DatabaseType } = {}) {
+  const databaseType = options.databaseType ?? "mysql";
+  const dialect = databaseType === "sqlserver" ? "sqlserver" : databaseType === "postgres" ? "postgres" : "mysql";
+  const semanticOptions = { databaseType, dialect } as const;
+  const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length, semanticOptions), getSqlCompletionContext(sql, sql.length, semanticOptions));
+  return buildSqlCompletionItemsFromContext(context, {
+    tables,
+    columnsByTable: options.columns ?? columnsByTable,
+    ...semanticOptions,
+  });
+}
 
 const mysqlCrossDatabaseColumnsByTable = new Map<string, SqlCompletionColumn[]>([
   [
@@ -232,6 +245,43 @@ test("suggests database-specific data types and functions", () => {
   assert.ok(mysqlCreateViewItems.some((item) => item.type === "function" && item.label === "DATE"));
 });
 
+test("suggests PostgreSQL CURRENT_DATE as a keyword without parentheses", () => {
+  const itemsFor = (sql: string, databaseType: DatabaseType = "postgres") =>
+    buildSqlCompletionItems(sql, sql.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType,
+    });
+  const assertBareKeyword = (items: ReturnType<typeof itemsFor>, label: string) => {
+    const item = items.find((candidate) => candidate.label === label);
+    assert.ok(item, `expected keyword ${label}`);
+    assert.equal(item.type, "keyword");
+    assert.equal((item.apply ?? item.label).includes("("), false);
+  };
+
+  assertBareKeyword(itemsFor("select current_d"), "CURRENT_DATE");
+
+  const currentPrefixItems = itemsFor("select current");
+  assertBareKeyword(currentPrefixItems, "CURRENT_DATE");
+  assertBareKeyword(currentPrefixItems, "CURRENT_TIMESTAMP");
+  assertBareKeyword(currentPrefixItems, "CURRENT_TIME");
+
+  const localtimeItems = itemsFor("select localt");
+  assertBareKeyword(localtimeItems, "LOCALTIME");
+  assertBareKeyword(localtimeItems, "LOCALTIMESTAMP");
+
+  const reportedSql = `SELECT * FROM "public"."table" where "CreateTime" >= current`;
+  assertBareKeyword(itemsFor(reportedSql), "CURRENT_DATE");
+
+  const mysqlCurrentDate = itemsFor("select current_d", "mysql").find((item) => item.label === "CURRENT_DATE");
+  assert.equal(mysqlCurrentDate?.type, "function");
+
+  assert.equal(
+    itemsFor("select current_d", "sqlserver").some((item) => item.label === "CURRENT_DATE"),
+    false,
+  );
+});
+
 test("suggests MySQL VERSION and REVERSE without broadening other dialects", () => {
   const buildFunctionItems = (prefix: string, databaseType?: "mysql" | "postgres" | "sqlserver") =>
     buildSqlCompletionItems(`select ${prefix}`, `select ${prefix}`.length, {
@@ -266,6 +316,123 @@ test("suggests MySQL VERSION and REVERSE without broadening other dialects", () 
     false,
   );
   assert.equal(buildFunctionItems("reve").find((item) => item.label === "REVERSE")?.apply, "REVERSE(${string})");
+});
+
+test("suggests the reported MySQL 5.7 built-in functions with dialect-specific signatures", () => {
+  const reportedFunctions = [
+    "VERSION",
+    "POSITION",
+    "REPEAT",
+    "STRCMP",
+    "POW",
+    "EXP",
+    "LN",
+    "LOG",
+    "LOG10",
+    "LOG2",
+    "SIN",
+    "PI",
+    "COS",
+    "TAN",
+    "ASIN",
+    "ACOS",
+    "ATAN",
+    "ATAN2",
+    "DEGREES",
+    "RADIANS",
+    "MONTHNAME",
+    "DAYOFMONTH",
+    "WEEKDAY",
+    "WEEK",
+    "QUARTER",
+    "ADDDATE",
+    "SUBDATE",
+    "ADDTIME",
+    "SUBTIME",
+    "TIMEDIFF",
+    "FROM_DAYS",
+    "TO_DAYS",
+    "MAKEDATE",
+    "MAKETIME",
+    "BIN",
+    "HEX",
+    "UNHEX",
+    "OCT",
+    "CONV",
+    "JSON_OBJECT",
+    "JSON_ARRAY",
+    "JSON_SET",
+    "JSON_INSERT",
+    "JSON_REPLACE",
+    "JSON_REMOVE",
+    "JSON_CONTAINS",
+    "JSON_LENGTH",
+    "PASSWORD",
+    "DATABASE",
+    "SCHEMA",
+    "USER",
+    "CURRENT_USER",
+    "COLLATION",
+    "FOUND_ROWS",
+    "LAST_INSERT_ID",
+    "BENCHMARK",
+    "SLEEP",
+    "UUID_SHORT",
+    "ELT",
+    "FIELD",
+    "MAKE_SET",
+    "TRUNCATE",
+    "MD5",
+    "SHA1",
+    "SHA2",
+  ] as const;
+  const mysqlItems = buildSqlCompletionItems("select ", "select ".length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+  });
+  const mysqlFunctions = mysqlItems.filter((item) => item.type === "function");
+  const mysqlFunctionLabels = new Set(mysqlFunctions.map((item) => item.label));
+
+  assert.deepEqual(
+    reportedFunctions.filter((name) => !mysqlFunctionLabels.has(name)),
+    [],
+  );
+  assert.equal(mysqlFunctions.find((item) => item.label === "POSITION")?.apply, "POSITION(${substring} IN ${string})");
+  assert.deepEqual(getSqlFunctionSignatureHelp("select position(", "select position(".length, "mysql")?.parameters, ["substring", "string"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select log(10,", "select log(10,".length, "mysql")?.parameters, ["base", "number"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select json_contains(", "select json_contains(".length, "mysql")?.parameters, ["target", "candidate"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select json_length(", "select json_length(".length, "mysql")?.parameters, ["json"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select benchmark(", "select benchmark(".length, "mysql")?.parameters, ["count", "expression"]);
+
+  for (const databaseType of ["postgres", "sqlserver"] as const) {
+    const items = buildSqlCompletionItems("select strc", "select strc".length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType,
+    });
+    assert.equal(
+      items.some((item) => item.type === "function" && item.label === "STRCMP"),
+      false,
+    );
+    assert.equal(getSqlFunctionSignatureHelp("select strcmp(", "select strcmp(".length, databaseType), null);
+  }
+
+  for (const name of ["TRUNCATE", "REPEAT", "DATABASE", "SCHEMA", "USER", "CURRENT_USER"]) {
+    const items = buildSqlCompletionItems(name.toLowerCase(), name.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "mysql",
+    });
+    assert.ok(
+      items.some((item) => item.type === "function" && item.label === name),
+      `${name} function suggestion missing`,
+    );
+    assert.ok(
+      items.some((item) => item.type === "keyword" && item.label === name),
+      `${name} keyword suggestion missing`,
+    );
+  }
 });
 
 test("suggests Oracle SQL, PL/SQL, and data type keywords", () => {
@@ -737,6 +904,300 @@ test("quotes mixed-case Dameng schema, table, and column identifiers", () => {
     dialect: "mysql",
   });
   assert.equal(columnItems.find((item) => item.type === "column" && item.label === "MixedColumn")?.apply, '"MixedColumn"');
+});
+
+test("replaces partially typed quoted identifiers without duplicating quotes", () => {
+  const cases = [
+    {
+      label: "Dameng paired double quotes",
+      markedSql: 'SELECT h."Mi|" FROM SHA."MixedTable" h',
+      databaseType: "dameng",
+      dialect: "mysql",
+      table: "MixedTable",
+      schema: "SHA",
+      column: "MixedColumn",
+      expectedSql: 'SELECT h."MixedColumn" FROM SHA."MixedTable" h',
+      expectedClosingQuote: '"',
+    },
+    {
+      label: "Dameng unclosed double quote in a later statement",
+      markedSql: 'SELECT 1;\nSELECT h."Mi| FROM SHA."MixedTable" h',
+      databaseType: "dameng",
+      dialect: "mysql",
+      table: "MixedTable",
+      schema: "SHA",
+      column: "MixedColumn",
+      expectedSql: 'SELECT 1;\nSELECT h."MixedColumn" FROM SHA."MixedTable" h',
+      expectedClosingQuote: undefined,
+    },
+    {
+      label: "PostgreSQL paired double quotes",
+      markedSql: 'SELECT o."Us|" FROM public."Order Details" o',
+      databaseType: "postgres",
+      dialect: "postgres",
+      table: "Order Details",
+      schema: "public",
+      column: "User Name",
+      expectedSql: 'SELECT o."User Name" FROM public."Order Details" o',
+      expectedClosingQuote: '"',
+    },
+    {
+      label: "MySQL paired backticks",
+      markedSql: "SELECT o.`SE|` FROM app.orders o",
+      databaseType: "mysql",
+      dialect: "mysql",
+      table: "orders",
+      schema: "app",
+      column: "SELECT",
+      expectedSql: "SELECT o.`SELECT` FROM app.orders o",
+      expectedClosingQuote: "`",
+    },
+    {
+      label: "SQL Server paired brackets",
+      markedSql: "SELECT o.[se|] FROM dbo.orders o",
+      databaseType: "sqlserver",
+      dialect: "sqlserver",
+      table: "orders",
+      schema: "dbo",
+      column: "select",
+      expectedSql: "SELECT o.[select] FROM dbo.orders o",
+      expectedClosingQuote: "]",
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const cursor = fixture.markedSql.indexOf("|");
+    const sql = fixture.markedSql.replace("|", "");
+    const options = { databaseType: fixture.databaseType, dialect: fixture.dialect };
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, options), getSqlCompletionContext(sql, cursor, options));
+    const items = buildSqlCompletionItemsFromContext(context, {
+      tables: [{ name: fixture.table, schema: fixture.schema, type: "table" }],
+      columnsByTable: new Map([[`${fixture.schema}.${fixture.table}`, [{ name: fixture.column, table: fixture.table, schema: fixture.schema }]]]),
+      ...options,
+    });
+    const replacement = prepareSqlCompletionReplacement(sql, cursor, context, items);
+    const column = replacement.items.find((item) => item.type === "column" && item.label === fixture.column);
+
+    assert.ok(column, fixture.label);
+    assert.equal(column.replaceClosingQuote, fixture.expectedClosingQuote, fixture.label);
+    const replaceTo = column.replaceClosingQuote === sql[cursor] ? cursor + 1 : cursor;
+    assert.equal(`${sql.slice(0, replacement.from)}${column.apply ?? column.label}${sql.slice(replaceTo)}`, fixture.expectedSql, fixture.label);
+  }
+});
+
+test("replaces typed unquoted prefixes through semantic SQL completion", () => {
+  for (const prefix of ["n", "na"] as const) {
+    const sql = `select * from test where ${prefix}`;
+    const cursor = sql.length;
+    const options = { databaseType: "sqlserver", dialect: "sqlserver" } as const;
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, options), getSqlCompletionContext(sql, cursor, options));
+    const items = buildSqlCompletionItemsFromContext(context, {
+      tables: [{ name: "test", schema: "dbo", type: "table" }],
+      columnsByTable: new Map([["test", [{ name: "name", table: "test", schema: "dbo" }]]]),
+      ...options,
+    });
+    const replacement = prepareSqlCompletionReplacement(sql, cursor, context, items);
+    const column = replacement.items.find((item) => item.type === "column" && item.label === "name");
+
+    assert.ok(column, prefix);
+    assert.deepEqual(context.replacementRange, { start: cursor - prefix.length, end: cursor }, prefix);
+    assert.equal(replacement.from, cursor - prefix.length, prefix);
+    assert.equal(`${sql.slice(0, replacement.from)}${column.apply ?? column.label}${sql.slice(cursor)}`, "select * from test where name", prefix);
+  }
+});
+
+test("replaces typed Unicode prefixes through semantic SQL Server completion", () => {
+  for (const fixture of [
+    { prefix: "名", column: "名称" },
+    { prefix: "客户", column: "客户名称" },
+  ] as const) {
+    const sql = `select * from test where ${fixture.prefix}`;
+    const cursor = sql.length;
+    const options = { databaseType: "sqlserver", dialect: "sqlserver" } as const;
+    const semanticModel = buildSqlSemanticModel(sql, cursor, options);
+    const context = sqlCompletionContextFromSemantic(semanticModel, getSqlCompletionContext(sql, cursor, options));
+    const items = buildSqlCompletionItemsFromContext(context, {
+      tables: [{ name: "test", schema: "dbo", type: "table" }],
+      columnsByTable: new Map([["test", [{ name: fixture.column, table: "test", schema: "dbo" }]]]),
+      ...options,
+    });
+    const replacement = prepareSqlCompletionReplacement(sql, cursor, context, items);
+    const column = replacement.items.find((item) => item.type === "column" && item.label === fixture.column);
+
+    assert.ok(column, fixture.prefix);
+    assert.deepEqual(semanticModel.cursorIntent.replacementRange, { start: cursor - fixture.prefix.length, end: cursor }, fixture.prefix);
+    assert.deepEqual(context.replacementRange, { start: cursor - fixture.prefix.length, end: cursor }, fixture.prefix);
+    assert.equal(replacement.from, cursor - fixture.prefix.length, fixture.prefix);
+    assert.equal(`${sql.slice(0, replacement.from)}${column.apply ?? column.label}${sql.slice(cursor)}`, `select * from test where ${fixture.column}`, fixture.prefix);
+  }
+});
+
+test("brackets only SQL Server completion identifiers that require delimiters", () => {
+  const sql = "select * from ";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "Orders", schema: "dbo", type: "table" },
+      { name: "名称", schema: "dbo", type: "table" },
+      { name: "04保险事前", schema: "dbo", type: "table" },
+      { name: "含]括号", schema: "dbo", type: "table" },
+      { name: "BACKUP", schema: "dbo", type: "table" },
+    ],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    dialect: "sqlserver",
+  });
+
+  assert.deepEqual(Object.fromEntries(items.filter((item) => item.type === "table").map((item) => [item.label, item.apply])), {
+    Orders: "Orders",
+    名称: "名称",
+    "04保险事前": "[04保险事前]",
+    "含]括号": "[含]]括号]",
+    BACKUP: "[BACKUP]",
+  });
+});
+
+test("quotes qualified SQL Server table apply names", () => {
+  const sql = "select * from ";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "04保险事前", schema: "dbo", type: "table", applyName: "dbo.04保险事前" },
+      { name: "04归档", schema: "dbo", type: "table", applyName: "dbo.[04归档]" },
+      { name: "04省略模式", schema: "dbo", type: "table", applyName: "datacenter..04省略模式" },
+      { name: "含].括号", schema: "dbo", type: "table", applyName: "dbo.[含]].括号]" },
+    ],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    dialect: "sqlserver",
+  });
+
+  assert.equal(items.find((item) => item.label === "04保险事前")?.apply, "dbo.[04保险事前]");
+  assert.equal(items.find((item) => item.label === "04归档")?.apply, "dbo.[04归档]");
+  assert.equal(items.find((item) => item.label === "04省略模式")?.apply, "datacenter..[04省略模式]");
+  assert.equal(items.find((item) => item.label === "含].括号")?.apply, "dbo.[含]].括号]");
+});
+
+test("quotes qualified SQL Server routine apply names", () => {
+  const sql = "select run";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [],
+    objects: [{ name: "run_report", schema: "dbo", type: "procedure", applyName: "dbo.04备份" }],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    dialect: "sqlserver",
+  });
+
+  assert.equal(items.find((item) => item.label === "run_report")?.apply, "dbo.[04备份]()");
+});
+
+test("replaces a Unicode prefix inside an open SQL Server bracket identifier", () => {
+  const sql = "select * from test where [名";
+  const cursor = sql.length;
+  const options = { databaseType: "sqlserver", dialect: "sqlserver" } as const;
+  const semanticModel = buildSqlSemanticModel(sql, cursor, options);
+  const context = sqlCompletionContextFromSemantic(semanticModel, getSqlCompletionContext(sql, cursor, options));
+  const items = buildSqlCompletionItemsFromContext(context, {
+    tables: [{ name: "test", schema: "dbo", type: "table" }],
+    columnsByTable: new Map([["test", [{ name: "名称", table: "test", schema: "dbo" }]]]),
+    ...options,
+  });
+  const replacement = prepareSqlCompletionReplacement(sql, cursor, context, items);
+  const column = replacement.items.find((item) => item.type === "column" && item.label === "名称");
+
+  assert.ok(column);
+  assert.deepEqual(context.replacementRange, { start: cursor - 2, end: cursor });
+  assert.equal(replacement.from, cursor - 2);
+  assert.equal(`${sql.slice(0, replacement.from)}${column.apply ?? column.label}${sql.slice(cursor)}`, "select * from test where [名称]");
+});
+
+test("replaces typed CJK table prefixes in MySQL semantic table completion", () => {
+  // Exact report from issue #7757: typing `select * from 测` and accepting the
+  // completion for table 测试表 must replace the typed prefix, not append
+  // after it. Chinese database qualifiers take the same path.
+  for (const fixture of [
+    { sql: "select * from 测", prefix: "测", expected: "select * from 测试表" },
+    { sql: "select * from 测试", prefix: "测试", expected: "select * from 测试表" },
+    { sql: "select * from 测库.测", prefix: "测", expected: "select * from 测库.测试表" },
+    { sql: "select * from mydb.测", prefix: "测", expected: "select * from mydb.测试表" },
+    // ASCII control: unchanged replacement semantics.
+    { sql: "select * from tes", prefix: "tes", expected: "select * from 测试表" },
+  ] as const) {
+    const cursor = fixture.sql.length;
+    const options = { databaseType: "mysql" as DatabaseType, dialect: "mysql" as const };
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(fixture.sql, cursor, options), getSqlCompletionContext(fixture.sql, cursor, options));
+    const replacement = prepareSqlCompletionReplacement(fixture.sql, cursor, context, [{ label: "测试表", type: "table" }]);
+
+    assert.equal(context.prefix, fixture.prefix, fixture.sql);
+    assert.equal(replacement.from, cursor - fixture.prefix.length, fixture.sql);
+    assert.equal(`${fixture.sql.slice(0, replacement.from)}测试表${fixture.sql.slice(cursor)}`, fixture.expected, fixture.sql);
+  }
+});
+
+test("keeps MySQL CJK completion names unquoted per the existing quoting policy", () => {
+  // MySQL permits U+0080..U+FFFF unquoted, so a CJK name needs no backticks;
+  // quote-requiring names (reserved words) keep the existing backtick policy.
+  for (const fixture of [
+    { sql: "select * from 测", table: "测试表", expectedApply: "测试表" },
+    { sql: "select * from or", table: "order", expectedApply: "`order`" },
+  ] as const) {
+    const options = { databaseType: "mysql" as DatabaseType, dialect: "mysql" as const };
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(fixture.sql, fixture.sql.length, options), getSqlCompletionContext(fixture.sql, fixture.sql.length, options));
+    const items = buildSqlCompletionItemsFromContext(context, {
+      tables: [{ name: fixture.table, type: "table" }],
+      columnsByTable: new Map(),
+      ...options,
+    });
+
+    assert.equal(items.find((item) => item.type === "table")?.apply, fixture.expectedApply, fixture.table);
+  }
+});
+
+test("replaces the trailing identifier a semantic parameter token swallows", () => {
+  // The semantic tokenizer reads `:p测` as a single parameter token, so its
+  // cursor intent reports an empty prefix with a replacement range collapsed
+  // at the cursor. The merged context keeps the legacy prefix, and accepting a
+  // candidate must replace that prefix instead of appending after it.
+  for (const sql of ["select * from t where :p测", "select * from t where :p"] as const) {
+    const cursor = sql.length;
+    const options = { databaseType: "mysql" as DatabaseType, dialect: "mysql" as const };
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, options), getSqlCompletionContext(sql, cursor, options));
+    const replacement = prepareSqlCompletionReplacement(sql, cursor, context, [{ label: "名称", type: "column" }]);
+
+    assert.ok(context.prefix.length > 0, sql);
+    assert.equal(replacement.from, cursor - context.prefix.length, sql);
+    assert.equal(`${sql.slice(0, replacement.from)}名称${sql.slice(cursor)}`, "select * from t where :名称", sql);
+  }
+});
+
+test("suggests same-prefix tables while editing double-quoted Oracle-family identifiers", () => {
+  for (const databaseType of ["oracle", "dameng"] as const) {
+    const markedSql = 'SELECT * FROM "Fo|"';
+    const cursor = markedSql.indexOf("|");
+    const sql = markedSql.replace("|", "");
+    const options = { databaseType, dialect: "mysql" as const };
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, cursor, options), getSqlCompletionContext(sql, cursor, options));
+    const items = buildSqlCompletionItemsFromContext(context, {
+      tables: [
+        { name: "FormAlpha", schema: "APP", type: "table" },
+        { name: "FormArchive", schema: "APP", type: "table" },
+      ],
+      columnsByTable: new Map(),
+      ...options,
+    });
+    const replacement = prepareSqlCompletionReplacement(sql, cursor, context, items);
+    const tableItems = replacement.items.filter((item) => item.type === "table");
+
+    assert.deepEqual(
+      tableItems.map((item) => item.label),
+      ["FormAlpha", "FormArchive"],
+      databaseType,
+    );
+    assert.equal(replacement.from, sql.indexOf('"'), databaseType);
+    assert.equal(
+      tableItems.every((item) => item.replaceClosingQuote === '"'),
+      true,
+      databaseType,
+    );
+  }
 });
 
 test("uses PostgreSQL-style double quotes for PostgreSQL-family completion identifiers", () => {
@@ -1369,7 +1830,8 @@ test("keeps database-qualified FROM input in table suggestion mode", () => {
   assert.equal(context.exclusiveColumnSuggestions, false);
   assert.deepEqual(
     items.map((item) => [item.label, item.type, item.detail]),
-    [["orders", "table", "other_db.orders"]],
+    // 单一非同名表不再展示冗余 schema 详情（PR 只在跨 schema 同名表时保留区分信息）
+    [["orders", "table", undefined]],
   );
 });
 
@@ -1443,7 +1905,8 @@ test("includes views in exclusive FROM object suggestions", () => {
   const tableItems = items.filter((item) => item.type === "table");
   assert.deepEqual(
     tableItems.map((item) => [item.label, item.type, item.detail]),
-    [["ticket_summary", "table", "public.ticket_summary"]],
+    // 视图保留类型提示，替代旧的 schema 前缀详情
+    [["ticket_summary", "table", "view"]],
   );
 });
 
@@ -1706,7 +2169,8 @@ test("suggests matching table names for partial table input", () => {
   const tableItems = items.filter((item) => item.type === "table");
   assert.deepEqual(
     tableItems.map((item) => [item.label, item.type, item.detail]),
-    [["ihli_data", "table", "public.ihli_data"]],
+    // 单一非同名表不再展示冗余 schema 详情（PR 只在跨 schema 同名表时保留区分信息）
+    [["ihli_data", "table", undefined]],
   );
 });
 
@@ -2455,6 +2919,94 @@ test("prioritizes select aliases in GROUP BY completion", () => {
 
   assert.equal(items[0]?.label, "display_name");
   assert.equal(items[0]?.detail, "SELECT alias");
+});
+
+test("offers all safe SELECT aliases as one completion for an empty GROUP BY", () => {
+  const sql = "select voucher_date, member_id, min(voucher_date) from dwq_orders_actual_sale_amount_df group by ";
+  const items = buildSemanticSqlCompletionItems(sql);
+  const combined = items.find((item) => item.detail === "All non-aggregated SELECT aliases");
+
+  assert.deepEqual(combined, {
+    label: "voucher_date, member_id",
+    type: "snippet",
+    detail: "All non-aggregated SELECT aliases",
+    apply: "voucher_date, member_id",
+    boost: 3650,
+    dedupeKey: "group-by-all-select-aliases",
+  });
+  assert.ok(items.indexOf(combined!) < items.findIndex((item) => item.label === "voucher_date" && item.detail === "SELECT alias"));
+  assert.deepEqual(
+    items.filter((item) => item.detail === "SELECT alias").map((item) => item.label),
+    ["voucher_date", "member_id"],
+  );
+});
+
+test("preserves SELECT order and deduplicates combined GROUP BY aliases case-insensitively", () => {
+  const sql = "select region as region_key, status as REGION_KEY, email as state, sum(id) as total from public.users group by ";
+  const items = buildSemanticSqlCompletionItems(sql);
+  const combined = items.find((item) => item.detail === "All non-aggregated SELECT aliases");
+
+  assert.equal(combined?.label, "region_key, state");
+  assert.equal(combined?.apply, "region_key, state");
+});
+
+test("uses stable expression aliases and existing quoted column apply text in combined GROUP BY completion", () => {
+  const sql = "select date(created_at) as day, u.order, sum(u.id) as total from public.users u group by ";
+  const items = buildSemanticSqlCompletionItems(sql, {
+    columns: new Map([
+      [
+        "public.users",
+        [
+          { name: "order", table: "users", schema: "public" },
+          { name: "created_at", table: "users", schema: "public" },
+          { name: "id", table: "users", schema: "public" },
+        ],
+      ],
+    ]),
+  });
+  const combined = items.find((item) => item.detail === "All non-aggregated SELECT aliases");
+
+  assert.equal(combined?.label, "day, order");
+  assert.equal(combined?.apply, "day, `order`");
+});
+
+test("hides combined GROUP BY completion for unsafe or incomplete candidate sets", () => {
+  for (const sql of ["select name, count(id) as total from public.users group by ", "select lower(name), email, count(id) as total from public.users group by ", "select count(id) as total, sum(id) as sum_id from public.users group by "]) {
+    const items = buildSemanticSqlCompletionItems(sql);
+    assert.equal(
+      items.some((item) => item.detail === "All non-aggregated SELECT aliases"),
+      false,
+      sql,
+    );
+  }
+});
+
+test("hides combined GROUP BY completion after existing expressions or a non-empty prefix", () => {
+  for (const sql of ["select name, email from public.users group by name, ", "select name, email from public.users group by na"]) {
+    const items = buildSemanticSqlCompletionItems(sql);
+    assert.equal(
+      items.some((item) => item.detail === "All non-aggregated SELECT aliases"),
+      false,
+      sql,
+    );
+  }
+});
+
+test("does not add combined SELECT alias completion to ORDER BY", () => {
+  const sql = "select name as display_name, email as display_email from public.users order by ";
+  const items = buildSemanticSqlCompletionItems(sql);
+
+  assert.equal(
+    items.some((item) => item.detail === "All non-aggregated SELECT aliases"),
+    false,
+  );
+  assert.deepEqual(
+    items.slice(0, 2).map((item) => [item.label, item.detail]),
+    [
+      ["display_name", "SELECT alias"],
+      ["display_email", "SELECT alias"],
+    ],
+  );
 });
 
 test("suggests likely join condition snippets after ON", () => {

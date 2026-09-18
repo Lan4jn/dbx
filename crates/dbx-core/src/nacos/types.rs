@@ -768,6 +768,15 @@ pub enum NacosConflictPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct NacosBatchPreviewDiff {
+    pub before_content: String,
+    pub after_content: String,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct NacosBatchPreviewItem {
     pub namespace: String,
     pub group: String,
@@ -775,6 +784,8 @@ pub struct NacosBatchPreviewItem {
     pub status: String,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub diff: Option<NacosBatchPreviewDiff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -818,6 +829,14 @@ pub struct NacosBatchReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct NacosConfigDataIdMapping {
+    pub source_group: String,
+    pub source_data_id: String,
+    pub target_data_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct NacosConfigTransferRequest {
     pub operation_id: String,
     pub source_connection_id: String,
@@ -826,6 +845,8 @@ pub struct NacosConfigTransferRequest {
     pub target_namespace: String,
     #[serde(default)]
     pub target_group: Option<String>,
+    #[serde(default)]
+    pub data_id_mappings: Vec<NacosConfigDataIdMapping>,
     #[serde(default)]
     pub conflict_policy: NacosConflictPolicy,
 }

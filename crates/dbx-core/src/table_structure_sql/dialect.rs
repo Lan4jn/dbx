@@ -43,6 +43,7 @@ pub(super) struct TableStructureCapabilities {
     pub(super) index_filter: bool,
     pub(super) index_comment: bool,
     pub(super) index_concurrent: bool,
+    pub(super) add_primary_key: bool,
     pub(super) alter_primary_key: bool,
     pub(super) foreign_key: bool,
 }
@@ -65,6 +66,7 @@ impl Default for TableStructureCapabilities {
             index_filter: false,
             index_comment: false,
             index_concurrent: false,
+            add_primary_key: false,
             alter_primary_key: false,
             foreign_key: false,
         }
@@ -85,12 +87,16 @@ pub(super) fn gaussdb_m_capabilities() -> TableStructureCapabilities {
         rebuild_index: true,
         index_type: true,
         index_comment: true,
+        add_primary_key: true,
         alter_primary_key: true,
         ..TableStructureCapabilities::default()
     }
 }
 
-pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStructureCapabilities {
+pub(super) fn capabilities_for(
+    database_type: Option<DatabaseType>,
+    driver_profile: Option<&str>,
+) -> TableStructureCapabilities {
     let base = TableStructureCapabilities::default();
     match database_type {
         Some(
@@ -112,6 +118,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             rebuild_index: true,
             index_type: true,
             index_comment: true,
+            add_primary_key: true,
             alter_primary_key: true,
             foreign_key: true,
             ..base
@@ -125,6 +132,23 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             comment: true,
             ..base
         },
+        // GBase 8s is Informix-compatible, unlike the rest of the `Gbase`
+        // family (GBase 8a and friends) which speak MySQL wire protocol and
+        // SQL dialect. `driver_profile` is the only signal that distinguishes
+        // them (see the same check in `table_export.rs` / `table_select.rs`).
+        Some(DatabaseType::Gbase) if driver_profile.is_some_and(|profile| profile.eq_ignore_ascii_case("gbase8s")) => {
+            TableStructureCapabilities {
+                dialect: StructureDialect::Informix,
+                add_column: true,
+                drop_column: true,
+                rename_column: true,
+                alter_existing_column: true,
+                create_index: true,
+                drop_index: true,
+                rebuild_index: true,
+                ..base
+            }
+        }
         Some(DatabaseType::Gbase) => TableStructureCapabilities {
             dialect: StructureDialect::Mysql,
             add_column: true,
@@ -158,6 +182,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
                 index_include: true,
                 index_filter: true,
                 index_comment: true,
+                add_primary_key: true,
                 alter_primary_key: true,
                 foreign_key: true,
                 ..base
@@ -188,6 +213,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             index_filter: false,
             index_comment: false,
             index_concurrent: false,
+            add_primary_key: false,
             alter_primary_key: false,
             foreign_key: false,
         },
@@ -249,6 +275,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             drop_index: true,
             rebuild_index: true,
             index_type: true,
+            add_primary_key: true,
             alter_primary_key: true,
             ..base
         },
@@ -265,6 +292,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             drop_index: true,
             rebuild_index: true,
             index_type: true,
+            add_primary_key: true,
             alter_primary_key: true,
             ..base
         },
@@ -293,6 +321,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             drop_index: true,
             rebuild_index: true,
             index_type: true,
+            add_primary_key: true,
             foreign_key: true,
             ..base
         },

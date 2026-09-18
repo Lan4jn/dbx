@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,15 +11,24 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::MysqlMode;
 use crate::connection::{config_for_pool_key, task_client_session_id, AppState, PoolKind};
 #[cfg(test)]
+use crate::csv_export::format_csv;
+#[cfg(test)]
 use crate::csv_export::format_tsv_rows;
-use crate::csv_export::{format_csv, format_tsv, push_table_csv_row, push_tsv_row};
+use crate::csv_export::{
+    format_csv_with_quote_mode, format_tsv, push_table_csv_row, push_table_csv_row_with_quote_mode, push_tsv_row,
+    CsvQuoteMode,
+};
+use crate::data_grid_sql::extra_is_auto_generated;
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{
-    build_export_insert_statements, is_export_cancelled, is_internal_export_column, BuildExportInsertStatementsOptions,
+    build_export_insert_statements_excluding, is_export_cancelled, is_internal_export_column,
+    BuildExportInsertStatementsOptions, SqlInsertMode,
 };
 use crate::db::agent_driver::AgentTableReadStartParams;
 use crate::models::connection::DatabaseType;
-use crate::query::{close_query_session, execute_sql_statement_with_options, QueryExecutionOptions};
+use crate::query::{
+    close_query_session, execute_sql_statement_with_options, query_timeout_duration, QueryExecutionOptions,
+};
 use crate::transfer::{
     count_sql_with_where_and_identifier_quote, execute_read_on_pool, execute_read_on_pool_with_max_rows,
     keyset_pagination_sql_with_identifier_quote, pagination_sql_with_filter_order_and_identifier_quote,
@@ -31,6 +41,31 @@ const SQL_INSERT_BATCH_SIZE: usize = 100;
 
 pub fn table_export_client_session_id(export_id: &str) -> String {
     task_client_session_id("table-export", export_id)
+}
+
+/// SQL 导出时需要排除的列名：用户选择了“不含主键”时，与 copy-as-INSERT
+/// 一致只剔除自增/identity 主键；手动赋值的主键保留，否则回放 INSERT 缺值。
+fn sql_export_excluded_columns(
+    request: &TableExportRequest,
+    primary_keys: &[String],
+    col_names: &[String],
+    column_extras: &[Option<String>],
+) -> Vec<String> {
+    if !request.exclude_primary_keys {
+        return Vec::new();
+    }
+    primary_keys
+        .iter()
+        .filter(|pk| {
+            col_names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(pk))
+                .and_then(|index| column_extras.get(index))
+                .and_then(|extra| extra.as_deref())
+                .is_some_and(extra_is_auto_generated)
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,11 +82,18 @@ pub struct TableExportRequest {
     /// "csv", "xlsx", "json", "markdown", "sql", or "txt"
     pub format: String,
     #[serde(default)]
+    pub insert_mode: SqlInsertMode,
+    #[serde(default)]
+    pub csv_quote_mode: CsvQuoteMode,
+    #[serde(default)]
     pub columns: Option<Vec<String>>,
     #[serde(default)]
     pub column_types: Option<Vec<Option<String>>>,
     #[serde(default)]
     pub primary_keys: Option<Vec<String>>,
+    /// 导出 SQL 时是否排除主键列（对应前端数据提取设置里的“排除主键”）。
+    #[serde(default)]
+    pub exclude_primary_keys: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub where_input: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +110,14 @@ pub struct TableExportRequest {
     pub numeric_column_right_align: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_comments: Option<Vec<Option<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_filter: Option<bool>,
+    /// SQL format only: when set, the export is packaged as a `.zip` archive
+    /// containing multiple `part-N.sql` entries (plus a `manifest.json`)
+    /// capped at this many megabytes each, instead of one unbounded `.sql`
+    /// file. Ignored for every other format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_max_mb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,11 +148,17 @@ fn format_csv_rows(rows: &[Vec<Value>]) -> String {
     out
 }
 
-fn write_table_text_row<W: Write>(file: &mut W, csv: bool, row: &[Value], buffer: &mut String) -> Result<(), String> {
+fn write_table_text_row<W: Write>(
+    file: &mut W,
+    csv: bool,
+    row: &[Value],
+    buffer: &mut String,
+    csv_quote_mode: CsvQuoteMode,
+) -> Result<(), String> {
     buffer.clear();
     buffer.push('\n');
     if csv {
-        push_table_csv_row(buffer, row);
+        push_table_csv_row_with_quote_mode(buffer, row, csv_quote_mode);
     } else {
         push_tsv_row(buffer, row);
     }
@@ -114,12 +170,13 @@ fn write_table_text_rows<W: Write>(
     csv: bool,
     rows: &[Vec<Value>],
     buffer: &mut String,
+    csv_quote_mode: CsvQuoteMode,
 ) -> Result<(), String> {
     buffer.clear();
     for row in rows {
         buffer.push('\n');
         if csv {
-            push_table_csv_row(buffer, row);
+            push_table_csv_row_with_quote_mode(buffer, row, csv_quote_mode);
         } else {
             push_tsv_row(buffer, row);
         }
@@ -177,6 +234,7 @@ fn resolve_requested_export_column_types(
     requested_column_types: &[Option<String>],
     table_columns: &[crate::db::ColumnInfo],
 ) -> Vec<Option<String>> {
+    let table_columns_by_name = table_columns_by_name(table_columns);
     requested_columns
         .iter()
         .enumerate()
@@ -187,26 +245,29 @@ fn resolve_requested_export_column_types(
                 .flatten()
                 .filter(|column_type| !column_type.trim().is_empty())
                 .or_else(|| {
-                    table_columns
-                        .iter()
-                        .find(|column| column.name.eq_ignore_ascii_case(requested))
-                        .map(|column| column.data_type.clone())
+                    table_columns_by_name.get(&requested.to_ascii_lowercase()).map(|column| column.data_type.clone())
                 })
         })
         .collect()
+}
+
+fn table_columns_by_name(table_columns: &[crate::db::ColumnInfo]) -> HashMap<String, &crate::db::ColumnInfo> {
+    let mut by_name = HashMap::with_capacity(table_columns.len());
+    for column in table_columns {
+        by_name.entry(column.name.to_ascii_lowercase()).or_insert(column);
+    }
+    by_name
 }
 
 fn resolve_requested_export_column_extras(
     requested_columns: &[String],
     table_columns: &[crate::db::ColumnInfo],
 ) -> Vec<Option<String>> {
+    let table_columns_by_name = table_columns_by_name(table_columns);
     requested_columns
         .iter()
         .map(|requested| {
-            table_columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(requested))
-                .and_then(|column| column.extra.clone())
+            table_columns_by_name.get(&requested.to_ascii_lowercase()).and_then(|column| column.extra.clone())
         })
         .collect()
 }
@@ -333,6 +394,11 @@ fn table_page_sql(
     offset: u64,
     batch_size: usize,
 ) -> String {
+    let default_order_columns = if sql_context.database_type == DatabaseType::InfluxDb {
+        primary_keys.iter().find(|column| column.eq_ignore_ascii_case("time")).map(std::slice::from_ref).unwrap_or(&[])
+    } else {
+        primary_keys
+    };
     let sql = if use_keyset {
         keyset_pagination_sql_with_identifier_quote(
             col_names,
@@ -354,7 +420,7 @@ fn table_page_sql(
             batch_size,
             request.where_input.as_deref(),
             request.order_by.as_deref(),
-            primary_keys,
+            default_order_columns,
             request.identifier_quote.as_deref(),
         )
     };
@@ -503,6 +569,13 @@ enum TableExportCursorKind {
     ExternalDriver,
 }
 
+fn table_export_cursor_allowed(database_type: DatabaseType, cursor_kind: TableExportCursorKind) -> bool {
+    // HighGo's JDBC driver may materialize the complete unbounded result before
+    // startTableRead can return its first cursor page. Use the existing bounded
+    // keyset/LIMIT-OFFSET table export path instead.
+    database_type != DatabaseType::Highgo || cursor_kind != TableExportCursorKind::Agent
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TableExportCursorSession {
     Agent(String),
@@ -510,8 +583,8 @@ enum TableExportCursorSession {
 }
 
 async fn table_export_cursor_kind(state: &AppState, pool_key: &str) -> Option<TableExportCursorKind> {
-    let connections = state.connections.read().await;
-    match connections.get(pool_key) {
+    let pool_handle = state.pool_handle(pool_key).await;
+    match pool_handle.as_ref() {
         Some(PoolKind::Agent(_)) => Some(TableExportCursorKind::Agent),
         Some(PoolKind::ExternalDriver { .. }) => Some(TableExportCursorKind::ExternalDriver),
         _ => None,
@@ -650,12 +723,16 @@ async fn fetch_table_export_batch(
     }
 
     if !*table_read_attempted {
-        match table_export_cursor_kind(state, pool_key).await {
+        let cursor_kind = table_export_cursor_kind(state, pool_key)
+            .await
+            .filter(|cursor_kind| table_export_cursor_allowed(*db_type, *cursor_kind));
+        match cursor_kind {
             Some(TableExportCursorKind::Agent) => {
                 *table_read_attempted = true;
                 let sql = table_cursor_sql(request, sql_context, query_col_names, column_types, primary_keys);
                 let max_rows = request.row_limit.unwrap_or(i32::MAX as usize);
                 let query_timeout = table_export_query_timeout_secs(state, pool_key).await;
+                let rpc_timeout = query_timeout_duration(Some(query_timeout));
                 let params = AgentTableReadStartParams {
                     sql,
                     database: Some(request.database.clone()),
@@ -665,14 +742,20 @@ async fn fetch_table_export_batch(
                     fetch_size: Some(active_batch_size),
                     timeout_secs: (query_timeout > 0).then_some(query_timeout),
                 };
-                let connections = state.connections.read().await;
-                let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+                let pool_handle = state.pool_handle(pool_key).await;
+                let Some(PoolKind::Agent(client)) = pool_handle.as_ref() else {
                     return Err("Agent table read requires an agent connection".to_string());
                 };
                 let client = client.clone();
-                drop(connections);
                 let mut client = client.lock().await;
-                match client.start_table_read::<QueryResult>(params).await {
+                match client
+                    .start_table_read_with_timeout_and_cancel::<QueryResult>(
+                        params,
+                        rpc_timeout,
+                        Some(cancel_token.clone()),
+                    )
+                    .await
+                {
                     Ok(result) => {
                         *cursor_session = result.session_id.clone().map(TableExportCursorSession::Agent);
                         if result.session_id.is_none() && !result.has_more {
@@ -719,14 +802,22 @@ async fn fetch_table_export_batch(
     if let Some(session) = cursor_session.clone() {
         return match session {
             TableExportCursorSession::Agent(session_id) => {
-                let connections = state.connections.read().await;
-                let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+                let pool_handle = state.pool_handle(pool_key).await;
+                let Some(PoolKind::Agent(client)) = pool_handle.as_ref() else {
                     return Err("Table read session requires an agent connection".to_string());
                 };
                 let client = client.clone();
-                drop(connections);
                 let mut client = client.lock().await;
-                match client.fetch_table_read_page::<QueryResult>(&session_id, active_batch_size).await {
+                let query_timeout = table_export_query_timeout_secs(state, pool_key).await;
+                match client
+                    .fetch_table_read_page_with_timeout_and_cancel::<QueryResult>(
+                        &session_id,
+                        active_batch_size,
+                        query_timeout_duration(Some(query_timeout)),
+                        Some(cancel_token.clone()),
+                    )
+                    .await
+                {
                     Ok(result) => {
                         *cursor_session =
                             result.session_id.clone().or(Some(session_id)).map(TableExportCursorSession::Agent);
@@ -836,12 +927,11 @@ async fn close_table_export_cursor_if_open(
     };
     match session {
         TableExportCursorSession::Agent(session_id) => {
-            let connections = state.connections.read().await;
-            let Some(PoolKind::Agent(client)) = connections.get(pool_key) else {
+            let pool_handle = state.pool_handle(pool_key).await;
+            let Some(PoolKind::Agent(client)) = pool_handle.as_ref() else {
                 return;
             };
             let client = client.clone();
-            drop(connections);
             let mut client = client.lock().await;
             let _ = client.close_table_read_session::<bool>(&session_id).await;
         }
@@ -881,12 +971,11 @@ async fn stream_native_table_rows(
     cancel_token: CancellationToken,
     on_row: impl FnMut(&[Value]) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let connections = state.connections.read().await;
-    match connections.get(pool_key) {
+    let pool_handle = state.pool_handle(pool_key).await;
+    match pool_handle.as_ref() {
         Some(PoolKind::Mysql(pool, mode)) => {
             let pool = pool.clone();
             let bare = *mode == MysqlMode::Bare;
-            drop(connections);
             crate::db::mysql::stream_query_rows(
                 &pool,
                 sql,
@@ -901,13 +990,11 @@ async fn stream_native_table_rows(
         }
         Some(PoolKind::Postgres(pool)) => {
             let pool = pool.clone();
-            drop(connections);
             crate::db::postgres::stream_query_rows(&pool, sql, row_limit, cancelled, on_row).await?;
             Ok(true)
         }
         Some(PoolKind::SqlServer(client)) => {
             let client = client.clone();
-            drop(connections);
             let mut on_row = on_row;
             let mut client = client.lock().await;
             crate::db::sqlserver::stream_first_result_set(&mut client, sql, row_limit, Some(cancel_token), |item| {
@@ -921,6 +1008,53 @@ async fn stream_native_table_rows(
         }
         _ => Ok(false),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Output writer for the single-table SQL export. `Plain` is the historical
+/// unbounded `.sql` file; `SplitZip` packages the SQL into multiple
+/// `part-N.sql` entries inside a `.zip` when `TableExportRequest::split_max_mb`
+/// is set.
+enum TableExportSqlWriter {
+    Plain(BufWriter<std::fs::File>),
+    SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
+}
+
+impl Write for TableExportSqlWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(buffer),
+            Self::SplitZip(writer) => writer.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::SplitZip(writer) => writer.flush(),
+        }
+    }
+}
+
+impl TableExportSqlWriter {
+    fn finish(self, source_file_name: &str) -> Result<(), String> {
+        match self {
+            Self::Plain(mut writer) => writer.flush().map_err(|error| format!("Failed to flush export file: {error}")),
+            Self::SplitZip(writer) => writer.finish(source_file_name),
+        }
+    }
+}
+
+fn create_table_export_sql_writer(request: &TableExportRequest) -> Result<TableExportSqlWriter, String> {
+    if let Some(max_mb) = request.split_max_mb {
+        let zip_path = std::path::Path::new(&request.file_path);
+        let stem = zip_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(&request.table_name);
+        let writer = crate::export_split_zip::SplitZipExportWriter::create(zip_path, max_mb, stem, "sql")?;
+        return Ok(TableExportSqlWriter::SplitZip(Box::new(writer)));
+    }
+    Ok(TableExportSqlWriter::Plain(BufWriter::new(
+        std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -952,7 +1086,7 @@ async fn try_export_native_table_stream(
                 std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
             );
             file.write_all(b"\xEF\xBB\xBF").map_err(|e| format!("Failed to write BOM: {e}"))?;
-            let header = format_csv(col_names, &[]);
+            let header = format_csv_with_quote_mode(col_names, &[], request.csv_quote_mode);
             let header = header.strip_suffix('\n').unwrap_or(&header);
             file.write_all(header.as_bytes()).map_err(|e| format!("Failed to write CSV: {e}"))?;
             let mut row_buffer = String::new();
@@ -971,7 +1105,7 @@ async fn try_export_native_table_stream(
                         column_types,
                         request.date_time_format.as_deref(),
                     );
-                    write_table_text_row(&mut file, true, formatted.as_ref(), &mut row_buffer)?;
+                    write_table_text_row(&mut file, true, formatted.as_ref(), &mut row_buffer, request.csv_quote_mode)?;
                     rows_exported += 1;
                     if rows_exported.is_multiple_of(progress_interval) {
                         on_progress(TableExportProgress {
@@ -1015,7 +1149,13 @@ async fn try_export_native_table_stream(
                         column_types,
                         request.date_time_format.as_deref(),
                     );
-                    write_table_text_row(&mut file, false, formatted.as_ref(), &mut row_buffer)?;
+                    write_table_text_row(
+                        &mut file,
+                        false,
+                        formatted.as_ref(),
+                        &mut row_buffer,
+                        request.csv_quote_mode,
+                    )?;
                     rows_exported += 1;
                     if rows_exported.is_multiple_of(progress_interval) {
                         on_progress(TableExportProgress {
@@ -1050,6 +1190,7 @@ async fn try_export_native_table_stream(
                 &[],
                 request.date_time_format.as_deref(),
                 request.numeric_column_right_align,
+                request.auto_filter.unwrap_or(true),
             )?;
             let result = stream_native_table_rows(
                 state,
@@ -1194,28 +1335,31 @@ async fn try_export_native_table_stream(
             result
         }
         "sql" => {
-            let mut file = BufWriter::new(
-                std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
-            );
+            let mut file = create_table_export_sql_writer(request)?;
             let mut pending_rows: Vec<Vec<Value>> = Vec::new();
             let mut wrote_statements = false;
             let mut flush_pending =
-                |file: &mut BufWriter<std::fs::File>, pending_rows: &mut Vec<Vec<Value>>| -> Result<(), String> {
+                |file: &mut TableExportSqlWriter, pending_rows: &mut Vec<Vec<Value>>| -> Result<(), String> {
                     if pending_rows.is_empty() {
                         return Ok(());
                     }
-                    let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
-                        database_type: Some(*db_type),
-                        identifier_quote: request.identifier_quote.clone(),
-                        schema: request.schema.clone(),
-                        table_name: Some(request.table_name.clone()),
-                        qualified_table_name: None,
-                        columns: col_names.to_vec(),
-                        column_types: column_types.to_vec(),
-                        column_extras: column_extras.to_vec(),
-                        rows: std::mem::take(pending_rows),
-                        batch_size: Some(SQL_INSERT_BATCH_SIZE),
-                    })?;
+                    let statements = build_export_insert_statements_excluding(
+                        BuildExportInsertStatementsOptions {
+                            database_type: Some(*db_type),
+                            identifier_quote: request.identifier_quote.clone(),
+                            schema: request.schema.clone(),
+                            table_name: Some(request.table_name.clone()),
+                            qualified_table_name: None,
+                            columns: col_names.to_vec(),
+                            column_types: column_types.to_vec(),
+                            column_extras: column_extras.to_vec(),
+                            spatial_columns: Vec::new(),
+                            spatial_values: Vec::new(),
+                            rows: std::mem::take(pending_rows),
+                            batch_size: Some(request.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
+                        },
+                        &sql_export_excluded_columns(request, primary_keys, col_names, column_extras),
+                    )?;
                     if !statements.is_empty() {
                         if wrote_statements {
                             file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
@@ -1236,7 +1380,7 @@ async fn try_export_native_table_stream(
                 cancel_token.clone(),
                 |row| {
                     pending_rows.push(row.to_vec());
-                    if pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
+                    if request.insert_mode.flush_each_row() || pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
                         flush_pending(&mut file, &mut pending_rows)?;
                     }
                     rows_exported += 1;
@@ -1259,7 +1403,7 @@ async fn try_export_native_table_stream(
                 if wrote_statements {
                     file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
                 }
-                file.flush().map_err(|e| format!("Failed to flush export file: {e}"))?;
+                file.finish(&format!("{}.sql", request.table_name))?;
             }
             result
         }
@@ -1424,8 +1568,10 @@ async fn export_table_data_core_inner(
     // When no PK is available, falls back to offset-based pagination.
     let has_custom_filter_or_order = request.where_input.as_ref().is_some_and(|value| !value.trim().is_empty())
         || request.order_by.as_ref().is_some_and(|value| !value.trim().is_empty());
-    let use_keyset =
-        !has_custom_filter_or_order && !primary_keys.is_empty() && primary_keys.iter().all(|pk| col_names.contains(pk));
+    let use_keyset = db_type != DatabaseType::InfluxDb
+        && !has_custom_filter_or_order
+        && !primary_keys.is_empty()
+        && primary_keys.iter().all(|pk| col_names.contains(pk));
 
     // PK column indices within result rows (for extracting last-row values)
     let pk_indices: Vec<usize> = if use_keyset {
@@ -1498,8 +1644,13 @@ async fn export_table_data_core_inner(
     }
 
     // 8. Create output file
-    let file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?;
-    let mut file = BufWriter::new(file);
+    let mut file = if request.format.eq_ignore_ascii_case("sql") {
+        create_table_export_sql_writer(request)?
+    } else {
+        TableExportSqlWriter::Plain(BufWriter::new(
+            std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
+        ))
+    };
     let mut text_buffer = String::new();
 
     let mut rows_exported: u64 = 0;
@@ -1569,12 +1720,19 @@ async fn export_table_data_core_inner(
 
                 if is_first_batch {
                     // First batch: write header + rows via format_csv
-                    let csv_content = format_csv(&col_names, formatted_rows.as_ref());
+                    let csv_content =
+                        format_csv_with_quote_mode(&col_names, formatted_rows.as_ref(), request.csv_quote_mode);
                     file.write_all(csv_content.as_bytes()).map_err(|e| format!("Failed to write CSV: {e}"))?;
                     is_first_batch = false;
                 } else {
                     // Subsequent batches: write rows only (prepend newline for separation)
-                    write_table_text_rows(&mut file, true, formatted_rows.as_ref(), &mut text_buffer)?;
+                    write_table_text_rows(
+                        &mut file,
+                        true,
+                        formatted_rows.as_ref(),
+                        &mut text_buffer,
+                        request.csv_quote_mode,
+                    )?;
                 }
 
                 rows_exported += row_count as u64;
@@ -1656,10 +1814,22 @@ async fn export_table_data_core_inner(
                 );
 
                 if is_first_batch {
-                    write_table_text_rows(&mut file, false, formatted_rows.as_ref(), &mut text_buffer)?;
+                    write_table_text_rows(
+                        &mut file,
+                        false,
+                        formatted_rows.as_ref(),
+                        &mut text_buffer,
+                        request.csv_quote_mode,
+                    )?;
                     is_first_batch = false;
                 } else {
-                    write_table_text_rows(&mut file, false, formatted_rows.as_ref(), &mut text_buffer)?;
+                    write_table_text_rows(
+                        &mut file,
+                        false,
+                        formatted_rows.as_ref(),
+                        &mut text_buffer,
+                        request.csv_quote_mode,
+                    )?;
                 }
 
                 rows_exported += row_count as u64;
@@ -1703,6 +1873,7 @@ async fn export_table_data_core_inner(
                 &[],
                 request.date_time_format.as_deref(),
                 request.numeric_column_right_align,
+                request.auto_filter.unwrap_or(true),
             )?;
 
             loop {
@@ -2013,18 +2184,23 @@ async fn export_table_data_core_inner(
                     break;
                 }
 
-                let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
-                    database_type: Some(db_type),
-                    identifier_quote: request.identifier_quote.clone(),
-                    schema: request.schema.clone(),
-                    table_name: Some(request.table_name.clone()),
-                    qualified_table_name: None,
-                    columns: col_names.clone(),
-                    column_types: column_types.clone(),
-                    column_extras: column_extras.clone(),
-                    rows: result.rows.clone(),
-                    batch_size: Some(100),
-                })?;
+                let statements = build_export_insert_statements_excluding(
+                    BuildExportInsertStatementsOptions {
+                        database_type: Some(db_type),
+                        identifier_quote: request.identifier_quote.clone(),
+                        schema: request.schema.clone(),
+                        table_name: Some(request.table_name.clone()),
+                        qualified_table_name: None,
+                        columns: col_names.clone(),
+                        column_types: column_types.clone(),
+                        column_extras: column_extras.clone(),
+                        spatial_columns: result.spatial_columns.clone(),
+                        spatial_values: result.spatial_values.clone(),
+                        rows: result.rows.clone(),
+                        batch_size: Some(request.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
+                    },
+                    &sql_export_excluded_columns(request, &primary_keys, &col_names, &column_extras),
+                )?;
                 if !statements.is_empty() {
                     if wrote_statements {
                         file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
@@ -2067,7 +2243,7 @@ async fn export_table_data_core_inner(
     }
 
     close_table_export_cursor_if_open(state, &pool_key, request, &mut cursor_session).await;
-    file.flush().map_err(|e| format!("Failed to flush export file: {e}"))?;
+    file.finish(&format!("{}.sql", request.table_name))?;
 
     // 8. Emit Done progress
     on_progress(TableExportProgress {
@@ -2085,20 +2261,34 @@ async fn export_table_data_core_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database_export::{clear_export_cancelled, set_export_cancelled};
-    #[cfg(unix)]
+    use crate::database_export::{build_export_insert_statements, clear_export_cancelled, set_export_cancelled};
     use crate::models::connection::ConnectionConfig;
     #[cfg(unix)]
     use crate::plugins::{
         InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
     };
-    #[cfg(unix)]
     use crate::storage::Storage;
     use crate::xlsx_export::{build_xlsx_workbook, XlsxWorksheetData};
     use serde_json::json;
     use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn table_export_request_defaults_to_batch_insert_mode() {
+        let request: TableExportRequest = serde_json::from_value(json!({
+            "exportId": "export-1",
+            "connectionId": "conn-1",
+            "database": "db",
+            "schema": null,
+            "tableName": "users",
+            "filePath": "users.sql",
+            "format": "sql"
+        }))
+        .expect("deserialize table export request");
+
+        assert_eq!(request.insert_mode, SqlInsertMode::Batch);
+    }
 
     #[cfg(unix)]
     struct ExternalDriverExportFixture {
@@ -2130,8 +2320,8 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
 
-        let plugin = InstalledPlugin {
-            manifest: PluginManifest {
+        let plugin = InstalledPlugin::new(
+            PluginManifest {
                 id: "jdbc".to_string(),
                 name: "JDBC".to_string(),
                 version: "test".to_string(),
@@ -2144,9 +2334,12 @@ mod tests {
                     kind: "external".to_string(),
                     database_type: Some("jdbc".to_string()),
                 }],
+                contributions: Vec::new(),
+                ..PluginManifest::default()
             },
-            path: dir.clone(),
-        };
+            dir.clone(),
+            env!("CARGO_PKG_VERSION"),
+        );
         let session = Arc::new(
             PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
                 .await
@@ -2170,10 +2363,14 @@ mod tests {
         let export_id = format!("export-{}", uuid::Uuid::new_v4());
         let pool_key =
             format!("{}:session:{}", config.id, table_export_client_session_id(&export_id).replace(':', "_"));
-        state.connections.write().await.insert(
-            pool_key,
-            PoolKind::ExternalDriver { driver_id: "jdbc".to_string(), config: Arc::new(config), session },
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    pool_key,
+                    PoolKind::ExternalDriver { driver_id: "jdbc".to_string(), config: Arc::new(config), session },
+                );
+            })
+            .await;
 
         let output = dir.join("export.csv");
         let request = TableExportRequest {
@@ -2185,17 +2382,22 @@ mod tests {
             table_name: "EXPORT_SAMPLE".to_string(),
             file_path: output.to_string_lossy().into_owned(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: Some(vec!["id".to_string(), "name".to_string()]),
             column_types: Some(vec![Some("INTEGER".to_string()), Some("VARCHAR".to_string())]),
             primary_keys: Some(vec!["id".to_string()]),
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count,
             batch_size: Some(batch_size),
             row_limit,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
 
         ExternalDriverExportFixture { state, request, calls, output, dir }
@@ -2232,6 +2434,152 @@ mod tests {
     #[cfg(unix)]
     fn cleanup_external_driver_export_fixture(fixture: ExternalDriverExportFixture) {
         let _ = std::fs::remove_dir_all(fixture.dir);
+    }
+
+    async fn read_table_export_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 2048];
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "request ended before headers were complete");
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    async fn write_table_export_http_json(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn table_export_query_param(target: &str, name: &str) -> Option<String> {
+        target.split_once('?')?.1.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| percent_encoding::percent_decode_str(value).decode_utf8_lossy().into_owned())
+        })
+    }
+
+    async fn spawn_influxdb_table_export_server() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut queries = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_table_export_http_request(&mut socket).await;
+                let target = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                let query = table_export_query_param(target, "q").expect("InfluxDB request must include q");
+                if query != "SHOW DATABASES" {
+                    assert_eq!(table_export_query_param(target, "db").as_deref(), Some("dbx_issue_8022"));
+                }
+                let final_page = query.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 2");
+                let body = match query.as_str() {
+                    "SHOW DATABASES" => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"databases","columns":["name"],"values":[["dbx_issue_8022"]]}]}]}"#
+                    }
+                    "SHOW TAG KEYS FROM \"weather\"" => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["tagKey"],"values":[["location"]]}]}]}"#
+                    }
+                    "SHOW FIELD KEYS FROM \"weather\"" => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["fieldKey","fieldType"],"values":[["temperature","float"]]}]}]}"#
+                    }
+                    value if value.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 0") => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["time","location","temperature"],"values":[["2023-09-03T12:00:00Z","us-midwest",82]]}]}]}"#
+                    }
+                    value if value.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 1") => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["time","location","temperature"],"values":[["2023-09-03T12:01:00Z","us-midwest",83]]}]}]}"#
+                    }
+                    value if value.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 2") => {
+                        r#"{"results":[{"statement_id":0}]}"#
+                    }
+                    unexpected => panic!("unexpected InfluxDB export query: {unexpected}"),
+                };
+                queries.push(query);
+                write_table_export_http_json(&mut socket, "200 OK", body).await;
+                if final_page {
+                    break;
+                }
+            }
+            queries
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn influxdb_table_export_exports_paginated_rows() {
+        let (base_url, server) = spawn_influxdb_table_export_server().await;
+        let port = base_url.rsplit_once(':').unwrap().1.parse::<u16>().unwrap();
+        let dir = std::env::temp_dir().join(format!("dbx-influxdb-table-export-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config: ConnectionConfig = serde_json::from_value(json!({
+            "id": "conn-influxdb-export",
+            "name": "InfluxDB export",
+            "db_type": "influxdb",
+            "host": "127.0.0.1",
+            "port": port,
+            "username": "",
+            "password": "",
+            "database": "dbx_issue_8022",
+            "query_timeout_secs": 30
+        }))
+        .unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        state.configs.write().await.insert(config.id.clone(), config);
+        let export_id = format!("export-{}", uuid::Uuid::new_v4());
+        let output = dir.join("weather.csv");
+        let request = TableExportRequest {
+            export_id,
+            connection_id: "conn-influxdb-export".to_string(),
+            database: "dbx_issue_8022".to_string(),
+            schema: None,
+            identifier_quote: None,
+            table_name: "weather".to_string(),
+            file_path: output.to_string_lossy().into_owned(),
+            format: "csv".to_string(),
+            insert_mode: Default::default(),
+            csv_quote_mode: CsvQuoteMode::All,
+            exclude_primary_keys: false,
+            columns: None,
+            column_types: None,
+            primary_keys: None,
+            where_input: None,
+            order_by: None,
+            skip_count: true,
+            batch_size: Some(1),
+            row_limit: None,
+            date_time_format: None,
+            numeric_column_right_align: false,
+            column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
+        };
+
+        export_table_data_core(&state, &request, |_| {}).await.unwrap();
+        let queries = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("InfluxDB export server did not receive the final page")
+            .unwrap();
+        let csv = std::fs::read_to_string(&output).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first_page = queries.iter().find(|query| query.contains("LIMIT 1 OFFSET 0")).unwrap();
+        assert!(first_page.contains("ORDER BY \"time\""));
+        assert!(!first_page.contains("ORDER BY \"time\", \"location\""));
+        assert!(csv.contains("location"));
+        assert!(csv.contains("temperature"));
+        assert!(csv.contains("us-midwest"));
+        assert!(csv.contains("82"));
+        assert!(csv.contains("83"));
     }
 
     /// Read and decompress a single entry from an in-memory XLSX (ZIP) buffer.
@@ -2297,7 +2645,7 @@ mod tests {
         let mut output = Vec::new();
         let mut buffer = String::new();
 
-        write_table_text_row(&mut output, true, &row, &mut buffer).expect("write csv row");
+        write_table_text_row(&mut output, true, &row, &mut buffer, CsvQuoteMode::All).expect("write csv row");
         assert_eq!(String::from_utf8(output).expect("utf8 csv"), "\n\"\",\"\",\"line\n\"\"two\"\"\"");
     }
 
@@ -2340,6 +2688,13 @@ mod tests {
     }
 
     #[test]
+    fn highgo_table_export_avoids_unbounded_agent_cursor() {
+        assert!(!table_export_cursor_allowed(DatabaseType::Highgo, TableExportCursorKind::Agent));
+        assert!(table_export_cursor_allowed(DatabaseType::Highgo, TableExportCursorKind::ExternalDriver));
+        assert!(table_export_cursor_allowed(DatabaseType::Oracle, TableExportCursorKind::Agent));
+    }
+
+    #[test]
     fn export_batch_size_respects_row_limit_remaining_rows() {
         assert_eq!(next_export_batch_size(None, 12_000, 10_000), Some(10_000));
         assert_eq!(next_export_batch_size(Some(15_000), 0, 10_000), Some(10_000));
@@ -2358,17 +2713,22 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: Some("WHERE temperature > 1".to_string()),
             order_by: Some("Time DESC".to_string()),
             skip_count: true,
             batch_size: Some(50),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let columns = vec!["Time".to_string(), "root.test.device2.temperature".to_string()];
@@ -2413,17 +2773,22 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: true,
             batch_size: Some(50),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let columns = vec!["tImE".to_string(), "temperature".to_string()];
@@ -2446,17 +2811,22 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: true,
             batch_size: Some(50),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let error = table_export_query_columns(&request, &context, &["TIME".to_string()]).unwrap_err();
@@ -2474,17 +2844,22 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: true,
             batch_size: Some(50),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let columns = vec![
@@ -2510,17 +2885,22 @@ mod tests {
             table_name: "samples".to_string(),
             file_path: "samples.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: true,
             batch_size: Some(25),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["Time".to_string(), "value".to_string()];
 
@@ -2558,17 +2938,22 @@ mod tests {
             table_name: "events".to_string(),
             file_path: "events.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: Some("WHERE status = 'active'".to_string()),
             order_by: None,
             skip_count: false,
             batch_size: Some(500),
             row_limit: Some(1000),
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Oracle, None, request.schema.as_deref());
 
@@ -2600,17 +2985,22 @@ mod tests {
             table_name: "orders".to_string(),
             file_path: "orders.txt".to_string(),
             format: "txt".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: false,
             batch_size: Some(50),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["id".to_string(), "payload".to_string()];
         let primary_keys = vec!["id".to_string()];
@@ -2670,17 +3060,22 @@ mod tests {
             table_name: "order".to_string(),
             file_path: "order.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: false,
             batch_size: Some(100),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["id".to_string(), "DisplayName".to_string()];
         let primary_keys = vec!["id".to_string()];
@@ -2722,17 +3117,22 @@ mod tests {
             table_name: "spatial_data".to_string(),
             file_path: "spatial_data.sql".to_string(),
             format: "sql".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: true,
             batch_size: Some(100),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["id".to_string(), "geom".to_string(), "name".to_string()];
         let column_types = vec![Some("int".to_string()), Some("geometry".to_string()), Some("varchar".to_string())];
@@ -2776,17 +3176,22 @@ mod tests {
             table_name: "USERS".to_string(),
             file_path: "users.sql".to_string(),
             format: "sql".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
+            exclude_primary_keys: false,
             where_input: None,
             order_by: None,
             skip_count: false,
             batch_size: Some(100),
             row_limit: None,
             date_time_format: None,
+            csv_quote_mode: CsvQuoteMode::All,
             numeric_column_right_align: false,
             column_comments: None,
+            auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Oracle, None, request.schema.as_deref());
         let sql = table_cursor_sql(&request, &context, &columns, &[], &primary_keys);
@@ -2801,6 +3206,8 @@ mod tests {
             columns,
             column_types,
             column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")]],
             batch_size: Some(100),
         })
@@ -2904,7 +3311,188 @@ mod tests {
         );
         assert_eq!(progress.last().and_then(|event| event.total_rows), Some(3));
         assert!(matches!(progress.last().map(|event| &event.status), Some(ExportStatus::Done)));
-        assert!(fixture.state.connections.read().await.is_empty());
+        assert!(fixture.state.with_connection_pools(|pools| pools.is_empty()).await);
+
+        cleanup_external_driver_export_fixture(fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_driver_sql_export_without_split_writes_plain_sql() {
+        // The fallback export future is too large for the default test-thread
+        // stack in debug builds; mirror the dedicated-thread pattern used by
+        // the other fallback-path tests.
+        let handle = std::thread::Builder::new()
+            .name("table-export-plain-sql".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build table export plain SQL test runtime")
+                    .block_on(run_external_driver_sql_export_without_split_writes_plain_sql());
+            })
+            .expect("spawn table export plain SQL test thread");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_external_driver_sql_export_without_split_writes_plain_sql() {
+        let fixture = external_driver_export_fixture(
+            r#"  case "$line" in
+    *'"method":"executeQueryPage"'*)
+      echo executeQueryPage >> "$CALLS"
+      printf '{"id":%s,"result":{"columns":["id","name"],"rows":[[1,"Ada"],[2,"Grace"]],"affected_rows":0,"execution_time_ms":1,"session_id":null,"has_more":false}}\n' "$id"
+      ;;
+  esac"#,
+            2,
+            None,
+            true,
+        )
+        .await;
+        let output = fixture.dir.join("export.sql");
+        let mut request = fixture.request.clone();
+        request.format = "sql".to_string();
+        request.file_path = output.to_string_lossy().into_owned();
+
+        let terminal = Arc::new(std::sync::Mutex::new(None::<ExportStatus>));
+        let captured = terminal.clone();
+        export_table_data_core(&fixture.state, &request, move |event| {
+            *captured.lock().unwrap() = Some(event.status);
+        })
+        .await
+        .expect("plain JDBC SQL export should succeed");
+
+        let sql = std::fs::read_to_string(&output).unwrap();
+        // Default batch insert mode emits one multi-row INSERT statement.
+        assert_eq!(sql.matches("INSERT INTO").count(), 1, "both rows should be exported: {sql}");
+        assert!(sql.contains("Ada"));
+        assert!(sql.contains("Grace"));
+        assert!(sql.ends_with(";\n"));
+        // Without `split_max_mb` the fallback arm must keep producing a plain
+        // SQL file, not a zip archive.
+        assert!(!sql.starts_with("PK"));
+        assert_eq!(std::fs::read_to_string(&fixture.calls).unwrap(), "executeQueryPage\n");
+        assert!(matches!(*terminal.lock().unwrap(), Some(ExportStatus::Done)));
+
+        cleanup_external_driver_export_fixture(fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_driver_sql_export_honors_split_max_mb_into_zip_parts() {
+        // See external_driver_sql_export_without_split_writes_plain_sql: the
+        // fallback export future needs a larger-than-default test stack.
+        let handle = std::thread::Builder::new()
+            .name("table-export-split-sql".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build table export split SQL test runtime")
+                    .block_on(run_external_driver_sql_export_honors_split_max_mb_into_zip_parts());
+            })
+            .expect("spawn table export split SQL test thread");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_external_driver_sql_export_honors_split_max_mb_into_zip_parts() {
+        // Two cursor pages: 200 wide rows (~1.2MB of INSERT statements) then a
+        // short 100-row page. The first page alone must exceed the 1MB part
+        // threshold, forcing the second page into a new zip part, and every
+        // part must still contain only complete statements.
+        let fixture = external_driver_export_fixture(
+            r#"LONG=$(head -c 6000 /dev/zero | tr '\0' 'x')
+ROWS=''
+i=1
+while [ $i -le 100 ]; do ROWS="$ROWS,[$i,\"$LONG\"]"; i=$((i+1)); done
+ROWS=${ROWS#,}
+case "$line" in
+  *'"method":"executeQueryPage"'*)
+    echo executeQueryPage >> "$CALLS"
+    printf '{"id":%s,"result":{"columns":["id","name"],"rows":[%s,%s],"affected_rows":0,"execution_time_ms":1,"session_id":"cursor-1","has_more":true}}\n' "$id" "$ROWS" "$ROWS"
+    ;;
+  *'"method":"fetchQueryPage"'*)
+    echo fetchQueryPage >> "$CALLS"
+    printf '{"id":%s,"result":{"columns":["id","name"],"rows":[%s],"affected_rows":0,"execution_time_ms":1,"session_id":null,"has_more":false}}\n' "$id" "$ROWS"
+    ;;
+  *'"method":"closeQuerySession"'*)
+    echo closeQuerySession >> "$CALLS"
+    printf '{"id":%s,"result":{"ok":true}}\n' "$id"
+    ;;
+esac"#,
+            200,
+            None,
+            true,
+        )
+        .await;
+        let zip_path = fixture.dir.join("export.zip");
+        let mut request = fixture.request.clone();
+        request.format = "sql".to_string();
+        request.file_path = zip_path.to_string_lossy().into_owned();
+        request.split_max_mb = Some(crate::export_split_zip::MIN_SPLIT_PART_MAX_MB);
+
+        let terminal = Arc::new(std::sync::Mutex::new(None::<ExportStatus>));
+        let captured = terminal.clone();
+        export_table_data_core(&fixture.state, &request, move |event| {
+            *captured.lock().unwrap() = Some(event.status);
+        })
+        .await
+        .expect("split JDBC SQL export should succeed");
+
+        // The final page reports `has_more: false` with no session id, so the
+        // cursor is closed implicitly and no closeQuerySession RPC is issued.
+        assert_eq!(std::fs::read_to_string(&fixture.calls).unwrap(), "executeQueryPage\nfetchQueryPage\n");
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sql_parts = Vec::new();
+        let mut manifest = None;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if entry.name() == "manifest.json" {
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).unwrap();
+                manifest = Some(serde_json::from_slice::<serde_json::Value>(&contents).unwrap());
+                continue;
+            }
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            sql_parts.push((entry.name().to_string(), contents));
+        }
+        sql_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert!(
+            sql_parts.len() >= 2,
+            "expected the fallback SQL export to be split into multiple parts, got {}",
+            sql_parts.len()
+        );
+        for (name, contents) in &sql_parts {
+            assert!(!contents.is_empty(), "{name} must not be empty");
+            // Every non-blank line must be a complete statement -- the part
+            // boundary may only land between the fallback arm's per-batch
+            // writes, never inside a statement.
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    line.trim_start().starts_with("INSERT INTO") && line.trim_end().ends_with(';'),
+                    "{name} has a malformed line from a mid-statement cut"
+                );
+            }
+        }
+        // All 300 rows must be present across the parts: every row value is
+        // `(n, 'xxxx…')`, so one `, '` occurrence per row.
+        let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined.matches(", '").count(), 300);
+
+        let manifest = manifest.expect("split export must contain a manifest");
+        assert_eq!(manifest["totalParts"].as_u64().unwrap() as usize, sql_parts.len());
+        assert_eq!(manifest["sourceFileName"], "EXPORT_SAMPLE.sql");
+        assert!(matches!(*terminal.lock().unwrap(), Some(ExportStatus::Done)));
 
         cleanup_external_driver_export_fixture(fixture);
     }
@@ -2961,14 +3549,32 @@ mod tests {
 
         run_external_driver_export(&fixture).await.expect("row-limited JDBC export should succeed");
         assert_eq!(std::fs::read_to_string(&fixture.calls).unwrap(), "executeQueryPage\ncloseQuerySession\n");
-        assert!(fixture.state.connections.read().await.is_empty());
+        assert!(fixture.state.with_connection_pools(|pools| pools.is_empty()).await);
 
         cleanup_external_driver_export_fixture(fixture);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn external_driver_table_export_closes_cursor_after_fetch_error() {
+    #[test]
+    fn external_driver_table_export_closes_cursor_after_fetch_error() {
+        let handle = std::thread::Builder::new()
+            .name("table-export-fetch-error".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build table export fetch error test runtime")
+                    .block_on(run_external_driver_table_export_closes_cursor_after_fetch_error());
+            })
+            .expect("spawn table export fetch error test thread");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_external_driver_table_export_closes_cursor_after_fetch_error() {
         let fixture = external_driver_export_fixture(
             r#"  case "$line" in
     *'"method":"executeQueryPage"'*)
@@ -2996,7 +3602,7 @@ mod tests {
             std::fs::read_to_string(&fixture.calls).unwrap(),
             "executeQueryPage\nfetchQueryPage\ncloseQuerySession\n"
         );
-        assert!(fixture.state.connections.read().await.is_empty());
+        assert!(fixture.state.with_connection_pools(|pools| pools.is_empty()).await);
 
         cleanup_external_driver_export_fixture(fixture);
     }
@@ -3031,7 +3637,7 @@ mod tests {
 
         assert!(cancel_requested_at.elapsed() < Duration::from_secs(2));
         assert!(matches!(progress.last().map(|event| &event.status), Some(ExportStatus::Cancelled)));
-        assert!(fixture.state.connections.read().await.is_empty());
+        assert!(fixture.state.with_connection_pools(|pools| pools.is_empty()).await);
         clear_export_cancelled(&fixture.request.export_id).await;
         cleanup_external_driver_export_fixture(fixture);
     }
@@ -3070,7 +3676,7 @@ mod tests {
 
         assert!(cancel_requested_at.elapsed() < Duration::from_secs(2));
         assert!(matches!(progress.last().map(|event| &event.status), Some(ExportStatus::Cancelled)));
-        assert!(fixture.state.connections.read().await.is_empty());
+        assert!(fixture.state.with_connection_pools(|pools| pools.is_empty()).await);
         clear_export_cancelled(&fixture.request.export_id).await;
         cleanup_external_driver_export_fixture(fixture);
     }

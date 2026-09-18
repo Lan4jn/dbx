@@ -1,8 +1,9 @@
-import { DEFAULT_DESCRIPTION, SITE_NAME, SITE_URL } from "./metadata";
+import { DEFAULT_DESCRIPTION, getHtmlLang, SITE_NAME, SITE_URL } from "./metadata";
+import type { DocsLang } from "./i18n";
 
 const localizedDescription = {
   en: DEFAULT_DESCRIPTION,
-  cn: "90+ 种数据库，仅 20 MB。支持桌面端、Docker 自托管、AI 助手与 MCP Server。",
+  cn: "90+ 种数据库，仅 25 MB。支持桌面端、Docker 自托管、AI 助手与 MCP Server。",
 } as const;
 
 const localizedFeatureList = {
@@ -54,8 +55,8 @@ export function buildSiteStructuredData() {
   ] as const;
 }
 
-export function buildSoftwareApplicationStructuredData(lang: "en" | "cn", version: string) {
-  const language = lang === "cn" ? "zh-CN" : "en";
+export function buildSoftwareApplicationStructuredData(lang: DocsLang, version: string) {
+  const language = getHtmlLang(lang);
 
   return {
     "@context": "https://schema.org",

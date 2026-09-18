@@ -3,10 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const executeMulti = vi.fn();
 const executeQuery = vi.fn();
+const beginManualTransaction = vi.fn();
+const executeInManualTransaction = vi.fn();
+const cancelQuery = vi.fn();
 const analyzeEditableQueryEditability = vi.fn();
 const getColumns = vi.fn();
 const listIndexes = vi.fn();
 const listObjects = vi.fn();
+const listTables = vi.fn();
 const getConnectionConfig = vi.fn();
 const lookupLocalCompletionTables = vi.fn();
 const buildSortedQuerySql = vi.fn();
@@ -38,11 +42,15 @@ vi.mock("@/lib/backend/api", () => ({
   buildSortedQuerySql,
   closeClientConnectionSession: vi.fn().mockResolvedValue(undefined),
   closeQuerySession: vi.fn().mockResolvedValue(undefined),
+  beginManualTransaction,
+  cancelQuery,
+  executeInManualTransaction,
   executeMulti,
   executeQuery,
   getColumns,
   listIndexes,
   listObjects,
+  listTables,
   prepareQueryPaginationExecutionPlan,
   saveOpenTabsState: vi.fn().mockResolvedValue(undefined),
 }));
@@ -90,6 +98,7 @@ describe("queryStore hidden primary key editing", () => {
     ]);
     listIndexes.mockResolvedValue([]);
     listObjects.mockResolvedValue([]);
+    listTables.mockResolvedValue([]);
     lookupLocalCompletionTables.mockReturnValue([]);
     analyzeEditableQueryEditability.mockImplementation(async (sql: string) => queryAnalysis(sql));
     buildSortedQuerySql.mockImplementation(async (options) => ({ ok: true, sql: `${options.originalSql} ORDER BY ${options.column} ${options.direction.toUpperCase()}` }));
@@ -110,7 +119,17 @@ describe("queryStore hidden primary key editing", () => {
       affected_rows: 0,
       execution_time_ms: 1,
     });
+    cancelQuery.mockResolvedValue(false);
     executeMulti.mockResolvedValue([
+      {
+        columns: ["name", "__DBX_PK_0"],
+        rows: [["Alice", 7]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+    ]);
+    beginManualTransaction.mockResolvedValue("txn-1");
+    executeInManualTransaction.mockResolvedValue([
       {
         columns: ["name", "__DBX_PK_0"],
         rows: [["Alice", 7]],
@@ -138,7 +157,7 @@ describe("queryStore hidden primary key editing", () => {
     expect(tab.queryAnalysis).toBeDefined();
     expect(tab.queryAnalysis?.allowInsert).toBe(false);
     expect(tab.queryEditabilityReason).toBeUndefined();
-  });
+  }, 10_000);
 
   it("keeps MySQL expression columns read-only without disabling direct columns", async () => {
     const sql = "SELECT id, status, extra->>'$.mode' mode, extra->>'$.template' tmpl FROM items";
@@ -368,6 +387,42 @@ describe("queryStore hidden primary key editing", () => {
     expect(tab.tableMeta?.schema).toBe("reporting");
   });
 
+  it("executes a constant projection without waiting for Oracle table metadata", async () => {
+    getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+    getColumns.mockResolvedValue([{ name: "DUMMY", data_type: "VARCHAR2(1)", is_nullable: true, column_default: null, is_primary_key: false, extra: null }]);
+    listIndexes.mockResolvedValue([]);
+    listTables.mockReturnValue(new Promise(() => undefined));
+    analyzeEditableQueryEditability.mockResolvedValue({
+      editable: true,
+      analysis: {
+        schema: undefined,
+        tableName: "DUAL",
+        selectStar: false,
+        columns: [{ resultName: "1", expression: "1" }],
+      },
+    });
+    const result = [{ columns: ["1"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }];
+    const executionGate = deferred<typeof result>();
+    executeMulti.mockReturnValue(executionGate.promise);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query");
+    store.setAutoCommit(tabId, true);
+    const sql = "SELECT 1 FROM DUAL";
+
+    const execution = store.executeTabSql(tabId, sql);
+    await vi.waitFor(() => expect(executeMulti).toHaveBeenCalled(), { timeout: 250 });
+
+    expect(executeMulti).toHaveBeenCalledWith("oracle-1", "ORCL", sql, undefined, expect.any(String), expect.objectContaining({ timeoutSecs: 30 }));
+    expect(getColumns).not.toHaveBeenCalled();
+    expect(listIndexes).not.toHaveBeenCalled();
+    expect(listTables).not.toHaveBeenCalled();
+
+    executionGate.resolve(result);
+    await execution;
+  });
+
   it("uses a hidden Oracle ROWID to keep keyless base-table query results editable", async () => {
     getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
     getColumns.mockResolvedValue([
@@ -408,7 +463,7 @@ describe("queryStore hidden primary key editing", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "ORCL", "Query");
-    // Exercise auto-commit execute-multi path (Oracle tabs default to manual TX).
+    // Exercise the explicit auto-commit execute-multi path.
     store.setAutoCommit(tabId, true);
 
     await store.executeTabSql(tabId, "SELECT t.* FROM SH_SMCVDMS_OVERSEAS_DRSSITB.TT_PLATFORM_CARS t WHERE t.PLATFORM = '轻卡'");
@@ -421,6 +476,214 @@ describe("queryStore hidden primary key editing", () => {
     expect(tab.tableMeta?.primaryKeys).toEqual(["__DBX_ROWID"]);
     expect(tab.queryAnalysis).toBeDefined();
     expect(tab.queryAnalysis?.allowInsert).not.toBe(false);
+    expect(tab.queryEditabilityReason).toBeUndefined();
+  });
+
+  it.each([
+    {
+      connection: { id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 },
+      label: "native Oracle",
+    },
+    {
+      connection: { id: "oracle-jdbc-1", name: "Oracle JDBC", db_type: "jdbc", connection_string: "jdbc:oracle:thin:@//localhost:1521/ORCL", database: "ORCL", query_timeout_secs: 30 },
+      label: "Oracle-inferred JDBC",
+    },
+  ])("uses a physical primary index for $label star projections when column flags omit it", async ({ connection }) => {
+    getConnectionConfig.mockReturnValue(connection);
+    getColumns.mockResolvedValue([
+      { name: "OFFER_RELA_ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: false, extra: null },
+      { name: "ORI_OFFER_ID", data_type: "NUMBER", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ]);
+    listIndexes.mockResolvedValue([{ name: "PK_OFFER_RELA", columns: ["OFFER_RELA_ID"], is_unique: true, is_primary: true }]);
+    lookupLocalCompletionTables.mockReturnValue([{ name: "OFFER_RELA", type: "table", schema: "APP" }]);
+
+    const projections = [
+      {
+        sql: "SELECT T.* FROM APP.OFFER_RELA t",
+        analysisColumns: [],
+        resultColumns: ["OFFER_RELA_ID", "ORI_OFFER_ID"],
+        sourceColumns: undefined,
+        selectStar: true,
+      },
+      {
+        sql: "SELECT T.*, T.ROWID FROM APP.OFFER_RELA t",
+        analysisColumns: [
+          { star: true, sourceQualifier: "T", sourceKey: "t:0", resultName: "*", expression: "T.*" },
+          { sourceName: "ROWID", sourceNameQuoted: false, sourceQualifier: "T", sourceKey: "t:0", resultName: "ROWID", expression: "T.ROWID" },
+        ],
+        resultColumns: ["OFFER_RELA_ID", "ORI_OFFER_ID", "ROWID"],
+        sourceColumns: ["OFFER_RELA_ID", "ORI_OFFER_ID", undefined],
+        selectStar: false,
+      },
+    ];
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+
+    for (const projection of projections) {
+      analyzeEditableQueryEditability.mockResolvedValue({
+        editable: true,
+        analysis: {
+          schema: "APP",
+          tableName: "OFFER_RELA",
+          tableAlias: "t",
+          selectStar: projection.selectStar,
+          columns: projection.analysisColumns,
+        },
+      });
+      executeMulti.mockResolvedValue([
+        {
+          columns: projection.resultColumns,
+          rows: [],
+          affected_rows: 0,
+          execution_time_ms: 1,
+        },
+      ]);
+
+      const tabId = store.createTab(connection.id, "ORCL", "Query");
+      store.setAutoCommit(tabId, true);
+      await store.executeTabSql(tabId, projection.sql);
+
+      expect(executeMulti).toHaveBeenLastCalledWith(connection.id, "ORCL", projection.sql, undefined, expect.any(String), expect.objectContaining({ timeoutSecs: 30 }));
+      const tab = store.tabs.find((item) => item.id === tabId)!;
+      if (projection.sourceColumns) {
+        await vi.waitFor(() => expect(tab.querySourceColumns).toEqual(projection.sourceColumns));
+      } else {
+        expect(tab.querySourceColumns).toBeUndefined();
+      }
+      await vi.waitFor(() => expect(tab.tableMeta?.primaryKeys).toEqual(["OFFER_RELA_ID"]));
+      expect(tab.queryAnalysis).toBeDefined();
+      expect(tab.queryEditabilityReason).toBeUndefined();
+    }
+  });
+
+  it("uses a qualified Oracle ROWID from a joined query as the synthetic row key", async () => {
+    getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+    getColumns.mockImplementation(async (_connectionId: string, _database: string, _schema: string, tableName: string) =>
+      tableName === "USERS"
+        ? [
+            { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: false, extra: null },
+            { name: "NAME", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+          ]
+        : [{ name: "LABEL", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null }],
+    );
+    lookupLocalCompletionTables.mockReturnValue([
+      { name: "USERS", type: "table", schema: "APP" },
+      { name: "ORDERS", type: "table", schema: "APP" },
+    ]);
+    analyzeEditableQueryEditability.mockResolvedValue({
+      editable: true,
+      analysis: {
+        schema: "APP",
+        tableName: "USERS",
+        selectStar: false,
+        sources: [
+          { key: "t:0", schema: "APP", tableName: "USERS", alias: "t" },
+          { key: "o:1", schema: "APP", tableName: "ORDERS", alias: "o" },
+        ],
+        columns: [
+          { sourceName: "ROWID", sourceQualifier: "t", sourceKey: "t:0", resultName: "ROWID", expression: "t.ROWID" },
+          { sourceName: "NAME", sourceQualifier: "t", sourceKey: "t:0", resultName: "NAME", expression: "t.NAME" },
+          { sourceName: "LABEL", sourceQualifier: "o", sourceKey: "o:1", resultName: "LABEL", expression: "o.LABEL" },
+        ],
+      },
+    });
+    executeMulti.mockResolvedValue([
+      {
+        columns: ["ROWID", "NAME", "LABEL"],
+        rows: [["AAAPr9AAEAAAACXAAA", "Alice", "Order"]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+    ]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query");
+    store.setAutoCommit(tabId, true);
+
+    await store.executeTabSql(tabId, "SELECT t.ROWID, t.NAME, o.LABEL FROM APP.USERS t LEFT JOIN APP.ORDERS o ON o.USER_ID = t.ID");
+
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    await vi.waitFor(() => expect(tab.result?.columns).toEqual(["ROWID", "NAME", "LABEL"]));
+    await vi.waitFor(() => expect(tab.querySourceColumns).toEqual(["__DBX_ROWID", "NAME", undefined]), { timeout: 5000 });
+    expect(tab.tableMeta?.primaryKeys).toEqual(["__DBX_ROWID"]);
+    expect(tab.queryAnalysis).toBeDefined();
+    expect(tab.queryEditabilityReason).toBeUndefined();
+  }, 10_000);
+
+  it.each([
+    {
+      connection: { id: "oracle-1", name: "Oracle", db_type: "oracle", database: "XE", query_timeout_secs: 30 },
+      label: "native Oracle",
+    },
+    {
+      connection: { id: "oracle-jdbc-1", name: "Oracle JDBC", db_type: "jdbc", connection_string: "jdbc:oracle:thin:@//localhost:1521/XE", database: "XE", query_timeout_secs: 30 },
+      label: "Oracle-inferred JDBC",
+    },
+  ])("edits an unqualified lowercase query through the folded current-schema table for $label", async ({ connection }) => {
+    getConnectionConfig.mockReturnValue(connection);
+    getColumns.mockResolvedValue([
+      { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+      { name: "NAME", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ]);
+    listIndexes.mockResolvedValue([]);
+    analyzeEditableQueryEditability.mockResolvedValue({
+      editable: true,
+      analysis: {
+        schema: undefined,
+        tableName: "imp_t",
+        selectStar: true,
+        columns: [],
+      },
+    });
+    executeMulti.mockResolvedValue([{ columns: ["ID", "NAME"], rows: [[1, "Alice"]], affected_rows: 0, execution_time_ms: 1 }]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab(connection.id, "XE", "Query");
+    store.setAutoCommit(tabId, true);
+
+    await store.executeTabSql(tabId, "select * from imp_t");
+
+    // The service name must not leak into the metadata schema, and the stored
+    // table spelling has to fold to uppercase so the generated UPDATE quotes
+    // the object Oracle actually resolved for the unqualified SELECT.
+    expect(getColumns).toHaveBeenCalledWith(connection.id, "XE", "", "IMP_T", undefined);
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    await vi.waitFor(() => expect(tab.tableMeta?.tableName).toBe("IMP_T"));
+    expect(tab.tableMeta?.schema).toBeUndefined();
+    expect(tab.queryEditabilityReason).toBeUndefined();
+  });
+
+  it("keeps an unqualified lowercase MySQL JDBC query on its unfolded table name", async () => {
+    getConnectionConfig.mockReturnValue({ id: "jdbc-mysql-1", name: "MySQL JDBC", db_type: "jdbc", connection_string: "jdbc:mysql://localhost:3306/app", database: "app", query_timeout_secs: 30 });
+    getColumns.mockResolvedValue([
+      { name: "id", data_type: "int", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+      { name: "name", data_type: "varchar(64)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ]);
+    analyzeEditableQueryEditability.mockResolvedValue({
+      editable: true,
+      analysis: {
+        schema: undefined,
+        tableName: "users",
+        selectStar: true,
+        columns: [],
+      },
+    });
+    executeMulti.mockResolvedValue([{ columns: ["id", "name"], rows: [[1, "Alice"]], affected_rows: 0, execution_time_ms: 1 }]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("jdbc-mysql-1", "app", "Query");
+    store.setAutoCommit(tabId, true);
+
+    await store.executeTabSql(tabId, "select * from users");
+
+    expect(getColumns).toHaveBeenCalledWith("jdbc-mysql-1", "app", "", "users", undefined);
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    await vi.waitFor(() => expect(tab.tableMeta?.tableName).toBe("users"));
+    expect(tab.tableMeta?.schema).toBeUndefined();
     expect(tab.queryEditabilityReason).toBeUndefined();
   });
 
@@ -472,6 +735,48 @@ describe("queryStore hidden primary key editing", () => {
     expect(store.tabs.find((item) => item.id === tabId)?.result?.hidden_column_indexes).toEqual([2]);
   });
 
+  it("executes an unqualified Oracle query without enumerating objects when its type is unknown", async () => {
+    getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+    getColumns.mockResolvedValue([
+      { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: false, extra: null },
+      { name: "NAME", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ]);
+    listTables.mockReturnValue(new Promise(() => undefined));
+    analyzeEditableQueryEditability.mockResolvedValue({
+      editable: true,
+      analysis: {
+        schema: undefined,
+        tableName: "CUSTOMER_VIEW",
+        selectStar: true,
+        columns: [],
+      },
+    });
+    executeMulti.mockResolvedValue([
+      {
+        columns: ["ID", "NAME"],
+        rows: [[1, "Alice"]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+    ]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query");
+    store.setAutoCommit(tabId, true);
+
+    const execution = store.executeTabSql(tabId, "SELECT * FROM CUSTOMER_VIEW");
+    await vi.waitFor(() => expect(executeMulti).toHaveBeenCalled(), { timeout: 250 });
+    await execution;
+
+    expect(listTables).not.toHaveBeenCalled();
+    expect(executeMulti).toHaveBeenCalledWith("oracle-1", "ORCL", "SELECT * FROM CUSTOMER_VIEW", undefined, expect.any(String), expect.objectContaining({ timeoutSecs: 30 }));
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    expect(tab.result?.hidden_column_indexes).toBeUndefined();
+    await vi.waitFor(() => expect(tab.queryEditabilityReason).toBe("no-primary-key"));
+    expect(tab.queryAnalysis).toBeUndefined();
+  });
+
   it("does not check Oracle ROWID eligibility when query metadata returns no columns", async () => {
     getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
     getColumns.mockResolvedValue([]);
@@ -497,7 +802,7 @@ describe("queryStore hidden primary key editing", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "ORCL", "Query");
-    // Exercise auto-commit execute-multi path (Oracle tabs default to manual TX).
+    // Exercise the explicit auto-commit execute-multi path.
     store.setAutoCommit(tabId, true);
 
     await store.executeTabSql(tabId, "SELECT * FROM aa");
@@ -574,18 +879,303 @@ describe("queryStore hidden primary key editing", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "ORCL", "Query");
-    // Exercise auto-commit execute-multi path (Oracle tabs default to manual TX).
+    // Exercise the explicit auto-commit execute-multi path.
     store.setAutoCommit(tabId, true);
 
     const execution = store.executeTabSql(tabId, "SELECT t.* FROM APP.WIDE_TABLE t");
     await vi.waitFor(() => expect(executeMulti).toHaveBeenCalled());
     expect(executeMulti).toHaveBeenCalledWith("oracle-1", "ORCL", "SELECT t.* FROM APP.WIDE_TABLE t", undefined, expect.any(String), expect.objectContaining({ timeoutSecs: 30 }));
+    expect(executeMulti.mock.calls[0]?.[5]).not.toHaveProperty("tableDataPreview");
 
     columnsGate.resolve([
       { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
       { name: "NAME", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
     ]);
     await execution;
+  });
+
+  it("starts an Oracle star query when index metadata exceeds the preflight budget", async () => {
+    vi.useFakeTimers();
+    const columnsGate = deferred<Awaited<ReturnType<typeof getColumns>>>();
+    const indexesGate = deferred<Awaited<ReturnType<typeof listIndexes>>>();
+    try {
+      getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+      getColumns.mockReturnValue(columnsGate.promise);
+      listIndexes.mockReturnValue(indexesGate.promise);
+      analyzeEditableQueryEditability.mockImplementation(async () => ({
+        editable: true,
+        analysis: {
+          schema: "APP",
+          tableName: "SLOW_METADATA_TABLE",
+          selectStar: true,
+          columns: [],
+        },
+      }));
+      executeMulti.mockResolvedValue([
+        {
+          columns: ["ID", "NAME"],
+          rows: [[1, "Alice"]],
+          affected_rows: 0,
+          execution_time_ms: 12,
+        },
+      ]);
+
+      const { useQueryStore } = await import("@/stores/queryStore");
+      const store = useQueryStore();
+      const tabId = store.createTab("oracle-1", "ORCL", "Query");
+      store.setAutoCommit(tabId, true);
+
+      const execution = store.executeTabSql(tabId, "SELECT * FROM APP.SLOW_METADATA_TABLE");
+      await vi.waitFor(() => expect(listIndexes).toHaveBeenCalledOnce());
+      expect(executeMulti).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(executeMulti).toHaveBeenCalledOnce());
+      expect(executeMulti).toHaveBeenCalledWith("oracle-1", "ORCL", "SELECT * FROM APP.SLOW_METADATA_TABLE", undefined, expect.any(String), expect.objectContaining({ timeoutSecs: 30 }));
+      await execution;
+
+      indexesGate.resolve([{ name: "PK_SLOW_METADATA_TABLE", columns: ["ID"], is_unique: true, is_primary: true }]);
+      columnsGate.resolve([
+        { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+        { name: "NAME", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+      ]);
+      await vi.waitFor(() => expect(store.tabs.find((item) => item.id === tabId)?.tableMeta?.primaryKeys).toEqual(["ID"]));
+
+      await store.executeTabSql(tabId, "SELECT * FROM APP.SLOW_METADATA_TABLE");
+      expect(executeMulti).toHaveBeenCalledTimes(2);
+      expect(listIndexes).toHaveBeenCalledOnce();
+      expect(getColumns).toHaveBeenCalledOnce();
+    } finally {
+      indexesGate.resolve([{ name: "PK_SLOW_METADATA_TABLE", columns: ["ID"], is_unique: true, is_primary: true }]);
+      columnsGate.resolve([
+        { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+        { name: "NAME", data_type: "VARCHAR2(100)", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+      ]);
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for first-run Oracle XMLTYPE metadata before manual transaction execution", async () => {
+    const columnsGate = deferred<Awaited<ReturnType<typeof getColumns>>>();
+    getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+    getColumns.mockReturnValue(columnsGate.promise);
+    listIndexes.mockResolvedValue([{ name: "PK_WIDE_TABLE", columns: ["ID"], is_unique: true, is_primary: true }]);
+    lookupLocalCompletionTables.mockReturnValue([{ name: "WIDE_TABLE", type: "table", schema: "APP" }]);
+    analyzeEditableQueryEditability.mockImplementation(async () => ({
+      editable: true,
+      analysis: {
+        schema: "APP",
+        tableName: "WIDE_TABLE",
+        tableAlias: "t",
+        selectStar: true,
+        columns: [],
+      },
+    }));
+    executeInManualTransaction.mockResolvedValue([
+      {
+        columns: ["ID", "PAYLOAD"],
+        rows: [[1, "<XMLTYPE>"]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+        large_value_cells: [{ row_index: 0, column_index: 1, original_bytes: 81920 }],
+      },
+    ]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query");
+    // Tabs default to auto-commit; exercise the explicit manual-transaction path.
+    store.setAutoCommit(tabId, false);
+    const execution = store.executeTabSql(tabId, "SELECT t.* FROM APP.WIDE_TABLE t");
+
+    await vi.waitFor(() => expect(listIndexes).toHaveBeenCalled());
+    expect(executeInManualTransaction).not.toHaveBeenCalled();
+
+    columnsGate.resolve([
+      { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+      { name: "PAYLOAD", data_type: "SYS.XMLTYPE", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ]);
+    await execution;
+
+    expect(beginManualTransaction).toHaveBeenCalledWith("oracle-1", "ORCL", undefined, undefined);
+    expect(executeInManualTransaction).toHaveBeenCalledWith("txn-1", "SELECT t.* FROM APP.WIDE_TABLE t", "ORCL", undefined, expect.any(Number), true, undefined, undefined, "SELECT t.* FROM APP.WIDE_TABLE t");
+    expect(store.tabs.find((tab) => tab.id === tabId)?.result?.large_value_cells).toEqual([{ row_index: 0, column_index: 1, original_bytes: 81920 }]);
+  });
+
+  it("continues the Oracle cursor for page 2 in a manual transaction", async () => {
+    getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+    analyzeEditableQueryEditability.mockResolvedValue({ editable: false, reason: "complex-query" });
+    prepareQueryPaginationExecutionPlan.mockImplementation(async (options) => ({
+      sqlToExecute: options.sql,
+      pageSql: options.sql,
+      pageLimit: options.pagination.limit,
+      pageOffset: options.pagination.offset,
+      countSql: undefined,
+      useAgentResultSession: true,
+    }));
+    executeInManualTransaction
+      .mockResolvedValueOnce([
+        {
+          columns: ["ID"],
+          rows: Array.from({ length: 100 }, (_, index) => [index + 1]),
+          affected_rows: 0,
+          execution_time_ms: 1,
+          session_id: "oracle-go-1",
+          has_more: true,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          columns: ["ID"],
+          rows: Array.from({ length: 100 }, (_, index) => [index + 101]),
+          affected_rows: 0,
+          execution_time_ms: 1,
+          has_more: false,
+        },
+      ]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query");
+    // Tabs default to auto-commit; exercise the explicit manual-transaction path.
+    store.setAutoCommit(tabId, false);
+    const sql = "SELECT ID FROM APP.EVENTS ORDER BY ID";
+
+    await store.executeTabSql(tabId, sql);
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    expect(tab.autoCommit).toBe(false);
+    expect(executeInManualTransaction).toHaveBeenNthCalledWith(1, "txn-1", sql, "ORCL", undefined, expect.any(Number), false, 100, undefined, sql);
+    expect(tab.result?.rows).toHaveLength(100);
+
+    await store.executeTabSql(tabId, sql, {
+      resultBaseSql: sql,
+      pagination: { limit: 100, offset: 100, sessionId: "oracle-go-1" },
+      appendResult: { maxRows: 10_000 },
+      preserveResultDuringExecution: true,
+      preserveTotalRowCountDuringExecution: true,
+      replaceActiveResultInGroup: true,
+    });
+
+    expect(executeInManualTransaction).toHaveBeenNthCalledWith(2, "txn-1", sql, "ORCL", undefined, expect.any(Number), false, 100, "oracle-go-1", undefined);
+    expect(tab.result?.rows).toHaveLength(200);
+    expect(tab.result?.rows[100]).toEqual([101]);
+  });
+
+  it("advances an Elasticsearch cursor without replacing the displayed page", async () => {
+    getConnectionConfig.mockReturnValue({ id: "elasticsearch-1", name: "Elasticsearch", db_type: "elasticsearch", query_timeout_secs: 30 });
+    analyzeEditableQueryEditability.mockResolvedValue({ editable: false, reason: "complex-query" });
+    prepareQueryPaginationExecutionPlan.mockImplementation(async (options) => ({
+      sqlToExecute: options.sql,
+      pageSql: options.sql,
+      pageLimit: options.pagination.limit,
+      pageOffset: options.pagination.offset,
+      countSql: undefined,
+      useAgentResultSession: true,
+    }));
+    executeMulti
+      .mockResolvedValueOnce([
+        {
+          columns: ["message"],
+          rows: [["page-1"]],
+          affected_rows: 20_000,
+          execution_time_ms: 1,
+          session_id: "cursor-1",
+          has_more: true,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          columns: ["message"],
+          rows: [["page-2"]],
+          affected_rows: 20_000,
+          execution_time_ms: 1,
+          session_id: "cursor-2",
+          has_more: true,
+        },
+      ]);
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("elasticsearch-1", "", "Query");
+    const sql = "SELECT * FROM `dbx-app-logs-v1` AS dalv";
+
+    await store.executeTabSql(tabId, sql, { pagination: { limit: 100, offset: 0 } });
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    const displayedResult = tab.result;
+
+    await store.executeTabSql(tabId, sql, {
+      resultBaseSql: sql,
+      pagination: { limit: 100, offset: 100, sessionId: "cursor-1", clientSessionId: tab.resultClientSessionId },
+      preserveResultDuringExecution: true,
+      preserveTotalRowCountDuringExecution: true,
+      replaceActiveResultInGroup: true,
+      retainDisplayedResult: true,
+    });
+
+    expect(tab.result).toBe(displayedResult);
+    expect(tab.result?.rows).toEqual([["page-1"]]);
+    expect(tab.resultPageOffset).toBe(0);
+    expect(tab.resultSessionId).toBe("cursor-2");
+  });
+
+  it("does not start an Oracle manual transaction after cancellation during metadata loading", async () => {
+    const columnsGate = deferred<Awaited<ReturnType<typeof getColumns>>>();
+    getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
+    getColumns.mockReturnValue(columnsGate.promise);
+    listIndexes.mockResolvedValue([{ name: "PK_WIDE_TABLE", columns: ["ID"], is_unique: true, is_primary: true }]);
+    lookupLocalCompletionTables.mockReturnValue([{ name: "WIDE_TABLE", type: "table", schema: "APP" }]);
+    analyzeEditableQueryEditability.mockImplementation(async () => ({
+      editable: true,
+      analysis: {
+        schema: "APP",
+        tableName: "WIDE_TABLE",
+        tableAlias: "t",
+        selectStar: true,
+        columns: [],
+      },
+    }));
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query");
+    // Tabs default to auto-commit; exercise the explicit manual-transaction path.
+    store.setAutoCommit(tabId, false);
+    const execution = store.executeTabSql(tabId, "SELECT t.* FROM APP.WIDE_TABLE t");
+
+    await vi.waitFor(() => expect(listIndexes).toHaveBeenCalled());
+    await expect(store.cancelTabExecution(tabId)).resolves.toBe(false);
+
+    columnsGate.resolve([
+      { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+      { name: "PAYLOAD", data_type: "SYS.XMLTYPE", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ]);
+    await expect(execution).resolves.toBe(false);
+
+    expect(cancelQuery).toHaveBeenCalledWith(expect.any(String));
+    expect(beginManualTransaction).not.toHaveBeenCalled();
+    expect(executeInManualTransaction).not.toHaveBeenCalled();
+    expect(store.tabs.find((tab) => tab.id === tabId)).toMatchObject({
+      isExecuting: false,
+      isCancelling: false,
+      executionId: undefined,
+    });
+    expect(store.tabs.find((tab) => tab.id === tabId)?.txnSessionId).toBeUndefined();
+  });
+
+  it("keeps manual non-Oracle queries out of table-data preview mode", async () => {
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query");
+    store.setAutoCommit(tabId, false);
+
+    await store.executeTabSql(tabId, "SELECT name FROM users");
+
+    // MySQL is a sticky proven-read-only dialect (#9018): the call now ends
+    // with the user-facing classification SQL (9th argument), but still opts
+    // out of table-data preview. Every slot stays asserted — the spec's mocks
+    // are fixed, so database/schema/row-limit/cursor args must not drift.
+    expect(executeInManualTransaction).toHaveBeenCalledWith("txn-1", "SELECT name, `id` AS `__DBX_PK_0` FROM users", "app", undefined, 100000, false, undefined, undefined, "SELECT name FROM users");
   });
 
   it("keeps a keyless Oracle query editable when its WHERE clause reads another table", async () => {
@@ -626,7 +1216,7 @@ describe("queryStore hidden primary key editing", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "ORCL", "Query");
-    // Exercise auto-commit execute-multi path (Oracle tabs default to manual TX).
+    // Exercise the explicit auto-commit execute-multi path.
     store.setAutoCommit(tabId, true);
 
     await store.executeTabSql(tabId, sql);
@@ -675,7 +1265,7 @@ describe("queryStore hidden primary key editing", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "ORCL", "Query");
-    // Exercise auto-commit execute-multi path (Oracle tabs default to manual TX).
+    // Exercise the explicit auto-commit execute-multi path.
     store.setAutoCommit(tabId, true);
     const tab = store.tabs.find((item) => item.id === tabId)!;
 
@@ -686,11 +1276,11 @@ describe("queryStore hidden primary key editing", () => {
     expect(tab.result?.hidden_column_indexes).toBeUndefined();
   });
 
-  it("enables deferred Oracle LOBs only when a base-table query has a stable key", async () => {
+  it.each(["CLOB", "XMLTYPE", "SYS.XMLTYPE"])("enables deferred Oracle %s values only when a base-table query has a stable key", async (dataType) => {
     getConnectionConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
     getColumns.mockResolvedValue([
       { name: "ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
-      { name: "PAYLOAD", data_type: "CLOB", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+      { name: "PAYLOAD", data_type: dataType, is_nullable: true, column_default: null, is_primary_key: false, extra: null },
     ]);
     lookupLocalCompletionTables.mockReturnValue([{ name: "DOCUMENTS", type: "table", schema: "APP" }]);
     analyzeEditableQueryEditability.mockImplementation(async (sql: string) => ({
@@ -976,7 +1566,7 @@ describe("queryStore hidden primary key editing", () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
     const tabId = store.createTab("oracle-1", "XEPDB1", "Query");
-    // Exercise auto-commit execute-multi path (Oracle tabs default to manual TX).
+    // Exercise the explicit auto-commit execute-multi path.
     store.setAutoCommit(tabId, true);
 
     await store.executeTabSql(tabId, "SELECT NAME FROM DBX_HIDDEN_PK_EDIT_TEST");

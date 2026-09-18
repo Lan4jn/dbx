@@ -1,6 +1,40 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import { buildAllDatabaseExportPlan } from "../../apps/desktop/src/lib/export/databaseExport.ts";
+import { isDatabaseExportTableSelectionValid } from "../../apps/desktop/src/lib/export/databaseExportSelection.ts";
+
+test("database export allows object-only exports without selecting tables", () => {
+  assert.equal(
+    isDatabaseExportTableSelectionValid({
+      allTableCount: 982,
+      selectedTableCount: 0,
+      includeStructure: false,
+      includeData: false,
+    }),
+    true,
+  );
+});
+
+test("database export still requires a table when exporting structure or data", () => {
+  assert.equal(
+    isDatabaseExportTableSelectionValid({
+      allTableCount: 982,
+      selectedTableCount: 0,
+      includeStructure: true,
+      includeData: false,
+    }),
+    false,
+  );
+  assert.equal(
+    isDatabaseExportTableSelectionValid({
+      allTableCount: 982,
+      selectedTableCount: 1,
+      includeStructure: false,
+      includeData: true,
+    }),
+    true,
+  );
+});
 
 test("all-database export includes every schema for schema-aware databases", () => {
   const plan = buildAllDatabaseExportPlan({
@@ -16,6 +50,23 @@ test("all-database export includes every schema for schema-aware databases", () 
     { database: "app", schema: "public", fileStem: "app.public", displayName: "app.public" },
     { database: "app", schema: "private", fileStem: "app.private", displayName: "app.private" },
     { database: "analytics", schema: "reporting", fileStem: "analytics", displayName: "analytics" },
+  ]);
+});
+
+test("all-database PostgreSQL export keeps all schemas in one database file", () => {
+  const plan = buildAllDatabaseExportPlan({
+    databases: ["app", "analytics"],
+    schemaAware: true,
+    schemasByDatabase: {
+      app: ["public", "private"],
+      analytics: ["reporting"],
+    },
+    dbType: "postgres",
+  });
+
+  assert.deepEqual(plan, [
+    { database: "app", schema: "", fileStem: "app", displayName: "app" },
+    { database: "analytics", schema: "", fileStem: "analytics", displayName: "analytics" },
   ]);
 });
 

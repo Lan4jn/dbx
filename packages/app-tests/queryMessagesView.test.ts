@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "vitest";
 import { compileScript, compileTemplate, parse } from "vue/compiler-sfc";
+import az from "../../apps/desktop/src/i18n/locales/az.ts";
 import en from "../../apps/desktop/src/i18n/locales/en.ts";
 import es from "../../apps/desktop/src/i18n/locales/es.ts";
 import it from "../../apps/desktop/src/i18n/locales/it.ts";
 import ja from "../../apps/desktop/src/i18n/locales/ja.ts";
 import ko from "../../apps/desktop/src/i18n/locales/ko.ts";
+import tr from "../../apps/desktop/src/i18n/locales/tr.ts";
 import ptBR from "../../apps/desktop/src/i18n/locales/pt-BR.ts";
 import zhCN from "../../apps/desktop/src/i18n/locales/zh-CN.ts";
 import zhTW from "../../apps/desktop/src/i18n/locales/zh-TW.ts";
@@ -69,18 +71,24 @@ test("view switcher exposes a messages button with a count badge", () => {
 test("ContentArea wires server messages into the switcher and the messages view", () => {
   const contentArea = source(contentAreaPath);
 
-  assert.match(contentArea, /resultMessageCount = computed\(\(\) => props\.activeTab\.result\?\.messages\?\.length \?\? 0\)/);
+  // Messages are aggregated across every statement result of the run so a
+  // message-only statement (e.g. a PostgreSQL DO block) keeps its notices even
+  // when a later statement owns the active result.
+  assert.match(contentArea, /const resultMessages = computed<QueryMessage\[\]>\(\(\) => \{/);
+  assert.match(contentArea, /props\.activeTab\.results\?\.length \? props\.activeTab\.results : props\.activeTab\.result \? \[props\.activeTab\.result\] : \[\]/);
+  assert.match(contentArea, /results\.flatMap\(queryResultMessages\)/);
+  assert.match(contentArea, /resultMessageCount = computed\(\(\) => resultMessages\.value\.length\)/);
   assert.match(contentArea, /canShowMessagesOutput = computed\(\(\) => resultMessageCount\.value > 0\)/);
   assert.equal((contentArea.match(/:can-show-messages="canShowMessagesOutput"/g) ?? []).length, 2);
   assert.equal((contentArea.match(/:message-count="resultMessageCount"/g) ?? []).length, 2);
-  assert.match(contentArea, /<QueryMessagesView v-else-if="activeOutputView === 'messages'"[\s\S]*:messages="activeTab\.result\?\.messages \?\? \[\]"/);
+  assert.match(contentArea, /<QueryMessagesView v-else-if="activeOutputView === 'messages'"[\s\S]*:messages="resultMessages"/);
   // Results with no result set auto-switch via the shared default-view helper.
   assert.match(contentArea, /import \{ defaultViewForResult \} from "@\/lib\/query\/queryResultDefaultView"/);
-  assert.match(contentArea, /emit\("update:activeOutputView", result \? defaultViewForResult\(result\) : "summary"\)/);
+  assert.match(contentArea, /emit\("update:activeOutputView", props\.activeTab\.id, result \? defaultViewForResult\(result\) : "summary"\)/);
 });
 
 test("every locale defines the query message strings", () => {
-  const locales = { en, es, it, ja, ko, "pt-BR": ptBR, "zh-CN": zhCN, "zh-TW": zhTW };
+  const locales = { az, en, es, it, ja, ko, "pt-BR": ptBR, tr, "zh-CN": zhCN, "zh-TW": zhTW };
 
   for (const [name, locale] of Object.entries(locales)) {
     assert.ok(locale.queryMessages.empty.length > 0, `${name}: queryMessages.empty`);

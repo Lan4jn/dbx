@@ -180,6 +180,9 @@ pub async fn list_indexes(client: &RqliteClient, _schema: &str, table: &str) -> 
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         });
     }
 

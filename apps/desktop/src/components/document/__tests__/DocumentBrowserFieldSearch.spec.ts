@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createApp, nextTick, type App, type ComputedRef, type InjectionKey } from "vue";
+import { createApp, defineComponent, h, nextTick, type App, type ComputedRef, type InjectionKey } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const backend = vi.hoisted(() => ({
@@ -14,10 +14,15 @@ const backend = vi.hoisted(() => ({
   documentUpdateDocument: vi.fn(),
   documentDeleteDocument: vi.fn(),
   documentSaveMeilisearchBatch: vi.fn(),
+  closeQuerySession: vi.fn(),
 }));
 
 const documentJsonEditor = vi.hoisted(() => ({
   openSearch: vi.fn().mockReturnValue(true),
+}));
+
+const clipboard = vi.hoisted(() => ({
+  copyToClipboard: vi.fn(),
 }));
 
 const dataGrid = vi.hoisted(() => ({
@@ -79,6 +84,7 @@ vi.mock("@/lib/backend/api", () => ({
   documentUpdateDocument: backend.documentUpdateDocument,
   documentDeleteDocument: backend.documentDeleteDocument,
   documentSaveMeilisearchBatch: backend.documentSaveMeilisearchBatch,
+  closeQuerySession: backend.closeQuerySession,
 }));
 
 vi.mock("@/stores/connectionStore", () => ({
@@ -93,8 +99,11 @@ vi.mock("@/stores/settingsStore", () => ({
   useSettingsStore: () => settings,
 }));
 
-vi.mock("@/components/grid/DataGrid.vue", async () => {
-  const { defineComponent, h } = await import("vue");
+vi.mock("@/lib/common/clipboard", () => ({
+  copyToClipboard: clipboard.copyToClipboard,
+}));
+
+vi.mock("@/components/grid/DataGrid.vue", () => {
   return {
     default: defineComponent({
       name: "DataGridStub",
@@ -274,6 +283,16 @@ async function flushUi() {
   }
 }
 
+// flushUi only drains microtasks; popovers that mount through a timer need
+// polling or the query below races the render and returns null under load.
+async function waitForElement<T extends Element>(selector: string): Promise<T> {
+  return vi.waitFor(() => {
+    const element = document.body.querySelector<T>(selector);
+    if (!element) throw new Error(`element not rendered yet: ${selector}`);
+    return element;
+  });
+}
+
 function buttonWithTitle(title: string): HTMLButtonElement {
   const button = document.body.querySelector<HTMLElement>(`[title="${title}"]`)?.closest<HTMLButtonElement>("button") ?? null;
   expect(button).not.toBeNull();
@@ -316,12 +335,15 @@ beforeEach(async () => {
   backend.documentUpdateDocument.mockReset();
   backend.documentDeleteDocument.mockReset();
   backend.documentSaveMeilisearchBatch.mockReset();
+  backend.closeQuerySession.mockReset();
   dataGrid.fullExportResult = undefined;
   dataGrid.customSaveHandler = undefined;
   dataGrid.countTotalRows = undefined;
   dataGrid.paginate = undefined;
   dataGrid.editable = true;
   documentJsonEditor.openSearch.mockClear();
+  clipboard.copyToClipboard.mockReset();
+  clipboard.copyToClipboard.mockResolvedValue(undefined);
   backend.documentDeleteDocument.mockResolvedValue(undefined);
   backend.documentInsertDocument.mockResolvedValue("created");
   backend.documentUpdateDocument.mockResolvedValue(1);
@@ -386,6 +408,33 @@ afterEach(() => {
 });
 
 describe("DocumentBrowser Elasticsearch field search", () => {
+  it("passes Elasticsearch mapping types through to the table grid", async () => {
+    app?.unmount();
+    backend.getColumns.mockResolvedValue([
+      { name: "profile", data_type: "object" },
+      { name: "profile.name", data_type: "keyword" },
+      { name: "title", data_type: "text" },
+    ]);
+    backend.documentFindDocuments.mockResolvedValue({
+      documents: [{ _id: "document-1", title: "Example", profile: { name: "Ada" } }],
+      raw_documents: [],
+      total: 1,
+      total_is_exact: true,
+    });
+    app = createApp(DocumentBrowser, {
+      connectionId: "connection-1",
+      database: "",
+      collection: "orders",
+      databaseType: "elasticsearch",
+    });
+    app.mount(root!);
+    await flushUi();
+
+    const types = JSON.parse(root!.querySelector<HTMLElement>("[data-testid='data-grid']")!.dataset.resultColumnTypes ?? "[]");
+
+    expect(types).toEqual(["keyword", "text", "object"]);
+  });
+
   it("migrates hidden columns and passes a stable index layout scope without changing the query result", async () => {
     app?.unmount();
     const legacyScopeKey = documentGridColumnVisibilityScopeKey({
@@ -890,8 +939,39 @@ describe("DocumentBrowser MongoDB filter value types", () => {
     expect(progress).toHaveBeenLastCalledWith({ rowsExported: 1, totalRows: null });
   });
 
-  it("does not offer the MongoDB full export callback to Elasticsearch viewers", () => {
-    expect(dataGrid.fullExportResult).toBeUndefined();
+  it("exports Elasticsearch documents with cursor pagination", async () => {
+    settings.editorSettings.exportBatchSize = 2;
+    backend.documentFindDocuments.mockReset();
+    backend.documentFindDocuments
+      .mockResolvedValueOnce({
+        documents: [
+          { _id: "one", title: "First" },
+          { _id: "two", title: "Second" },
+        ],
+        total: 3,
+        total_is_exact: true,
+        next_cursor: "cursor-1",
+      })
+      .mockResolvedValueOnce({
+        documents: [{ _id: "three", title: "Third" }],
+        total: 3,
+        total_is_exact: true,
+      });
+
+    expect(dataGrid.fullExportResult).toBeTypeOf("function");
+    const result = await dataGrid.fullExportResult!();
+    await flushUi();
+
+    expect(backend.documentFindDocuments.mock.calls.map((call) => [call[3], call[4], call[10], call[11]])).toEqual([
+      [0, 2, undefined, true],
+      [0, 2, "cursor-1", true],
+    ]);
+    expect(result?.rows).toEqual([
+      ["one", "First"],
+      ["two", "Second"],
+      ["three", "Third"],
+    ]);
+    expect(backend.closeQuerySession).toHaveBeenCalledWith("connection-1", "", "cursor-1");
   });
 
   it("identifies consistently numeric MongoDB columns for shared grid alignment", async () => {
@@ -1012,7 +1092,7 @@ describe("DocumentBrowser MongoDB filter value types", () => {
 
     root!.querySelector<HTMLButtonElement>('[data-testid="data-grid"] button')!.click();
     await flushUi();
-    const valueInput = document.body.querySelector<HTMLInputElement>('input[placeholder="grid.filterBuilderValue"]')!;
+    const valueInput = await waitForElement<HTMLInputElement>('input[placeholder="grid.filterBuilderValue"]');
     const callsBeforeEnter = backend.documentFindDocuments.mock.calls.length;
     valueInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
     await flushUi();
@@ -1020,7 +1100,7 @@ describe("DocumentBrowser MongoDB filter value types", () => {
 
     root!.querySelector<HTMLButtonElement>('[data-testid="data-grid"] button')!.click();
     await flushUi();
-    const reopenedValueInput = document.body.querySelector<HTMLInputElement>('input[placeholder="grid.filterBuilderValue"]')!;
+    const reopenedValueInput = await waitForElement<HTMLInputElement>('input[placeholder="grid.filterBuilderValue"]');
     reopenedValueInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", shiftKey: true, bubbles: true, cancelable: true }));
     await flushUi();
     expect(document.body.querySelectorAll('input[placeholder="grid.filterBuilderValue"]')).toHaveLength(2);
@@ -1053,6 +1133,7 @@ describe("DocumentBrowser MongoDB filter value types", () => {
     const jsonText = viewer.querySelector<HTMLElement>(".cm-line .json-string")!;
     const documentId = root!.querySelector<HTMLInputElement>('input[aria-label^="_id:"]')!;
     expect(root!.firstElementChild?.classList.contains("select-none")).toBe(true);
+    expect(viewer.classList.contains("select-text")).toBe(true);
     expect(documentId.readOnly).toBe(true);
     expect(documentId.value).toBe("document-1");
     expect(documentId.classList.contains("select-text")).toBe(true);
@@ -1063,6 +1144,10 @@ describe("DocumentBrowser MongoDB filter value types", () => {
     expect(viewer.querySelector<HTMLElement>("[data-redis-json-editor-stub]")?.dataset.readOnly).toBe("true");
     expect(viewer.querySelector<HTMLElement>("[data-redis-json-editor-stub]")?.dataset.lineNumbers).toBe("false");
     expect(viewer.querySelector<HTMLElement>("[data-redis-json-editor-stub]")?.dataset.presentation).toBe("viewer");
+
+    buttonWithTitle("grid.copy").click();
+    await flushUi();
+    expect(clipboard.copyToClipboard).toHaveBeenCalledWith(expect.stringContaining('"_id": "document-1"'));
 
     documentId.setSelectionRange(0, documentId.value.length);
     expect(documentId.selectionStart).toBe(0);

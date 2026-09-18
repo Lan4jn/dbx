@@ -55,6 +55,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Hive
             | DatabaseType::Kyuubi
             | DatabaseType::Impala
+            | DatabaseType::Argo
             | DatabaseType::Spark
             | DatabaseType::Db2
             | DatabaseType::Informix
@@ -79,6 +80,18 @@ pub fn uses_oracle_row_id(database_type: Option<DatabaseType>) -> bool {
     matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
 }
 
+/// Xugu exposes an unqualified ROWID pseudo-column for base, partitioned and
+/// temporary tables. It is intentionally separate from Oracle's ROWIDTOCHAR
+/// representation because qualified ROWID and ROWIDTOCHAR are not supported
+/// by Xugu.
+pub fn uses_xugu_row_id(database_type: Option<DatabaseType>) -> bool {
+    database_type == Some(DatabaseType::Xugu)
+}
+
+pub fn uses_synthetic_row_id(database_type: Option<DatabaseType>) -> bool {
+    uses_oracle_row_id(database_type) || uses_xugu_row_id(database_type)
+}
+
 /// Oracle 系方言不支持 `INSERT ... VALUES (...), (...)` 多行语法，
 /// 复制为 INSERT 与导出 INSERT 都需按行生成单条语句。
 pub fn uses_single_row_insert_statements(database_type: DatabaseType) -> bool {
@@ -91,8 +104,11 @@ pub fn pagination_strategy(database_type: Option<DatabaseType>, context: Paginat
         Some(DatabaseType::Oracle) if matches!(context, PaginationContext::TablePreview) => {
             TablePaginationStrategy::Rownum
         }
+        // Oracle's row-limiting clause (`FETCH FIRST`/`OFFSET ... FETCH`) was
+        // introduced in 12c. ROWNUM remains compatible with the supported 11g
+        // baseline while still providing a bounded read for newer servers.
         Some(DatabaseType::Oracle) if matches!(context, PaginationContext::BoundedRead) => {
-            TablePaginationStrategy::FetchFirst
+            TablePaginationStrategy::Rownum
         }
         Some(DatabaseType::Oracle) => TablePaginationStrategy::Unbounded,
         Some(DatabaseType::Oscar)
@@ -101,7 +117,7 @@ pub fn pagination_strategy(database_type: Option<DatabaseType>, context: Paginat
             TablePaginationStrategy::Rownum
         }
         Some(DatabaseType::Oscar) => TablePaginationStrategy::Unbounded,
-        Some(DatabaseType::Dameng) => TablePaginationStrategy::FetchFirst,
+        Some(DatabaseType::Dameng) => TablePaginationStrategy::Rownum,
         Some(DatabaseType::Db2) => TablePaginationStrategy::Db2FetchFirst,
         Some(DatabaseType::SqlServer) => TablePaginationStrategy::SqlServerTop,
         Some(DatabaseType::Iris) => TablePaginationStrategy::IrisTop,

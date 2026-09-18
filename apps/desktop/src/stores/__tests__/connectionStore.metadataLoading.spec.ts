@@ -175,7 +175,14 @@ describe("connectionStore metadata loading", () => {
       fallback_used: false,
     });
     vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/backend/api", () => ({ checkConnectionHealth: vi.fn().mockResolvedValue(undefined), completionAssistantSearch, deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined), listInstalledAgents: vi.fn().mockResolvedValue([]) }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+    }));
 
     const { useConnectionStore } = await import("@/stores/connectionStore");
     const store = useConnectionStore();
@@ -314,6 +321,8 @@ describe("connectionStore metadata loading", () => {
       completionAssistantSearch,
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
       getCustomTypeDetails,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
     }));
 
     const { useConnectionStore } = await import("@/stores/connectionStore");
@@ -638,7 +647,15 @@ describe("connectionStore metadata loading", () => {
     const listTables = vi.fn().mockResolvedValue([{ name: "sheet", table_type: "TABLE", comment: null }]);
 
     vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    const executeQuery = vi.fn().mockResolvedValue({
+      columns: ["OWNER", "DB_LINK", "USERNAME", "HOST", "CREATED"],
+      rows: [
+        ["DBX_TEST", "PRIVATE.EXAMPLE", "REMOTE", "service", ""],
+        ["PUBLIC", "PUBLIC.EXAMPLE", "REMOTE", "service", ""],
+      ],
+    });
     vi.doMock("@/lib/backend/api", () => ({
+      executeQuery,
       checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
       listDatabases,
@@ -665,7 +682,23 @@ describe("connectionStore metadata loading", () => {
 
     expect(listDatabases).not.toHaveBeenCalled();
     expect(listSchemas).toHaveBeenCalledWith(connection.id, "");
-    expect(connectionNode.children?.map((node) => [node.type, node.label, node.database, node.schema])).toEqual([["schema", "DBX_TEST", "DBX_TEST", "DBX_TEST"]]);
+    expect(connectionNode.children?.map((node) => [node.type, node.label, node.database, node.schema])).toEqual([
+      ["schema", "DBX_TEST", "DBX_TEST", "DBX_TEST"],
+      ["oracle-db-links", "tree.databaseLinks", "", undefined],
+    ]);
+
+    const linkRoot = connectionNode.children!.find((node) => node.type === "oracle-db-links")!;
+    await store.loadTreeNodeChildren(linkRoot, { force: true });
+    expect(executeQuery).toHaveBeenCalledWith(connection.id, "", expect.stringContaining("SESSION_USER"), undefined, undefined, { maxRows: 10000, timeoutSecs: 15 });
+    expect(linkRoot.children?.map((node) => [node.type, node.label, node.schema])).toEqual([
+      ["oracle-db-link", "PRIVATE.EXAMPLE", "DBX_TEST"],
+      ["oracle-db-link", "PUBLIC.EXAMPLE", "PUBLIC"],
+    ]);
+    expect(linkRoot.objectCount).toBe(2);
+    executeQuery.mockResolvedValue({ columns: ["OWNER", "DB_LINK"], rows: [] });
+    await store.refreshOracleDatabaseLinks(connection.id);
+    expect(linkRoot.children).toEqual([]);
+    expect(linkRoot.objectCount).toBe(0);
 
     const schemaNode = connectionNode.children?.[0];
     expect(schemaNode).toBeDefined();
@@ -3233,6 +3266,158 @@ describe("connectionStore metadata loading", () => {
 
     await store.loadAllObjectGroupChildren(tablesGroup);
     expect(listTables).toHaveBeenCalledTimes(5);
+  });
+
+  it("pages table-scoped search results instead of truncating at the search budget", async () => {
+    const tables = Array.from({ length: 5 }, (_, index) => ({
+      name: `t_${String(index + 1).padStart(4, "0")}`,
+      table_type: "TABLE" as const,
+      comment: null,
+    }));
+    const listTables = vi.fn((_connectionId: string, _database: string, _schema: string, searchFilter?: string, limit?: number, offset?: number) => {
+      const matches = searchFilter ? tables.filter((table) => table.name.includes(searchFilter)) : tables;
+      const start = offset ?? 0;
+      return Promise.resolve(matches.slice(start, start + (limit ?? matches.length)));
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    const settingsStore = useSettingsStore();
+    settingsStore.editorSettings.sidebarObjectDisplay = "grouped";
+    settingsStore.desktopSettings.sidebar_table_page_size = 2;
+
+    const connection = mysqlConnection();
+    const tablesGroup: TreeNode = {
+      id: "mysql-1:app:__tables",
+      label: "tree.tables",
+      type: "group-tables",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: true,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [
+          {
+            id: "mysql-1:app",
+            label: "app",
+            type: "database",
+            connectionId: connection.id,
+            database: "app",
+            isExpanded: true,
+            children: [tablesGroup],
+          },
+        ],
+      },
+    ];
+
+    store.sidebarTableSearchQueries[tablesGroup.id] = "t";
+    await store.loadObjectGroupChildren(tablesGroup, {
+      force: true,
+      searchFilter: "t",
+      sidebarTableSearchParentId: tablesGroup.id,
+      expectedSidebarTableSearchQuery: "t",
+    });
+
+    expect(tablesGroup.children?.map((child) => child.label)).toEqual(["t_0001", "t_0002", "tree.loadMore"]);
+    expect(tablesGroup.children?.at(-1)?.type).toBe("load-more");
+    expect(listTables.mock.calls[0].slice(3, 6)).toEqual(["t", 3, 0]);
+
+    await store.loadMoreObjectGroupChildren(tablesGroup.children!.at(-1)!, { searchFilter: "t" });
+
+    expect(tablesGroup.children?.map((child) => child.label)).toEqual(["t_0001", "t_0002", "t_0003", "t_0004", "tree.loadMore"]);
+    expect(tablesGroup.children?.at(-1)?.type).toBe("load-more");
+    expect(listTables.mock.calls[1].slice(3, 6)).toEqual(["t", 3, 2]);
+  });
+
+  it("discards a collapsed remote-search projection so the next expansion reloads the ordinary page", async () => {
+    const listTables = vi.fn((_connectionId: string, _database: string, _schema: string, searchFilter?: string, limit?: number) => {
+      if (searchFilter) {
+        return Promise.resolve([{ name: "zz_late_probe", table_type: "TABLE" as const, comment: null }]);
+      }
+      return Promise.resolve(
+        Array.from({ length: Math.min(limit ?? 1001, 1001) }, (_, index) => ({
+          name: `t_${String(index + 1).padStart(4, "0")}`,
+          table_type: "TABLE" as const,
+          comment: null,
+        })),
+      );
+    });
+    const deleteSchemaCachePrefix = vi.fn().mockResolvedValue(undefined);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix,
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    const settingsStore = useSettingsStore();
+    settingsStore.editorSettings.sidebarObjectDisplay = "grouped";
+    settingsStore.desktopSettings.sidebar_table_page_size = 1000;
+
+    const connection = mysqlConnection();
+    const tablesGroup: TreeNode = {
+      id: "mysql-1:app:__tables",
+      label: "tree.tables",
+      type: "group-tables",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: false,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [{ id: connection.id, label: connection.name, type: "connection", connectionId: connection.id, children: [tablesGroup] }];
+
+    store.sidebarSearchQuery = "zz_late_probe";
+    await store.loadObjectGroupChildren(tablesGroup, { force: true });
+
+    expect(listTables).toHaveBeenLastCalledWith(connection.id, "app", "app", "zz_late_probe", SIDEBAR_SEARCH_RESULT_BUDGET, undefined, ["TABLE"]);
+    expect(tablesGroup.children?.map((node) => node.label)).toEqual(["zz_late_probe"]);
+    expect(tablesGroup.objectCount).toBe(1);
+    expect(store.canUseLoadedTreeNodeToggle(tablesGroup)).toBe(true);
+
+    tablesGroup.isExpanded = false;
+    expect(store.discardFilteredTreeNodeChildren(tablesGroup.id)).toBe(true);
+    expect(tablesGroup.children).toEqual([]);
+    expect(tablesGroup.objectCount).toBeUndefined();
+    expect(store.canUseLoadedTreeNodeToggle(tablesGroup)).toBe(false);
+    expect(deleteSchemaCachePrefix).not.toHaveBeenCalled();
+
+    store.sidebarSearchQuery = "";
+    await store.loadObjectGroupChildren(tablesGroup);
+
+    expect(listTables).toHaveBeenLastCalledWith(connection.id, "app", "app", undefined, 1001, 0, ["TABLE"]);
+    expect(tablesGroup.children).toHaveLength(1001);
+    expect(tablesGroup.children?.at(-1)?.type).toBe("load-more");
   });
 
   it("keeps connection-name matches out of object metadata filters", async () => {

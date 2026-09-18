@@ -37,6 +37,17 @@ function spansVisualRows(start: PositionRect, end: PositionRect): boolean {
 }
 
 /**
+ * Statements spanning more logical lines than this render no frame. The
+ * horizontal-bounds loop below does a constant number of geometry probes
+ * per logical line, so its cost is O(logical lines) — fine for ordinary
+ * statements, but a multi-thousand-line PL/SQL package body (Oracle, and
+ * other dialects with BEGIN/END routine bodies) is parsed as a single
+ * statement spanning the whole file, turning routine scrolling into
+ * thousands of `coordsAtPos` calls per frame. See dbx#7226.
+ */
+export const MAX_FRAME_STATEMENT_LINES = 500;
+
+/**
  * Measure the pixel rectangle of one statement rendered in `view`.
  *
  * The frame is a single continuous rectangle: it starts at the first
@@ -62,6 +73,7 @@ export function currentStatementFrameRect(view: Viewish, from: number, to: numbe
 
   const startLine = doc.lineAt(from);
   const endLine = doc.lineAt(to);
+  if (endLine.number - startLine.number > MAX_FRAME_STATEMENT_LINES) return null;
   const base = view.scrollDOM.getBoundingClientRect();
 
   // Vertical bounds: convert screen coords to content-layer coords.
@@ -136,21 +148,45 @@ interface CurrentStatementFrameModule {
 /**
  * Draw one continuous green rectangle around the current executable
  * statement. `resolve` decides visibility and returns the statement range;
- * returning null hides the frame.
+ * returning null hides the frame. `options.shouldRefresh` forces a repaint on
+ * updates that change statement boundaries without touching the document
+ * (e.g. a debounced boundary rebuild landing after a typing pause).
  */
-export function currentStatementFrameLayer(viewModule: CurrentStatementFrameModule, resolve: StatementFrameResolver): Extension {
+export function currentStatementFrameLayer(viewModule: CurrentStatementFrameModule, resolve: StatementFrameResolver, options?: { shouldRefresh?: (update: ViewUpdate) => boolean }): Extension {
+  let lastRequest: StatementFrameRequest | null | undefined;
+
+  const sameRequest = (left: StatementFrameRequest | null | undefined, right: StatementFrameRequest | null): boolean => left === right || (!!left && !!right && left.from === right.from && left.to === right.to);
+
   return viewModule.layer({
-    above: false,
+    // Keep the outline above line decorations so opaque active-line colors
+    // from editor themes cannot cover the frame border.
+    above: true,
     class: "cm-db-currentStatementFrameLayer",
     markers(view) {
       const request = resolve(view);
+      lastRequest = request;
       if (!request || request.to < request.from) return [];
       const rect = currentStatementFrameRect(view, request.from, request.to);
       if (!rect) return [];
       return [new viewModule.RectangleMarker("cm-db-currentStatementFrame", rect.left, rect.top, rect.width, rect.height)];
     },
     update(update) {
-      return update.docChanged || update.selectionSet || update.viewportChanged || update.geometryChanged || update.transactions.some((transaction) => transaction.reconfigured);
+      if (update.docChanged || update.viewportChanged || update.geometryChanged || update.transactions.some((transaction) => transaction.reconfigured)) {
+        lastRequest = undefined;
+        return true;
+      }
+      if (options?.shouldRefresh?.(update)) {
+        lastRequest = undefined;
+        return true;
+      }
+      if (!update.selectionSet) return false;
+
+      // Moving inside one statement does not change its frame. Avoid repeating
+      // the per-line DOM geometry probes for every auto-repeated key event.
+      const request = resolve(update.view);
+      if (sameRequest(lastRequest, request)) return false;
+      lastRequest = undefined;
+      return true;
     },
   });
 }

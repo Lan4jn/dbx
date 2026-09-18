@@ -325,6 +325,9 @@ fn table_key_index(name: &str, line: &str, is_unique: bool, is_primary: bool, in
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        column_opclasses: vec![],
+        key_options: Vec::new(),
+        constraint_backed: false,
     })
 }
 
@@ -345,6 +348,9 @@ fn secondary_index(line: &str) -> Option<IndexInfo> {
         included_columns: None,
         comment: mysql_quoted_string_argument(after_name, "COMMENT"),
         key_is_expression: Vec::new(),
+        column_opclasses: vec![],
+        key_options: Vec::new(),
+        constraint_backed: false,
     })
 }
 

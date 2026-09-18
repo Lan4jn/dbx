@@ -1,6 +1,40 @@
 use super::dialect::{is_oracle_like, StructureDialect};
-use super::types::EditableStructureColumn;
+use super::types::{EditableStructureColumn, TableStructureSqlOptions};
 use super::util::{clean, format_default_for_sql, normalize_default, quote_ident, quote_string};
+
+/// Drops the `CHARACTER SET` / `COLLATE` inputs of MySQL columns that merely
+/// inherit the table's default collation, so the generated DDL does not spell
+/// out clauses the server would apply anyway.
+///
+/// MySQL reports the *effective* collation of every character column and never
+/// records whether it was written out explicitly, so "equals the table default"
+/// is the only signal available. Omitting the clauses is equivalent to keeping
+/// them: a column definition without `CHARACTER SET` takes the table default,
+/// which is exactly the value being dropped here. This runs on the DDL inputs
+/// only — introspection (`get_columns`) still reports the real values so the
+/// structure editor can show the column's current charset and collation.
+///
+/// The original snapshot is normalized alongside the draft so that an untouched
+/// column does not register as a charset change and trigger a needless `MODIFY`.
+pub(super) fn strip_inherited_mysql_column_charsets(options: &mut TableStructureSqlOptions) {
+    let Some(table_collation) = options.table_collation.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let inherits = |collation: &str| collation.trim().eq_ignore_ascii_case(table_collation);
+    for column in &mut options.columns {
+        if inherits(&column.collation) {
+            column.character_set = String::new();
+            column.collation = String::new();
+        }
+        if let Some(original) = column.original.as_mut() {
+            if original.collation.as_deref().is_some_and(inherits) {
+                original.character_set = None;
+                original.collation = None;
+            }
+        }
+    }
+}
 
 pub(super) fn column_definition(dialect: StructureDialect, column: &EditableStructureColumn) -> String {
     let data_type = column_data_type(dialect, column);
@@ -26,6 +60,12 @@ pub(super) fn column_definition(dialect: StructureDialect, column: &EditableStru
     }
     if !column.is_nullable && !is_oracle_like(dialect) && dialect != StructureDialect::ClickHouse {
         parts.push("NOT NULL".to_string());
+    } else if column.is_nullable
+        && dialect == StructureDialect::Mysql
+        && mysql_generated_clause.is_none()
+        && is_mysql_timestamp_type(&column.data_type)
+    {
+        parts.push("NULL".to_string());
     }
     if mysql_generated_clause.is_none() {
         if let Some(extra_clause) = column_extra_clause(dialect, column) {
@@ -39,7 +79,7 @@ pub(super) fn column_definition(dialect: StructureDialect, column: &EditableStru
     if mysql_generated_clause.is_none() {
         if let Some(on_update) = column.extra.as_ref().and_then(|e| e.on_update_current_timestamp).filter(|v| *v) {
             if on_update && dialect == StructureDialect::Mysql {
-                parts.push("ON UPDATE CURRENT_TIMESTAMP".to_string());
+                parts.push(mysql_on_update_current_timestamp_clause(&column.data_type));
             }
         }
     }
@@ -73,6 +113,13 @@ pub(super) fn original_is_mysql_generated_column(column: &EditableStructureColum
 pub(super) fn column_extra_clause(dialect: StructureDialect, column: &EditableStructureColumn) -> Option<String> {
     let extra = column.extra.as_ref()?;
     match dialect {
+        StructureDialect::Sqlite => {
+            if extra.auto_increment.unwrap_or(false) && column.is_primary_key {
+                Some("AUTOINCREMENT".to_string())
+            } else {
+                None
+            }
+        }
         StructureDialect::Mysql => {
             let mut clauses = Vec::new();
             if extra.auto_increment.unwrap_or(false) {
@@ -162,7 +209,15 @@ pub(super) fn column_data_type(dialect: StructureDialect, column: &EditableStruc
     if dialect == StructureDialect::Questdb {
         return questdb_column_type(column);
     }
-    normalize_column_data_type(dialect, &column.data_type)
+    let normalized = normalize_column_data_type(dialect, &column.data_type);
+    // Dameng only recognizes its built-in type keywords in the canonical
+    // upper-case form: a lower-case `varchar(50)` in DDL is stored as a
+    // USER-DEFINED type instead of VARCHAR (issue #7343). Uppercase after the
+    // dialect-specific normalization so its rewrites still apply.
+    if dialect == StructureDialect::Dameng {
+        return normalized.to_uppercase();
+    }
+    normalized
 }
 
 fn manticore_column_type(column: &EditableStructureColumn) -> String {
@@ -372,6 +427,39 @@ pub(super) fn is_valid_temporal_precision(params: &str, dialect: StructureDialec
     value <= max && params == value.to_string()
 }
 
+/// Fractional-seconds precision of a MySQL temporal column type, e.g. `3` for
+/// `datetime(3)`. MySQL requires every `CURRENT_TIMESTAMP` in a column
+/// definition to carry the same precision the column type declares: a
+/// `datetime(3) ... DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+/// definition is rejected with `ERROR 1067 (42000): Invalid default value`
+/// while the `(3)`-suffixed clauses succeed. The editor model keeps only an
+/// on-update flag, so the precision has to be recovered from the data type.
+/// Non-temporal types and invalid precisions fall back to `None` (no suffix).
+pub(super) fn mysql_temporal_precision(data_type: &str) -> Option<String> {
+    let trimmed = data_type.trim();
+    let open_index = trimmed.find('(')?;
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let base_type = trimmed[..open_index].trim();
+    let params = trimmed[open_index + 1..trimmed.len() - 1].trim();
+    if !is_temporal_precision_type(StructureDialect::Mysql, base_type)
+        || !is_valid_temporal_precision(params, StructureDialect::Mysql)
+    {
+        return None;
+    }
+    Some(params.to_string())
+}
+
+/// `ON UPDATE CURRENT_TIMESTAMP` clause for a MySQL column, carrying the
+/// column's temporal precision (if any) so the clause matches the type.
+pub(super) fn mysql_on_update_current_timestamp_clause(data_type: &str) -> String {
+    match mysql_temporal_precision(data_type) {
+        Some(fsp) => format!("ON UPDATE CURRENT_TIMESTAMP({fsp})"),
+        None => "ON UPDATE CURRENT_TIMESTAMP".to_string(),
+    }
+}
+
 pub(super) fn clickhouse_column_type(column: &EditableStructureColumn) -> String {
     let data_type = column.data_type.trim();
     if column.is_nullable {
@@ -429,4 +517,19 @@ pub(super) fn is_mysql_character_data_type(data_type: &str) -> bool {
     };
     let normalized = base_type.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
     matches!(normalized.as_str(), "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set")
+}
+
+/// MySQL silently rewrites a nullable `TIMESTAMP` column to `NOT NULL` when the
+/// generated DDL omits an explicit `NULL` keyword — regardless of whether a
+/// `DEFAULT` is present. With the (still common) `explicit_defaults_for_timestamp`
+/// server default of `OFF`, this can outright fail with `ERROR 1067 (42000):
+/// Invalid default value` for any non-first TIMESTAMP column. `DATETIME` is not
+/// affected and must not be touched.
+pub(super) fn is_mysql_timestamp_type(data_type: &str) -> bool {
+    let trimmed = data_type.trim();
+    let base_type = match trimmed.find('(') {
+        Some(open_index) => trimmed[..open_index].trim(),
+        None => trimmed,
+    };
+    base_type.eq_ignore_ascii_case("timestamp")
 }

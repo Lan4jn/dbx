@@ -38,8 +38,8 @@ pub async fn get_agent_explain_info_core(
     }
 
     let target = {
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or_else(|| "Connection not found".to_string())?;
+        let pool_handle = state.pool_handle(&pool_key).await;
+        let pool = pool_handle.as_ref().ok_or_else(|| "Connection not found".to_string())?;
         match pool {
             PoolKind::Agent(client) => ExplainTarget::Agent(client.clone()),
             PoolKind::ExternalDriver { config, session, .. } => {
@@ -190,13 +190,12 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
 
-        let plugin = InstalledPlugin {
-            manifest: PluginManifest {
+        let plugin = InstalledPlugin::new(
+            PluginManifest {
                 id: "jdbc".to_string(),
                 name: "JDBC".to_string(),
                 version: "test".to_string(),
                 protocol_version: 1,
-                description: String::new(),
                 executable: Some("plugin.sh".to_string()),
                 drivers: vec![PluginDriverManifest {
                     id: "jdbc".to_string(),
@@ -204,9 +203,11 @@ mod tests {
                     kind: "external".to_string(),
                     database_type: Some("jdbc".to_string()),
                 }],
+                ..PluginManifest::default()
             },
-            path: dir.clone(),
-        };
+            dir.clone(),
+            env!("CARGO_PKG_VERSION"),
+        );
         let session = Arc::new(
             PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default()).await.unwrap(),
         );
@@ -227,14 +228,18 @@ mod tests {
         let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         state.configs.write().await.insert(config.id.clone(), config.clone());
-        state.connections.write().await.insert(
-            "oracle-jdbc".to_string(),
-            PoolKind::ExternalDriver {
-                driver_id: "jdbc".to_string(),
-                config: Arc::new(config),
-                session: session.clone(),
-            },
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "oracle-jdbc".to_string(),
+                    PoolKind::ExternalDriver {
+                        driver_id: "jdbc".to_string(),
+                        config: Arc::new(config),
+                        session: session.clone(),
+                    },
+                );
+            })
+            .await;
 
         let plan = get_agent_explain_info_core(
             &state,

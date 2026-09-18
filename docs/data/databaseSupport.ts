@@ -58,6 +58,7 @@ export const databaseSupport: DatabaseSupportItem[] = [
   { id: "prestosql", name: "PrestoSQL", icon: "/icons/database/presto.svg", tone: "#5890ff" },
   { id: "hive", name: "Hive", icon: "/icons/database/hive.svg", tone: "#fdcb00" },
   { id: "kyuubi", name: "Kyuubi", icon: "/icons/database/kyuubi.svg", tone: "#f51b21" },
+  { id: "argo", name: "ArgoDB", icon: "/icons/database/hive.svg", tone: "#0055b8" },
   { id: "impala", name: "Impala", icon: "/icons/database/impala.svg", tone: "#2c6791" },
   { id: "hbase", name: "HBase", icon: "/icons/database/hbase.svg", tone: "#ba160c" },
   { id: "phoenix", name: "Phoenix", icon: "/icons/database/phoenix.svg", tone: "#f97316" },
@@ -77,6 +78,7 @@ export const databaseSupport: DatabaseSupportItem[] = [
   { id: "dremio", name: "Dremio", icon: "/icons/database/dremio.svg", tone: "#30bdbe" },
   { id: "oscar", name: "OSCAR", icon: "/icons/database/oscar.png", tone: "#1b8dff" },
   { id: "influxdb", name: "InfluxDB", icon: "/icons/database/influxdb.svg", tone: "#22adf6" },
+  { id: "influxdb3", name: "InfluxDB 3", icon: "/icons/database/influxdb.svg", tone: "#22adf6" },
   { id: "victoriametrics", name: "VictoriaMetrics", icon: "/icons/database/victoriametrics.png", tone: "#f97316" },
   { id: "questdb", name: "QuestDB", icon: "/icons/database/questdb.svg", tone: "#dc2626" },
   { id: "iotdb", name: "IoTDB", icon: "/icons/database/iotdb.svg", tone: "#3cb371" },
@@ -99,6 +101,7 @@ export const databaseSupport: DatabaseSupportItem[] = [
   { id: "nacos", name: "Nacos", icon: "/icons/database/nacos.png", tone: "#2f80ed" },
   { id: "consul", name: "Consul", icon: "/icons/database/consul.svg", tone: "#e03875" },
   { id: "iris", name: "IRIS", icon: "/icons/database/iris.svg", tone: "#0085ca" },
+  { id: "cache", name: "Caché", icon: "/icons/database/iris.svg", tone: "#358a4e" },
   { id: "jdbcx", name: "JDBC", icon: "/icons/database/jdbcx.svg", tone: "#6ea8ff" },
   { id: "request", name: "Your DB?", icon: "/icons/database/jdbcx.svg", tone: "#6ea8ff", href: "https://github.com/t8y2/dbx/discussions" },
 ];

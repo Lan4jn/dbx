@@ -15,7 +15,7 @@ vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
 
 vi.mock("@/components/ui/dialog", async () => {
-  const { defineComponent, h } = await import("vue");
+  const { defineComponent, h, Teleport } = await import("vue");
   const passthrough = defineComponent({
     setup(_props, { slots }) {
       return () => h("div", slots.default?.());
@@ -27,9 +27,20 @@ vi.mock("@/components/ui/dialog", async () => {
       return () => (props.open ? h("div", slots.default?.()) : null);
     },
   });
+  const dialogContent = defineComponent({
+    props: {
+      class: [String, Array, Object],
+      overlayClass: [String, Array, Object],
+      portalClass: [String, Array, Object],
+    },
+    inheritAttrs: false,
+    setup(props, { slots }) {
+      return () => h(Teleport, { to: "body" }, [h("div", { class: ["dialog-overlay", "z-50", props.overlayClass] }), h("div", { class: ["dialog-positioner", "z-50", props.portalClass] }, [h("div", { class: ["dialog-content", props.class] }, slots.default?.())])]);
+    },
+  });
   return {
     Dialog: dialog,
-    DialogContent: passthrough,
+    DialogContent: dialogContent,
     DialogDescription: passthrough,
     DialogFooter: passthrough,
     DialogHeader: passthrough,
@@ -133,6 +144,51 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     expect(dialogSource).toContain('portal-class="z-[200]"');
   });
 
+  it("keeps the prompt above a later body-mounted connection dialog and answerable", async () => {
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "prompt-layered",
+        kind: "HostKeyVerify",
+        host: "layered.example.test",
+        port: 22,
+        key_type: "ssh-ed25519",
+        fingerprint: "SHA256:layered",
+      },
+    });
+    await nextTick();
+
+    // Simulate ConnectionDialog opening after the global prompt: its portal is
+    // appended later and remains on the shared default z-50 layer.
+    const connectionPositioner = document.createElement("div");
+    connectionPositioner.className = "dialog-positioner z-50";
+    connectionPositioner.textContent = "New connection";
+    document.body.append(connectionPositioner);
+
+    const promptPositioner = document.body.querySelector<HTMLElement>(".dialog-positioner.z-\\[200\\]");
+    const promptOverlay = document.body.querySelector<HTMLElement>(".dialog-overlay.z-\\[200\\]");
+    expect(promptPositioner).not.toBeNull();
+    expect(promptOverlay).not.toBeNull();
+    expect(connectionPositioner.classList.contains("z-50")).toBe(true);
+    expect(promptPositioner?.classList.contains("z-[200]")).toBe(true);
+    expect(promptOverlay?.classList.contains("z-[200]")).toBe(true);
+    expect(document.body.textContent).toContain("layered.example.test:22");
+
+    const buttons = document.body.querySelectorAll<HTMLButtonElement>("button");
+    buttons.item(buttons.length - 1).click();
+    await vi.waitFor(() => {
+      expect(resolveSshPromptMock).toHaveBeenCalledWith({
+        id: "prompt-layered",
+        action: "accept",
+        remember: true,
+        secret: undefined,
+      });
+    });
+  });
+
   it("shows an SSE host-key prompt and posts the user's acceptance", async () => {
     await mountDialog();
 
@@ -163,6 +219,77 @@ describe("SshHostKeyPromptDialog web bridge", () => {
         id: "prompt-1",
         action: "accept",
         remember: true,
+        secret: undefined,
+      });
+    });
+  });
+
+  it("shows a changed host-key prompt and updates the saved fingerprint", async () => {
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "changed-1",
+        kind: "HostKeyChanged",
+        host: "192.168.1.111",
+        port: 22,
+        key_type: "ssh-ed25519",
+        fingerprint: "SHA256:new-fingerprint",
+        previous_fingerprint: "SHA256:old-fingerprint",
+      },
+    });
+    await nextTick();
+
+    expect(document.body.textContent).toContain("Host fingerprint has changed");
+    expect(document.body.textContent).toContain("new-fingerprint");
+    expect(document.body.textContent).toContain("old-fingerprint");
+    expect(document.body.textContent).toContain("Saved fingerprint");
+
+    const buttons = [...document.body.querySelectorAll("button")].map((button) => button.textContent?.trim());
+    expect(buttons).toContain("Close");
+    expect(buttons).toContain("Continue");
+    expect(buttons).toContain("Update and Continue");
+
+    const update = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "Update and Continue");
+    update?.click();
+
+    await vi.waitFor(() => {
+      expect(resolveSshPromptMock).toHaveBeenCalledWith({
+        id: "changed-1",
+        action: "accept",
+        remember: true,
+        secret: undefined,
+      });
+    });
+  });
+
+  it("continues a changed host key for this session only", async () => {
+    await mountDialog();
+
+    MockEventSource.instances[0]?.emit({
+      type: "prompt",
+      request: {
+        id: "changed-2",
+        kind: "HostKeyChanged",
+        host: "board.example.test",
+        port: 22,
+        key_type: "ssh-ed25519",
+        fingerprint: "SHA256:new",
+        previous_fingerprint: "SHA256:old",
+      },
+    });
+    await nextTick();
+
+    const cont = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "Continue");
+    cont?.click();
+
+    await vi.waitFor(() => {
+      expect(resolveSshPromptMock).toHaveBeenCalledWith({
+        id: "changed-2",
+        action: "accept",
+        remember: false,
         secret: undefined,
       });
     });
@@ -236,6 +363,34 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     // A disconnect re-arms polling so prompts are not lost during the outage.
     eventSource?.error();
     expect(setSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows worker-upload consent buttons and wraps the digest and path", async () => {
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "worker-1",
+        kind: "WorkerUploadConsent",
+        host: "203.0.113.10",
+        port: 22,
+        fingerprint: "08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709",
+        prompt: "/home/testuser/.cache/dbx/sqlite-worker/session-ebd207de-8f26cd6e-08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709",
+      },
+    });
+    await nextTick();
+
+    expect(document.body.textContent).toContain("203.0.113.10:22");
+    expect(document.body.textContent).toContain("08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709");
+    expect(document.body.textContent).toContain("/home/testuser/.cache/dbx/sqlite-worker/");
+    expect(dialogSource).toContain("break-all");
+    expect(dialogSource).toContain("shrink-0");
+
+    const buttons = [...document.body.querySelectorAll("button")].map((button) => button.textContent?.trim());
+    expect(buttons).toContain("Cancel");
+    expect(buttons).toContain("Upload");
   });
 
   it("submits a keyboard-interactive TOTP challenge as a secret response", async () => {

@@ -23,6 +23,13 @@ struct ExecuteMultiProgress {
     error: Option<BackendError>,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum ManualTransactionCommandError {
+    Structured(Box<BackendError>),
+    Legacy(String),
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_query(
@@ -455,16 +462,35 @@ pub async fn execute_in_manual_transaction(
     database: String,
     schema: Option<String>,
     max_rows: Option<usize>,
-) -> Result<Vec<db::QueryResult>, String> {
-    dbx_core::query::execute_in_manual_transaction(
+    table_data_preview: Option<bool>,
+    page_size: Option<usize>,
+    result_session_id: Option<String>,
+    classification_sql: Option<String>,
+) -> Result<Vec<dbx_core::query::ExecuteMultiResult>, ManualTransactionCommandError> {
+    dbx_core::query::execute_in_manual_transaction_with_options(
         &state,
         &txn_session_id,
         &sql,
         &database,
         schema.as_deref(),
-        max_rows,
+        dbx_core::query::ManualTransactionExecutionOptions {
+            max_rows,
+            table_data_preview: table_data_preview.unwrap_or(false),
+            page_size,
+            result_session_id,
+            classification_sql,
+        },
     )
     .await
+    .map_err(|error| {
+        if dbx_core::query::is_manual_transaction_session_expired_error(&error) {
+            ManualTransactionCommandError::Structured(Box::new(BackendError::from_manual_transaction_session_expired(
+                dbx_core::query::MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS,
+            )))
+        } else {
+            ManualTransactionCommandError::Legacy(error)
+        }
+    })
 }
 
 #[tauri::command]
@@ -531,8 +557,14 @@ pub fn build_dropped_file_preview_sql(
 }
 
 #[tauri::command]
-pub fn build_table_select_sql(options: dbx_core::sql_dialect::TableDataSelectSqlOptions) -> Result<String, String> {
-    Ok(dbx_core::sql_dialect::build_table_data_select_sql(options))
+pub fn build_table_select_sql(
+    options: dbx_core::sql_dialect::TableDataSelectSqlOptions,
+    include_database_name: Option<bool>,
+) -> Result<String, String> {
+    Ok(dbx_core::sql_dialect::build_table_data_select_sql_with_database(
+        options,
+        include_database_name.unwrap_or(false),
+    ))
 }
 
 #[tauri::command]
@@ -552,6 +584,24 @@ pub fn build_search_result_where(
 #[tauri::command]
 pub fn build_rename_object_sql(options: dbx_core::db_admin_sql::RenameObjectSqlOptions) -> Result<String, String> {
     dbx_core::db_admin_sql::build_rename_object_sql(options)
+}
+
+#[tauri::command]
+pub fn build_rename_database_sql(
+    database_type: Option<dbx_core::models::connection::DatabaseType>,
+    old_name: String,
+    new_name: String,
+    terminate_connections: bool,
+) -> Result<String, String> {
+    dbx_core::db_admin_sql::build_rename_database_sql(database_type, &old_name, &new_name, terminate_connections)
+}
+
+#[tauri::command]
+pub fn build_rename_database_preflight_sql(
+    database_type: Option<dbx_core::models::connection::DatabaseType>,
+    database_name: String,
+) -> Result<String, String> {
+    dbx_core::db_admin_sql::build_rename_database_preflight_sql(database_type, &database_name)
 }
 
 #[tauri::command]
@@ -688,6 +738,13 @@ pub fn build_table_structure_change_sql(
 }
 
 #[tauri::command]
+pub fn build_table_owner_change_sql(
+    options: dbx_core::table_structure_sql::TableOwnerChangeSqlOptions,
+) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {
+    Ok(dbx_core::table_structure_sql::build_table_owner_change_sql(options))
+}
+
+#[tauri::command]
 pub async fn preview_sqlite_table_structure_change(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -770,6 +827,13 @@ pub fn build_data_grid_copy_insert_statement(
     options: dbx_core::data_grid_sql::DataGridCopyInsertStatementOptions,
 ) -> Result<Option<String>, String> {
     Ok(dbx_core::data_grid_sql::build_data_grid_copy_insert_statement(options))
+}
+
+#[tauri::command]
+pub fn build_dml_change_preview_sql(
+    options: dbx_core::dml_preview_sql::DmlChangePreviewSqlOptions,
+) -> Result<dbx_core::dml_preview_sql::DmlChangePreviewSqlResult, String> {
+    dbx_core::dml_preview_sql::build_dml_change_preview_sql(options)
 }
 
 #[tauri::command]

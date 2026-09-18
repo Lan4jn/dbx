@@ -6,7 +6,18 @@ import { DEFAULT_SQL_FORMATTER_SETTINGS } from "../../apps/desktop/src/lib/sql/s
 import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS } from "../../apps/desktop/src/lib/table/tableColumnTemplates.ts";
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "../../apps/desktop/src/lib/app/appFonts.ts";
 import { tableOpenPageLimit } from "../../apps/desktop/src/lib/table/tableOpenPageLimit.ts";
-import { AI_PROVIDER_PRESETS, DEFAULT_EDITOR_SETTINGS, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, normalizeAiConfig, normalizeEditorSettings, useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
+import {
+  AI_PROVIDER_PARTNER_PRESETS,
+  AI_PROVIDER_PRESETS,
+  DEFAULT_EDITOR_SETTINGS,
+  EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+  SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
+  getAiProviderPreset,
+  getAiProviderPresetId,
+  normalizeAiConfig,
+  normalizeEditorSettings,
+  useSettingsStore,
+} from "../../apps/desktop/src/stores/settingsStore.ts";
 import { DEFAULT_SHORTCUT_SETTINGS, tabNavigationHistoryDefaultShortcut, type ShortcutSettings } from "../../apps/desktop/src/lib/editor/shortcutRegistry.ts";
 
 const saveEditorSettingsMock = vi.hoisted(() => vi.fn());
@@ -28,6 +39,16 @@ const OLD_FONT_SIZE_KEY = "dbx-query-editor-font-size";
 beforeEach(() => {
   saveEditorSettingsMock.mockClear();
 });
+
+function createDeferred() {
+  let resolve!: () => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 async function withMockLocalStorage(initial: Record<string, string>, run: () => void | Promise<void>) {
   const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -176,6 +197,21 @@ test("updateEditorSettings persists numericColumnRightAlign toggles", async () =
   });
 });
 
+test("updateEditorSettings persists the CSV quote mode", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    store.updateEditorSettings({ csvQuoteMode: "necessary" });
+    assert.equal(store.editorSettings.csvQuoteMode, "necessary");
+    await vi.waitFor(() => {
+      const saved = saveEditorSettingsMock.mock.calls.at(-1)?.[0] as { csvQuoteMode?: string } | undefined;
+      assert.equal(saved?.csvQuoteMode, "necessary");
+    });
+  });
+});
+
 test("migrates legacy execute-all settings to current once and preserves later explicit choices", async () => {
   await withMockLocalStorage({ "dbx-app-state:editor_settings": JSON.stringify({ executeMode: "all" }) }, async () => {
     setActivePinia(createPinia());
@@ -217,6 +253,13 @@ test("defaults export batch size to 2000 rows", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.exportBatchSize, 2000);
   assert.equal(normalizeEditorSettings({}).exportBatchSize, 2000);
   assert.equal(normalizeEditorSettings({ exportBatchSize: 2000 }).exportBatchSize, 2000);
+});
+
+test("CSV quote mode defaults to all fields and preserves a saved necessary mode", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.csvQuoteMode, "all");
+  assert.equal(normalizeEditorSettings({}).csvQuoteMode, "all");
+  assert.equal(normalizeEditorSettings({ csvQuoteMode: "necessary" }).csvQuoteMode, "necessary");
+  assert.equal(normalizeEditorSettings({ csvQuoteMode: "invalid" as any }).csvQuoteMode, "all");
 });
 
 test("migrates the legacy saved export batch default to 2000 once", async () => {
@@ -380,8 +423,13 @@ test("defaults shortcut settings", () => {
   assert.equal(settings.shortcuts.executeSql, "Mod+Enter");
   assert.equal(settings.shortcuts.saveSql, "Mod+S");
   assert.equal(settings.shortcuts.extendSelection, "Alt+W");
+  assert.equal(settings.shortcuts.editTableStructure, "Mod+Shift+D");
   assert.equal(settings.shortcuts.copyCurrentRow, "Mod+D");
   assert.equal(settings.shortcuts.deleteCurrentRow, "Delete");
+  assert.equal(settings.shortcuts.goToFirstPage, "");
+  assert.equal(settings.shortcuts.goToPreviousPage, "");
+  assert.equal(settings.shortcuts.goToNextPage, "");
+  assert.equal(settings.shortcuts.goToLastPage, "");
   assert.equal(settings.shortcuts.newQuery, "Mod+T");
   assert.equal(settings.shortcuts.openSettings, "Mod+,");
   assert.equal(settings.shortcuts.focusSearch, "Mod+F");
@@ -403,6 +451,7 @@ test("keeps saved shortcut overrides", () => {
       executeSql: "Shift+Mod+Enter",
       copyCurrentRow: "Alt+Shift+D",
       deleteCurrentRow: "Backspace",
+      goToNextPage: "Alt+F3",
       newQuery: "Shift+Mod+N",
       openSettings: "Shift+Mod+P",
       zoomInUi: "Alt+Mod+=",
@@ -413,6 +462,8 @@ test("keeps saved shortcut overrides", () => {
   assert.equal(settings.shortcuts.executeSql, "Shift+Mod+Enter");
   assert.equal(settings.shortcuts.copyCurrentRow, "Alt+Shift+D");
   assert.equal(settings.shortcuts.deleteCurrentRow, "Backspace");
+  assert.equal(settings.shortcuts.goToNextPage, "Alt+F3");
+  assert.equal(settings.shortcuts.goToFirstPage, "");
   assert.equal(settings.shortcuts.newQuery, "Shift+Mod+N");
   assert.equal(settings.shortcuts.openSettings, "Shift+Mod+P");
   assert.equal(settings.shortcuts.zoomInUi, "Alt+Mod+=");
@@ -464,6 +515,47 @@ test("preserves adjacent tab shortcuts and persists unbound history actions when
 test("defaults sidebar activation to single click", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarActivation, "single");
   assert.equal(normalizeEditorSettings({}).sidebarActivation, "single");
+});
+
+test("preserves object browsing for legacy sidebar settings", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation, false);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivationMigrationVersion, SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION);
+  assert.equal(normalizeEditorSettings({}).sidebarBrowseObjectsOnDatabaseActivation, false);
+  assert.equal(normalizeEditorSettings({ sidebarBrowseObjectsOnDatabaseActivation: true }).sidebarBrowseObjectsOnDatabaseActivation, true);
+  assert.equal(normalizeEditorSettings({ sidebarBrowseObjectsOnDatabaseActivation: false }).sidebarBrowseObjectsOnDatabaseActivation, false);
+  assert.equal(normalizeEditorSettings({ sidebarBrowseObjectsOnDatabaseActivation: "yes" as any }).sidebarBrowseObjectsOnDatabaseActivation, false);
+  assert.equal(normalizeEditorSettings({ sidebarOpenDatabaseOnSingleClick: true } as any).sidebarBrowseObjectsOnDatabaseActivation, true);
+  assert.equal(normalizeEditorSettings({ sidebarOpenDatabaseOnSingleClick: false } as any).sidebarBrowseObjectsOnDatabaseActivation, true);
+  assert.equal(normalizeEditorSettings({ sidebarBrowseObjectsOnDatabaseActivation: false, sidebarOpenDatabaseOnSingleClick: true } as any).sidebarBrowseObjectsOnDatabaseActivation, false);
+});
+
+test("migrates existing settings once and preserves a later explicit opt-out", async () => {
+  await withMockLocalStorage(
+    {
+      "dbx-app-state:editor_settings": JSON.stringify({ sidebarBrowseObjectsOnDatabaseActivation: false }),
+    },
+    async () => {
+      setActivePinia(createPinia());
+      const migratedStore = useSettingsStore();
+      await migratedStore.initEditorSettings();
+
+      assert.equal(migratedStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation, true);
+      assert.equal(migratedStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivationMigrationVersion, SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION);
+      await vi.waitFor(() => {
+        const saved = JSON.parse(localStorage.getItem("dbx-app-state:editor_settings") || "{}") as Record<string, unknown>;
+        assert.equal(saved.sidebarBrowseObjectsOnDatabaseActivation, true);
+        assert.equal(saved.sidebarBrowseObjectsOnDatabaseActivationMigrationVersion, SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION);
+      });
+
+      migratedStore.updateEditorSettings({ sidebarBrowseObjectsOnDatabaseActivation: false });
+      await vi.waitFor(() => assert.equal(migratedStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation, false));
+
+      setActivePinia(createPinia());
+      const reloadedStore = useSettingsStore();
+      await reloadedStore.initEditorSettings();
+      assert.equal(reloadedStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation, false);
+    },
+  );
 });
 
 test("defaults active tab sidebar selection to off", () => {
@@ -627,6 +719,168 @@ test("keeps only valid saved column formatter configs", () => {
   });
 });
 
+test("deleting a saved custom formatter clears every reference to it", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_remove: { id: "fmt_remove", name: "Remove me", template: "remove:${value}" },
+        fmt_keep: { id: "fmt_keep", name: "Keep me", template: "keep:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_remove" },
+        second: { kind: "custom-ref", formatterId: "fmt_remove" },
+        keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+        mask: { kind: "mask", prefix: 1, suffix: 1 },
+      },
+    });
+
+    await store.deleteCustomColumnFormatter("fmt_remove");
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_keep: { id: "fmt_keep", name: "Keep me", template: "keep:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {
+      keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+      mask: { kind: "mask", prefix: 1, suffix: 1 },
+    });
+  });
+});
+
+test("serializes concurrent custom formatter deletes", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+        fmt_b: { id: "fmt_b", name: "B", template: "b:${value}" },
+        fmt_keep: { id: "fmt_keep", name: "Keep", template: "keep:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+        second: { kind: "custom-ref", formatterId: "fmt_b" },
+        keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+      },
+    });
+    await store.persistEditorSettings();
+
+    await Promise.all([store.deleteCustomColumnFormatter("fmt_a"), store.deleteCustomColumnFormatter("fmt_b")]);
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_keep: { id: "fmt_keep", name: "Keep", template: "keep:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {
+      keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+    });
+    const saved = saveEditorSettingsMock.mock.calls.at(-1)?.[0] as { customColumnFormatters?: Record<string, unknown> } | undefined;
+    assert.deepEqual(saved?.customColumnFormatters, {
+      fmt_keep: { id: "fmt_keep", name: "Keep", template: "keep:${value}" },
+    });
+  });
+});
+
+test("queues formatter upserts behind a deferred delete save", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+        fmt_b: { id: "fmt_b", name: "B", template: "b:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+      },
+    });
+    await store.persistEditorSettings();
+    const deleteSave = createDeferred();
+    saveEditorSettingsMock.mockImplementationOnce(() => deleteSave.promise);
+
+    const deletePromise = store.deleteCustomColumnFormatter("fmt_a");
+    await vi.waitFor(() => assert.equal(store.editorSettings.customColumnFormatters.fmt_a, undefined));
+    const upsertPromise = store.upsertCustomColumnFormatter({ id: "fmt_b", name: "B updated", template: "updated:${value}" });
+    await Promise.resolve();
+    assert.equal(store.editorSettings.customColumnFormatters.fmt_b.name, "B");
+
+    deleteSave.resolve();
+    await deletePromise;
+    await upsertPromise;
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_b: { id: "fmt_b", name: "B updated", template: "updated:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {});
+  });
+});
+
+test("rolls back a failed delete before running a queued formatter upsert", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+      },
+    });
+    await store.persistEditorSettings();
+    const deleteSave = createDeferred();
+    saveEditorSettingsMock.mockImplementationOnce(() => deleteSave.promise);
+
+    const deletePromise = store.deleteCustomColumnFormatter("fmt_a");
+    const deleteRejected = assert.rejects(deletePromise, /disk full/);
+    await vi.waitFor(() => assert.equal(store.editorSettings.customColumnFormatters.fmt_a, undefined));
+    const upsertPromise = store.upsertCustomColumnFormatter({ id: "fmt_b", name: "B", template: "b:${value}" });
+    await Promise.resolve();
+    assert.equal(store.editorSettings.customColumnFormatters.fmt_b, undefined);
+
+    deleteSave.reject(new Error("disk full"));
+    await deleteRejected;
+    await upsertPromise;
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+      fmt_b: { id: "fmt_b", name: "B", template: "b:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {
+      first: { kind: "custom-ref", formatterId: "fmt_a" },
+    });
+  });
+});
+
+test("rejects stale formatter drafts but allows deliberate same-id recreation", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_rebuild: { id: "fmt_rebuild", name: "Original", template: "original:${value}" },
+      },
+    });
+    await store.persistEditorSettings();
+    const capturedDeleteVersion = store.customColumnFormatterDeleteVersion("fmt_rebuild");
+    const staleFormatter = store.editorSettings.customColumnFormatters.fmt_rebuild;
+
+    await store.deleteCustomColumnFormatter("fmt_rebuild");
+
+    assert.equal(await store.upsertCustomColumnFormatter(staleFormatter, capturedDeleteVersion), undefined);
+    assert.equal(store.editorSettings.customColumnFormatters.fmt_rebuild, undefined);
+    const rebuilt = { id: "fmt_rebuild", name: "Rebuilt", template: "rebuilt:${value}" };
+    assert.deepEqual(await store.upsertCustomColumnFormatter(rebuilt), rebuilt);
+    assert.deepEqual(store.editorSettings.customColumnFormatters.fmt_rebuild, rebuilt);
+    assert.notEqual(store.customColumnFormatterDeleteVersion("fmt_rebuild"), capturedDeleteVersion);
+  });
+});
+
 test("AI provider presets include common hosted and local providers", () => {
   assert.equal(AI_PROVIDER_PRESETS.gemini.endpoint, "https://generativelanguage.googleapis.com");
   assert.equal(AI_PROVIDER_PRESETS.gemini.model, "gemini-1.5-pro");
@@ -638,6 +892,12 @@ test("AI provider presets include common hosted and local providers", () => {
   assert.equal(AI_PROVIDER_PRESETS.minimax.requiresApiKey, true);
   assert.equal(AI_PROVIDER_PRESETS.minimax.iconSlug, "minimax");
   assert.equal(AI_PROVIDER_PRESETS.qwen.endpoint, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+  assert.equal(AI_PROVIDER_PRESETS.zhipu.endpoint, "https://open.bigmodel.cn/api/paas/v4");
+  assert.equal(AI_PROVIDER_PRESETS.zhipu.model, "glm-5.3");
+  assert.equal(AI_PROVIDER_PRESETS.zhipu.apiStyle, "completions");
+  assert.equal(AI_PROVIDER_PRESETS.zhipu.authMethod, "bearer");
+  assert.equal(AI_PROVIDER_PRESETS.zhipu.requiresApiKey, true);
+  assert.equal(AI_PROVIDER_PRESETS.zhipu.iconSlug, "zhipu");
   assert.equal(AI_PROVIDER_PRESETS.ollama.endpoint, "http://localhost:11434/v1");
   assert.equal(AI_PROVIDER_PRESETS.ollama.requiresApiKey, false);
   assert.equal(AI_PROVIDER_PRESETS.claude.authMethod, "api-key");
@@ -683,6 +943,22 @@ test("AI provider presets include common hosted and local providers", () => {
   assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("qoder-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("grok-cli"));
   assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("codex-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("grok-cli"));
   assert.ok(Object.keys(AI_PROVIDER_PRESETS).indexOf("codex-cli") < Object.keys(AI_PROVIDER_PRESETS).indexOf("pi-agent-cli"));
+});
+
+test("AI partner presets reuse a supported runtime adapter", () => {
+  const jalapeno = AI_PROVIDER_PARTNER_PRESETS.find((preset) => preset.id === "jalapeno-cloud");
+
+  assert.ok(jalapeno);
+  assert.equal(jalapeno.provider, "openai-compatible");
+  assert.equal(jalapeno.endpoint, "https://api.jalapeno-cloud.ai/v1");
+  assert.equal(jalapeno.model, "GLM-5.2");
+  assert.deepEqual(jalapeno.models, [{ name: "GLM-5.2" }, { name: "DeepSeek-V4-Pro" }, { name: "MiniMax-M3" }]);
+  assert.equal(jalapeno.requiresApiKey, true);
+  assert.equal(jalapeno.websiteUrl, "https://www.jalapeno-cloud.ai/dbx");
+  assert.equal(jalapeno.apiKeyUrl, "https://www.jalapeno-cloud.ai/dbx");
+  assert.equal(getAiProviderPreset("openai-compatible", "https://api.jalapeno-cloud.ai/v1/").label, "Jalapeno Cloud");
+  assert.equal(getAiProviderPresetId("openai-compatible", "https://api.jalapeno-cloud.ai/v1/"), "jalapeno-cloud");
+  assert.equal(getAiProviderPreset("openai-compatible", "https://api.example.com/v1").label, "OpenAI Compatible");
 });
 
 test("API AI provider settings expose and persist a default model ID", () => {
@@ -825,7 +1101,7 @@ test("normalizeEditorSettings falls back to the default UI scale", () => {
 });
 
 test("normalizeEditorSettings clamps UI scale into the supported range", () => {
-  assert.equal(normalizeEditorSettings({ uiScale: 0.2 }).uiScale, 0.75);
+  assert.equal(normalizeEditorSettings({ uiScale: 0.2 }).uiScale, 0.7);
   assert.equal(normalizeEditorSettings({ uiScale: 2.8 }).uiScale, 2);
 });
 

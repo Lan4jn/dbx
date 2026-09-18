@@ -1,29 +1,34 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { buildTransferObjectSelections } from "./transferSelections";
 import { createTaskLoadTracker } from "./taskLoadTracker";
+import { confirmTransferWithProductionSafety, createTransferSubmission, rebuildUnavailableReason, resolveTransferStrategy, transferStrategyOptions, type TransferStrategy } from "./transferStrategy";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import SearchableSelect from "@/components/ui/searchable-select/SearchableSelect.vue";
-import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
+import ConnectionTreeSelect from "@/components/connection/ConnectionTreeSelect.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
-import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
-import { connectionIconType } from "@/lib/connection/connectionPresentation";
+import { ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
+import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import * as api from "@/lib/backend/api";
-import type { TransferContent, TransferMode, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/api";
+import type { TransferContent, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/api";
 import { crossFamilyTransferableKinds, isSameTransferFamily, transferObjectKindsForDatabase } from "@/lib/database/transferObjectKinds";
 import ObjectSelectionTree from "@/components/transfer/ObjectSelectionTree.vue";
 import TransferTaskTree from "@/components/transfer/TransferTaskTree.vue";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import type { DatabaseType } from "@/types/database";
 import type { TransferTask, TransferTaskConfig } from "@/types/database";
 import { isSchemaAware, supportsTransfer } from "@/lib/database/databaseCapabilities";
+import { transferDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { isDorisFamilyCatalogCapable } from "@/lib/database/databaseFeatureSupport";
-import { isSameTransferDatabase, normalizeTransferCatalog } from "@/lib/database/dataTransferSelection";
+import { decodeTransferDatabaseOption, encodeTransferDatabaseOptions, isSameTransferDatabase, isTransferDatabaseSelected, normalizeTransferCatalog } from "@/lib/database/dataTransferSelection";
+import { formatDatabaseLabel } from "@/lib/database/defaultDatabase";
 import { databaseOptionsForConnection, fetchCatalogNamespaceOptions, fetchNamespaceOptionsForConnection, namespaceOptionsAreSchemas } from "@/composables/useDatabaseOptions";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { useTransferTaskStore, TransferTaskNameConflictError, nextTransferTaskCopyName } from "@/stores/transferTaskStore";
@@ -35,6 +40,7 @@ const { t } = useI18n();
 const { startDataTransferTask } = useExportTracker();
 const { toast } = useToast();
 const taskStore = useTransferTaskStore();
+const productionSafetyStore = useProductionSafetyStore();
 const open = defineModel<boolean>("open", { default: false });
 
 const props = defineProps<{
@@ -48,9 +54,18 @@ const props = defineProps<{
   prefillTargetSchema?: string;
 }>();
 
+const transferDialogStyle = {
+  width: "min(1120px, calc(100vw - 2rem))",
+  height: "min(80vh, calc(var(--dbx-viewport-height) - 2rem))",
+  minWidth: "min(780px, calc(100vw - 2rem))",
+  minHeight: "min(480px, calc(var(--dbx-viewport-height) - 2rem))",
+  maxWidth: "calc(100vw - 2rem)",
+  maxHeight: "calc(var(--dbx-viewport-height) - 2rem)",
+} as const;
+
 const store = useConnectionStore();
 
-const sqlConnections = computed(() => store.connections.filter((c) => supportsTransfer(c.db_type)));
+const sqlConnections = computed(() => store.connections.filter((c) => supportsTransfer(transferDatabaseTypeForConnection(c))));
 
 // Source state
 const sourceConnectionId = ref("");
@@ -105,7 +120,7 @@ const treeDisabledGroups = computed<TransferObjectKind[]>(() => {
   }
   const sourceConfig = store.getConfig(sourceConnectionId.value);
   const targetConfig = store.getConfig(targetConnectionId.value);
-  const allowed = crossFamilyTransferableKinds(sourceConfig?.db_type, targetConfig?.db_type);
+  const allowed = crossFamilyTransferableKinds(transferDatabaseTypeForConnection(sourceConfig), transferDatabaseTypeForConnection(targetConfig));
   return presentKinds.filter((k) => k !== "TABLE" && !allowed.includes(k));
 });
 
@@ -123,9 +138,9 @@ const showCrossFamilyViewHint = computed(() => {
   const targetConfig = store.getConfig(targetConnectionId.value);
   if (transferContent.value === "dataOnly") return false;
   if (!sourceConfig || !targetConfig) return false;
-  const allowed = crossFamilyTransferableKinds(sourceConfig.db_type, targetConfig.db_type);
+  const allowed = crossFamilyTransferableKinds(transferDatabaseTypeForConnection(sourceConfig), transferDatabaseTypeForConnection(targetConfig));
   if (!allowed.includes("VIEW")) return false;
-  return !isSameTransferFamily(sourceConfig.db_type, targetConfig.db_type) && (selectedObjects.value.VIEW?.size ?? 0) > 0;
+  return !isSameTransferFamily(transferDatabaseTypeForConnection(sourceConfig), transferDatabaseTypeForConnection(targetConfig)) && (selectedObjects.value.VIEW?.size ?? 0) > 0;
 });
 const pendingSourceSchemaPrefill = ref("");
 const pendingSelectedTablesPrefill = ref<string[] | null>(null);
@@ -144,16 +159,34 @@ const targetSchema = ref("");
 const pendingTargetSchemaPrefill = ref("");
 
 // Options
-const transferMode = ref<TransferMode>("append");
+const selectedStrategy = ref<TransferStrategy>("append");
+const targetTableStrategy = computed<TransferStrategy>({
+  get: () => (transferContent.value === "structureOnly" && selectedStrategy.value !== "rebuild" ? "append" : selectedStrategy.value),
+  set: (value) => {
+    selectedStrategy.value = value;
+  },
+});
 const targetTableNameCase = ref<TransferTableNameCase>("preserve");
+const quoteTargetColumnNames = ref(true);
 const batchSize = ref(1000);
+const showRebuildConfirm = ref(false);
 const isSubmitting = ref(false);
+const pendingTransferId = ref<string | null>(null);
 const showStartConfirm = ref(false);
+const confirmationRequest = shallowRef<api.TransferRequest | null>(null);
+const confirmationPreview = shallowRef<api.TransferOwnershipPreview | null>(null);
+let resolveTransferConfirmation: ((confirmed: boolean) => void) | undefined;
 const ownershipDialogOpen = ref(false);
 const ownershipMissingOwners = ref<string[]>([]);
 const ownershipTargetOwner = ref("");
-const pendingOwnershipRequest = ref<api.TransferRequest | null>(null);
-const pendingOwnershipRefresh = ref<{ shouldRefreshTargetTree: boolean } | null>(null);
+let resolveOwnershipConfirmation: ((policy: api.TransferOwnershipPolicy | null) => void) | undefined;
+const transferSubmission = createTransferSubmission({
+  ensureWritable: (request) => ensureReadOnlyWriteAccess({ connection: store.getConfig(request.targetConnectionId), source: t("readOnlyUnlock.sourceTransfer"), treatAsMutation: true }),
+  preview: api.previewTransferOwnership,
+  confirmOwnership: requestOwnershipConfirmation,
+  confirm: requestTransferConfirmation,
+  execute: (request) => runTransfer(request, request.content !== "dataOnly"),
+});
 
 // Saved-task state: the form mirrors the active task; a canonical JSON
 // snapshot taken at load/save time drives the unsaved-changes check.
@@ -172,27 +205,55 @@ function isMongoConnection(id: string): boolean {
   return connectionType(id) === "mongodb";
 }
 
+const showTargetColumnQuoteOption = computed(() => ["gaussdb", "opengauss"].includes(connectionType(targetConnectionId.value) ?? ""));
+
+const rebuildDisabledReason = computed(() => rebuildUnavailableReason(transferContent.value, connectionType(targetConnectionId.value)));
+const rebuildDisabledHint = computed(() => {
+  if (rebuildDisabledReason.value === "dataOnly") return t("transfer.rebuildDataOnlyDisabled");
+  if (rebuildDisabledReason.value === "unsupported") return t("transfer.rebuildUnsupportedDisabled");
+  return "";
+});
+
 function isCatalogCapable(id: string): boolean {
   const config = store.getConfig(id);
   return isDorisFamilyCatalogCapable(config?.db_type, config?.driver_profile);
 }
 
+function decodedDatabase(connectionId: string, option: string): string {
+  return decodeTransferDatabaseOption(connectionType(connectionId), option);
+}
+
+function encodedDatabase(connectionId: string, database: string): string {
+  return encodeTransferDatabaseOptions(connectionType(connectionId), [database])[0] ?? "";
+}
+
+function databaseOptionLabel(connectionId: string, option: string): string {
+  return formatDatabaseLabel(store.getConfig(connectionId), decodedDatabase(connectionId, option), {
+    defaultDatabase: t("editor.defaultDatabase"),
+    noDatabase: t("editor.noDatabase"),
+  });
+}
+
+const sourceDatabaseName = computed(() => decodedDatabase(sourceConnectionId.value, sourceDatabase.value));
+const targetDatabaseName = computed(() => decodedDatabase(targetConnectionId.value, targetDatabase.value));
+
 const canStart = computed(() => {
-  const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
-  const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
+  const effectiveSourceSchema = sourceSchema.value || sourceDatabaseName.value;
+  const effectiveTargetSchema = targetSchema.value || targetDatabaseName.value;
   const sameCatalogAndDatabase = isSameTransferDatabase(
-    { connectionId: sourceConnectionId.value, catalog: sourceCatalog.value, catalogs: sourceCatalogs.value, database: sourceDatabase.value },
-    { connectionId: targetConnectionId.value, catalog: targetCatalog.value, catalogs: targetCatalogs.value, database: targetDatabase.value },
+    { connectionId: sourceConnectionId.value, catalog: sourceCatalog.value, catalogs: sourceCatalogs.value, database: sourceDatabaseName.value },
+    { connectionId: targetConnectionId.value, catalog: targetCatalog.value, catalogs: targetCatalogs.value, database: targetDatabaseName.value },
   );
   const sameSourceAndTarget = sameCatalogAndDatabase && effectiveSourceSchema === effectiveTargetSchema;
   return (
     !!sourceConnectionId.value &&
-    !!sourceDatabase.value &&
+    isTransferDatabaseSelected(sourceDatabase.value) &&
     !!targetConnectionId.value &&
-    !!targetDatabase.value &&
+    isTransferDatabaseSelected(targetDatabase.value) &&
     (sourceCatalogs.value.length <= 1 || !!sourceCatalog.value) &&
     (targetCatalogs.value.length <= 1 || !!targetCatalog.value) &&
     (selectedTables.value.size > 0 || Object.values(selectedObjects.value).some((names) => names.size > 0)) &&
+    (targetTableStrategy.value !== "rebuild" || !rebuildDisabledReason.value) &&
     !sameSourceAndTarget
   );
 });
@@ -242,13 +303,14 @@ async function loadDatabases(connectionId: string, target: "source" | "target", 
     const config = store.getConfig(connectionId);
     if (!config) return;
     const names = isMongoConnection(connectionId) ? databaseOptionsForConnection(await api.mongoListDatabases(connectionId), config) : await fetchNamespaceOptionsForConnection(connectionId, config);
+    const options = encodeTransferDatabaseOptions(config.db_type, names);
     if (isStale()) return;
     if (target === "source") {
-      sourceDatabases.value = names;
-      sourceDatabase.value = names.length === 1 ? names[0] : "";
+      sourceDatabases.value = options;
+      sourceDatabase.value = options.length === 1 ? options[0] : "";
     } else {
-      targetDatabases.value = names;
-      targetDatabase.value = names.length === 1 ? names[0] : "";
+      targetDatabases.value = options;
+      targetDatabase.value = options.length === 1 ? options[0] : "";
     }
   } catch {
     if (isStale()) return;
@@ -270,13 +332,14 @@ async function loadDatabasesForCatalog(connectionId: string, catalog: string, ta
     const config = store.getConfig(connectionId);
     if (!config) return;
     const names = await fetchCatalogNamespaceOptions(connectionId, catalog, config);
+    const options = encodeTransferDatabaseOptions(config.db_type, names);
     if (isStale()) return;
     if (target === "source") {
-      sourceDatabases.value = names;
-      sourceDatabase.value = names.length === 1 ? names[0] : "";
+      sourceDatabases.value = options;
+      sourceDatabase.value = options.length === 1 ? options[0] : "";
     } else {
-      targetDatabases.value = names;
-      targetDatabase.value = names.length === 1 ? names[0] : "";
+      targetDatabases.value = options;
+      targetDatabase.value = options.length === 1 ? options[0] : "";
     }
   } catch {
     if (isStale()) return;
@@ -286,11 +349,11 @@ async function loadDatabasesForCatalog(connectionId: string, catalog: string, ta
 }
 
 async function loadSchemas(connectionId: string, database: string, side: "source" | "target", preferredSchema = "", isCancelled: () => boolean = () => false) {
-  if (!connectionId || !database) return;
+  if (!connectionId) return;
   // 竞态防护：连接或数据库切换后，旧请求的 schema 列表回调直接丢弃。
   const isStale = () => {
     const currentConnection = side === "source" ? sourceConnectionId.value : targetConnectionId.value;
-    const currentDatabase = side === "source" ? sourceDatabase.value : targetDatabase.value;
+    const currentDatabase = side === "source" ? sourceDatabaseName.value : targetDatabaseName.value;
     return isCancelled() || currentConnection !== connectionId || currentDatabase !== database;
   };
   if (isMongoConnection(connectionId)) {
@@ -355,8 +418,9 @@ function applyPendingObjectSelection() {
 
 async function loadObjects(isCancelled: () => boolean = () => false) {
   const connectionId = sourceConnectionId.value;
-  const database = sourceDatabase.value;
-  if (!connectionId || !database) {
+  const databaseOption = sourceDatabase.value;
+  const database = sourceDatabaseName.value;
+  if (!connectionId || !isTransferDatabaseSelected(databaseOption)) {
     objectGroups.value = {};
     return;
   }
@@ -364,7 +428,7 @@ async function loadObjects(isCancelled: () => boolean = () => false) {
   // 旧请求的对象列表回调直接丢弃，不覆盖新选择对应的状态。
   const catalog = sourceCatalog.value || undefined;
   const schemaValue = sourceSchema.value;
-  const isStale = () => isCancelled() || sourceConnectionId.value !== connectionId || sourceDatabase.value !== database || (sourceCatalog.value || undefined) !== catalog || sourceSchema.value !== schemaValue;
+  const isStale = () => isCancelled() || sourceConnectionId.value !== connectionId || sourceDatabase.value !== databaseOption || (sourceCatalog.value || undefined) !== catalog || sourceSchema.value !== schemaValue;
   loadingObjects.value = true;
   try {
     if (isMongoConnection(connectionId)) {
@@ -378,7 +442,7 @@ async function loadObjects(isCancelled: () => boolean = () => false) {
     const config = store.getConfig(connectionId);
     const needsSchema = isSchemaAware(config?.db_type);
     const schema = needsSchema && schemaValue ? schemaValue : database;
-    const kinds = transferObjectKindsForDatabase(config?.db_type);
+    const kinds = transferObjectKindsForDatabase(transferDatabaseTypeForConnection(config));
     const groups: Partial<Record<TransferObjectKind, string[]>> = {};
     for (const kind of kinds) {
       try {
@@ -458,18 +522,19 @@ watch(sourceDatabase, async (db) => {
     skipSourceDatabaseWatch.value = false;
     return;
   }
-  if (db) {
+  if (isTransferDatabaseSelected(db)) {
     const config = store.getConfig(sourceConnectionId.value);
+    const database = sourceDatabaseName.value;
     if (namespaceOptionsAreSchemas(config)) {
       // Dameng has no selectable catalog, so the top-level namespace option is
       // also the schema used for metadata lookup and qualified transfer SQL.
       sourceSchemas.value = [];
-      sourceSchema.value = db;
+      sourceSchema.value = database;
     } else if (isSchemaAware(config?.db_type)) {
-      await loadSchemas(sourceConnectionId.value, db, "source", pendingSourceSchemaPrefill.value);
+      await loadSchemas(sourceConnectionId.value, database, "source", pendingSourceSchemaPrefill.value);
       pendingSourceSchemaPrefill.value = "";
     } else {
-      sourceSchema.value = db;
+      sourceSchema.value = database;
     }
   }
 });
@@ -524,16 +589,17 @@ watch(targetDatabase, async (db) => {
     skipTargetDatabaseWatch.value = false;
     return;
   }
-  if (db) {
+  if (isTransferDatabaseSelected(db)) {
     const config = store.getConfig(targetConnectionId.value);
+    const database = targetDatabaseName.value;
     if (namespaceOptionsAreSchemas(config)) {
       targetSchemas.value = [];
-      targetSchema.value = db;
+      targetSchema.value = database;
     } else if (isSchemaAware(config?.db_type)) {
-      await loadSchemas(targetConnectionId.value, db, "target", pendingTargetSchemaPrefill.value);
+      await loadSchemas(targetConnectionId.value, database, "target", pendingTargetSchemaPrefill.value);
       pendingTargetSchemaPrefill.value = "";
     } else {
-      targetSchema.value = db;
+      targetSchema.value = database;
     }
   }
 });
@@ -561,7 +627,7 @@ watch(
         } else {
           await loadDatabases(props.prefillConnectionId, "source");
         }
-        if (props.prefillDatabase) sourceDatabase.value = props.prefillDatabase;
+        if (props.prefillDatabase !== undefined) sourceDatabase.value = encodedDatabase(props.prefillConnectionId, props.prefillDatabase);
       }
       if (props.prefillTargetConnectionId) {
         skipTargetWatch.value = true;
@@ -574,7 +640,7 @@ watch(
         } else {
           await loadDatabases(props.prefillTargetConnectionId, "target");
         }
-        if (props.prefillTargetDatabase) targetDatabase.value = props.prefillTargetDatabase;
+        if (props.prefillTargetDatabase !== undefined) targetDatabase.value = encodedDatabase(props.prefillTargetConnectionId, props.prefillTargetDatabase);
       }
     }
   },
@@ -583,6 +649,7 @@ watch(
 
 function resetState(cancelTaskLoad = true) {
   if (cancelTaskLoad) taskLoadTracker.cancel();
+  cancelPendingTransfer();
   sourceConnectionId.value = "";
   sourceCatalog.value = "";
   sourceCatalogs.value = [];
@@ -605,73 +672,139 @@ function resetState(cancelTaskLoad = true) {
   targetSchema.value = "";
   pendingTargetSchemaPrefill.value = "";
   transferContent.value = "structureAndData";
-  transferMode.value = "append";
+  selectedStrategy.value = "append";
   targetTableNameCase.value = "preserve";
+  quoteTargetColumnNames.value = true;
   batchSize.value = 1000;
-  isSubmitting.value = false;
-  showStartConfirm.value = false;
-  ownershipDialogOpen.value = false;
-  ownershipMissingOwners.value = [];
-  ownershipTargetOwner.value = "";
-  pendingOwnershipRequest.value = null;
-  pendingOwnershipRefresh.value = null;
   pendingSelectedObjectsPrefill.value = null;
   activeTaskId.value = null;
   savedConfigSnapshot.value = "";
 }
 
-async function startTransfer() {
+/**
+ * 交换源和目标两侧：连接、Catalog、数据库、Schema 的选择随各自一侧整体互换，
+ * 一次点击即可反转传输方向。对象树只属于源端，旧选择作废，按新源端重新加载。
+ */
+function swapSourceAndTarget() {
+  const sourceState = {
+    connectionId: sourceConnectionId.value,
+    catalog: sourceCatalog.value,
+    catalogs: sourceCatalogs.value,
+    database: sourceDatabase.value,
+    databases: sourceDatabases.value,
+    schema: sourceSchema.value,
+    schemas: sourceSchemas.value,
+  };
+  const targetState = {
+    connectionId: targetConnectionId.value,
+    catalog: targetCatalog.value,
+    catalogs: targetCatalogs.value,
+    database: targetDatabase.value,
+    databases: targetDatabases.value,
+    schema: targetSchema.value,
+    schemas: targetSchemas.value,
+  };
+
+  if (sourceState.connectionId === targetState.connectionId && sourceState.catalog === targetState.catalog && sourceState.database === targetState.database && sourceState.schema === targetState.schema) {
+    // 两侧选择完全相同（含都未选择）时交换没有意义
+    return;
+  }
+
+  // 若正在加载已保存任务，先取消，避免任务加载链覆盖交换后的状态
+  taskLoadTracker.cancel();
+  pendingSourceSchemaPrefill.value = "";
+  pendingTargetSchemaPrefill.value = "";
+  pendingSelectedTablesPrefill.value = null;
+  pendingSelectedObjectsPrefill.value = null;
+
+  // 只在值确实变化时设置一次性跳过标记：标记由对应 watcher 消费，
+  // 若值未变则 watcher 不会触发，残留标记会误吞后续一次真实变更。
+  if (sourceConnectionId.value !== targetState.connectionId) {
+    skipSourceWatch.value = true;
+    sourceConnectionId.value = targetState.connectionId;
+  }
+  if (sourceCatalog.value !== targetState.catalog) {
+    skipSourceCatalogWatch.value = true;
+    sourceCatalog.value = targetState.catalog;
+  }
+  sourceCatalogs.value = targetState.catalogs;
+  if (sourceDatabase.value !== targetState.database) {
+    skipSourceDatabaseWatch.value = true;
+    sourceDatabase.value = targetState.database;
+  }
+  sourceDatabases.value = targetState.databases;
+  if (sourceSchema.value !== targetState.schema) {
+    skipSourceSchemaWatch.value = true;
+    sourceSchema.value = targetState.schema;
+  }
+  sourceSchemas.value = targetState.schemas;
+
+  if (targetConnectionId.value !== sourceState.connectionId) {
+    skipTargetWatch.value = true;
+    targetConnectionId.value = sourceState.connectionId;
+  }
+  if (targetCatalog.value !== sourceState.catalog) {
+    skipTargetCatalogWatch.value = true;
+    targetCatalog.value = sourceState.catalog;
+  }
+  targetCatalogs.value = sourceState.catalogs;
+  if (targetDatabase.value !== sourceState.database) {
+    skipTargetDatabaseWatch.value = true;
+    targetDatabase.value = sourceState.database;
+  }
+  targetDatabases.value = sourceState.databases;
+  targetSchema.value = sourceState.schema;
+  targetSchemas.value = sourceState.schemas;
+
+  // 对象树始终跟随源端：新源端是旧目标端，旧选择已无意义，清空后重新加载
+  objectGroups.value = {};
+  selectedObjects.value = {};
+  objectSearch.value = "";
+  void loadObjects();
+}
+
+async function requestStartTransfer() {
   if (!canStart.value || isSubmitting.value) return;
   isSubmitting.value = true;
 
-  const effectiveSourceSchema = sourceSchema.value || sourceDatabase.value;
-  const effectiveTargetSchema = targetSchema.value || targetDatabase.value;
-  const sourceDatabaseName = sourceDatabase.value;
+  const effectiveSourceSchema = sourceSchema.value || sourceDatabaseName.value;
+  const effectiveTargetSchema = targetSchema.value || targetDatabaseName.value;
+  const sourceDatabase = sourceDatabaseName.value;
   const targetConnection = targetConnectionId.value;
-  const targetDatabaseName = targetDatabase.value;
-  const shouldRefreshTargetTree = transferContent.value !== "dataOnly";
-
+  const targetDatabase = targetDatabaseName.value;
   const request: api.TransferRequest = {
     transferId: uuid(),
     sourceConnectionId: sourceConnectionId.value,
-    sourceDatabase: sourceDatabaseName,
+    sourceDatabase,
     sourceSchema: effectiveSourceSchema,
     sourceCatalog: normalizeTransferCatalog(sourceCatalog.value, sourceCatalogs.value) || undefined,
     targetConnectionId: targetConnection,
-    targetDatabase: targetDatabaseName,
+    targetDatabase,
     targetSchema: effectiveTargetSchema,
     targetCatalog: normalizeTransferCatalog(targetCatalog.value, targetCatalogs.value) || undefined,
     tables: [...selectedTables.value],
     createTable: transferContent.value !== "dataOnly",
     content: transferContent.value,
     objects: buildTransferObjectSelections(selectedObjects.value, treeDisabledGroups.value),
-    mode: transferMode.value,
+    ...transferStrategyOptions(targetTableStrategy.value),
     targetTableNameCase: targetTableNameCase.value,
+    quoteTargetColumnNames: quoteTargetColumnNames.value,
     ownershipPolicy: "preserve",
     batchSize: batchSize.value,
+    dropTargetConfirmed: false,
   };
-
-  if (transferContent.value !== "dataOnly") {
-    try {
-      const preview = await api.previewTransferOwnership(request);
-      if (preview.missingOwners.length > 0) {
-        ownershipMissingOwners.value = preview.missingOwners;
-        ownershipTargetOwner.value = preview.targetOwner;
-        pendingOwnershipRequest.value = request;
-        pendingOwnershipRefresh.value = {
-          shouldRefreshTargetTree,
-        };
-        ownershipDialogOpen.value = true;
-        isSubmitting.value = false;
-        return;
-      }
-    } catch {
+  pendingTransferId.value = request.transferId;
+  try {
+    await transferSubmission.start(request);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    toast(message === "TRANSFER_REBUILD_PREVIEW_UNAVAILABLE" ? t("transfer.rebuildPreviewUnavailable") : t("transfer.previewFailed", { message }), 5000);
+  } finally {
+    if (pendingTransferId.value === request.transferId) {
+      pendingTransferId.value = null;
       isSubmitting.value = false;
-      return;
     }
   }
-
-  runTransfer(request, shouldRefreshTargetTree);
 }
 
 function runTransfer(request: api.TransferRequest, shouldRefreshTargetTree: boolean) {
@@ -688,19 +821,22 @@ function runTransfer(request: api.TransferRequest, shouldRefreshTargetTree: bool
   resetState();
 }
 
+function requestOwnershipConfirmation(preview: api.TransferOwnershipPreview): Promise<api.TransferOwnershipPolicy | null> {
+  ownershipMissingOwners.value = preview.missingOwners;
+  ownershipTargetOwner.value = preview.targetOwner;
+  ownershipDialogOpen.value = true;
+  return new Promise((resolve) => {
+    resolveOwnershipConfirmation = resolve;
+  });
+}
+
 function resolveOwnershipDecision(policy: api.TransferOwnershipPolicy | null) {
-  const request = pendingOwnershipRequest.value;
-  const refresh = pendingOwnershipRefresh.value;
-  pendingOwnershipRequest.value = null;
-  pendingOwnershipRefresh.value = null;
+  const resolve = resolveOwnershipConfirmation;
+  resolveOwnershipConfirmation = undefined;
   ownershipDialogOpen.value = false;
   ownershipMissingOwners.value = [];
   ownershipTargetOwner.value = "";
-  if (!policy || !request || !refresh) {
-    isSubmitting.value = false;
-    return;
-  }
-  runTransfer({ ...request, ownershipPolicy: policy }, refresh.shouldRefreshTargetTree);
+  resolve?.(policy);
 }
 
 function getConnectionName(id: string) {
@@ -722,17 +858,19 @@ function currentConfig(): TransferTaskConfig {
   return {
     sourceConnectionId: sourceConnectionId.value,
     sourceCatalog: normalizeTransferCatalog(sourceCatalog.value, sourceCatalogs.value) || undefined,
-    sourceDatabase: sourceDatabase.value,
+    sourceDatabase: sourceDatabaseName.value,
     sourceSchema: sourceSchema.value || undefined,
     targetConnectionId: targetConnectionId.value,
     targetCatalog: normalizeTransferCatalog(targetCatalog.value, targetCatalogs.value) || undefined,
-    targetDatabase: targetDatabase.value,
+    targetDatabase: targetDatabaseName.value,
     targetSchema: targetSchema.value || undefined,
     objects,
     content: transferContent.value,
-    mode: transferMode.value,
+    ...transferStrategyOptions(targetTableStrategy.value),
     targetTableNameCase: targetTableNameCase.value,
+    quoteTargetColumnNames: quoteTargetColumnNames.value,
     batchSize: batchSize.value,
+    dropTargetConfirmed: false,
   };
 }
 
@@ -748,7 +886,28 @@ function configSnapshot(config: TransferTaskConfig) {
 const formHasContent = computed(() => !!sourceConnectionId.value || !!targetConnectionId.value);
 const isConfigDirty = computed(() => !!activeTaskId.value && configSnapshot(currentConfig()) !== savedConfigSnapshot.value);
 const needsDiscardConfirm = computed(() => isConfigDirty.value || (!activeTaskId.value && formHasContent.value));
-const canSaveConfig = computed(() => !!sourceConnectionId.value && !!sourceDatabase.value && !!targetConnectionId.value && !!targetDatabase.value);
+const canSaveConfig = computed(() => !!sourceConnectionId.value && isTransferDatabaseSelected(sourceDatabase.value) && !!targetConnectionId.value && isTransferDatabaseSelected(targetDatabase.value));
+
+// Invalidate before asynchronous callbacks can publish a preview for an old form,
+// including a task switch whose new values happen to equal the previous task.
+watch(() => configSnapshot(currentConfig()), cancelPendingTransfer, { flush: "sync" });
+watch(activeTaskId, cancelPendingTransfer, { flush: "sync" });
+watch(
+  open,
+  (isOpen) => {
+    if (!isOpen) cancelPendingTransfer();
+  },
+  { flush: "sync" },
+);
+watch(
+  () => {
+    const connection = store.getConfig(targetConnectionId.value);
+    return JSON.stringify([connection?.read_only, connection?.is_production, connection?.production_databases]);
+  },
+  cancelPendingTransfer,
+  { flush: "sync" },
+);
+onBeforeUnmount(cancelPendingTransfer);
 
 /** Applies a saved task to the form, loading catalogs/databases/schemas/objects with explicit awaits. */
 async function loadTaskIntoForm(task: TransferTask) {
@@ -758,8 +917,9 @@ async function loadTaskIntoForm(task: TransferTask) {
   resetState(false);
   activeTaskId.value = task.id;
   transferContent.value = config.content;
-  transferMode.value = config.mode;
+  selectedStrategy.value = resolveTransferStrategy(config);
   targetTableNameCase.value = config.targetTableNameCase;
+  quoteTargetColumnNames.value = config.quoteTargetColumnNames;
   batchSize.value = config.batchSize;
   pendingSelectedObjectsPrefill.value = Object.keys(config.objects).length > 0 ? JSON.parse(JSON.stringify(config.objects)) : null;
 
@@ -780,11 +940,12 @@ async function loadTaskIntoForm(task: TransferTask) {
     await loadDatabases(config.sourceConnectionId, "source", isTaskLoadStale);
     if (isTaskLoadStale()) return;
   }
-  if (sourceDatabase.value !== config.sourceDatabase) {
-    skipSourceDatabaseWatch.value = true;
-    sourceDatabase.value = config.sourceDatabase;
-  }
   const sourceConfig = store.getConfig(config.sourceConnectionId);
+  const sourceDatabaseOption = encodedDatabase(config.sourceConnectionId, config.sourceDatabase);
+  if (sourceDatabase.value !== sourceDatabaseOption) {
+    skipSourceDatabaseWatch.value = true;
+    sourceDatabase.value = sourceDatabaseOption;
+  }
   if (namespaceOptionsAreSchemas(sourceConfig)) {
     sourceSchemas.value = [];
     sourceSchema.value = config.sourceDatabase;
@@ -816,11 +977,12 @@ async function loadTaskIntoForm(task: TransferTask) {
     await loadDatabases(config.targetConnectionId, "target", isTaskLoadStale);
     if (isTaskLoadStale()) return;
   }
-  if (targetDatabase.value !== config.targetDatabase) {
-    skipTargetDatabaseWatch.value = true;
-    targetDatabase.value = config.targetDatabase;
-  }
   const targetConfig = store.getConfig(config.targetConnectionId);
+  const targetDatabaseOption = encodedDatabase(config.targetConnectionId, config.targetDatabase);
+  if (targetDatabase.value !== targetDatabaseOption) {
+    skipTargetDatabaseWatch.value = true;
+    targetDatabase.value = targetDatabaseOption;
+  }
   if (namespaceOptionsAreSchemas(targetConfig)) {
     targetSchemas.value = [];
     targetSchema.value = config.targetDatabase;
@@ -872,25 +1034,93 @@ function onSelectedTaskIdUpdate(id: string | null) {
   activeTaskId.value = id;
 }
 
-// ---- start confirmation (guards the only run entry: the footer button) ----
+// ---- confirmation for the immutable, previewed transfer request ----
 
-/** Number of objects currently selected across all kinds. */
-const selectedObjectCount = computed(() => Object.values(selectedObjects.value).reduce((total, names) => total + (names?.size ?? 0), 0));
-
-const startConfirmSource = computed(() => `${getConnectionName(sourceConnectionId.value)}.${sourceDatabase.value}`);
-const startConfirmTarget = computed(() => `${getConnectionName(targetConnectionId.value)}.${targetDatabase.value}`);
-
-/** Opens the confirmation dialog before starting a transfer. */
-function requestStartTransfer() {
-  if (!canStart.value || isSubmitting.value) return;
-  showStartConfirm.value = true;
+function transferStrategyLabel(request: api.TransferRequest): string {
+  if (request.content === "structureOnly") return t(request.dropTargetBeforeCreate ? "transfer.modeRebuildStructure" : "transfer.modeKeepExisting");
+  const strategy = resolveTransferStrategy(request);
+  const keys = { append: "modeAppend", overwrite: "modeOverwrite", upsert: "modeUpsert", rebuild: "modeRebuild" };
+  return t(`transfer.${keys[strategy]}`);
 }
 
-/** Confirmed: close the prompt and run the normal start flow. */
-function confirmStartTransfer() {
+const confirmationSummary = computed(() => {
+  const request = confirmationRequest.value;
+  if (!request) return "";
+  const source = `${getConnectionName(request.sourceConnectionId)}.${request.sourceDatabase}.${request.sourceSchema}`;
+  const target = `${getConnectionName(request.targetConnectionId)}.${request.targetDatabase}.${request.targetSchema}`;
+  const count = request.tables.length + request.objects.reduce((total, selection) => total + selection.names.length, 0);
+  return t("transfer.startConfirmMessage", { source, target, count });
+});
+
+const confirmationStrategy = computed(() => (confirmationRequest.value ? transferStrategyLabel(confirmationRequest.value) : ""));
+const rebuildConfirmationDetails = computed(() => {
+  const rebuild = confirmationPreview.value?.rebuild;
+  if (!rebuild) return "";
+  const missingTargets = rebuild.tables.some((table) => !table.backupTable);
+  return [confirmationSummary.value, t("transfer.rebuildSummary", { count: rebuild.tables.length }), missingTargets ? t("transfer.rebuildMissingTargets") : ""].filter(Boolean).join("\n");
+});
+
+function requestTransferConfirmation(request: api.TransferRequest, preview: api.TransferOwnershipPreview): Promise<boolean> {
+  confirmationRequest.value = request;
+  confirmationPreview.value = preview;
+  const reviewText = preview.rebuild
+    ? [confirmationStrategy.value, rebuildConfirmationDetails.value, preview.rebuild.sql].filter(Boolean).join("\n\n")
+    : [confirmationSummary.value, `${t("transfer.targetTableHandling")}: ${confirmationStrategy.value}`, ...request.objects.map((selection) => selection.names.join(", "))].join("\n");
+  return confirmTransferWithProductionSafety({
+    request,
+    connection: store.getConfig(request.targetConnectionId),
+    reviewText,
+    source: t("transfer.title"),
+    confirm: () =>
+      new Promise((resolve) => {
+        resolveTransferConfirmation = resolve;
+        if (request.dropTargetBeforeCreate) showRebuildConfirm.value = true;
+        else showStartConfirm.value = true;
+      }),
+  });
+}
+
+function resolveStartDecision(confirmed: boolean) {
+  const resolve = resolveTransferConfirmation;
+  resolveTransferConfirmation = undefined;
   showStartConfirm.value = false;
-  void startTransfer();
+  showRebuildConfirm.value = false;
+  resolve?.(confirmed);
 }
+
+function cancelPendingTransfer() {
+  transferSubmission.cancel();
+  const scopeId = pendingTransferId.value;
+  pendingTransferId.value = null;
+  if (scopeId) productionSafetyStore.cancelScope(scopeId);
+  resolveStartDecision(false);
+  resolveOwnershipDecision(null);
+  confirmationRequest.value = null;
+  confirmationPreview.value = null;
+  isSubmitting.value = false;
+}
+
+watch(
+  showStartConfirm,
+  (isOpen) => {
+    if (!isOpen) resolveStartDecision(false);
+  },
+  { flush: "sync" },
+);
+watch(
+  showRebuildConfirm,
+  (isOpen) => {
+    if (!isOpen) resolveStartDecision(false);
+  },
+  { flush: "sync" },
+);
+watch(
+  ownershipDialogOpen,
+  (isOpen) => {
+    if (!isOpen) resolveOwnershipDecision(null);
+  },
+  { flush: "sync" },
+);
 
 /** Saves the form into the active task, or creates a new one and starts its rename. */
 async function saveConfigTask() {
@@ -921,7 +1151,7 @@ async function saveConfigTask() {
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent class="dbx-transfer-dialog sm:max-w-[1120px] max-h-[80vh] flex flex-col overflow-hidden" @interact-outside.prevent>
+    <DialogContent class="dbx-transfer-dialog sm:max-w-[1120px] max-h-[80vh] flex flex-col overflow-hidden resize" :style="transferDialogStyle" @interact-outside.prevent>
       <DialogHeader class="shrink-0">
         <DialogTitle class="flex items-center gap-2">
           <ArrowRightLeft class="w-4 h-4" />
@@ -946,25 +1176,16 @@ async function saveConfigTask() {
 
                 <div class="space-y-1.5">
                   <Label class="text-xs">{{ t("transfer.sourceConnection") }}</Label>
-                  <SearchableSelect
+                  <ConnectionTreeSelect
                     v-model="sourceConnectionId"
-                    :options="sqlConnections.map((c) => c.id)"
+                    :connections="sqlConnections"
+                    :layout="store.sidebarLayout"
                     :placeholder="t('transfer.selectConnection')"
                     :search-placeholder="t('transfer.searchConnection')"
                     :empty-text="t('common.noResults')"
-                    :display-name="getConnectionName"
-                    trigger-variant="outline"
-                    trigger-class="h-8 w-full justify-between text-xs"
-                    content-class="w-[var(--reka-popover-trigger-width)]"
-                  >
-                    <template #option-label="{ option, label }">
-                      <div class="flex min-w-0 items-center gap-1.5">
-                        <DatabaseIcon :db-type="connectionIconType(sqlConnections.find((c) => c.id === option))" class="h-3.5 w-3.5 shrink-0" />
-                        <ConnectionGroupBadge :connection-id="option" />
-                        <span class="min-w-0 flex-1 truncate">{{ label }}</span>
-                      </div>
-                    </template>
-                  </SearchableSelect>
+                    trigger-class="h-8 w-full max-w-none justify-between gap-1.5 border border-input rounded-md bg-transparent px-2.5 text-xs shadow-none hover:bg-muted/40 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30 dark:hover:bg-input/50"
+                    list-class="w-[var(--reka-popover-trigger-width)]"
+                  />
                 </div>
 
                 <!-- Source Catalog (Doris/StarRocks multi-catalog) -->
@@ -987,6 +1208,7 @@ async function saveConfigTask() {
                   <SearchableSelect
                     v-model="sourceDatabase"
                     :options="sourceDatabases"
+                    :display-name="(option) => databaseOptionLabel(sourceConnectionId, option)"
                     :placeholder="t('transfer.selectDatabase')"
                     :search-placeholder="t('transfer.searchDatabase')"
                     :empty-text="t('common.noResults')"
@@ -1012,9 +1234,11 @@ async function saveConfigTask() {
                 </div>
               </div>
 
-              <!-- Arrow -->
+              <!-- Swap source / target -->
               <div class="flex items-center pt-8">
-                <ArrowLeftRight class="w-5 h-5 text-muted-foreground" />
+                <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('transfer.swap')" :aria-label="t('transfer.swap')" @click="swapSourceAndTarget">
+                  <ArrowLeftRight class="w-3.5 h-3.5" />
+                </Button>
               </div>
 
               <!-- Target Section -->
@@ -1025,25 +1249,16 @@ async function saveConfigTask() {
 
                 <div class="space-y-1.5">
                   <Label class="text-xs">{{ t("transfer.targetConnection") }}</Label>
-                  <SearchableSelect
+                  <ConnectionTreeSelect
                     v-model="targetConnectionId"
-                    :options="sqlConnections.map((c) => c.id)"
+                    :connections="sqlConnections"
+                    :layout="store.sidebarLayout"
                     :placeholder="t('transfer.selectConnection')"
                     :search-placeholder="t('transfer.searchConnection')"
                     :empty-text="t('common.noResults')"
-                    :display-name="getConnectionName"
-                    trigger-variant="outline"
-                    trigger-class="h-8 w-full justify-between text-xs"
-                    content-class="w-[var(--reka-popover-trigger-width)]"
-                  >
-                    <template #option-label="{ option, label }">
-                      <div class="flex min-w-0 items-center gap-1.5">
-                        <DatabaseIcon :db-type="connectionIconType(sqlConnections.find((c) => c.id === option))" class="h-3.5 w-3.5 shrink-0" />
-                        <ConnectionGroupBadge :connection-id="option" />
-                        <span class="min-w-0 flex-1 truncate">{{ label }}</span>
-                      </div>
-                    </template>
-                  </SearchableSelect>
+                    trigger-class="h-8 w-full max-w-none justify-between gap-1.5 border border-input rounded-md bg-transparent px-2.5 text-xs shadow-none hover:bg-muted/40 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30 dark:hover:bg-input/50"
+                    list-class="w-[var(--reka-popover-trigger-width)]"
+                  />
                 </div>
 
                 <!-- Target Catalog (Doris/StarRocks multi-catalog) -->
@@ -1066,6 +1281,7 @@ async function saveConfigTask() {
                   <SearchableSelect
                     v-model="targetDatabase"
                     :options="targetDatabases"
+                    :display-name="(option) => databaseOptionLabel(targetConnectionId, option)"
                     :placeholder="t('transfer.selectDatabase')"
                     :search-placeholder="t('transfer.searchDatabase')"
                     :empty-text="t('common.noResults')"
@@ -1131,19 +1347,21 @@ async function saveConfigTask() {
                   </label>
                 </div>
               </div>
-              <div v-if="transferContent !== 'structureOnly'" class="flex items-center gap-3">
-                <Label class="text-xs shrink-0">{{ t("transfer.dataWriteMode") }}</Label>
-                <Select v-model="transferMode">
+              <div class="flex items-center gap-3">
+                <Label class="text-xs shrink-0">{{ t("transfer.targetTableHandling") }}</Label>
+                <Select v-model="targetTableStrategy">
                   <SelectTrigger class="h-7 text-xs">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="append">{{ t("transfer.modeAppend") }}</SelectItem>
-                    <SelectItem value="overwrite">{{ t("transfer.modeOverwrite") }}</SelectItem>
-                    <SelectItem value="upsert">{{ t("transfer.modeUpsert") }}</SelectItem>
+                    <SelectItem value="append">{{ t(transferContent === "structureOnly" ? "transfer.modeKeepExisting" : "transfer.modeAppend") }}</SelectItem>
+                    <SelectItem v-if="transferContent !== 'structureOnly'" value="overwrite">{{ t("transfer.modeOverwrite") }}</SelectItem>
+                    <SelectItem v-if="transferContent !== 'structureOnly'" value="upsert">{{ t("transfer.modeUpsert") }}</SelectItem>
+                    <SelectItem value="rebuild" :disabled="!!rebuildDisabledReason">{{ t(transferContent === "structureOnly" ? "transfer.modeRebuildStructure" : "transfer.modeRebuild") }}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
+              <p v-if="rebuildDisabledHint" class="text-xs text-muted-foreground">{{ rebuildDisabledHint }}</p>
               <div class="flex items-center gap-3">
                 <Label class="text-xs shrink-0">{{ t("transfer.targetTableNameCase") }}</Label>
                 <Select v-model="targetTableNameCase">
@@ -1156,6 +1374,10 @@ async function saveConfigTask() {
                     <SelectItem value="upper">{{ t("transfer.tableNameCaseUpper") }}</SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+              <div v-if="showTargetColumnQuoteOption" class="flex items-center gap-3">
+                <Label for="transfer-quote-target-column-names" class="text-xs shrink-0">{{ t("transfer.quoteTargetColumnNames") }}</Label>
+                <Switch id="transfer-quote-target-column-names" v-model="quoteTargetColumnNames" size="sm" />
               </div>
               <div class="flex items-center gap-3">
                 <Label class="text-xs shrink-0">{{ t("transfer.batchSize") }}</Label>
@@ -1206,19 +1428,31 @@ async function saveConfigTask() {
       <DialogHeader>
         <DialogTitle>{{ t("transfer.startConfirmTitle") }}</DialogTitle>
         <DialogDescription>
-          {{ t("transfer.startConfirmMessage", { source: startConfirmSource, target: startConfirmTarget, count: selectedObjectCount }) }}
+          {{ confirmationSummary }}
         </DialogDescription>
       </DialogHeader>
+      <p class="text-xs text-muted-foreground">{{ t("transfer.targetTableHandling") }}: {{ confirmationStrategy }}</p>
       <DialogFooter class="gap-2">
-        <Button variant="outline" size="sm" @click="showStartConfirm = false">
+        <Button variant="outline" size="sm" @click="resolveStartDecision(false)">
           {{ t("transfer.cancel") }}
         </Button>
-        <Button size="sm" @click="confirmStartTransfer">
+        <Button size="sm" @click="resolveStartDecision(true)">
           {{ t("transfer.start") }}
         </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
+
+  <DangerConfirmDialog
+    v-model:open="showRebuildConfirm"
+    :sql="confirmationPreview?.rebuild?.sql"
+    :title="confirmationStrategy"
+    :message="t('transfer.rebuildDanger')"
+    :details-text="rebuildConfirmationDetails"
+    :confirm-label="t('transfer.start')"
+    :close-on-confirm="false"
+    @confirm="resolveStartDecision(true)"
+  />
 
   <Dialog v-model:open="ownershipDialogOpen">
     <DialogContent class="sm:max-w-[520px]" @interact-outside.prevent>
@@ -1252,10 +1486,8 @@ async function saveConfigTask() {
 </template>
 
 <style>
-@media (min-width: 640px) {
-  html.dbx-legacy-webview [data-slot="dialog-content"].dbx-transfer-dialog[class~="max-w-sm"] {
-    width: calc(100vw - 2rem) !important;
-    max-width: 1120px !important;
-  }
+html.dbx-legacy-webview [data-slot="dialog-content"].dbx-transfer-dialog[class~="max-w-sm"] {
+  /* Override the legacy default cap without pinning width, so native resize remains effective. */
+  max-width: calc(100vw - 2rem) !important;
 }
 </style>

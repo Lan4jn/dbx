@@ -5,6 +5,7 @@ use dbx_core::query::execute_sql_statement;
 use dbx_core::sql::SqlFileRequest;
 use dbx_core::sql_file_import::execute_sql_file_path;
 use dbx_core::storage::Storage;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 fn exported_view_position(sql: &str, view_name: &str) -> Option<usize> {
@@ -40,6 +41,78 @@ fn live_mysql_config(id: &str) -> ConnectionConfig {
 
 #[tokio::test]
 #[ignore = "requires a disposable MySQL endpoint"]
+async fn live_mysql_selected_table_restore_preserves_unselected_tables() {
+    use dbx_core::sql_file_import::{inspect_sql_file_tables, SqlFileTable};
+    use futures::FutureExt;
+    use std::io::Write;
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("selected-restore-{suffix}");
+    let database = format!("dbx_restore_{suffix}");
+    let dir = std::env::temp_dir().join(format!("dbx-selected-restore-{suffix}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+    let state = AppState::new(storage);
+    state.configs.write().await.insert(connection_id.clone(), live_mysql_config(&connection_id));
+    execute_sql_statement(&state, &connection_id, "", &format!("CREATE DATABASE `{database}`"), None, None)
+        .await
+        .unwrap();
+
+    let outcome = std::panic::AssertUnwindSafe(async {
+        execute_sql_statement(&state, &connection_id, &database, "CREATE TABLE untouched (id INT PRIMARY KEY)", None, None).await?;
+        execute_sql_statement(&state, &connection_id, &database, "INSERT INTO untouched VALUES (99)", None, None).await?;
+        let script = format!("CREATE DATABASE IF NOT EXISTS `{database}`; USE `{database}`; SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS chosen, untouched; CREATE TABLE chosen (id INT PRIMARY KEY, body LONGTEXT); INSERT INTO chosen VALUES (7, '{}'); CREATE TABLE untouched (id INT PRIMARY KEY); INSERT INTO untouched VALUES (1); CREATE VIEW skipped_view AS SELECT id FROM chosen; SET FOREIGN_KEY_CHECKS=1;", "x".repeat(400_000));
+        for compressed in [false, true] {
+            let path = dir.join(if compressed { "backup.sql.gz" } else { "backup.sql" });
+            if compressed {
+                let mut writer = flate2::write::GzEncoder::new(std::fs::File::create(&path).map_err(|e| e.to_string())?, flate2::Compression::default());
+                writer.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+                writer.finish().map_err(|e| e.to_string())?;
+            } else {
+                std::fs::write(&path, &script).map_err(|e| e.to_string())?;
+            }
+            let tables = inspect_sql_file_tables(&path).await?;
+            assert_eq!(tables.len(), 2);
+            let request = SqlFileRequest {
+                execution_id: format!("restore-{suffix}-{compressed}"), connection_id: connection_id.clone(), database: database.clone(), file_path: path.display().to_string(), continue_on_error: false,
+                selected_tables: Some(vec![SqlFileTable { database: Some(database.clone()), name: "chosen".into() }]),
+                part_cooldown_ms: 0,
+                skip_relational_constraints: false,
+            };
+            execute_sql_file_path(&state, &request, &path, CancellationToken::new(), std::time::Instant::now(), |_| {}).await?;
+            let rows = execute_sql_statement(&state, &connection_id, &database, "SELECT id, LENGTH(body) FROM chosen", None, None).await?;
+            assert_eq!(rows.rows, vec![vec![serde_json::json!("7"), serde_json::json!("400000")]]);
+            let untouched = execute_sql_statement(&state, &connection_id, &database, "SELECT id FROM untouched", None, None).await?;
+            assert_eq!(untouched.rows, vec![vec![serde_json::json!("99")]]);
+            let views = execute_sql_statement(&state, &connection_id, &database, "SHOW FULL TABLES WHERE Table_type = 'VIEW'", None, None).await?;
+            assert!(views.rows.is_empty());
+        }
+        let path = dir.join("unsupported.sql");
+        std::fs::write(&path, "DROP TABLE chosen; INSERT INTO chosen VALUES (1, 'bad'); CALL unexpected();").map_err(|e| e.to_string())?;
+        let request = SqlFileRequest {
+            execution_id: format!("invalid-{suffix}"), connection_id: connection_id.clone(), database: database.clone(), file_path: path.display().to_string(), continue_on_error: true,
+            selected_tables: Some(vec![SqlFileTable { database: None, name: "chosen".into() }]),
+            part_cooldown_ms: 0,
+            skip_relational_constraints: false,
+        };
+        let mut events = Vec::new();
+        assert!(execute_sql_file_path(&state, &request, &path, CancellationToken::new(), std::time::Instant::now(), |event| events.push(event)).await.is_err());
+        assert_eq!(events.last().unwrap().success_count, 0);
+        let rows = execute_sql_statement(&state, &connection_id, &database, "SELECT id FROM chosen", None, None).await?;
+        assert_eq!(rows.rows, vec![vec![serde_json::json!("7")]]);
+        Ok::<_, String>(())
+    }).catch_unwind().await;
+
+    let cleanup =
+        execute_sql_statement(&state, &connection_id, "", &format!("DROP DATABASE `{database}`"), None, None).await;
+    drop(state);
+    std::fs::remove_dir_all(&dir).unwrap();
+    cleanup.unwrap();
+    outcome.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable MySQL endpoint"]
 async fn live_mysql_database_export_restores_dependent_views() {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let connection_id = format!("live-mysql-export-{suffix}");
@@ -47,7 +120,7 @@ async fn live_mysql_database_export_restores_dependent_views() {
     let dir = std::env::temp_dir().join(format!("dbx-live-mysql-export-{suffix}"));
     std::fs::create_dir_all(&dir).unwrap();
     let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let state = Arc::new(AppState::new(storage));
     state.configs.write().await.insert(connection_id.clone(), live_mysql_config(&connection_id));
 
     for sql in [
@@ -77,8 +150,11 @@ async fn live_mysql_database_export_restores_dependent_views() {
         drop_table_if_exists: true,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
+        output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
     let test_result = async {
         export_database_sql_core(&state, &export_request, |_| {}).await?;
@@ -98,6 +174,9 @@ async fn live_mysql_database_export_restores_dependent_views() {
             database: String::new(),
             file_path: file_path.to_string_lossy().to_string(),
             continue_on_error: false,
+            selected_tables: None,
+            part_cooldown_ms: 0,
+            skip_relational_constraints: false,
         };
         execute_sql_file_path(
             &state,
@@ -134,6 +213,122 @@ async fn live_mysql_database_export_restores_dependent_views() {
     assert_eq!(spatial_result.rows, vec![vec![serde_json::json!(4326), serde_json::json!(1)]]);
 }
 
+/// Regression coverage for #6882. A whole-database export prefetches MySQL
+/// metadata concurrently, so late health checks for an older pool generation
+/// must not remove a replacement pool from routing. Empty tables must still
+/// contribute their DDL even though they naturally produce no INSERT rows.
+#[test]
+#[ignore = "requires a disposable MySQL endpoint"]
+fn live_mysql_database_export_handles_many_tables_including_empty_tables() {
+    let handle = std::thread::Builder::new()
+        .name("live-mysql-export-many-tables".to_string())
+        // Tokio worker threads use a 2 MiB stack by default. Keep this test at
+        // that production-sized boundary so large metadata futures cannot
+        // silently rely on the oversized stacks used by older export tests.
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build live MySQL export runtime")
+                .block_on(run_live_mysql_database_export_handles_many_tables_including_empty_tables());
+        })
+        .expect("spawn live MySQL export thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn run_live_mysql_database_export_handles_many_tables_including_empty_tables() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("live-mysql-export-many-tables-{suffix}");
+    let database = format!("dbx_export_many_{suffix}");
+    let dir = std::env::temp_dir().join(format!("dbx-live-mysql-export-many-tables-{suffix}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+    let state = Arc::new(AppState::new(storage));
+    state.configs.write().await.insert(connection_id.clone(), live_mysql_config(&connection_id));
+
+    execute_sql_statement(&state, &connection_id, "", &format!("CREATE DATABASE `{database}`"), None, None)
+        .await
+        .unwrap();
+    for index in 1..=80 {
+        let table = format!("export_probe_{index:03}");
+        let create = format!(
+            "CREATE TABLE `{database}`.`{table}` (\
+             id INT PRIMARY KEY, parent_id INT NULL, name VARCHAR(120) NOT NULL, note TEXT, \
+             created_at DATETIME, amount DECIMAL(12, 2), active BOOLEAN, metadata JSON, \
+             INDEX idx_parent (parent_id))"
+        );
+        execute_sql_statement(&state, &connection_id, "", &create, None, None).await.unwrap();
+        if index % 5 != 0 {
+            let insert = format!(
+                "INSERT INTO `{database}`.`{table}` \
+                 (id, parent_id, name, note, created_at, amount, active, metadata) \
+                 VALUES ({index}, NULL, 'row-{index:03}', 'batch export probe', \
+                 '2026-08-25 12:00:00', 12.34, TRUE, '{{\"index\": {index}}}')"
+            );
+            execute_sql_statement(&state, &connection_id, "", &insert, None, None).await.unwrap();
+        }
+    }
+    let test_result = async {
+        for attempt in 1..=5 {
+            let file_path = dir.join(format!("export-{attempt}.sql"));
+            let request = DatabaseExportRequest {
+                export_id: format!("live-mysql-export-many-tables-{suffix}-{attempt}"),
+                connection_id: connection_id.clone(),
+                database: database.clone(),
+                schema: database.clone(),
+                file_path: file_path.to_string_lossy().to_string(),
+                selected_tables: Vec::new(),
+                excluded_tables: Vec::new(),
+                include_structure: true,
+                include_data: true,
+                include_objects: false,
+                include_create_database: false,
+                drop_table_if_exists: false,
+                omit_auto_increment: false,
+                fail_on_error: false,
+                prevent_overwrite: false,
+                output_compression: Default::default(),
+                snapshot_session_id: None,
+                batch_size: 1000,
+                split_max_mb: None,
+            };
+
+            export_database_sql_core(&state, &request, |_| {}).await?;
+            let exported = std::fs::read_to_string(&file_path).map_err(|error| error.to_string())?;
+            if exported.contains("-- ERROR") || exported.contains("Agent runtime is unavailable") {
+                return Err(format!("attempt {attempt} contained an inline export error:\n{exported}"));
+            }
+            for index in 1..=80 {
+                let table = format!("export_probe_{index:03}");
+                let create = format!("CREATE TABLE `{table}`");
+                if !exported.contains(&create) {
+                    return Err(format!("attempt {attempt} did not export DDL for {table}"));
+                }
+                if index % 5 == 0 {
+                    let qualified_insert = format!("INSERT INTO `{database}`.`{table}`");
+                    let unqualified_insert = format!("INSERT INTO `{table}`");
+                    if exported.contains(&qualified_insert) || exported.contains(&unqualified_insert) {
+                        return Err(format!("attempt {attempt} unexpectedly exported rows for empty table {table}"));
+                    }
+                } else if !exported.contains(&format!("'row-{index:03}'")) {
+                    return Err(format!("attempt {attempt} did not export the seeded row for {table}"));
+                }
+            }
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+
+    let cleanup =
+        execute_sql_statement(&state, &connection_id, "", &format!("DROP DATABASE `{database}`"), None, None).await;
+    cleanup.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    test_result.unwrap();
+}
+
 /// Regression test for #6109 ("backup always errors"): the very first export
 /// to a destination directory that has never been configured or used before
 /// (a normal, not-yet-created local folder -- e.g. the user just typed a new
@@ -157,7 +352,7 @@ async fn live_mysql_database_export_creates_missing_destination_directory() {
     let dir = std::env::temp_dir().join(format!("dbx-live-mysql-export-missing-dir-{suffix}"));
     std::fs::create_dir_all(&dir).unwrap();
     let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let state = Arc::new(AppState::new(storage));
     state.configs.write().await.insert(connection_id.clone(), live_mysql_config(&connection_id));
 
     for sql in [
@@ -189,8 +384,11 @@ async fn live_mysql_database_export_creates_missing_destination_directory() {
         drop_table_if_exists: true,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
+        output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     let result = export_database_sql_core(&state, &export_request, |_| {}).await;
@@ -222,7 +420,7 @@ async fn live_mysql_database_export_refuses_to_recreate_a_destination_that_disap
     let dir = std::env::temp_dir().join(format!("dbx-live-mysql-export-vanished-dir-{suffix}"));
     std::fs::create_dir_all(&dir).unwrap();
     let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let state = Arc::new(AppState::new(storage));
     state.configs.write().await.insert(connection_id.clone(), live_mysql_config(&connection_id));
 
     for sql in [
@@ -253,8 +451,11 @@ async fn live_mysql_database_export_refuses_to_recreate_a_destination_that_disap
         drop_table_if_exists: true,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
+        output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     export_database_sql_core(&state, &export_request, |_| {}).await.expect("first export should succeed");
@@ -301,7 +502,7 @@ async fn live_mysql_database_export_refuses_a_destination_that_vanished_before_i
     let dir = std::env::temp_dir().join(format!("dbx-live-mysql-export-preconfigured-vanished-dir-{suffix}"));
     std::fs::create_dir_all(&dir).unwrap();
     let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let state = Arc::new(AppState::new(storage));
     state.configs.write().await.insert(connection_id.clone(), live_mysql_config(&connection_id));
 
     for sql in [
@@ -338,8 +539,11 @@ async fn live_mysql_database_export_refuses_a_destination_that_vanished_before_i
         drop_table_if_exists: true,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
+        output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     // The mount disappears before the scheduler ever runs this schedule for

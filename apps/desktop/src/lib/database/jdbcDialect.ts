@@ -2,7 +2,7 @@ import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { isSchemaAware, spannerObjectTreeSchema, usesDatabaseObjectTreeMode, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import type { CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
 
-type JdbcDialectConnection = Partial<Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "connection_string" | "url_params" | "jdbc_driver_class" | "jdbc_driver_paths" | "database_info" | "external_config">>;
+type JdbcDialectConnection = Partial<Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "connection_string" | "url_params" | "jdbc_driver_class" | "jdbc_driver_paths" | "database_info" | "external_config" | "username">>;
 
 export type GaussdbIdentifierQuoteStyle = "auto" | "double" | "backtick";
 export type GaussdbConnectionMode = "native" | "m-jdbc";
@@ -15,14 +15,19 @@ const GAUSSDB_COUNT_QUERY_DOP_KEY = "gaussdbCountQueryDop";
 export const GAUSSDB_M_JDBC_DRIVER_PROFILE = "gaussdb-m";
 export const GAUSSDB_M_JDBC_DRIVER_CLASS = "com.huawei.gaussdb.jdbc.Driver";
 
-const DATABASE_AS_EXECUTION_SCHEMA_TYPES = new Set<DatabaseType>(["hive", "kyuubi", "impala", "spark"]);
+const DATABASE_AS_EXECUTION_SCHEMA_TYPES = new Set<DatabaseType>(["hive", "kyuubi", "impala", "argo", "spark"]);
 const CONNECTION_ROOT_SCHEMA_TYPES = new Set<DatabaseType>(["oracle", "dameng", "oceanbase-oracle"]);
 
 const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> = [
   { type: "databend", patterns: [/jdbc:databend:/i, /com\.databend\.jdbc\.DatabendDriver/i, /databend-jdbc/i] },
   { type: "starrocks", patterns: [/starrocks/i] },
+  // Phoenix remains a generic JDBC connection, but exposes queryable schemas.
+  // Returning `jdbc` keeps its generic SQL behavior while enabling the schema tree.
+  { type: "jdbc", patterns: [/phoenix/i] },
   { type: "doris", patterns: [/doris/i] },
   { type: "goldendb", patterns: [/jdbc:goldendb:/i, /goldendb/i] },
+  // GBase 8a only: 8s (`gbasedbt`/`jdbc:gbasedbt-sqli`) is Informix-based and must stay on jdbc.
+  { type: "gbase", patterns: [/jdbc:gbase:/i, /cn\.gbase\./i, /gbase(?!dbt)(?!8s).*jdbc/i] },
   { type: "mysql", patterns: [/kyuubi/i] },
   { type: "hive", patterns: [/inceptor/i, /\bapache\s+hive\b/i, /org\.apache\.hive\.jdbc\.HiveDriver/i, /hive-jdbc/i] },
   { type: "mysql", patterns: [/jdbc:mysql:/i, /mysql/i, /mariadb/i, /hive2/i] },
@@ -33,11 +38,14 @@ const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> =
   { type: "sqlserver", patterns: [/jdbc:sqlserver:/i, /sqlserver/i, /mssql/i] },
   { type: "oracle", patterns: [/jdbc:oracle:/i, /oracle/i] },
   { type: "clickhouse", patterns: [/jdbc:clickhouse:/i, /clickhouse/i] },
+  { type: "tdengine", patterns: [/jdbc:taos(?:-rs|-ws)?:/i, /taosdata/i, /tdengine/i] },
   { type: "h2", patterns: [/jdbc:h2:/i, /\bh2\b/i] },
   { type: "sqlite", patterns: [/jdbc:sqlite:/i, /sqlite/i] },
   { type: "db2", patterns: [/jdbc:db2:/i, /\bdb2\b/i] },
   { type: "informix", patterns: [/jdbc:informix/i, /informix/i] },
-  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i] },
+  // CacheDB.jar (legacy Caché driver) carries none of the intersystems URL or
+  // class-name markers, so match the jar file name / driver label directly.
+  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i, /\bcache(?:db)?\b/i] },
 ];
 
 // ASE uses Transact-SQL, but treating it as SQL Server globally would also
@@ -47,11 +55,16 @@ const JDBC_ASE_PROFILE_PATTERNS = [/(?:^|[\s_-])ase(?:$|[\s_-])/i, /\bsap[\s_-]+
 
 export function inferJdbcDialect(connection?: JdbcDialectConnection): DatabaseType | undefined {
   if (!connection || connection.db_type !== "jdbc") return undefined;
+  if (isGbase8sProfile(connection.driver_profile)) return undefined;
   const haystack = [connection.driver_profile, connection.driver_label, connection.connection_string, connection.jdbc_driver_class, ...(connection.jdbc_driver_paths ?? []), connection.database_info?.productName, connection.database_info?.serverComment, connection.database_info?.driverName]
     .filter(Boolean)
     .join("\n");
   if (!haystack) return undefined;
   return JDBC_DIALECT_MATCHERS.find((matcher) => matcher.patterns.some((pattern) => pattern.test(haystack)))?.type;
+}
+
+export function jdbcDriverProfileUsesSchemaQualification(driverProfile?: string): boolean {
+  return inferJdbcDialect({ db_type: "jdbc", driver_profile: driverProfile }) === "jdbc";
 }
 
 export function effectiveDatabaseTypeForConnection(connection?: JdbcDialectConnection): DatabaseType | undefined {
@@ -72,6 +85,22 @@ export function effectiveDatabaseTypeForConnection(connection?: JdbcDialectConne
   return inferJdbcDialect(connection) ?? "jdbc";
 }
 
+/**
+ * Database type the data-transfer pipeline treats a connection as. Doris-family
+ * engines (Doris/SelectDB/StarRocks) are saved as `db_type=mysql` with a
+ * doris/starrocks `driver_profile`, and the transfer backend routes them through
+ * the MySQL object family (catalog routing is driver_profile-aware); the
+ * standalone `doris`/`starrocks` manifest entries are not transfer-capable.
+ * Resolve those connections back to their raw db_type so they stay selectable in
+ * the transfer dialog and keep the MySQL object kinds — the effective type alone
+ * would drop them from the connection list and disable every non-table kind.
+ */
+export function transferDatabaseTypeForConnection(connection?: JdbcDialectConnection): DatabaseType | undefined {
+  const effective = effectiveDatabaseTypeForConnection(connection);
+  if (effective === "doris" || effective === "starrocks") return connection?.db_type;
+  return effective;
+}
+
 export function connectionUsesConnectionRootSchemaMode(connection?: JdbcDialectConnection): boolean {
   const type = effectiveDatabaseTypeForConnection(connection);
   return !!type && CONNECTION_ROOT_SCHEMA_TYPES.has(type);
@@ -90,7 +119,8 @@ export function connectionShouldLoadIdentifierQuote(connection: JdbcDialectConne
   if (gaussdbIdentifierQuoteStyle(connection) !== "auto") return false;
   if (connection.db_type === "gaussdb") return true;
   if (connection.db_type !== "jdbc") return false;
-  return ["gaussdb", "opengauss", "postgres"].includes(inferJdbcDialect(connection) ?? "");
+  const dialect = inferJdbcDialect(connection);
+  return dialect === "jdbc" || ["gaussdb", "opengauss", "postgres"].includes(dialect ?? "");
 }
 
 export function supportsGaussdbIdentifierQuoteStyle(connection: JdbcDialectConnection | undefined): boolean {
@@ -185,6 +215,8 @@ export function connectionUsesDatabaseObjectTreeMode(connection?: JdbcDialectCon
   const dialect = inferJdbcDialect(connection);
   if (!dialect) return true;
   if (dialect === "hive" || dialect === "trino") return false;
+  // TDengine exposes databases as the top-level namespace, without schemas.
+  if (dialect === "tdengine") return false;
   if (dialect === "databend") return true;
   return !usesTreeSchemaMode(dialect);
 }
@@ -210,13 +242,44 @@ export function connectionQueryExecutionSchema(connection: JdbcDialectConnection
   return type && DATABASE_AS_EXECUTION_SCHEMA_TYPES.has(type) ? database || undefined : undefined;
 }
 
+/**
+ * Whether the database name is a wrong guess for an unknown schema. Engines that keep tables under a
+ * dedicated schema level in the tree (PostgreSQL and relatives, SQL Server, DB2, Trino, generic JDBC)
+ * address objects as database.schema.table, so the database name matches no schema there. Oracle,
+ * Dameng and the Hive family are schema-aware without that level — their database *is* the schema —
+ * and must keep the `schema || database` fallback.
+ */
+function databaseNameIsNotASchema(type: DatabaseType | undefined): boolean {
+  return isSchemaAware(type) && usesTreeSchemaMode(type);
+}
+
 export function connectionObjectTreeQuerySchema(connection: JdbcDialectConnection | undefined, database: string, schema?: string): string {
   if (connection?.db_type === "jdbc" && inferJdbcDialect(connection) === "databend") return schema || database;
   if (connectionUsesDatabaseObjectTreeMode(connection)) return "";
   const type = effectiveDatabaseTypeForConnection(connection);
   if (type === "informix") return schema || "";
   if (type === "spanner") return spannerObjectTreeSchema(schema);
+  // A query tab that never picked a schema (toolbar "new query", a reopened .sql
+  // file) would otherwise send the database name and match no objects at all, so
+  // sidebar locate silently did nothing (issue #7648). The blank schema is the
+  // established "resolve it on the backend" value used by the completion paths.
+  if (!schema && databaseNameIsNotASchema(type)) return "";
   return schema || database;
+}
+
+/**
+ * Schema sent with object-list (listObjects) requests. Dameng's object SQL
+ * filters on a fixed `WHERE o.OWNER = ?`, so a blank schema matches nothing and
+ * the object tab renders empty when the schema could not be resolved (#8301).
+ * Mirror the completion path (connectionStore.listCompletionColumns) and fall
+ * back to the connection username — uppercased, the Oracle-family storage
+ * convention for unquoted Dameng users. Other Oracle-family types keep the
+ * blank schema so the backend resolves the current schema itself.
+ */
+export function objectListSchemaForConnection(connection: JdbcDialectConnection | undefined, schema?: string): string {
+  if (schema) return schema;
+  if (effectiveDatabaseTypeForConnection(connection) !== "dameng") return "";
+  return connection?.username?.trim().toUpperCase() || "";
 }
 
 /**
@@ -245,7 +308,14 @@ export function connectionObjectTreeNodeSchema(connection: JdbcDialectConnection
   if (type === "sqlite") return schema || database;
   if (type === "spanner") return spannerObjectTreeSchema(schema);
   if (!type) return schema;
+  if (!schema && databaseNameIsNotASchema(type)) return undefined;
   return isSchemaAware(type) ? schema || database : undefined;
+}
+
+/** GBase 8s reports the table owner as a schema, but does not accept it in table DML/DDL names. */
+export function connectionTableSqlSchema(connection: JdbcDialectConnection | undefined, schema?: string): string | undefined {
+  if (connection?.db_type === "gbase" && isGbase8sProfile(connection.driver_profile)) return undefined;
+  return schema;
 }
 
 /** Maps a database type to the corresponding CodeMirror SQL dialect name used by QueryEditor and DdlViewDialog. */

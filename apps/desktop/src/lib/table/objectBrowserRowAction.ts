@@ -16,7 +16,9 @@ export type ObjectBrowserRowAction = "table-info" | "type-info" | "open-table" |
  */
 export function singleClickRowAction(row: ObjectBrowserRow | null | undefined, dbType?: DatabaseType): ObjectBrowserRowAction {
   if (!row) return "none";
+  if (dbType === "mongodb") return mongoObjectBrowserRowAction(row);
   if (row.type === "TABLE") return "table-info";
+  if (row.type === "EVENT") return "none";
   if (row.type === "TYPE" && customTypeCapabilities(dbType).details) return "type-info";
   if (canOpenSource(row, dbType)) return "open-source";
   return "none";
@@ -30,7 +32,9 @@ export function singleClickRowAction(row: ObjectBrowserRow | null | undefined, d
  */
 export function doubleClickRowAction(row: ObjectBrowserRow | null | undefined, dbType?: DatabaseType): ObjectBrowserRowAction {
   if (!row) return "none";
+  if (dbType === "mongodb") return mongoObjectBrowserRowAction(row);
   if (row.type === "TABLE") return "open-table";
+  if (row.type === "EVENT") return "open-source";
   if (row.type === "TYPE" && customTypeCapabilities(dbType).details) return "type-info";
   if (canOpenSource(row, dbType)) return "open-source";
   return "none";
@@ -63,10 +67,10 @@ export function resolveRowClickAction(row: ObjectBrowserRow | null | undefined, 
  * open-table). For rows whose single and double actions are identical
  * (e.g. VIEW → open-source both), no deferral is needed.
  */
-export function shouldDeferSingleClick(row: ObjectBrowserRow | null | undefined, action: ObjectBrowserRowAction): boolean {
+export function shouldDeferSingleClick(row: ObjectBrowserRow | null | undefined, action: ObjectBrowserRowAction, dbType?: DatabaseType): boolean {
   if (action === "none") return false;
-  const single = singleClickRowAction(row);
-  const double = doubleClickRowAction(row);
+  const single = singleClickRowAction(row, dbType);
+  const double = doubleClickRowAction(row, dbType);
   return single !== double && action === single;
 }
 
@@ -78,10 +82,16 @@ export function isSourceOnlyObjectBrowserRow(row: ObjectBrowserRow): boolean {
   return row.type === "TRIGGER" || row.type === "SEQUENCE" || row.type === "PACKAGE" || row.type === "PACKAGE_BODY" || row.type === "TYPE" || row.type === "TYPE_BODY";
 }
 
+function mongoObjectBrowserRowAction(row: ObjectBrowserRow): ObjectBrowserRowAction {
+  return row.type === "TABLE" || row.type === "VIEW" ? "open-table" : "none";
+}
+
 function canOpenSource(row: ObjectBrowserRow, dbType?: DatabaseType): boolean {
   // Verified PG-family TYPE rows open the read-only details panel instead;
   // Xugu keeps its source editor entry through supportsTypeObjectSource below.
   if (row.type === "TYPE" && customTypeCapabilities(dbType).details) return false;
   if ((row.type === "TYPE" || row.type === "TYPE_BODY") && !supportsTypeObjectSource(dbType)) return false;
-  return row.type === "VIEW" || row.type === "MATERIALIZED_VIEW" || row.type === "PROCEDURE" || row.type === "FUNCTION" || row.type === "TRIGGER" || row.type === "SEQUENCE" || row.type === "PACKAGE" || row.type === "PACKAGE_BODY" || row.type === "TYPE" || row.type === "TYPE_BODY";
+  return (
+    row.type === "VIEW" || row.type === "MATERIALIZED_VIEW" || row.type === "PROCEDURE" || row.type === "FUNCTION" || row.type === "TRIGGER" || row.type === "EVENT" || row.type === "SEQUENCE" || row.type === "PACKAGE" || row.type === "PACKAGE_BODY" || row.type === "TYPE" || row.type === "TYPE_BODY"
+  );
 }

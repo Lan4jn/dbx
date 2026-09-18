@@ -4,6 +4,8 @@ mod db;
 mod gateway_identity;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
+#[cfg(target_os = "macos")]
+mod macos_escape_guard;
 mod models;
 #[cfg(any(target_os = "windows", test))]
 mod startup_recovery;
@@ -44,6 +46,10 @@ const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
 const APP_MENU_QUIT_ID: &str = "app-menu-quit";
 #[cfg(target_os = "macos")]
 const APP_MENU_COPY_SUPPORT_INFO_ID: &str = "app-menu-copy-support-info";
+#[cfg(target_os = "macos")]
+const APP_MENU_CLOSE_TAB_ID: &str = "app-menu-close-tab";
+#[cfg(target_os = "macos")]
+const APP_CLOSE_ACTIVE_TAB_EVENT: &str = "dbx-close-active-tab";
 
 pub struct CloseBehaviorState {
     confirmed_exit: AtomicBool,
@@ -121,6 +127,18 @@ fn should_hide_window_on_close(target_os: &str) -> bool {
     matches!(target_os, "macos" | "windows")
 }
 
+/// How long to keep the app off-screen after hiding it and before the process
+/// exits, so WindowServer has removed the window before WKWebView teardown.
+#[cfg(target_os = "macos")]
+pub(crate) const EXIT_HIDE_GRACE_MS: u64 = 250;
+
+/// On macOS, tearing down WKWebView while the window is still on screen can
+/// paint the window red for a frame before the process exits, so the app is
+/// hidden first. Windows and Linux keep their existing exit behavior.
+fn should_hide_window_before_exit(target_os: &str) -> bool {
+    target_os == "macos"
+}
+
 fn should_setup_desktop_tray(target_os: &str, show_tray_icon: bool, linux_appindicator_available: bool) -> bool {
     show_tray_icon
         && (matches!(target_os, "macos" | "windows") || (target_os == "linux" && linux_appindicator_available))
@@ -178,8 +196,8 @@ fn append_startup_probe(message: impl AsRef<str>) {
     startup_recovery::record(message);
 }
 
-pub(crate) fn clear_startup_probe_after_frontend_ready() {
-    startup_recovery::mark_frontend_ready();
+pub(crate) fn clear_startup_probe_after_frontend_ready(main_window_visible: bool) {
+    startup_recovery::mark_frontend_ready(main_window_visible);
 }
 
 fn should_confirm_app_exit_request(target_os: &str, exit_code: Option<i32>, confirmed_exit: bool) -> bool {
@@ -222,6 +240,13 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
         true,
         Some("Cmd+Q"),
     )?;
+    let close_tab_item = MenuItem::with_id(
+        app_handle,
+        APP_MENU_CLOSE_TAB_ID,
+        app_menu_close_tab_label(&current_app_locale(app_handle)),
+        true,
+        Some("Cmd+W"),
+    )?;
 
     Menu::with_items(
         app_handle,
@@ -242,7 +267,7 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
                     &quit_item,
                 ],
             )?,
-            &Submenu::with_items(app_handle, "File", true, &[&PredefinedMenuItem::close_window(app_handle, None)?])?,
+            &Submenu::with_items(app_handle, "File", true, &[&close_tab_item])?,
             &Submenu::with_items(
                 app_handle,
                 "Edit",
@@ -262,12 +287,7 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
                 app_handle,
                 "Window",
                 true,
-                &[
-                    &PredefinedMenuItem::minimize(app_handle, None)?,
-                    &PredefinedMenuItem::maximize(app_handle, None)?,
-                    &PredefinedMenuItem::separator(app_handle)?,
-                    &PredefinedMenuItem::close_window(app_handle, None)?,
-                ],
+                &[&PredefinedMenuItem::minimize(app_handle, None)?, &PredefinedMenuItem::maximize(app_handle, None)?],
             )?,
             &Submenu::with_items(app_handle, "Help", true, &[])?,
         ],
@@ -288,7 +308,23 @@ struct LinuxDrmRenderDevice {
     device_file: std::path::PathBuf,
     driver: Option<String>,
     boot_vga: bool,
+    pci_id: Option<(u16, u16)>,
 }
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxDmabufRendererPciQuirk {
+    vendor_id: u16,
+    device_id: u16,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_DMABUF_RENDERER_PCI_QUIRKS: &[LinuxDmabufRendererPciQuirk] = &[LinuxDmabufRendererPciQuirk {
+    // Strix Halo can stop presenting new WebKitGTK DMABuf frames while the
+    // WebView remains interactive on native Wayland.
+    vendor_id: 0x1002,
+    device_id: 0x1586,
+}];
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_nvidia_driver_from_state(
@@ -320,6 +356,13 @@ fn linux_selected_drm_render_device<'a>(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_pci_id_from_sysfs_value(value: &str) -> Option<u16> {
+    let value = value.trim();
+    let value = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    (!value.is_empty()).then(|| u16::from_str_radix(value, 16).ok()).flatten()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_drm_render_devices_from_paths(
     sys_class_drm: &std::path::Path,
     dev_dri: &std::path::Path,
@@ -345,7 +388,13 @@ fn linux_drm_render_devices_from_paths(
                 .ok()
                 .and_then(|path| path.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase));
             let boot_vga = std::fs::read_to_string(device_path.join("boot_vga")).is_ok_and(|value| value.trim() == "1");
-            Some(LinuxDrmRenderDevice { device_file, driver, boot_vga })
+            let vendor_id = std::fs::read_to_string(device_path.join("vendor"))
+                .ok()
+                .and_then(|value| linux_pci_id_from_sysfs_value(&value));
+            let device_id = std::fs::read_to_string(device_path.join("device"))
+                .ok()
+                .and_then(|value| linux_pci_id_from_sysfs_value(&value));
+            Some(LinuxDrmRenderDevice { device_file, driver, boot_vga, pci_id: vendor_id.zip(device_id) })
         })
         .collect::<Vec<_>>();
     devices.sort_by(|left, right| left.device_file.cmp(&right.device_file));
@@ -381,27 +430,28 @@ fn linux_drm_driver_is_software_only(driver: Option<&str>) -> bool {
     driver.is_none_or(|driver| LINUX_SOFTWARE_ONLY_DRM_DRIVERS.contains(&driver))
 }
 
-#[cfg(target_os = "linux")]
-fn linux_nvidia_driver() -> LinuxNvidiaDriver {
-    let devices = linux_drm_render_devices();
-    let explicit_device_file = std::env::var_os("WEBKIT_WEB_RENDER_DEVICE_FILE")
-        .filter(|path| !path.is_empty())
-        .map(std::path::PathBuf::from)
-        // Resolve stable /dev/dri/by-path links to the renderD* node used by sysfs.
-        .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
-    let render_driver = linux_selected_drm_render_device(explicit_device_file.as_deref(), &devices)
-        .and_then(|device| device.driver.as_deref());
-    linux_nvidia_driver_from_state(
-        std::path::Path::new("/dev/nvidiactl").exists(),
-        std::path::Path::new("/proc/driver/nvidia/version").exists(),
-        render_driver,
-    )
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_selected_device_has_dmabuf_quirk(
+    selected_device: Option<&LinuxDrmRenderDevice>,
+    uses_native_wayland: bool,
+) -> bool {
+    uses_native_wayland
+        && selected_device.is_some_and(|device| {
+            let Some((vendor_id, device_id)) = device.pci_id else {
+                return false;
+            };
+            LINUX_DMABUF_RENDERER_PCI_QUIRKS
+                .iter()
+                .any(|quirk| vendor_id == quirk.vendor_id && device_id == quirk.device_id)
+        })
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_webkit_rendering_workarounds(
     driver: LinuxNvidiaDriver,
     has_hardware_render_device: bool,
+    selected_device: Option<&LinuxDrmRenderDevice>,
+    uses_native_wayland: bool,
 ) -> &'static [(&'static str, &'static str)] {
     match driver {
         LinuxNvidiaDriver::Proprietary => {
@@ -422,6 +472,9 @@ fn linux_webkit_rendering_workarounds(
             // disable the DMABuf renderer there as well.
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         }
+        LinuxNvidiaDriver::None if linux_selected_device_has_dmabuf_quirk(selected_device, uses_native_wayland) => {
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        }
         LinuxNvidiaDriver::None => {
             // AMD / Intel and other Mesa drivers keep DMABuf enabled to avoid
             // unnecessary CPU usage and UI lag on Wayland.
@@ -431,87 +484,81 @@ fn linux_webkit_rendering_workarounds(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_system_gtk3_immodules_cache_path() -> Option<&'static str> {
-    [
-        "/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
-        "/usr/lib/aarch64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
-        "/usr/lib64/gtk-3.0/3.0.0/immodules.cache",
-        "/usr/lib/gtk-3.0/3.0.0/immodules.cache",
-    ]
-    .iter()
-    .copied()
-    .find(|path| std::path::Path::new(path).is_file())
+fn linux_webkit_environment_override<'a>(
+    existing_value: Option<&std::ffi::OsStr>,
+    workaround_value: &'a str,
+) -> Option<&'a str> {
+    existing_value.is_none().then_some(workaround_value)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_appimage_wayland_backend_override(
-    appimage: Option<&std::ffi::OsStr>,
+fn linux_appimage_requires_dmabuf_workaround(appimage: Option<&std::ffi::OsStr>) -> bool {
+    appimage.is_some_and(|value| !value.is_empty())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_uses_native_wayland(
     wayland_display: Option<&std::ffi::OsStr>,
+    session_type: Option<&std::ffi::OsStr>,
     gdk_backend: Option<&std::ffi::OsStr>,
-) -> Option<&'static str> {
-    if appimage.is_some() && wayland_display.is_some() && gdk_backend.is_none() {
-        // AppImage uses the host GTK/WebKitGTK stack. Prefer XWayland for the
-        // affected Wayland/EGL path, but keep Wayland and other compiled
-        // backends as fallbacks for systems without XWayland.
-        Some("x11,wayland,*")
-    } else {
-        None
-    }
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_appimage_system_gtk_immodules_cache(
-    appimage: Option<&std::ffi::OsStr>,
-    appdir: Option<&std::ffi::OsStr>,
-    gtk_im_module: Option<&std::ffi::OsStr>,
-    gtk_im_module_file: Option<&std::ffi::OsStr>,
-    system_cache_path: Option<&'static str>,
-) -> Option<&'static str> {
-    let system_cache_path = system_cache_path?;
-    if appimage.is_none() || gtk_im_module.is_none() {
-        return None;
+) -> bool {
+    let has_wayland_display = wayland_display.is_some_and(|value| !value.is_empty());
+    let is_wayland_session =
+        session_type.and_then(std::ffi::OsStr::to_str).is_some_and(|value| value.eq_ignore_ascii_case("wayland"));
+    if !has_wayland_display || !is_wayland_session {
+        return false;
     }
 
-    let Some(gtk_im_module_file) = gtk_im_module_file else {
-        return Some(system_cache_path);
-    };
-    let appdir = appdir?;
-
-    if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
-        Some(system_cache_path)
-    } else {
-        None
-    }
+    gdk_backend.is_none_or(|backends| {
+        backends
+            .to_string_lossy()
+            .split(',')
+            .next()
+            .is_some_and(|backend| backend.trim().eq_ignore_ascii_case("wayland"))
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_rendering_workarounds() {
     let render_devices = linux_drm_render_devices();
+    let appimage = std::env::var_os("APPIMAGE");
+    let explicit_device_file = std::env::var_os("WEBKIT_WEB_RENDER_DEVICE_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        // Resolve stable /dev/dri/by-path links to the renderD* node used by sysfs.
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+    let selected_device = linux_selected_drm_render_device(explicit_device_file.as_deref(), &render_devices);
+    let nvidia_driver = linux_nvidia_driver_from_state(
+        std::path::Path::new("/dev/nvidiactl").exists(),
+        std::path::Path::new("/proc/driver/nvidia/version").exists(),
+        selected_device.and_then(|device| device.driver.as_deref()),
+    );
     let has_hardware_render_device =
         render_devices.iter().any(|device| !linux_drm_driver_is_software_only(device.driver.as_deref()));
-    for (key, value) in linux_webkit_rendering_workarounds(linux_nvidia_driver(), has_hardware_render_device) {
-        if std::env::var_os(key).is_none() {
+    let uses_native_wayland = linux_uses_native_wayland(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+        std::env::var_os("GDK_BACKEND").as_deref(),
+    );
+    // AppImages bundle WebKitGTK/GTK but use the host EGL/GL stack. On some
+    // combinations, WebKit's DMABUF initialization aborts the WebProcess
+    // before it can fall back to software rendering. Keep this opt-out
+    // user-overridable and use the stable shared-memory renderer instead.
+    if linux_appimage_requires_dmabuf_workaround(appimage.as_deref())
+        && linux_webkit_environment_override(std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref(), "1")
+            .is_some()
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    for (key, value) in linux_webkit_rendering_workarounds(
+        nvidia_driver,
+        has_hardware_render_device,
+        selected_device,
+        uses_native_wayland,
+    ) {
+        if let Some(value) = linux_webkit_environment_override(std::env::var_os(key).as_deref(), value) {
             std::env::set_var(key, value);
         }
-    }
-    if let Some(gdk_backend) = linux_appimage_wayland_backend_override(
-        std::env::var_os("APPIMAGE").as_deref(),
-        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-        std::env::var_os("GDK_BACKEND").as_deref(),
-    ) {
-        std::env::set_var("GDK_BACKEND", gdk_backend);
-    }
-    if let Some(gtk_im_module_file) = linux_appimage_system_gtk_immodules_cache(
-        std::env::var_os("APPIMAGE").as_deref(),
-        std::env::var_os("APPDIR").as_deref(),
-        std::env::var_os("GTK_IM_MODULE").as_deref(),
-        std::env::var_os("GTK_IM_MODULE_FILE").as_deref(),
-        linux_system_gtk3_immodules_cache_path(),
-    ) {
-        // linuxdeploy-plugin-gtk points GTK_IM_MODULE_FILE at the bundled
-        // cache. That hides host IM modules such as fcitx5/ibus, so prefer the
-        // host GTK cache when the user has configured a GTK input method.
-        std::env::set_var("GTK_IM_MODULE_FILE", gtk_im_module_file);
     }
 }
 
@@ -646,14 +693,37 @@ fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
         return;
     }
     if let Some(state) = app.try_state::<commands::deep_link::DeepLinkOpenState>() {
-        state.push(links.clone());
+        state.push_connection_links(links.clone());
     }
     let _ = app.emit("dbx-open-connection-links", links);
     show_main_window(app);
 }
 
+fn open_ai_config_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
+    if links.is_empty() {
+        return;
+    }
+    if let Some(state) = app.try_state::<commands::deep_link::DeepLinkOpenState>() {
+        state.push_ai_config_links(links.clone());
+    }
+    let _ = app.emit("dbx-open-ai-config-links", links);
+    show_main_window(app);
+}
+
+fn open_plugin_install_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
+    if links.is_empty() {
+        return;
+    }
+    if let Some(state) = app.try_state::<commands::deep_link::DeepLinkOpenState>() {
+        state.push_plugin_install_links(links.clone());
+    }
+    let _ = app.emit("dbx-open-plugin-install-links", links);
+    show_main_window(app);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocaleFamily {
+    Azerbaijani,
     English,
     SimplifiedChinese,
     TraditionalChinese,
@@ -662,6 +732,7 @@ enum LocaleFamily {
     Spanish,
     Italian,
     Portuguese,
+    Turkish,
 }
 
 // Mirrors the frontend language mapping in apps/desktop/src/i18n/index.ts
@@ -683,8 +754,12 @@ fn locale_family(locale: &str) -> LocaleFamily {
         LocaleFamily::Japanese
     } else if is_language("ko") {
         LocaleFamily::Korean
+    } else if is_language("az") {
+        LocaleFamily::Azerbaijani
     } else if is_language("es") {
         LocaleFamily::Spanish
+    } else if is_language("tr") {
+        LocaleFamily::Turkish
     } else if is_language("it") {
         LocaleFamily::Italian
     } else if is_language("pt") {
@@ -700,8 +775,10 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
         LocaleFamily::TraditionalChinese => ("顯示 DBX", "退出 DBX"),
         LocaleFamily::Japanese => ("DBXを表示", "DBXを終了"),
         LocaleFamily::Korean => ("DBX 표시", "DBX 종료"),
+        LocaleFamily::Azerbaijani => ("DBX-i göstər", "DBX-dən çıx"),
         LocaleFamily::Spanish => ("Mostrar DBX", "Salir de DBX"),
         LocaleFamily::Italian => ("Mostra DBX", "Esci da DBX"),
+        LocaleFamily::Turkish => ("DBX'i Göster", "DBX'ten Çık"),
         LocaleFamily::Portuguese => ("Mostrar DBX", "Sair do DBX"),
         LocaleFamily::English => ("Show DBX", "Quit DBX"),
     }
@@ -715,10 +792,28 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
         LocaleFamily::TraditionalChinese => "複製支援資訊",
         LocaleFamily::Japanese => "サポート情報をコピー",
         LocaleFamily::Korean => "지원 정보 복사",
+        LocaleFamily::Azerbaijani => "Dəstək məlumatlarını kopyala",
         LocaleFamily::Spanish => "Copiar información",
         LocaleFamily::Italian => "Copia informazioni",
+        LocaleFamily::Turkish => "Destek bilgilerini kopyala",
         LocaleFamily::Portuguese => "Copiar informações",
         LocaleFamily::English => "Copy Support Info",
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu_close_tab_label(locale: &str) -> &'static str {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese => "关闭标签页",
+        LocaleFamily::TraditionalChinese => "關閉分頁",
+        LocaleFamily::Japanese => "タブを閉じる",
+        LocaleFamily::Korean => "탭 닫기",
+        LocaleFamily::Azerbaijani => "Vərəqi bağla",
+        LocaleFamily::Spanish => "Cerrar pestaña",
+        LocaleFamily::Italian => "Chiudi scheda",
+        LocaleFamily::Turkish => "Sekmeyi kapat",
+        LocaleFamily::Portuguese => "Fechar aba",
+        LocaleFamily::English => "Close Tab",
     }
 }
 
@@ -728,8 +823,10 @@ fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
         LocaleFamily::SimplifiedChinese | LocaleFamily::TraditionalChinese => format!("退出 {app_name}"),
         LocaleFamily::Japanese => format!("{app_name}を終了"),
         LocaleFamily::Korean => format!("{app_name} 종료"),
+        LocaleFamily::Azerbaijani => format!("{app_name}-dən çıx"),
         LocaleFamily::Spanish => format!("Salir de {app_name}"),
         LocaleFamily::Italian => format!("Esci da {app_name}"),
+        LocaleFamily::Turkish => format!("{app_name} Uygulamasından Çık"),
         LocaleFamily::Portuguese => format!("Sair do {app_name}"),
         LocaleFamily::English => format!("Quit {app_name}"),
     }
@@ -913,20 +1010,19 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_system_gtk_immodules_cache,
-        linux_appimage_wayland_backend_override, linux_drm_driver_is_software_only,
-        linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_selected_drm_render_device,
+        app_menu_close_tab_label, app_menu_copy_support_info_label, app_menu_quit_label,
+        linux_appimage_requires_dmabuf_workaround, linux_drm_driver_is_software_only,
+        linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_pci_id_from_sysfs_value,
+        linux_selected_drm_render_device, linux_uses_native_wayland, linux_webkit_environment_override,
         linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
-        should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_on_close,
-        should_setup_desktop_tray, should_show_main_window_after_setup, should_show_main_window_before_setup_tasks,
-        startup_data_dir_mode, tray_menu_labels_for_locale, uses_application_level_icon, LinuxDrmRenderDevice,
-        LinuxNvidiaDriver,
+        should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_before_exit,
+        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        should_show_main_window_before_setup_tasks, startup_data_dir_mode, tray_menu_labels_for_locale,
+        uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
     use crate::data_dir::DataDirMode;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
-
-    const TEST_GTK3_IMMODULES_CACHE: &str = "/usr/lib/test/gtk-3.0/3.0.0/immodules.cache";
 
     #[test]
     fn tray_menu_labels_follow_locale() {
@@ -939,9 +1035,11 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("zh-MO"), ("顯示 DBX", "退出 DBX"));
         assert_eq!(tray_menu_labels_for_locale("ja-JP"), ("DBXを表示", "DBXを終了"));
         assert_eq!(tray_menu_labels_for_locale("ko-KR"), ("DBX 표시", "DBX 종료"));
+        assert_eq!(tray_menu_labels_for_locale("az-AZ"), ("DBX-i göstər", "DBX-dən çıx"));
         assert_eq!(tray_menu_labels_for_locale("es-ES"), ("Mostrar DBX", "Salir de DBX"));
         assert_eq!(tray_menu_labels_for_locale("it-IT"), ("Mostra DBX", "Esci da DBX"));
         assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
+        assert_eq!(tray_menu_labels_for_locale("tr-TR"), ("DBX'i Göster", "DBX'ten Çık"));
         assert_eq!(tray_menu_labels_for_locale("en-US"), ("Show DBX", "Quit DBX"));
         // Unknown and empty locales fall back to English; "ita" must not match "it".
         assert_eq!(tray_menu_labels_for_locale("ita"), ("Show DBX", "Quit DBX"));
@@ -954,12 +1052,20 @@ mod tests {
         assert_eq!(app_menu_quit_label("zh-TW", "DBX"), "退出 DBX");
         assert_eq!(app_menu_quit_label("ja-JP", "DBX"), "DBXを終了");
         assert_eq!(app_menu_quit_label("ko-KR", "DBX"), "DBX 종료");
+        assert_eq!(app_menu_quit_label("tr-TR", "DBX"), "DBX Uygulamasından Çık");
+        assert_eq!(app_menu_quit_label("az-AZ", "DBX"), "DBX-dən çıx");
         assert_eq!(app_menu_quit_label("en-US", "DBX"), "Quit DBX");
         assert_eq!(app_menu_quit_label("", "DBX"), "Quit DBX");
         assert_eq!(app_menu_copy_support_info_label("zh-CN"), "复制支持信息");
         assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
         assert_eq!(app_menu_copy_support_info_label("ko-KR"), "지원 정보 복사");
+        assert_eq!(app_menu_copy_support_info_label("tr-TR"), "Destek bilgilerini kopyala");
+        assert_eq!(app_menu_copy_support_info_label("az-AZ"), "Dəstək məlumatlarını kopyala");
         assert_eq!(app_menu_copy_support_info_label("en-US"), "Copy Support Info");
+        assert_eq!(app_menu_close_tab_label("zh-CN"), "关闭标签页");
+        assert_eq!(app_menu_close_tab_label("zh-TW"), "關閉分頁");
+        assert_eq!(app_menu_close_tab_label("ja-JP"), "タブを閉じる");
+        assert_eq!(app_menu_close_tab_label("en-US"), "Close Tab");
     }
 
     #[test]
@@ -971,6 +1077,13 @@ mod tests {
     #[test]
     fn does_not_hide_window_on_close_for_other_platforms() {
         assert!(!should_hide_window_on_close("linux"));
+    }
+
+    #[test]
+    fn hides_window_before_exit_only_on_macos() {
+        assert!(should_hide_window_before_exit("macos"));
+        assert!(!should_hide_window_before_exit("windows"));
+        assert!(!should_hide_window_before_exit("linux"));
     }
 
     #[test]
@@ -1083,7 +1196,27 @@ mod tests {
     }
 
     fn drm_render_device(path: &str, driver: &str, boot_vga: bool) -> LinuxDrmRenderDevice {
-        LinuxDrmRenderDevice { device_file: PathBuf::from(path), driver: Some(driver.to_string()), boot_vga }
+        LinuxDrmRenderDevice {
+            device_file: PathBuf::from(path),
+            driver: Some(driver.to_string()),
+            boot_vga,
+            pci_id: None,
+        }
+    }
+
+    fn drm_pci_render_device(
+        path: &str,
+        driver: &str,
+        boot_vga: bool,
+        vendor_id: u16,
+        device_id: u16,
+    ) -> LinuxDrmRenderDevice {
+        LinuxDrmRenderDevice {
+            device_file: PathBuf::from(path),
+            driver: Some(driver.to_string()),
+            boot_vga,
+            pci_id: Some((vendor_id, device_id)),
+        }
     }
 
     #[test]
@@ -1098,9 +1231,42 @@ mod tests {
         assert!(linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri).is_empty());
 
         std::fs::write(dev_dri.join("renderD129"), []).unwrap();
+        std::fs::write(sys_class_drm.join("renderD129/device/vendor"), "0x1002\n").unwrap();
+        std::fs::write(sys_class_drm.join("renderD129/device/device"), "0x1586\n").unwrap();
         let devices = linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri);
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_file, dev_dri.join("renderD129"));
+        assert_eq!(devices[0].pci_id, Some((0x1002, 0x1586)));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_linux_drm_pci_ids_without_accepting_malformed_values() {
+        assert_eq!(linux_pci_id_from_sysfs_value("0x1002\n"), Some(0x1002));
+        assert_eq!(linux_pci_id_from_sysfs_value("0X1586"), Some(0x1586));
+        assert_eq!(linux_pci_id_from_sysfs_value("8086"), Some(0x8086));
+        assert_eq!(linux_pci_id_from_sysfs_value(""), None);
+        assert_eq!(linux_pci_id_from_sysfs_value("0x"), None);
+        assert_eq!(linux_pci_id_from_sysfs_value("0x10000"), None);
+        assert_eq!(linux_pci_id_from_sysfs_value("not-a-device"), None);
+
+        let root = std::env::temp_dir().join(format!("dbx-drm-pci-ids-{}", uuid::Uuid::new_v4()));
+        let sys_class_drm = root.join("sys/class/drm");
+        let dev_dri = root.join("dev/dri");
+        for node in ["renderD128", "renderD129"] {
+            std::fs::create_dir_all(sys_class_drm.join(node).join("device")).unwrap();
+            std::fs::create_dir_all(&dev_dri).unwrap();
+            std::fs::write(dev_dri.join(node), []).unwrap();
+        }
+        std::fs::write(sys_class_drm.join("renderD128/device/vendor"), "malformed").unwrap();
+        std::fs::write(sys_class_drm.join("renderD128/device/device"), "0x1586").unwrap();
+        std::fs::write(sys_class_drm.join("renderD129/device/vendor"), "0x1002").unwrap();
+
+        let devices = linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].pci_id, None);
+        assert_eq!(devices[1].pci_id, None);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1158,21 +1324,111 @@ mod tests {
     #[test]
     fn applies_driver_specific_linux_webkit_rendering_workarounds() {
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Proprietary, true),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Proprietary, true, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]
         );
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Nouveau, true),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Nouveau, true, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         );
-        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true), &[]);
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, None, false), &[]);
         // Without any hardware render device (GPU-less VM / server) Mesa falls
         // back to llvmpipe, whose DMABuf compositing path can crash the WebKit
         // process.
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, false),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, false, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         );
+    }
+
+    #[test]
+    fn enables_appimage_dmabuf_workaround_only_for_real_appimage_values() {
+        assert!(linux_appimage_requires_dmabuf_workaround(Some(OsStr::new("/opt/DBX.AppImage"))));
+        assert!(!linux_appimage_requires_dmabuf_workaround(Some(OsStr::new(""))));
+        assert!(!linux_appimage_requires_dmabuf_workaround(None));
+    }
+
+    #[test]
+    fn disables_linux_webkit_dmabuf_only_for_strix_halo_on_native_wayland() {
+        let strix_halo = drm_pci_render_device("/dev/dri/renderD128", "amdgpu", true, 0x1002, 0x1586);
+        let mut strix_halo_without_driver = strix_halo.clone();
+        strix_halo_without_driver.driver = None;
+        let adjacent_amd = drm_pci_render_device("/dev/dri/renderD128", "amdgpu", true, 0x1002, 0x1587);
+        let native_wayland =
+            linux_uses_native_wayland(Some(OsStr::new("wayland-0")), Some(OsStr::new("wayland")), None);
+        assert!(native_wayland);
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(&strix_halo), native_wayland),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert_eq!(
+            linux_webkit_rendering_workarounds(
+                LinuxNvidiaDriver::None,
+                true,
+                Some(&strix_halo_without_driver),
+                native_wayland,
+            ),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(&adjacent_amd), native_wayland),
+            &[]
+        );
+
+        for native_wayland in [
+            linux_uses_native_wayland(
+                Some(OsStr::new("wayland-0")),
+                Some(OsStr::new("wayland")),
+                Some(OsStr::new("x11")),
+            ),
+            linux_uses_native_wayland(None, Some(OsStr::new("wayland")), None),
+            linux_uses_native_wayland(Some(OsStr::new("wayland-0")), None, None),
+            linux_uses_native_wayland(Some(OsStr::new("wayland-0")), Some(OsStr::new("x11")), None),
+        ] {
+            assert!(!native_wayland);
+            assert_eq!(
+                linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(&strix_halo), native_wayland),
+                &[]
+            );
+        }
+    }
+
+    #[test]
+    fn linux_webkit_strix_quirk_follows_the_selected_hybrid_render_node() {
+        let devices = [
+            drm_pci_render_device("/dev/dri/renderD128", "i915", true, 0x8086, 0x46a6),
+            drm_pci_render_device("/dev/dri/renderD129", "amdgpu", false, 0x1002, 0x1586),
+        ];
+        let default_device = linux_selected_drm_render_device(None, &devices).unwrap();
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(default_device), true), &[]);
+
+        let explicit_device = linux_selected_drm_render_device(Some(Path::new("/dev/dri/renderD129")), &devices);
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, explicit_device, true),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+
+        let unmatched_device = linux_selected_drm_render_device(Some(Path::new("/dev/dri/renderD130")), &devices);
+        assert!(unmatched_device.is_none());
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, unmatched_device, true), &[]);
+    }
+
+    #[test]
+    fn linux_webkit_quirk_respects_explicit_gdk_backend() {
+        let display = Some(OsStr::new("wayland-0"));
+        let session = Some(OsStr::new("wayland"));
+
+        assert!(linux_uses_native_wayland(display, session, None));
+        assert!(linux_uses_native_wayland(display, session, Some(OsStr::new("wayland"))));
+        assert!(!linux_uses_native_wayland(display, session, Some(OsStr::new("x11,wayland,*"))));
+    }
+
+    #[test]
+    fn linux_webkit_workarounds_preserve_user_environment_values() {
+        assert_eq!(linux_webkit_environment_override(None, "1"), Some("1"));
+        for value in [OsStr::new(""), OsStr::new("0"), OsStr::new("1")] {
+            assert_eq!(linux_webkit_environment_override(Some(value), "1"), None);
+        }
     }
 
     #[test]
@@ -1185,100 +1441,6 @@ mod tests {
         assert!(!linux_drm_driver_is_software_only(Some("amdgpu")));
         assert!(!linux_drm_driver_is_software_only(Some("i915")));
         assert!(!linux_drm_driver_is_software_only(Some("nouveau")));
-    }
-
-    #[test]
-    fn prefers_x11_for_appimage_wayland_when_backend_is_not_user_configured() {
-        assert_eq!(
-            linux_appimage_wayland_backend_override(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("wayland-0")),
-                None
-            ),
-            Some("x11,wayland,*")
-        );
-        assert_eq!(
-            linux_appimage_wayland_backend_override(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("wayland-0")),
-                Some(OsStr::new("wayland"))
-            ),
-            None
-        );
-        assert_eq!(linux_appimage_wayland_backend_override(Some(OsStr::new("/tmp/DBX.AppImage")), None, None), None);
-        assert_eq!(linux_appimage_wayland_backend_override(None, Some(OsStr::new("wayland-0")), None), None);
-    }
-
-    #[test]
-    fn prefers_system_gtk_immodules_cache_for_appimage_input_methods() {
-        assert_eq!(
-            linux_appimage_system_gtk_immodules_cache(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("/tmp/.mount_DBX123")),
-                Some(OsStr::new("fcitx5")),
-                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
-                Some(TEST_GTK3_IMMODULES_CACHE),
-            ),
-            Some(TEST_GTK3_IMMODULES_CACHE)
-        );
-        assert_eq!(
-            linux_appimage_system_gtk_immodules_cache(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("/tmp/.mount_DBX123")),
-                Some(OsStr::new("ibus")),
-                None,
-                Some(TEST_GTK3_IMMODULES_CACHE),
-            ),
-            Some(TEST_GTK3_IMMODULES_CACHE)
-        );
-    }
-
-    #[test]
-    fn preserves_external_gtk_immodules_cache_overrides() {
-        assert_eq!(
-            linux_appimage_system_gtk_immodules_cache(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("/tmp/.mount_DBX123")),
-                Some(OsStr::new("fcitx5")),
-                Some(OsStr::new("/opt/custom/immodules.cache")),
-                Some(TEST_GTK3_IMMODULES_CACHE),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn skips_system_gtk_immodules_cache_without_required_context() {
-        assert_eq!(
-            linux_appimage_system_gtk_immodules_cache(
-                None,
-                Some(OsStr::new("/tmp/.mount_DBX123")),
-                Some(OsStr::new("fcitx5")),
-                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
-                Some(TEST_GTK3_IMMODULES_CACHE),
-            ),
-            None
-        );
-        assert_eq!(
-            linux_appimage_system_gtk_immodules_cache(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("/tmp/.mount_DBX123")),
-                None,
-                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
-                Some(TEST_GTK3_IMMODULES_CACHE),
-            ),
-            None
-        );
-        assert_eq!(
-            linux_appimage_system_gtk_immodules_cache(
-                Some(OsStr::new("/tmp/DBX.AppImage")),
-                Some(OsStr::new("/tmp/.mount_DBX123")),
-                Some(OsStr::new("fcitx5")),
-                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
-                None,
-            ),
-            None
-        );
     }
 }
 
@@ -1300,8 +1462,13 @@ pub fn run() {
 
     let builder = if should_enable_single_instance(cfg!(debug_assertions)) {
         builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let app_open_requested = args.iter().any(|arg| commands::deep_link::is_app_open_deep_link(arg));
             let links = commands::deep_link::connection_deep_links_from_args(args.clone());
             open_connection_deep_links(app, links);
+            let ai_config_links = commands::deep_link::ai_config_deep_links_from_args(args.clone());
+            open_ai_config_deep_links(app, ai_config_links);
+            let plugin_install_links = commands::deep_link::plugin_install_deep_links_from_args(args.clone());
+            open_plugin_install_deep_links(app, plugin_install_links);
 
             let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
             if !paths.is_empty() {
@@ -1324,7 +1491,7 @@ pub fn run() {
             // simply vanished - so make the reason recoverable from the logs.
             if !show_main_window(app) {
                 eprintln!(
-                    "[WINDOW] single-instance handoff could not reveal the main window; {}",
+                    "[WINDOW] single-instance handoff could not reveal the main window; app_open_requested={app_open_requested}; {}",
                     main_window_probe_state(app)
                 );
             }
@@ -1354,6 +1521,8 @@ pub fn run() {
             if let Err(err) = app.clipboard().write_text(commands::support_info::format_support_info_for_clipboard()) {
                 log::warn!("Failed to copy support info from app menu: {err}");
             }
+        } else if event.id() == APP_MENU_CLOSE_TAB_ID {
+            let _ = app.emit(APP_CLOSE_ACTIVE_TAB_EVENT, ());
         }
     });
 
@@ -1479,6 +1648,7 @@ pub fn run() {
             let gateway_identity_provider =
                 Arc::new(gateway_identity::StorageGatewayIdentityProvider::new(state.storage.clone()));
             let state = state.with_gateway_identity_provider(gateway_identity_provider.clone());
+            dbx_core::db::sqlite_worker::enable_sqlite_ssh_runtime(env!("CARGO_PKG_VERSION"));
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
             let oidc_app_handle = app.handle().clone();
@@ -1496,6 +1666,13 @@ pub fn run() {
             });
             app.manage(state.clone());
             app.manage(commands::gateway::GatewayIdentityState(gateway_identity_provider));
+            commands::plugins::install_plugin_event_bridge(app.handle(), state.clone());
+            let mcp_http_server = Arc::new(commands::mcp_http_server::McpHttpServerState::new(data_dir.clone()));
+            app.manage(mcp_http_server.clone());
+            let mcp_http_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                commands::mcp_http_server::start_if_enabled(mcp_http_state, mcp_http_server).await;
+            });
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
@@ -1507,10 +1684,17 @@ pub fn run() {
             commands::ssh_prompt::install_ssh_notice_bridge(app.handle());
             #[cfg(target_os = "macos")]
             macos_app_delegate::install_dock_quit_handler(app.handle());
+            #[cfg(target_os = "macos")]
+            macos_escape_guard::install_escape_fullscreen_guard();
             #[cfg(target_os = "windows")]
             webview2_recovery::install(app.handle());
-            let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
+            let startup_args: Vec<String> = std::env::args().skip(1).collect();
+            let startup_links = commands::deep_link::connection_deep_links_from_args(&startup_args);
             open_connection_deep_links(app.handle(), startup_links);
+            let startup_ai_config_links = commands::deep_link::ai_config_deep_links_from_args(&startup_args);
+            open_ai_config_deep_links(app.handle(), startup_ai_config_links);
+            let startup_plugin_install_links = commands::deep_link::plugin_install_deep_links_from_args(&startup_args);
+            open_plugin_install_deep_links(app.handle(), startup_plugin_install_links);
 
             let app_handle = app.handle().clone();
             commands::mcp_bridge::start(app_handle, state, data_dir);
@@ -1546,7 +1730,24 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(tab_id) = window.label().strip_prefix("detached-tab-") {
+                    let _ = window.emit("dbx:detached-tab-lost", serde_json::json!({ "tabId": tab_id }));
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if let Some(tab_id) = window.label().strip_prefix("detached-tab-") {
+                    if commands::app_settings::take_approved_detached_window_close(window.label()) {
+                        return;
+                    }
+                    api.prevent_close();
+                    // Broadcast with the tabId payload: JS listeners registered
+                    // with the default `listen()` target receive events emitted
+                    // to any window, so the frontend must filter by tabId.
+                    let _ = window.emit("dbx:detached-tab-close-requested", serde_json::json!({ "tabId": tab_id }));
+                    return;
+                }
                 if !should_hide_window_on_close(std::env::consts::OS) {
                     return;
                 }
@@ -1577,6 +1778,9 @@ pub fn run() {
             commands::ai::save_ai_conversation,
             commands::ai::load_ai_conversations,
             commands::ai::delete_ai_conversation,
+            commands::ai::save_ai_run,
+            commands::ai::save_ai_run_state,
+            commands::ai::load_ai_runs,
             commands::ai_multi_config::save_ai_configs,
             commands::ai_multi_config::load_ai_configs,
             commands::ai_multi_config::set_default_ai_config,
@@ -1609,15 +1813,29 @@ pub fn run() {
             commands::app_settings::save_pinned_tree_node_ids,
             commands::app_settings::load_mcp_global_policy,
             commands::app_settings::save_mcp_global_policy,
+            commands::background_image::save_background_image,
+            commands::background_image::clear_background_image,
+            commands::background_image::read_background_image,
+            commands::background_image::check_background_image,
+            commands::mcp_http_server::load_mcp_http_server_settings,
+            commands::mcp_http_server::save_mcp_http_server_settings,
+            commands::mcp_http_server::mcp_http_server_status,
+            commands::mcp_http_server::rotate_mcp_http_server_token,
             commands::app_settings::load_editor_settings,
             commands::app_settings::save_editor_settings,
             commands::app_settings::load_open_tabs_state,
             commands::app_settings::save_open_tabs_state,
+            commands::app_settings::save_detached_tab_handoff,
+            commands::app_settings::load_detached_tab_handoff,
+            commands::app_settings::list_detached_tab_handoffs,
+            commands::app_settings::delete_detached_tab_handoff,
+            commands::app_settings::approve_detached_window_close,
             commands::app_settings::load_saved_sql_editor_positions,
             commands::app_settings::save_saved_sql_editor_positions,
             commands::app_settings::load_transfer_task_library,
             commands::app_settings::save_transfer_task_library,
             commands::app_settings::load_native_debug_logs,
+            commands::diagnostics::get_process_memory_info,
             commands::support_info::get_app_support_info,
             commands::cloud_sync::webdav_sync_test,
             commands::cloud_sync::webdav_password_status,
@@ -1639,6 +1857,7 @@ pub fn run() {
             commands::cloud_sync::snippet_sync_download,
             commands::connection::test_connection,
             commands::connection::test_connection_with_info,
+            commands::connection::test_ssh_tunnel,
             commands::connection::connect_db,
             commands::connection::connection_final_proxy_port,
             commands::connection::disconnect_db,
@@ -1652,11 +1871,42 @@ pub fn run() {
             commands::connection::connection_identifier_quote,
             commands::connection::connection_database_info,
             commands::connection::save_connection_database_info,
+            commands::connection::unlock_connection_writes,
+            commands::connection::lock_connection_writes,
+            commands::connection::connection_write_unlock_state,
             commands::connection::save_connections,
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
             commands::connection::load_sidebar_layout,
             commands::plugins::list_plugins,
+            commands::plugins::list_plugin_trusted_keys,
+            commands::plugins::save_plugin_trusted_key,
+            commands::plugins::remove_plugin_trusted_key,
+            commands::plugins::list_plugin_repositories,
+            commands::plugins::save_plugin_repository,
+            commands::plugins::remove_plugin_repository,
+            commands::plugins::fetch_plugin_marketplace_catalogs,
+            commands::plugins::install_marketplace_plugin,
+            commands::plugins::install_plugin_package,
+            commands::plugins::install_plugin_package_from_url,
+            commands::plugins::rollback_plugin,
+            commands::plugins::uninstall_plugin,
+            commands::plugins::activate_plugin,
+            commands::plugins::list_active_plugins,
+            commands::plugins::stop_plugin,
+            commands::plugins::invoke_plugin,
+            commands::plugins::invoke_plugin_connection_action,
+            commands::plugins::notify_plugin,
+            commands::plugins::send_plugin_binary,
+            commands::plugins::list_plugin_filesystem_entries,
+            commands::plugins::read_plugin_filesystem_file,
+            commands::plugins::write_plugin_filesystem_file,
+            commands::plugins::create_plugin_filesystem_directory,
+            commands::plugins::delete_plugin_filesystem_entry,
+            commands::plugins::rename_plugin_filesystem_entry,
+            commands::plugins::read_plugin_ui_entry,
+            commands::plugins::read_plugin_asset,
+            commands::plugins::read_plugin_ui_asset,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,
             commands::plugins::list_jdbc_local_bundles,
@@ -1673,6 +1923,7 @@ pub fn run() {
             commands::schema::list_databases,
             commands::schema::list_database_metadata,
             commands::schema::list_database_storage,
+            commands::schema::list_xugu_tablespaces,
             commands::schema::get_sqlserver_completion_context,
             commands::schema::list_doris_catalogs,
             commands::schema::list_doris_catalog_databases,
@@ -1682,11 +1933,13 @@ pub fn run() {
             commands::schema::list_sqlserver_linked_server_tables,
             commands::schema::list_tables,
             commands::schema::get_table_comment,
+            commands::schema::get_mysql_table_auto_increment,
             commands::schema::list_objects,
             commands::schema::list_object_statistics,
             commands::schema::list_completion_objects,
             commands::schema::completion_assistant_search,
             commands::schema::get_object_source,
+            commands::schema::get_event_info,
             commands::schema::get_custom_type_details,
             commands::schema::list_schemas,
             commands::schema::list_schema_infos,
@@ -1695,6 +1948,8 @@ pub fn run() {
             commands::schema::get_all_columns,
             commands::schema::get_sqlserver_column_metadata,
             commands::schema::list_indexes,
+            commands::schema::list_reference_key_columns,
+            commands::schema::list_reference_keys,
             commands::schema::list_foreign_keys,
             commands::schema::list_triggers,
             commands::schema::list_constraints,
@@ -1707,10 +1962,12 @@ pub fn run() {
             commands::schema::list_sequences,
             commands::schema::list_rules,
             commands::schema::list_owners,
+            commands::schema::get_table_owner,
             commands::schema::list_extensions,
             commands::schema::list_available_extensions,
             commands::schema_diff::prepare_schema_diff,
             commands::schema_diff::generate_schema_sync_sql,
+            commands::schema_diff::generate_schema_sync_plan,
             commands::dialect_cmd::list_dialect_data_types,
             commands::schema_cache::save_schema_cache,
             commands::schema_cache::load_schema_cache,
@@ -1748,6 +2005,8 @@ pub fn run() {
             commands::query::build_database_search_sql,
             commands::query::build_search_result_where,
             commands::query::build_rename_object_sql,
+            commands::query::build_rename_database_sql,
+            commands::query::build_rename_database_preflight_sql,
             commands::query::build_create_database_sql,
             #[cfg(feature = "duckdb-sidecar")]
             commands::query::build_duckdb_attach_database_sql,
@@ -1771,6 +2030,7 @@ pub fn run() {
             commands::query::build_routine_rename_object_source_statements,
             commands::query::build_view_ddl_sql,
             commands::query::build_table_structure_change_sql,
+            commands::query::build_table_owner_change_sql,
             commands::query::preview_sqlite_table_structure_change,
             commands::query::apply_sqlite_table_structure_change,
             commands::query::build_create_table_sql,
@@ -1780,6 +2040,7 @@ pub fn run() {
             commands::query::extract_data_grid_selection,
             commands::query::build_data_grid_copy_update_statements,
             commands::query::build_data_grid_copy_insert_statement,
+            commands::query::build_dml_change_preview_sql,
             commands::query::build_data_grid_context_filter_condition,
             commands::query::build_data_grid_column_value_filter_condition,
             commands::query::build_data_grid_column_values_filter_condition,
@@ -1795,6 +2056,7 @@ pub fn run() {
             commands::data_compare::prepare_data_compare_missing_target,
             commands::data_compare::build_data_compare_sync_plan,
             commands::sql_file::preview_sql_file,
+            commands::sql_file::inspect_sql_file_tables,
             commands::sql_file::execute_sql_file,
             commands::sql_file::execute_sql_files,
             commands::sql_file::cancel_sql_file_execution,
@@ -1804,6 +2066,9 @@ pub fn run() {
             commands::external_sql::write_external_sql_file,
             commands::external_sql::save_external_sql_file,
             commands::list_sql_files::list_sql_files_in_folder,
+            commands::list_sql_files::create_sql_file_in_folder,
+            commands::list_sql_files::rename_sql_file_in_folder,
+            commands::list_sql_files::delete_sql_file_in_folder,
             commands::external_db::pending_open_db_files,
             commands::keychain::read_keychain_password,
             commands::keychain::read_keychain_passwords,
@@ -1813,9 +2078,22 @@ pub fn run() {
             commands::gateway::list_gateway_routes,
             commands::gateway::test_gateway_profile,
             commands::deep_link::pending_open_connection_links,
+            commands::deep_link::pending_open_ai_config_links,
+            commands::deep_link::pending_open_plugin_install_links,
             commands::table_import::preview_table_import_file,
             commands::table_import::import_table_file,
             commands::table_import::cancel_table_import,
+            commands::mongodb_import_export::preview_mongodb_import_file,
+            commands::mongodb_import_export::import_mongodb_file,
+            commands::mongodb_import_export::cancel_mongodb_import,
+            commands::mongodb_import_export::export_mongodb_query,
+            commands::mongodb_import_export::cancel_mongodb_export,
+            commands::mongodb_dump::inspect_mongodb_database_dump,
+            commands::mongodb_dump::prepare_mongodb_restore_source,
+            commands::mongodb_dump::release_mongodb_restore_source,
+            commands::mongodb_dump::dump_mongodb_database,
+            commands::mongodb_dump::restore_mongodb_database,
+            commands::mongodb_dump::cancel_mongodb_database_dump,
             commands::redis_cmd::redis_list_databases,
             commands::redis_cmd::redis_scan_keys,
             commands::redis_cmd::redis_scan_keys_batch,
@@ -1831,6 +2109,7 @@ pub fn run() {
             commands::redis_cmd::redis_rename_key,
             commands::redis_cmd::redis_hash_set,
             commands::redis_cmd::redis_hash_del,
+            commands::redis_cmd::redis_hash_field_update,
             commands::redis_cmd::redis_hash_field_set_ttl,
             commands::redis_cmd::redis_hash_field_set_expire_at,
             commands::redis_cmd::redis_list_push,
@@ -1846,6 +2125,8 @@ pub fn run() {
             commands::redis_cmd::redis_check_json_module,
             commands::redis_cmd::redis_set_ttl,
             commands::redis_cmd::redis_set_expire_at,
+            commands::redis_cmd::redis_set_keys_ttl,
+            commands::redis_cmd::redis_set_keys_expire_at,
             commands::redis_cmd::redis_delete_keys,
             commands::redis_cmd::redis_flush_db,
             commands::redis_cmd::redis_execute_command,
@@ -2037,14 +2318,16 @@ pub fn run() {
             commands::fs_open::is_sqlite_database_file,
             commands::fs_open::delete_database_backup_files,
             commands::sqlite_backup::backup_sqlite_database,
+            commands::sqlite_backup::restore_sqlite_database,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
-            commands::mongo_cmd::vector_collection_detail,
+            commands::vector_cmd::vector_collection_detail,
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
-            commands::mongo_cmd::vector_drop_database,
-            commands::mongo_cmd::vector_drop_collection,
+            commands::vector_cmd::vector_drop_database,
+            commands::vector_cmd::vector_drop_collection,
+            commands::vector_cmd::vector_rename_collection,
             commands::mongo_cmd::mongo_rename_collection,
             commands::mongo_cmd::mongo_clone_collection,
             commands::docs::docs_collect_snapshot,
@@ -2058,6 +2341,8 @@ pub fn run() {
             commands::document_cmd::document_count_documents,
             commands::document_cmd::dynamodb_describe_table,
             commands::document_cmd::elasticsearch_count_documents,
+            commands::document_cmd::elasticsearch_get_index_metadata,
+            commands::document_cmd::elasticsearch_delete_all_documents,
             commands::document_cmd::document_list_gridfs_buckets,
             commands::document_cmd::document_create_gridfs_bucket,
             commands::document_cmd::document_delete_gridfs_bucket,
@@ -2084,6 +2369,8 @@ pub fn run() {
             commands::document_cmd::document_update_document,
             commands::mongo_cmd::mongo_update_document,
             commands::mongo_cmd::mongo_update_documents,
+            commands::mongo_cmd::mongo_replace_document,
+            commands::mongo_cmd::mongo_bulk_write,
             commands::document_cmd::document_delete_document,
             commands::document_cmd::document_save_meilisearch_batch,
             commands::document_cmd::meilisearch_search_documents,
@@ -2095,6 +2382,16 @@ pub fn run() {
             commands::document_cmd::meilisearch_get_index_overview,
             commands::document_cmd::meilisearch_delete_index,
             commands::document_cmd::meilisearch_delete_all_documents,
+            commands::document_cmd::meilisearch_get_system_overview,
+            commands::document_cmd::meilisearch_list_keys,
+            commands::document_cmd::meilisearch_get_key,
+            commands::document_cmd::meilisearch_create_key,
+            commands::document_cmd::meilisearch_update_key,
+            commands::document_cmd::meilisearch_delete_key,
+            commands::document_cmd::meilisearch_get_tasks,
+            commands::document_cmd::meilisearch_get_task,
+            commands::document_cmd::meilisearch_cancel_tasks,
+            commands::document_cmd::meilisearch_delete_tasks,
             commands::hbase_cmd::hbase_get_table_schema,
             commands::hbase_cmd::hbase_scan_rows,
             commands::hbase_cmd::hbase_get_row,
@@ -2287,6 +2584,8 @@ pub fn run() {
             commands::update::check_for_updates,
             commands::update::fetch_changelog,
             commands::update::get_system_proxy_url,
+            commands::update::get_downloaded_update,
+            commands::update::discard_downloaded_update,
             commands::update::download_update,
             commands::update::cancel_update_download,
             commands::update::install_downloaded_update,
@@ -2296,6 +2595,8 @@ pub fn run() {
             commands::database_export::begin_database_backup_snapshot,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,
+            commands::database_export::clear_database_export_cancellation,
+            commands::database_export::database_export_destination_needs_confirmation,
             commands::database_export::record_database_export_destination,
             commands::table_export::start_table_export,
             commands::table_export::cancel_table_export,
@@ -2307,6 +2608,7 @@ pub fn run() {
             commands::xlsx_export::export_query_results_xlsx,
             commands::text_export::export_query_result_json,
             commands::text_export::export_query_result_markdown,
+            commands::text_export::export_query_result_html,
             commands::agents::list_installed_agents,
             commands::agents::list_installed_agents_local,
             commands::agents::is_agent_installed,
@@ -2328,10 +2630,13 @@ pub fn run() {
             commands::agents::reinstall_jre,
             commands::agents::invalidate_agent_registry_cache,
             commands::agents::import_agents_from_zip,
+            commands::agents::preview_agent_offline_export,
+            commands::agents::export_agents_offline,
             commands::agents::import_agent_driver_cmd,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
             commands::ssh_config::list_ssh_config_hosts,
+            commands::ssh_keys::list_local_ssh_keys,
             commands::ssh_prompt::ssh_prompt_ready,
             commands::ssh_prompt::ssh_prompt_not_ready,
             commands::ssh_prompt::resolve_ssh_prompt,
@@ -2362,6 +2667,14 @@ pub fn run() {
                     api.prevent_exit();
                     request_app_close(app_handle, "quit");
                 } else {
+                    // Restart exits and the no-frontend native quit bypass
+                    // `complete_app_close`, so hide the window here too; the
+                    // shutdown below gives WindowServer time to remove it.
+                    if should_hide_window_before_exit(std::env::consts::OS) {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
                     tauri::async_runtime::block_on(async {
                         if let Some(server) = app_handle.try_state::<commands::redis_pubsub_server::PubSubServerState>()
                         {
@@ -2376,12 +2689,30 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             if let RunEvent::Opened { urls } = &event {
+                if urls.iter().any(|url| commands::deep_link::is_app_open_deep_link(url.as_str())) {
+                    show_main_window(app_handle);
+                }
+
                 let links: Vec<String> = urls
                     .iter()
                     .map(|url| url.to_string())
                     .filter_map(|url| commands::deep_link::connection_deep_link_from_arg(&url))
                     .collect();
                 open_connection_deep_links(app_handle, links);
+
+                let ai_config_links: Vec<String> = urls
+                    .iter()
+                    .map(|url| url.to_string())
+                    .filter_map(|url| commands::deep_link::ai_config_deep_link_from_arg(&url))
+                    .collect();
+                open_ai_config_deep_links(app_handle, ai_config_links);
+
+                let plugin_install_links: Vec<String> = urls
+                    .iter()
+                    .map(|url| url.to_string())
+                    .filter_map(|url| commands::deep_link::plugin_install_deep_link_from_arg(&url))
+                    .collect();
+                open_plugin_install_deep_links(app_handle, plugin_install_links);
 
                 let paths: Vec<String> = urls
                     .iter()

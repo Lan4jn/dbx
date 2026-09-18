@@ -10,6 +10,33 @@ const XLSX_DATE_STYLE: usize = 2;
 const XLSX_DATETIME_STYLE: usize = 3;
 const NUMERIC_RIGHT_ALIGN_STYLE: usize = 4;
 const NUMERIC_LEFT_ALIGN_STYLE: usize = 5;
+// Excel renders numeric cells with the General format in the shortest form, so
+// database scale like "0.3500000" displays as "0.35" even though the full value
+// is stored. Pre-registered number formats (one per fractional-digit count up
+// to MAX_NUMERIC_SCALE_FORMAT) keep the declared decimals visible (#8225).
+// Styles are appended after the six fixed entries, two per scale (right/left
+// alignment), so the indices stay stable for the streaming writer.
+const MAX_NUMERIC_SCALE_FORMAT: usize = 15;
+const NUMERIC_SCALE_STYLE_BASE: usize = 6;
+const SCALE_NUMFMT_ID_BASE: usize = 166;
+
+fn numeric_scale_style(scale: usize, right_align: bool) -> Option<usize> {
+    if scale == 0 || scale > MAX_NUMERIC_SCALE_FORMAT {
+        return None;
+    }
+    Some(NUMERIC_SCALE_STYLE_BASE + (scale - 1) * 2 + usize::from(!right_align))
+}
+
+/// Fractional digit count of a plain (non-exponent) decimal string. Values in
+/// exponent notation return 0: a fixed "0.00"-style format would round tiny
+/// magnitudes to zero, so they keep the General format's scientific display.
+fn decimal_fraction_digits(value: &str) -> usize {
+    let trimmed = value.trim();
+    if trimmed.contains(['e', 'E']) {
+        return 0;
+    }
+    trimmed.split_once('.').map_or(0, |(_, fraction)| fraction.chars().filter(|ch| ch.is_ascii_digit()).count())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +158,7 @@ pub struct StreamingXlsxWriter<W: Write + Seek> {
     column_comments: Vec<Option<String>>,
     date_time_format: Option<String>,
     numeric_right_align: bool,
+    auto_filter: bool,
     row_buffer: String,
 }
 
@@ -210,7 +238,10 @@ fn push_data_row_xml(
 /// `inlineStr` cell encoding is highly repetitive, so Deflate typically shrinks
 /// the file several-fold over `Stored` (matching what Excel/Navicat produce).
 fn xlsx_zip_options() -> zip::write::SimpleFileOptions {
-    zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+    // Table exports can exceed the ZIP32 4 GiB entry limit even when the
+    // result is streamed row by row. Enable ZIP64 up front so the writer does
+    // not fail after a long export has already queried the database.
+    zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true)
 }
 
 fn write_zip_entry<W: Write + Seek>(zip: &mut zip::ZipWriter<W>, path: &str, content: &str) -> Result<(), String> {
@@ -229,7 +260,7 @@ pub(crate) fn start_streaming_xlsx_workbook<W: Write + Seek>(
     columns: &[String],
     column_types: &[String],
 ) -> Result<StreamingXlsxWriter<W>, String> {
-    start_streaming_xlsx_workbook_with_options(writer, sheet_name, columns, column_types, &[], &[], None, false)
+    start_streaming_xlsx_workbook_with_options(writer, sheet_name, columns, column_types, &[], &[], None, false, true)
 }
 
 #[cfg(test)]
@@ -249,6 +280,7 @@ pub(crate) fn start_streaming_xlsx_workbook_with_trailing_sheets<W: Write + Seek
         trailing_sheets,
         None,
         false,
+        true,
     )
 }
 
@@ -265,6 +297,7 @@ fn start_xlsx_writer_inner<W: Write + Seek>(
     trailing_sheets: &[XlsxWorksheetData],
     date_time_format: Option<&str>,
     numeric_right_align: bool,
+    auto_filter: bool,
     max_data_rows_per_sheet: usize,
 ) -> Result<StreamingXlsxWriter<W>, String> {
     let width_cache = estimate_header_widths(columns, column_comments);
@@ -306,6 +339,7 @@ fn start_xlsx_writer_inner<W: Write + Seek>(
         column_comments: column_comments.to_vec(),
         date_time_format: date_time_format.map(str::to_string),
         numeric_right_align,
+        auto_filter,
         row_buffer: String::with_capacity(columns.len().saturating_mul(48)),
     })
 }
@@ -319,6 +353,7 @@ pub(crate) fn start_streaming_xlsx_workbook_with_options<W: Write + Seek>(
     trailing_sheets: &[XlsxWorksheetData],
     date_time_format: Option<&str>,
     numeric_right_align: bool,
+    auto_filter: bool,
 ) -> Result<StreamingXlsxWriter<W>, String> {
     start_xlsx_writer_inner(
         writer,
@@ -329,6 +364,7 @@ pub(crate) fn start_streaming_xlsx_workbook_with_options<W: Write + Seek>(
         trailing_sheets,
         date_time_format,
         numeric_right_align,
+        auto_filter,
         XLSX_MAX_DATA_ROWS,
     )
 }
@@ -351,6 +387,7 @@ pub(crate) fn start_streaming_xlsx_workbook_with_max_rows<W: Write + Seek>(
         trailing_sheets,
         None,
         false,
+        true,
         max_data_rows_per_sheet,
     )
 }
@@ -380,14 +417,12 @@ impl<W: Write + Seek> StreamingXlsxWriter<W> {
         Ok(())
     }
 
-    /// Close the currently open data sheet XML: writes `</sheetData>`,
-    /// `<autoFilter>` and `</worksheet>`.
+    /// Close the currently open data sheet XML, optionally writing `<autoFilter>`.
     fn finish_current_sheet(&mut self) -> Result<(), String> {
         let row_count = self.next_row_number.saturating_sub(1);
         let range = sheet_range(self.columns.len(), row_count);
-        self.zip
-            .write_all(format!("</sheetData><autoFilter ref=\"{range}\"/></worksheet>").as_bytes())
-            .map_err(|err| err.to_string())
+        let auto_filter = if self.auto_filter { format!("<autoFilter ref=\"{range}\"/>") } else { String::new() };
+        self.zip.write_all(format!("</sheetData>{auto_filter}</worksheet>").as_bytes()).map_err(|err| err.to_string())
     }
 
     /// Start a new data sheet, reusing the same header row, column widths and
@@ -446,7 +481,7 @@ impl<W: Write + Seek> StreamingXlsxWriter<W> {
                 rows: &sheet.rows,
                 numeric_column_right_align: sheet.numeric_column_right_align,
             };
-            write_worksheet_xml(&mut self.zip, &segment)?;
+            write_worksheet_xml(&mut self.zip, &segment, self.auto_filter, self.date_time_format.as_deref())?;
         }
 
         // 3. Write metadata files. These appear AFTER sheet data in the ZIP
@@ -762,10 +797,15 @@ fn push_typed_cell_xml(
     if is_numeric_column_type(column_type) {
         if let Some(Value::String(value)) = value {
             if let Some(number) = safe_excel_number(value) {
+                // Excel's General format drops database scale ("0.3500000"
+                // renders as "0.35"), so numeric cells carrying a fractional
+                // part switch to the matching pre-registered scale format.
+                let scale_style =
+                    numeric_scale_style(decimal_fraction_digits(number), style == Some(NUMERIC_RIGHT_ALIGN_STYLE));
                 output.push_str("<c r=\"");
                 push_cell_ref(output, row_index, col_index);
                 output.push('"');
-                push_cell_style(output, style);
+                push_cell_style(output, scale_style.or(style));
                 write!(output, "><v>{number}</v></c>").expect("writing XLSX numeric cells into a String cannot fail");
                 return;
             }
@@ -774,7 +814,12 @@ fn push_typed_cell_xml(
     push_cell_xml(output, value, row_index, col_index, style);
 }
 
-fn write_worksheet_xml<W: Write>(writer: &mut W, segment: &WorksheetSegment) -> Result<(), String> {
+fn write_worksheet_xml<W: Write>(
+    writer: &mut W,
+    segment: &WorksheetSegment,
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<(), String> {
     let total_rows = segment.rows.len() + 1;
     let range = sheet_range(segment.columns.len(), total_rows);
     let widths = estimate_column_widths(segment.columns, segment.column_comments, segment.rows);
@@ -811,15 +856,14 @@ fn write_worksheet_xml<W: Write>(writer: &mut W, segment: &WorksheetSegment) -> 
             segment.columns,
             segment.column_types,
             row,
-            None,
+            date_time_format,
             segment.numeric_column_right_align,
         );
         writer.write_all(row_buffer.as_bytes()).map_err(|err| err.to_string())?;
     }
 
-    writer
-        .write_all(format!("</sheetData><autoFilter ref=\"{range}\"/></worksheet>").as_bytes())
-        .map_err(|err| err.to_string())
+    let auto_filter = if auto_filter { format!("<autoFilter ref=\"{range}\"/>") } else { String::new() };
+    writer.write_all(format!("</sheetData>{auto_filter}</worksheet>").as_bytes()).map_err(|err| err.to_string())
 }
 
 fn content_types_xml_for_sheet_count(sheet_count: usize) -> String {
@@ -970,21 +1014,43 @@ fn styles_xml(date_time_format: Option<&str>) -> String {
             }
         })
         .unwrap_or((default_date, default_datetime));
+    // One fixed "0.0…0" format per fractional-digit count plus right/left xfs
+    // per format, appended after the six fixed styles (see numeric_scale_style).
+    let mut scale_numfmts = String::new();
+    let mut scale_xfs = String::new();
+    for scale in 1..=MAX_NUMERIC_SCALE_FORMAT {
+        let format_code = format!("0.{}", "0".repeat(scale));
+        scale_numfmts.push_str(&format!(
+            "<numFmt numFmtId=\"{}\" formatCode=\"{}\"/>",
+            SCALE_NUMFMT_ID_BASE + scale - 1,
+            format_code
+        ));
+        for (alignment, _) in [("right", true), ("left", false)] {
+            scale_xfs.push_str(&format!(
+                "<xf numFmtId=\"{}\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\" applyAlignment=\"1\"><alignment horizontal=\"{alignment}\"/></xf>",
+                SCALE_NUMFMT_ID_BASE + scale - 1
+            ));
+        }
+    }
     format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
             "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
-            "<numFmts count=\"2\"><numFmt numFmtId=\"164\" formatCode=\"{}\"/><numFmt numFmtId=\"165\" formatCode=\"{}\"/></numFmts>",
+            "<numFmts count=\"{}\"><numFmt numFmtId=\"164\" formatCode=\"{}\"/><numFmt numFmtId=\"165\" formatCode=\"{}\"/>{}</numFmts>",
             "<fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>",
             "<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>",
             "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>",
             "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>",
-            "<cellXfs count=\"6\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/><xf numFmtId=\"165\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment horizontal=\"right\"/></xf><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment horizontal=\"left\"/></xf></cellXfs>",
+            "<cellXfs count=\"{}\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/><xf numFmtId=\"165\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment horizontal=\"right\"/></xf><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment horizontal=\"left\"/></xf>{}</cellXfs>",
             "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>",
             "</styleSheet>"
         ),
+        2 + MAX_NUMERIC_SCALE_FORMAT,
         escape_xml(&date_format),
-        escape_xml(&datetime_format)
+        escape_xml(&datetime_format),
+        scale_numfmts,
+        6 + MAX_NUMERIC_SCALE_FORMAT * 2,
+        scale_xfs
     )
 }
 
@@ -1077,11 +1143,30 @@ fn split_sheets_for_max_rows<'a>(
 }
 
 pub fn build_xlsx_workbook(data: &XlsxWorksheetData) -> Result<Vec<u8>, String> {
-    build_xlsx_workbook_multi(std::slice::from_ref(data))
+    build_xlsx_workbook_with_auto_filter(data, true, None)
 }
 
 pub fn build_xlsx_workbook_multi(sheets: &[XlsxWorksheetData]) -> Result<Vec<u8>, String> {
-    build_xlsx_workbook_multi_with_max_rows(sheets, XLSX_MAX_DATA_ROWS)
+    build_xlsx_workbook_multi_with_auto_filter(sheets, true, None)
+}
+
+pub fn build_xlsx_workbook_with_auto_filter(
+    data: &XlsxWorksheetData,
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    build_xlsx_workbook_multi_with_auto_filter(std::slice::from_ref(data), auto_filter, date_time_format)
+}
+
+pub fn build_xlsx_workbook_multi_with_auto_filter(
+    sheets: &[XlsxWorksheetData],
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if auto_filter {
+        return build_xlsx_workbook_multi_with_max_rows(sheets, XLSX_MAX_DATA_ROWS, date_time_format);
+    }
+    build_xlsx_workbook_multi_with_max_rows_and_auto_filter(sheets, XLSX_MAX_DATA_ROWS, auto_filter, date_time_format)
 }
 
 /// Build an in-memory XLSX workbook with an explicit per-sheet data-row limit.
@@ -1091,6 +1176,16 @@ pub fn build_xlsx_workbook_multi(sheets: &[XlsxWorksheetData]) -> Result<Vec<u8>
 pub(crate) fn build_xlsx_workbook_multi_with_max_rows(
     sheets: &[XlsxWorksheetData],
     max_data_rows_per_sheet: usize,
+    date_time_format: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    build_xlsx_workbook_multi_with_max_rows_and_auto_filter(sheets, max_data_rows_per_sheet, true, date_time_format)
+}
+
+fn build_xlsx_workbook_multi_with_max_rows_and_auto_filter(
+    sheets: &[XlsxWorksheetData],
+    max_data_rows_per_sheet: usize,
+    auto_filter: bool,
+    date_time_format: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     if sheets.is_empty() {
         return Err("At least one worksheet is required".to_string());
@@ -1102,7 +1197,7 @@ pub(crate) fn build_xlsx_workbook_multi_with_max_rows(
         ("_rels/.rels", root_rels_xml().to_string()),
         ("xl/workbook.xml", workbook_xml_for_sheets(&sheet_names)),
         ("xl/_rels/workbook.xml.rels", workbook_rels_xml_for_sheet_count(segments.len())),
-        ("xl/styles.xml", styles_xml(None)),
+        ("xl/styles.xml", styles_xml(date_time_format)),
     ];
 
     let cursor = Cursor::new(Vec::<u8>::new());
@@ -1115,7 +1210,7 @@ pub(crate) fn build_xlsx_workbook_multi_with_max_rows(
     }
     for (index, segment) in segments.iter().enumerate() {
         zip.start_file(format!("xl/worksheets/sheet{}.xml", index + 1), options).map_err(|err| err.to_string())?;
-        write_worksheet_xml(&mut zip, segment)?;
+        write_worksheet_xml(&mut zip, segment, auto_filter, date_time_format)?;
     }
 
     let output = zip.finish().map_err(|err| err.to_string())?;
@@ -1125,15 +1220,16 @@ pub(crate) fn build_xlsx_workbook_multi_with_max_rows(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_xlsx_workbook, build_xlsx_workbook_multi, build_xlsx_workbook_multi_with_max_rows,
-        is_numeric_column_type, start_streaming_xlsx_workbook, start_streaming_xlsx_workbook_with_max_rows,
+        build_xlsx_workbook, build_xlsx_workbook_multi, build_xlsx_workbook_multi_with_auto_filter,
+        build_xlsx_workbook_multi_with_max_rows, build_xlsx_workbook_with_auto_filter, is_numeric_column_type,
+        start_streaming_xlsx_workbook, start_streaming_xlsx_workbook_with_max_rows,
         start_streaming_xlsx_workbook_with_options, start_streaming_xlsx_workbook_with_trailing_sheets,
         write_worksheet_xml, WorksheetSegment, XlsxWorksheetData,
     };
     use calamine::{open_workbook_auto, Reader};
     use serde_json::{json, Value};
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
 
     #[derive(Default)]
     struct WriteStats {
@@ -1162,6 +1258,20 @@ mod tests {
         let mut content = String::new();
         entry.read_to_string(&mut content).expect("read zip entry");
         content
+    }
+
+    #[test]
+    fn xlsx_zip_entries_enable_zip64_for_large_exports() {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("large-entry.xml", super::xlsx_zip_options()).expect("start ZIP64 entry");
+        zip.write_all(b"test").expect("write ZIP64 entry");
+        let bytes = zip.finish().expect("finish ZIP64 archive").into_inner();
+
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+        let extra_data = &bytes[30 + name_len..30 + name_len + extra_len];
+        assert!(extra_data.windows(2).any(|tag| tag == [0x01, 0x00]));
     }
 
     /// Assert every entry in the XLSX (ZIP) buffer is Deflate-compressed, which
@@ -1206,6 +1316,21 @@ mod tests {
     }
 
     #[test]
+    fn omits_auto_filter_when_disabled() {
+        let worksheet = XlsxWorksheetData {
+            sheet_name: Some("Users".to_string()),
+            columns: vec!["id".to_string()],
+            column_types: vec![],
+            column_comments: vec![],
+            rows: vec![vec![json!(1)]],
+            numeric_column_right_align: false,
+        };
+        let workbook = build_xlsx_workbook_multi_with_auto_filter(&[worksheet], false, None).expect("build workbook");
+
+        assert!(!read_zip_entry(&workbook, "xl/worksheets/sheet1.xml").contains("<autoFilter"));
+    }
+
+    #[test]
     fn writes_safe_numeric_strings_as_numbers_for_numeric_columns() {
         let workbook = build_xlsx_workbook(&XlsxWorksheetData {
             sheet_name: Some("Amounts".to_string()),
@@ -1218,9 +1343,66 @@ mod tests {
         .expect("build workbook");
 
         let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
-        assert!(sheet.contains("<c r=\"A2\" s=\"5\"><v>1.00000</v></c>"));
-        assert!(sheet.contains("<c r=\"B2\" s=\"5\"><v>2800.000000</v></c>"));
+        assert!(sheet.contains("<c r=\"A2\" s=\"15\"><v>1.00000</v></c>"));
+        assert!(sheet.contains("<c r=\"B2\" s=\"17\"><v>2800.000000</v></c>"));
         assert!(sheet.contains("<c r=\"C2\" t=\"inlineStr\"><is><t>00123</t></is></c>"));
+    }
+
+    #[test]
+    fn applies_scale_preserving_number_formats_to_fractional_numeric_cells() {
+        let workbook = build_xlsx_workbook(&XlsxWorksheetData {
+            sheet_name: Some("Scale formats".to_string()),
+            columns: vec!["qty".to_string(), "cost".to_string(), "exp".to_string()],
+            column_types: vec!["numeric(18,4)".to_string(), "decimal(10,7)".to_string(), "double".to_string()],
+            column_comments: vec![],
+            rows: vec![vec![json!("5.0000"), json!("0.3500000"), json!("1.23E-5")]],
+            numeric_column_right_align: true,
+        })
+        .expect("build workbook");
+
+        let styles = read_zip_entry(&workbook, "xl/styles.xml");
+        assert!(styles.contains("numFmtId=\"169\" formatCode=\"0.0000\""));
+        assert!(styles.contains("numFmtId=\"172\" formatCode=\"0.0000000\""));
+        assert!(styles.contains("<cellXfs count=\"36\">"));
+
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("<c r=\"A2\" s=\"12\"><v>5.0000</v></c>"));
+        assert!(sheet.contains("<c r=\"B2\" s=\"18\"><v>0.3500000</v></c>"));
+        // Exponent-notation values keep the General format's scientific display.
+        assert!(sheet.contains("<c r=\"C2\" s=\"4\"><v>1.23E-5</v></c>"));
+    }
+
+    #[test]
+    fn keeps_integral_and_left_aligned_numeric_cells_on_plain_styles() {
+        let workbook = build_xlsx_workbook(&XlsxWorksheetData {
+            sheet_name: Some("Left align".to_string()),
+            columns: vec!["qty".to_string(), "count".to_string()],
+            column_types: vec!["numeric(18,4)".to_string(), "int".to_string()],
+            column_comments: vec![],
+            rows: vec![vec![json!("5.0000"), json!("7")]],
+            numeric_column_right_align: false,
+        })
+        .expect("build workbook");
+
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("<c r=\"A2\" s=\"13\"><v>5.0000</v></c>"));
+        assert!(sheet.contains("<c r=\"B2\" s=\"5\"><v>7</v></c>"));
+    }
+
+    #[test]
+    fn caps_scale_formats_beyond_fifteen_decimals() {
+        let workbook = build_xlsx_workbook(&XlsxWorksheetData {
+            sheet_name: Some("Deep scale".to_string()),
+            columns: vec!["value".to_string()],
+            column_types: vec!["numeric(38,20)".to_string()],
+            column_comments: vec![],
+            rows: vec![vec![json!("0.00000000000000000001")]],
+            numeric_column_right_align: true,
+        })
+        .expect("build workbook");
+
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("<c r=\"A2\" s=\"4\"><v>0.00000000000000000001</v></c>"));
     }
 
     #[test]
@@ -1250,9 +1432,9 @@ mod tests {
         .expect("build workbook");
 
         let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
-        assert!(sheet.contains("<c r=\"A2\" s=\"4\"><v>-100000.0000000000</v></c>"));
-        assert!(sheet.contains("<c r=\"B2\" s=\"4\"><v>-999999999999999.0000</v></c>"));
-        assert!(sheet.contains("<c r=\"C2\" s=\"4\"><v>123456789012345.0000000000</v></c>"));
+        assert!(sheet.contains("<c r=\"A2\" s=\"24\"><v>-100000.0000000000</v></c>"));
+        assert!(sheet.contains("<c r=\"B2\" s=\"12\"><v>-999999999999999.0000</v></c>"));
+        assert!(sheet.contains("<c r=\"C2\" s=\"24\"><v>123456789012345.0000000000</v></c>"));
         assert!(sheet.contains("<c r=\"D2\" t=\"inlineStr\" s=\"4\"><is><t>1234567890123456.0000</t></is></c>"));
         assert!(sheet.contains("<c r=\"E2\" t=\"inlineStr\" s=\"4\"><is><t>100000.0000000001</t></is></c>"));
         assert!(sheet.contains("<c r=\"F2\" t=\"inlineStr\" s=\"4\"><is><t>not-a-number</t></is></c>"));
@@ -1297,10 +1479,38 @@ mod tests {
         assert!(sheet.contains("<c r=\"B2\" s=\"3\"><v>45347.543229166666</v></c>"));
         assert!(sheet.contains("<c r=\"C2\" t=\"inlineStr\"><is><t>2024-02-25</t></is></c>"));
         assert!(sheet.contains("<c r=\"D2\" t=\"inlineStr\"><is><t>not-a-date</t></is></c>"));
-        assert!(sheet.contains("<c r=\"E2\" s=\"5\"><v>2800.000000</v></c>"));
+        assert!(sheet.contains("<c r=\"E2\" s=\"17\"><v>2800.000000</v></c>"));
         assert!(sheet.contains("<c r=\"F2\" t=\"inlineStr\"><is><t>2024-02-25T13:02:15+08:00</t></is></c>"));
         assert!(styles.contains("numFmtId=\"164\" formatCode=\"yyyy-mm-dd\""));
         assert!(styles.contains("numFmtId=\"165\" formatCode=\"yyyy-mm-dd hh:mm:ss\""));
+    }
+
+    #[test]
+    fn in_memory_temporal_cells_keep_the_configured_excel_display_format() {
+        // The current-page export builds the whole workbook in memory instead of
+        // streaming it. It used to hardcode `styles_xml(None)`, so a millisecond
+        // pattern produced serials that carried the fraction but a numFmt that
+        // displayed only whole seconds.
+        let data = XlsxWorksheetData {
+            sheet_name: Some("Temporal".to_string()),
+            columns: vec!["ts".to_string()],
+            column_types: vec!["datetime(3)".to_string()],
+            column_comments: vec![],
+            rows: vec![vec![json!("2026-07-25 13:02:15.456")]],
+            numeric_column_right_align: false,
+        };
+
+        let workbook =
+            build_xlsx_workbook_with_auto_filter(&data, true, Some("YYYY-MM-DD HH:mm:ss.SSS")).expect("build workbook");
+        let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+        let styles = read_zip_entry(&workbook, "xl/styles.xml");
+        assert!(sheet.contains("<c r=\"A2\" s=\"3\"><v>46228.54323444444</v></c>"), "sheet={sheet}");
+        assert!(styles.contains("numFmtId=\"165\" formatCode=\"yyyy-mm-dd hh:mm:ss.000\""), "styles={styles}");
+
+        // No configured pattern keeps the historical default.
+        let workbook = build_xlsx_workbook_with_auto_filter(&data, true, None).expect("build workbook");
+        let styles = read_zip_entry(&workbook, "xl/styles.xml");
+        assert!(styles.contains("numFmtId=\"165\" formatCode=\"yyyy-mm-dd hh:mm:ss\""), "styles={styles}");
     }
 
     #[test]
@@ -1343,17 +1553,17 @@ mod tests {
         .expect("build workbook");
 
         let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
-        for (reference, value) in [
-            ("A2", "2"),
-            ("B2", "42"),
-            ("C2", "-7"),
-            ("D2", "4000000000"),
-            ("E2", "123456789012345"),
-            ("F2", "123.5"),
-            ("G2", "987654.321"),
-            ("H2", "2800.000000"),
+        for (reference, value, style) in [
+            ("A2", "2", "5"),
+            ("B2", "42", "5"),
+            ("C2", "-7", "5"),
+            ("D2", "4000000000", "5"),
+            ("E2", "123456789012345", "5"),
+            ("F2", "123.5", "7"),
+            ("G2", "987654.321", "11"),
+            ("H2", "2800.000000", "17"),
         ] {
-            assert!(sheet.contains(&format!("<c r=\"{reference}\" s=\"5\"><v>{value}</v></c>")), "sheet={sheet}");
+            assert!(sheet.contains(&format!("<c r=\"{reference}\" s=\"{style}\"><v>{value}</v></c>")), "sheet={sheet}");
         }
     }
 
@@ -1460,8 +1670,8 @@ mod tests {
         let bytes = fs::read(&path).expect("read workbook");
         let sheet = read_zip_entry(&bytes, "xl/worksheets/sheet1.xml");
         assert!(sheet.contains("<c r=\"A2\" s=\"5\"><v>42</v></c>"));
-        assert!(sheet.contains("<c r=\"B2\" s=\"5\"><v>123.5</v></c>"));
-        assert!(sheet.contains("<c r=\"C2\" s=\"5\"><v>2800.000000</v></c>"));
+        assert!(sheet.contains("<c r=\"B2\" s=\"7\"><v>123.5</v></c>"));
+        assert!(sheet.contains("<c r=\"C2\" s=\"17\"><v>2800.000000</v></c>"));
         let _ = fs::remove_file(&path);
     }
 
@@ -1481,6 +1691,7 @@ mod tests {
                 &[],
                 Some("YYYY/MM/DD HH:mm:ss.SSS"),
                 false,
+                true,
             )
             .expect("start workbook");
             writer.write_row(&[json!("2024/02/25 13:02:15.125")]).expect("write temporal row");
@@ -1878,6 +2089,7 @@ mod tests {
                 numeric_column_right_align: false,
             }],
             2,
+            None,
         )
         .expect("build workbook");
 
@@ -1949,7 +2161,7 @@ mod tests {
         };
         let mut stats = WriteStats::default();
 
-        write_worksheet_xml(&mut stats, &segment).expect("write large worksheet");
+        write_worksheet_xml(&mut stats, &segment, true, None).expect("write large worksheet");
 
         assert!(stats.bytes_written > 10_000_000, "expected realistic worksheet size, got {}", stats.bytes_written);
         assert!(
@@ -1980,7 +2192,7 @@ mod tests {
             rows: (100..102).map(|i| vec![json!(i)]).collect(),
             numeric_column_right_align: false,
         };
-        let data = build_xlsx_workbook_multi_with_max_rows(&[sheet_a, sheet_b], 3).expect("build workbook");
+        let data = build_xlsx_workbook_multi_with_max_rows(&[sheet_a, sheet_b], 3, None).expect("build workbook");
 
         let workbook_xml = read_zip_entry(&data, "xl/workbook.xml");
         assert!(workbook_xml.contains("name=\"A\""), "workbook: {workbook_xml}");
@@ -2014,6 +2226,7 @@ mod tests {
                 numeric_column_right_align: false,
             }],
             100,
+            None,
         )
         .expect("build workbook");
 

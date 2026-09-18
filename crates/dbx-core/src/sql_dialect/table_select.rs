@@ -1,11 +1,11 @@
 use crate::models::connection::DatabaseType;
 
 use super::capabilities::{
-    firebird_rows_clause, table_pagination_strategy, uses_oracle_row_id, TablePaginationStrategy,
+    firebird_rows_clause, table_pagination_strategy, uses_oracle_row_id, uses_xugu_row_id, TablePaginationStrategy,
 };
 use super::identifiers::{
     normalize_where_input, qualified_table_name, qualified_table_name_with_catalog, quote_gaussdb_jdbc_identifier,
-    quote_table_identifier,
+    quote_iris_identifier, quote_table_identifier,
 };
 use super::types::{
     TableDataSelectSqlOptions, TableSelectSqlOptions, DBX_NEO4J_ELEMENT_ID_COLUMN, DBX_ROWID_COLUMN,
@@ -180,7 +180,16 @@ pub(crate) fn table_data_schema<'a>(
     }
 }
 
+/// Builds the SQL used by the data-table grid. Database qualification is opt-in
+/// so existing callers retain their current SQL shape.
 pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String {
+    build_table_data_select_sql_with_database(options, false)
+}
+
+pub fn build_table_data_select_sql_with_database(
+    options: TableDataSelectSqlOptions,
+    include_database_name: bool,
+) -> String {
     let database_type = options.database_type;
     let schema = table_data_schema(database_type, options.driver_profile.as_deref(), options.schema.as_deref());
     let limit = options.limit.unwrap_or(100);
@@ -200,8 +209,26 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     let table = if let Some(database) = jdbc_tdengine_database {
         qualified_table_name(Some(DatabaseType::Tdengine), Some(database), &options.table_name)
     // Doris / StarRocks multi-catalog: prefix the catalog for external-catalog tables.
-    } else if uses_connection_identifier_quote(database_type, options.identifier_quote.as_deref()) {
+    } else if database_type == Some(DatabaseType::Iris)
+        || uses_connection_identifier_quote(database_type, options.identifier_quote.as_deref())
+    {
         table_data_qualified_table_name(database_type, schema, &options.table_name, options.identifier_quote.as_deref())
+    } else if include_database_name {
+        database_qualified_table_name(
+            database_type,
+            options.catalog.as_deref(),
+            options.database.as_deref(),
+            &options.table_name,
+        )
+        .unwrap_or_else(|| {
+            qualified_table_name_with_catalog(
+                database_type,
+                options.catalog.as_deref(),
+                schema,
+                options.database.as_deref(),
+                &options.table_name,
+            )
+        })
     } else {
         qualified_table_name_with_catalog(
             database_type,
@@ -212,9 +239,23 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
         )
     };
     let predicate = normalize_where_input(options.where_input.as_deref());
-    let where_clause = if predicate.is_empty() { String::new() } else { format!(" WHERE ({predicate})") };
-    let default_order_by = if database_type == Some(DatabaseType::InfluxDb) {
-        // InfluxQL only allows sorting of timestamp column
+    // Time-series engines like InfluxDB scan every shard when no time
+    // predicate is given, which turns the sidebar quick-open ("show me
+    // the latest rows") into a full-shard scan on any non-trivial
+    // dataset. Data-tab callers opt in to a rolling 5-minute window when
+    // the user has not provided their own WHERE; sampling and export
+    // callers keep the historical unfiltered behavior, and users can
+    // broaden the window by editing the SQL.
+    let effective_predicate = if predicate.is_empty() && options.inject_default_time_series_where {
+        default_time_series_predicate(database_type).unwrap_or_default()
+    } else {
+        predicate
+    };
+    let where_clause =
+        if effective_predicate.is_empty() { String::new() } else { format!(" WHERE ({effective_predicate})") };
+    let default_order_by = if matches!(database_type, Some(DatabaseType::InfluxDb) | Some(DatabaseType::InfluxDb3)) {
+        // InfluxQL only allows sorting of the timestamp column; SQL-mode
+        // InfluxDB 3 tables also key naturally on `time`.
         Some("time DESC".to_string())
     } else if database_type == Some(DatabaseType::Impala) {
         // Impala requires ORDER BY when OFFSET is present. Keeping the same
@@ -226,19 +267,28 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     };
     let order_by = options.order_by.as_deref().filter(|order| !order.trim().is_empty()).or(default_order_by.as_deref());
     let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
-    // Oracle join views can raise ORA-01445 when ROWID is selected; keep the
-    // synthetic ROWID fallback scoped to base-table reads.
+    // Oracle views with DISTINCT/GROUP BY raise ORA-01446 when ROWID is
+    // selected. Missing object metadata must therefore fail closed instead of
+    // being treated as a base table.
     let include_oracle_row_id = options.include_row_id
         && uses_oracle_row_id(database_type)
-        && !is_view_table_type(options.table_type.as_deref());
+        && is_oracle_base_table_type(options.table_type.as_deref());
+    let include_xugu_row_id =
+        options.include_row_id && uses_xugu_row_id(database_type) && !is_view_table_type(options.table_type.as_deref());
     let offset = options.offset.unwrap_or(0);
-    let oracle_view_first_page =
-        database_type == Some(DatabaseType::Oracle) && is_view_table_type(options.table_type.as_deref()) && offset == 0;
-
     let select_columns = if include_oracle_row_id {
         format!("ROWIDTOCHAR(t.ROWID) AS \"{DBX_ROWID_COLUMN}\", t.*")
     } else if let Some(preview_columns) = build_large_value_preview_columns(&options) {
         preview_columns
+    } else if include_xugu_row_id {
+        if options.columns.is_empty() {
+            format!("ROWID AS \"{DBX_ROWID_COLUMN}\", *")
+        } else {
+            format!(
+                "ROWID AS \"{DBX_ROWID_COLUMN}\", {}",
+                quoted_table_columns_or_star(database_type, &options.columns)
+            )
+        }
     } else {
         build_select_columns(
             database_type,
@@ -251,7 +301,21 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
         if options.columns.is_empty() {
             "*".to_string()
         } else {
-            format!("\"{DBX_ROWID_COLUMN}\", {rownum_select_columns}")
+            // Callers that address rows by the synthetic key may list it among
+            // the requested columns; the leading projection already supplies
+            // it from the inline view, so drop the duplicate.
+            let rest = options
+                .columns
+                .iter()
+                .filter(|column| !column.eq_ignore_ascii_case(DBX_ROWID_COLUMN))
+                .map(|column| quote_table_identifier(database_type, column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if rest.is_empty() {
+                format!("\"{DBX_ROWID_COLUMN}\"")
+            } else {
+                format!("\"{DBX_ROWID_COLUMN}\", {rest}")
+            }
         }
     } else {
         rownum_select_columns.clone()
@@ -295,9 +359,6 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
             )
         }
         TablePaginationStrategy::Rownum => {
-            if oracle_view_first_page {
-                return format!("SELECT {page_select_columns} FROM {table_alias}{where_clause}{order}");
-            }
             let rownum_inner_select_columns =
                 if include_oracle_row_id { &select_columns } else { &rownum_select_columns };
             build_rownum_table_select_sql(
@@ -320,6 +381,10 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
             &options.columns,
             limit,
             options.offset.unwrap_or(0),
+            options
+                .driver_profile
+                .as_deref()
+                .is_some_and(|profile| profile.trim().eq_ignore_ascii_case("sqlserver-legacy")),
         ),
         TablePaginationStrategy::QuestDbLimit => build_questdb_table_select_sql(
             &table_alias,
@@ -343,12 +408,69 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     }
 }
 
+/// Default WHERE predicate for time-series engines whose data model
+/// makes an unbounded `SELECT *` an accidental full-shard scan. When a
+/// data-tab caller opts in and the user has not supplied their own
+/// WHERE, we inject a rolling five-minute window on the mandatory
+/// `time` column so that sidebar quick-open queries stay cheap on
+/// production-sized tables. Users can broaden or drop the filter by
+/// editing the generated SQL.
+///
+/// Syntax is per-engine and cannot be shared:
+///
+/// * **InfluxDB 1.x / 2.x** — sidebar SELECTs go to the `/query`
+///   endpoint and are parsed as InfluxQL. InfluxQL accepts Go-style
+///   duration literals directly (`5m`, `1h`, `30s`).
+/// * **InfluxDB 3.x** — queries go through DataFusion SQL and require
+///   ANSI interval literals (`INTERVAL '5 minutes'`).
+///
+/// Returns `None` for engines where no default is appropriate — the
+/// caller then falls through to the historical unfiltered behavior.
+fn default_time_series_predicate(database_type: Option<DatabaseType>) -> Option<String> {
+    match database_type? {
+        DatabaseType::InfluxDb => Some("time > now() - 5m".to_string()),
+        DatabaseType::InfluxDb3 => Some("time > now() - INTERVAL '5 minutes'".to_string()),
+        _ => None,
+    }
+}
+
+/// Returns a `database.table` reference for engines whose active database is
+/// normally omitted from table-data SQL. Doris and StarRocks retain an external
+/// catalog prefix when one is selected.
+fn database_qualified_table_name(
+    database_type: Option<DatabaseType>,
+    catalog: Option<&str>,
+    database: Option<&str>,
+    table_name: &str,
+) -> Option<String> {
+    let database = database.map(str::trim).filter(|database| !database.is_empty())?;
+    match database_type {
+        Some(DatabaseType::ClickHouse) => Some(format!(
+            "{}.{}",
+            quote_table_identifier(database_type, database),
+            quote_table_identifier(database_type, table_name)
+        )),
+        Some(DatabaseType::Mysql | DatabaseType::Goldendb | DatabaseType::Doris | DatabaseType::StarRocks) => {
+            Some(qualified_table_name_with_catalog(database_type, catalog, Some(database), Some(database), table_name))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn table_data_qualified_table_name(
     database_type: Option<DatabaseType>,
     schema: Option<&str>,
     table_name: &str,
     identifier_quote: Option<&str>,
 ) -> String {
+    if database_type == Some(DatabaseType::Iris) {
+        let table = quote_iris_identifier(table_name, identifier_quote);
+        return schema
+            .map(str::trim)
+            .filter(|schema| !schema.is_empty())
+            .map(|schema| format!("{}.{table}", quote_iris_identifier(schema, identifier_quote)))
+            .unwrap_or(table);
+    }
     if !uses_connection_identifier_quote(database_type, identifier_quote) {
         return qualified_table_name(database_type, schema, table_name);
     }
@@ -385,6 +507,10 @@ pub(crate) fn uses_connection_identifier_quote(
     identifier_quote: Option<&str>,
 ) -> bool {
     database_type == Some(DatabaseType::Kingbase)
+        // JDBC table-data requests carry the schema returned by DatabaseMetaData.
+        // Keep the JDBC identifier unquoted when no driver quote was reported, but
+        // still qualify the table with that schema.
+        || database_type == Some(DatabaseType::Jdbc)
         // Spanner is dual-dialect: GoogleSQL uses backticks, the PostgreSQL dialect uses
         // double quotes, and only the connected agent knows which. Unconditional like
         // Kingbase — when no quote was reported the callers fall back to
@@ -399,12 +525,26 @@ fn is_view_table_type(table_type: Option<&str>) -> bool {
     table_type.is_some_and(|value| value.to_ascii_uppercase().contains("VIEW"))
 }
 
+fn is_oracle_base_table_type(table_type: Option<&str>) -> bool {
+    table_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("TABLE"))
+}
+
 pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
     let database_type = options.database_type;
     if database_type == Some(DatabaseType::VictoriaMetrics) {
         return format!("{}[1h]", victoriametrics_metric_selector(options.table_name));
     }
-    let table = qualified_table_name(database_type, options.schema, options.table_name);
+    let table = if database_type == Some(DatabaseType::Iris) {
+        let table = quote_iris_identifier(options.table_name, None);
+        options
+            .schema
+            .map(str::trim)
+            .filter(|schema| !schema.is_empty())
+            .map(|schema| format!("{}.{table}", quote_iris_identifier(schema, None)))
+            .unwrap_or(table)
+    } else {
+        qualified_table_name(database_type, options.schema, options.table_name)
+    };
     let select_columns = quoted_table_columns_or_star(database_type, options.columns);
     let order_by = if options.order_columns.is_empty() {
         String::new()
@@ -414,7 +554,17 @@ pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
             options
                 .order_columns
                 .iter()
-                .map(|column| format!("{} ASC", quote_table_identifier(database_type, column)))
+                .map(|column| {
+                    let quoted = if database_type == Some(DatabaseType::Iris) {
+                        // Caché/IRIS may run with delimited identifiers disabled,
+                        // where a quoted ORDER BY name becomes a string literal and
+                        // silently degrades to a constant sort.
+                        quote_iris_identifier(column, None)
+                    } else {
+                        quote_table_identifier(database_type, column)
+                    };
+                    format!("{quoted} ASC")
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -464,7 +614,20 @@ fn quoted_table_columns_or_star(database_type: Option<DatabaseType>, columns: &[
     if columns.is_empty() {
         return "*".to_string();
     }
-    columns.iter().map(|column| quote_table_identifier(database_type, column)).collect::<Vec<_>>().join(", ")
+    columns
+        .iter()
+        .map(|column| {
+            if database_type == Some(DatabaseType::Iris) {
+                // With delimited identifiers disabled, the Caché/IRIS JDBC
+                // preparser turns a quoted column name into a `:%qpar` host
+                // variable, so ordinary names must stay unquoted.
+                quote_iris_identifier(column, None)
+            } else {
+                quote_table_identifier(database_type, column)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn build_rownum_table_select_sql(
@@ -542,14 +705,26 @@ pub(super) fn build_select_columns(
             .collect::<Vec<_>>()
             .join(", ");
     }
-    if !matches!(database_type, Some(DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala)) {
+    // Everything outside the Hive-family identifier projection reads
+    // `SELECT *`. That includes InfluxDB (v1 / v2 / 3.x), whose tables
+    // can carry dozens of tags and fields — a full column list turns the
+    // generated SQL into a wall of names, while InfluxQL supports `*`
+    // natively and users can narrow the projection by editing the SQL.
+    if !matches!(
+        database_type,
+        Some(DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala | DatabaseType::Argo)
+    ) {
         return "*".to_string();
     }
     columns
         .iter()
         .map(|column| {
             let ident = quote_table_identifier(database_type, column);
-            format!("{ident} AS {ident}")
+            if database_type == Some(DatabaseType::Hive) {
+                format!("{ident} AS {ident}")
+            } else {
+                ident
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -562,6 +737,7 @@ pub(super) fn build_sqlserver_table_select_sql(
     columns: &[String],
     limit: usize,
     offset: usize,
+    legacy_compatible: bool,
 ) -> String {
     let columns_sql = if columns.is_empty() {
         "*".to_string()
@@ -573,6 +749,9 @@ pub(super) fn build_sqlserver_table_select_sql(
             .join(", ")
     };
     let order = if order_by == "(SELECT NULL)" { String::new() } else { format!(" ORDER BY {order_by}") };
+    if legacy_compatible {
+        return format!("SELECT {columns_sql} FROM {table}{where_clause}{order}");
+    }
     if offset == 0 {
         return format!("SELECT TOP ({limit}) {columns_sql} FROM {table}{where_clause}{order}");
     }
@@ -700,8 +879,114 @@ mod tests {
             offset: None,
             use_driver_row_offset: false,
             where_input: None,
+            inject_default_time_series_where: false,
             include_row_id: false,
         }
+    }
+
+    #[test]
+    fn influxdb_table_select_uses_star_and_rolling_window() {
+        // InfluxDB tables can carry dozens of tags/fields; enumerating them
+        // all in the SELECT list produces an unreadable wall of names.
+        // Emit `SELECT *` (InfluxQL supports it natively) and inject a
+        // rolling five-minute WHERE so the query stays cheap on production
+        // data. Users can narrow the projection or widen the window by
+        // editing the generated SQL.
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::InfluxDb),
+                database: Some("monitor".to_string()),
+                table_name: "cpu".to_string(),
+                columns: vec!["time".to_string(), "host".to_string(), "value".to_string()],
+                inject_default_time_series_where: true,
+                ..Default::default()
+            }),
+            "SELECT * FROM \"cpu\" WHERE (time > now() - 5m) ORDER BY time DESC LIMIT 100;"
+        );
+    }
+
+    #[test]
+    fn influxdb3_table_select_injects_datafusion_interval() {
+        // InfluxDB 3.x runs DataFusion SQL, which needs ANSI INTERVAL
+        // literals rather than InfluxQL's Go-style duration form.
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::InfluxDb3),
+                database: Some("monitor".to_string()),
+                table_name: "cpu".to_string(),
+                inject_default_time_series_where: true,
+                ..Default::default()
+            }),
+            "SELECT * FROM \"cpu\" WHERE (time > now() - INTERVAL '5 minutes') ORDER BY time DESC LIMIT 100;"
+        );
+    }
+
+    #[test]
+    fn influxdb_table_select_without_opt_in_stays_unfiltered() {
+        // Sampling (agent_tools) and whole-table export (csv_export) build
+        // SQL without the opt-in flag and must keep the historical
+        // unbounded scan semantics.
+        let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::InfluxDb),
+            database: Some("monitor".to_string()),
+            table_name: "cpu".to_string(),
+            ..Default::default()
+        });
+        assert!(!sql.contains("WHERE"), "unexpected default WHERE in non-opt-in SQL: {sql}");
+    }
+
+    #[test]
+    fn influxdb_table_select_honors_user_supplied_where() {
+        // When the caller passes their own predicate the default window is
+        // dropped — otherwise widening the range would require a new option.
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::InfluxDb),
+                database: Some("monitor".to_string()),
+                table_name: "cpu".to_string(),
+                where_input: Some("host = 'web-01'".to_string()),
+                ..Default::default()
+            }),
+            "SELECT * FROM \"cpu\" WHERE (host = 'web-01') ORDER BY time DESC LIMIT 100;"
+        );
+    }
+
+    #[test]
+    fn non_time_series_engines_get_no_default_where() {
+        // The rolling-window default is scoped to time-series engines; other
+        // dialects keep their historical unfiltered behavior.
+        let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: "orders".to_string(),
+            ..Default::default()
+        });
+        assert!(!sql.contains("WHERE"), "unexpected WHERE in non-time-series SQL: {sql}");
+    }
+
+    #[test]
+    fn databricks_table_select_uses_backtick_identifiers() {
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::Databricks),
+                schema: Some("sales".to_string()),
+                table_name: "ads_veeva_target_customer_df".to_string(),
+                limit: Some(100),
+                ..Default::default()
+            }),
+            "SELECT * FROM `sales`.`ads_veeva_target_customer_df` LIMIT 100;"
+        );
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::Databricks),
+                identifier_quote: Some("\"".to_string()),
+                schema: Some("sales`west".to_string()),
+                table_name: "ads`target".to_string(),
+                limit: Some(100),
+                ..Default::default()
+            }),
+            "SELECT * FROM `sales``west`.`ads``target` LIMIT 100;"
+        );
     }
 
     #[test]
@@ -716,6 +1001,13 @@ mod tests {
         let sql =
             build_table_data_select_sql(opts(DatabaseType::StarRocks, Some("hive_catalog"), Some("sales"), "orders"));
         assert!(sql.contains("FROM `hive_catalog`.`sales`.`orders`"), "sql was: {sql}");
+    }
+
+    #[test]
+    fn table_data_select_optionally_qualifies_database() {
+        let options = opts(DatabaseType::Mysql, None, Some("aaa"), "apis");
+        assert_eq!(build_table_data_select_sql(options.clone()), "SELECT * FROM `apis` LIMIT 10;");
+        assert_eq!(build_table_data_select_sql_with_database(options, true), "SELECT * FROM `aaa`.`apis` LIMIT 10;");
     }
 
     #[test]
@@ -765,5 +1057,17 @@ mod tests {
             build_count_table_sql(Some(DatabaseType::VictoriaMetrics), None, "rack\\\"temperature"),
             r#"count({__name__="rack\\\"temperature"})"#
         );
+    }
+
+    #[test]
+    fn sqlserver_legacy_table_preview_leaves_paging_to_the_agent_cursor() {
+        let mut options = opts(DatabaseType::SqlServer, None, None, "users");
+        options.driver_profile = Some(" SQLSERVER-LEGACY ".to_string());
+        options.columns = vec!["id".to_string(), "name".to_string()];
+        options.order_by = Some("[id] ASC".to_string());
+        options.limit = Some(100);
+        options.offset = Some(100);
+
+        assert_eq!(build_table_data_select_sql(options), "SELECT [id], [name] FROM [users] ORDER BY [id] ASC");
     }
 }

@@ -35,6 +35,11 @@ fn quotes_identifiers_by_database_type() {
     assert_eq!(quote_table_identifier(Some(DatabaseType::Jdbc), "user name"), "user name");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Iotdb), "root.test.device2"), "root.test.device2");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Spanner), "user`name"), "`user``name`");
+    // ArgoDB shares the Hive-family dialect: backticks quote identifiers and
+    // double quotes are string literals, and schemas qualify table names.
+    assert_eq!(quote_table_identifier(Some(DatabaseType::Argo), "user`name"), "`user``name`");
+    assert_eq!(quote_transfer_identifier("user`name", &DatabaseType::Argo), "`user``name`");
+    assert!(is_schema_aware(DatabaseType::Argo));
 }
 
 /// Spanner databases are created in one of two immutable dialects. The connected
@@ -110,6 +115,11 @@ fn qualifies_schema_only_for_schema_aware_databases() {
         "\"DBX_TEST\".\"PRODUCTS\""
     );
     assert_eq!(qualified_table_name(Some(DatabaseType::Oscar), Some("SYSDBA"), "EMPLOYEE"), "\"SYSDBA\".\"EMPLOYEE\"");
+    // ArgoDB (Transwarp fork of Hive) shares Hive's backtick identifier syntax; it must be
+    // classified as schema-aware AND quoted with backticks (not the default `"..."`, which
+    // ArgoDB parses as a string literal — see dbx-argo-double-quote-bug memory note).
+    assert_eq!(qualified_table_name(Some(DatabaseType::Argo), Some("dws"), "etl_log"), "`dws`.`etl_log`");
+    assert_eq!(qualified_table_name(Some(DatabaseType::Argo), None, "etl_log"), "`etl_log`");
     assert_eq!(qualified_table_name(Some(DatabaseType::Informix), Some("xtdpcky"), "users"), "xtdpcky.users");
     assert_eq!(qualified_table_name(Some(DatabaseType::Sqlite), Some("analytics"), "users"), "\"analytics\".\"users\"");
     assert_eq!(qualified_table_name(Some(DatabaseType::Jdbc), Some("cbsdw_dwd"), "dwd_test_df"), "dwd_test_df");
@@ -136,7 +146,7 @@ fn qualifies_schema_only_for_schema_aware_databases() {
 #[test]
 fn maps_table_pagination_strategy_by_database_type() {
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Mysql)), TablePaginationStrategy::LimitOffset);
-    assert_eq!(table_pagination_strategy(Some(DatabaseType::Dameng)), TablePaginationStrategy::FetchFirst);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Dameng)), TablePaginationStrategy::Rownum);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Db2)), TablePaginationStrategy::Db2FetchFirst);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::SqlServer)), TablePaginationStrategy::SqlServerTop);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Iris)), TablePaginationStrategy::IrisTop);
@@ -148,7 +158,7 @@ fn maps_table_pagination_strategy_by_database_type() {
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Oscar)), TablePaginationStrategy::Rownum);
     assert_eq!(
         pagination_strategy(Some(DatabaseType::Oracle), PaginationContext::BoundedRead),
-        TablePaginationStrategy::FetchFirst
+        TablePaginationStrategy::Rownum
     );
     assert_eq!(
         pagination_strategy(Some(DatabaseType::Oscar), PaginationContext::BoundedRead),
@@ -239,6 +249,17 @@ fn builds_select_sql_with_limit_syntax_for_database_type() {
         }),
         "SELECT \"id\", \"name\" FROM (SELECT \"id\", \"name\" FROM \"DBXTEST\".\"USERS\" ORDER BY \"id\" ASC) WHERE ROWNUM <= 100"
     );
+    assert_eq!(
+        build_table_select_sql(TableSelectSqlOptions {
+            database_type: Some(DatabaseType::Dameng),
+            schema: Some("SYSDBA"),
+            table_name: "USERS",
+            columns: &columns,
+            order_columns: &keys,
+            limit: 100,
+        }),
+        "SELECT \"id\", \"name\" FROM (SELECT \"id\", \"name\" FROM \"SYSDBA\".\"USERS\" ORDER BY \"id\" ASC) WHERE ROWNUM <= 100"
+    );
     // JDBC connections skip SQL-level row limiting — the JDBC agent handles
     // it via Statement.setMaxRows() which is universally supported.
     assert_eq!(
@@ -316,7 +337,34 @@ fn builds_select_sql_with_limit_syntax_for_database_type() {
             order_columns: &[],
             limit: 100,
         }),
-        "SELECT TOP 100 * FROM \"Ens\".\"AlarmResponse\""
+        "SELECT TOP 100 * FROM Ens.AlarmResponse"
+    );
+    // Caché 2016 often runs with delimited identifiers disabled: the JDBC
+    // preparser turns a quoted column into a `:%qpar` host variable and a
+    // quoted ORDER BY name into a string literal (constant sort), so ordinary
+    // column names must stay unquoted (#8340).
+    assert_eq!(
+        build_table_select_sql(TableSelectSqlOptions {
+            database_type: Some(DatabaseType::Iris),
+            schema: Some("SQLUser"),
+            table_name: "CT_Country",
+            columns: &columns,
+            order_columns: &keys,
+            limit: 200,
+        }),
+        "SELECT TOP 200 id, name FROM SQLUser.CT_Country ORDER BY id ASC"
+    );
+    // Non-Iris dialects keep their own quoting for the same input.
+    assert_eq!(
+        build_table_select_sql(TableSelectSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "users",
+            columns: &columns,
+            order_columns: &keys,
+            limit: 100,
+        }),
+        "SELECT `id`, `name` FROM `users` ORDER BY `id` ASC LIMIT 100;"
     );
     assert_eq!(
         build_table_select_sql(TableSelectSqlOptions {
@@ -376,6 +424,44 @@ fn jdbc_non_tdengine_and_unscoped_tdengine_previews_remain_unqualified() {
             "SELECT * FROM readings;"
         );
     }
+}
+
+#[test]
+fn jdbc_table_data_qualifies_schema_without_forcing_identifier_quotes() {
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Jdbc),
+            driver_profile: Some("phoenix".to_string()),
+            schema: Some("DEMO".to_string()),
+            table_name: "STUDENT".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT * FROM DEMO.STUDENT;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Jdbc),
+            driver_profile: Some("phoenix".to_string()),
+            identifier_quote: Some("\"".to_string()),
+            schema: Some("MY_SCHEMA".to_string()),
+            table_name: "ORDER".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT * FROM \"MY_SCHEMA\".\"ORDER\";"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Jdbc),
+            driver_profile: Some("phoenix".to_string()),
+            schema: None,
+            table_name: "STUDENT".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT * FROM STUDENT;"
+    );
 }
 
 #[test]
@@ -454,7 +540,7 @@ fn builds_table_data_where_and_schema_queries() {
             include_row_id: false,
             ..Default::default()
         }),
-        "SELECT `id` AS `id`, `name` AS `name` FROM `dbx_demo`.`connection_test` ORDER BY 1 LIMIT 2 OFFSET 1;"
+        "SELECT `id`, `name` FROM `dbx_demo`.`connection_test` ORDER BY 1 LIMIT 2 OFFSET 1;"
     );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -735,7 +821,7 @@ fn builds_table_data_where_and_schema_queries() {
             include_row_id: false,
             ..Default::default()
         }),
-        "SELECT TOP 100 * FROM \"Ens\".\"AlarmResponse\""
+        "SELECT TOP 100 * FROM Ens.AlarmResponse"
     );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -754,7 +840,7 @@ fn builds_table_data_where_and_schema_queries() {
             include_row_id: false,
             ..Default::default()
         }),
-        "SELECT * FROM \"Ens\".\"AlarmResponse\" WHERE (Status = 'Open') ORDER BY \"ID\" ASC"
+        "SELECT * FROM Ens.AlarmResponse WHERE (Status = 'Open') ORDER BY \"ID\" ASC"
     );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -1035,7 +1121,7 @@ fn explicit_table_data_order_is_preserved() {
 }
 
 #[test]
-fn builds_iris_table_data_sql_with_literal_top_and_quoted_object() {
+fn builds_iris_table_data_sql_with_literal_top_and_ordinary_object() {
     let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
         database_type: Some(DatabaseType::Iris),
         schema: Some("Ens".to_string()),
@@ -1052,13 +1138,23 @@ fn builds_iris_table_data_sql_with_literal_top_and_quoted_object() {
         ..Default::default()
     });
 
-    assert_eq!(
-        sql,
-        "SELECT TOP 25 * FROM \"Ens\".\"AlarmResponse\" WHERE (\"Status\" = 'Open') ORDER BY \"Status\" DESC"
-    );
+    assert_eq!(sql, "SELECT TOP 25 * FROM Ens.AlarmResponse WHERE (\"Status\" = 'Open') ORDER BY \"Status\" DESC");
     assert!(!sql.contains("?"));
     assert!(!sql.contains(":%qpar"));
     assert!(!sql.contains(" LIMIT "));
+}
+
+#[test]
+fn iris_table_data_sql_quotes_only_delimited_object_names() {
+    let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::Iris),
+        schema: Some("App Schema".to_string()),
+        table_name: "Patient Record".to_string(),
+        limit: Some(25),
+        ..Default::default()
+    });
+
+    assert_eq!(sql, "SELECT TOP 25 * FROM \"App Schema\".\"Patient Record\"");
 }
 
 #[test]
@@ -1208,7 +1304,7 @@ fn builds_oracle_and_neo4j_table_data_queries() {
             database_type: Some(DatabaseType::Oracle),
             schema: Some("DBXTEST".to_string()),
             table_name: "DBX_LOAD_TABLE_006".to_string(),
-            table_type: None,
+            table_type: Some("TABLE".to_string()),
             primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
             columns: Vec::new(),
             fallback_order_columns: Vec::new(),
@@ -1226,7 +1322,7 @@ fn builds_oracle_and_neo4j_table_data_queries() {
             database_type: Some(DatabaseType::Oracle),
             schema: Some("DBXTEST".to_string()),
             table_name: "DBX_LOAD_TABLE_006".to_string(),
-            table_type: None,
+            table_type: Some("TABLE".to_string()),
             primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
             columns: vec!["ID".to_string(), "NAME".to_string()],
             fallback_order_columns: Vec::new(),
@@ -1259,6 +1355,60 @@ fn builds_oracle_and_neo4j_table_data_queries() {
     );
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Xugu),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "DBX_LOAD_TABLE_006".to_string(),
+            table_type: Some("PARTITIONED TABLE".to_string()),
+            primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
+            columns: Vec::new(),
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(100),
+            offset: None,
+            where_input: None,
+            include_row_id: true,
+            ..Default::default()
+        }),
+        "SELECT ROWID AS \"__DBX_ROWID\", * FROM \"DBXTEST\".\"DBX_LOAD_TABLE_006\" LIMIT 100;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Xugu),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "DBX_LOAD_TABLE_006".to_string(),
+            table_type: Some("TEMPORARY TABLE".to_string()),
+            primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(25),
+            offset: Some(10),
+            where_input: None,
+            include_row_id: true,
+            ..Default::default()
+        }),
+        "SELECT ROWID AS \"__DBX_ROWID\", \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_LOAD_TABLE_006\" LIMIT 25 OFFSET 10;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Xugu),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "DBX_JOIN_VIEW".to_string(),
+            table_type: Some("VIEW".to_string()),
+            primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(100),
+            offset: None,
+            where_input: None,
+            include_row_id: true,
+            ..Default::default()
+        }),
+        "SELECT * FROM \"DBXTEST\".\"DBX_JOIN_VIEW\" LIMIT 100;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
             database_type: Some(DatabaseType::Oracle),
             schema: Some("DBXTEST".to_string()),
             table_name: "DBX_JOIN_VIEW".to_string(),
@@ -1273,7 +1423,7 @@ fn builds_oracle_and_neo4j_table_data_queries() {
             include_row_id: true,
             ..Default::default()
         }),
-        "SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_JOIN_VIEW\""
+        "SELECT \"ID\", \"NAME\" FROM (SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_JOIN_VIEW\") WHERE ROWNUM <= 100"
     );
     assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -1296,7 +1446,51 @@ fn builds_oracle_and_neo4j_table_data_queries() {
 }
 
 #[test]
-fn oracle_view_first_page_preserves_filter_and_sort_without_rownum() {
+fn oracle_unknown_table_type_does_not_assume_rowid_support() {
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("DBXTEST".to_string()),
+            table_name: "DBX_DISTINCT_VIEW".to_string(),
+            table_type: None,
+            primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            limit: Some(100),
+            offset: Some(100),
+            include_row_id: true,
+            ..Default::default()
+        }),
+        "SELECT \"ID\", \"NAME\" FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_DISTINCT_VIEW\") dbx_inner WHERE ROWNUM <= 200) WHERE \"__dbx_row_num\" > 100"
+    );
+}
+
+#[test]
+fn builds_oracle_rowid_wrapped_large_value_reload_sql() {
+    // The data-grid large-value reload selects the synthetic rowid key plus the
+    // target column with a rowid equality filter; `__DBX_ROWID` exists only as
+    // the inline-view alias, never as a base-table column (ORA-00904).
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("APP".to_string()),
+            table_name: "T_TEST".to_string(),
+            table_type: Some("TABLE".to_string()),
+            primary_keys: vec![DBX_ROWID_COLUMN.to_string()],
+            columns: vec![DBX_ROWID_COLUMN.to_string(), "ELM_CONTENT".to_string()],
+            where_input: Some("ROWIDTOCHAR(ROWID) = 'AAAFd1AAFAAAABSAA/'".to_string()),
+            fallback_order_columns: Vec::new(),
+            order_by: None,
+            limit: Some(1),
+            offset: Some(0),
+            include_row_id: true,
+            ..Default::default()
+        }),
+        "SELECT \"__DBX_ROWID\", \"ELM_CONTENT\" FROM (SELECT ROWIDTOCHAR(t.ROWID) AS \"__DBX_ROWID\", t.* FROM \"APP\".\"T_TEST\" t WHERE (ROWIDTOCHAR(ROWID) = 'AAAFd1AAFAAAABSAA/')) WHERE ROWNUM <= 1"
+    );
+}
+
+#[test]
+fn oracle_view_first_page_is_bounded_and_preserves_filter_and_sort() {
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
             database_type: Some(DatabaseType::Oracle),
@@ -1311,7 +1505,7 @@ fn oracle_view_first_page_preserves_filter_and_sort_without_rownum() {
             include_row_id: true,
             ..Default::default()
         }),
-        "SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_JOIN_VIEW\" WHERE (STATUS = 'A') ORDER BY \"ID\" DESC"
+        "SELECT \"ID\", \"NAME\" FROM (SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_JOIN_VIEW\" WHERE (STATUS = 'A') ORDER BY \"ID\" DESC) WHERE ROWNUM <= 100"
     );
 }
 
@@ -1324,12 +1518,13 @@ fn oracle_view_later_pages_keep_rownum_pagination() {
             table_name: "DBX_JOIN_VIEW".to_string(),
             table_type: Some("VIEW".to_string()),
             columns: vec!["ID".to_string(), "NAME".to_string()],
+            order_by: Some("\"ID\" DESC".to_string()),
             limit: Some(100),
             offset: Some(100),
             include_row_id: true,
             ..Default::default()
         }),
-        "SELECT \"ID\", \"NAME\" FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_JOIN_VIEW\") dbx_inner WHERE ROWNUM <= 200) WHERE \"__dbx_row_num\" > 100"
+        "SELECT \"ID\", \"NAME\" FROM (SELECT dbx_inner.*, ROWNUM AS \"__dbx_row_num\" FROM (SELECT \"ID\", \"NAME\" FROM \"DBXTEST\".\"DBX_JOIN_VIEW\" ORDER BY \"ID\" DESC) dbx_inner WHERE ROWNUM <= 200) WHERE \"__dbx_row_num\" > 100"
     );
 }
 

@@ -252,6 +252,8 @@ export interface NacosAdminConfig {
   apiPlane?: NacosApiPlane;
   serverAddr: string;
   contextPath?: string;
+  /** Browser URL for the Nacos web console. Nacos 3 uses a separate console endpoint. */
+  consoleUrl?: string;
   /** Namespace IDs used when an official Nacos ordinary user cannot enumerate namespaces or authorization data. */
   managedNamespaces?: string[];
   rnacosConsoleAddr?: string;
@@ -356,12 +358,19 @@ export interface NacosConfigSelector {
 
 export type NacosConflictPolicy = "ABORT" | "SKIP" | "OVERWRITE";
 
+export interface NacosBatchPreviewDiff {
+  beforeContent: string;
+  afterContent: string;
+  format?: string;
+}
+
 export interface NacosBatchPreviewItem {
   namespace: string;
   group: string;
   dataId: string;
   status: string;
   message?: string;
+  diff?: NacosBatchPreviewDiff;
 }
 
 export interface NacosBatchPreview {
@@ -397,6 +406,12 @@ export interface NacosBatchReport {
   items: NacosBatchItemResult[];
 }
 
+export interface NacosConfigDataIdMapping {
+  sourceGroup: string;
+  sourceDataId: string;
+  targetDataId: string;
+}
+
 export interface NacosConfigTransferRequest {
   operationId: string;
   sourceConnectionId: string;
@@ -404,6 +419,7 @@ export interface NacosConfigTransferRequest {
   source: NacosConfigSelector;
   targetNamespace: string;
   targetGroup?: string;
+  dataIdMappings?: NacosConfigDataIdMapping[];
   conflictPolicy: NacosConflictPolicy;
 }
 

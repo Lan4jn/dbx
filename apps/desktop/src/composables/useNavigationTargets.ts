@@ -1,11 +1,11 @@
 import * as api from "@/lib/backend/api";
 import { connectionObjectTreeNodeSchema, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { invalidateTableMetadataCache, loadTableMetadata } from "@/lib/metadata/tableMetadataCache";
-import { canApplyDataTabMetadata } from "@/lib/sidebar/dataTabOpenPolicy";
+import { canApplyDataTabMetadata, canReuseActiveMongoTab, type DataTabReuseMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
-import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { editableRowIdentifierColumns, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
@@ -22,9 +22,34 @@ export type NavigationTarget = {
   schema?: string;
   tableName: string;
   tableType?: string;
+  comment?: string | null;
   columnName?: string;
   whereInput?: string;
 };
+
+function openMongoCollectionTarget(target: NavigationTarget, reuseMode: DataTabReuseMode) {
+  const connectionStore = useConnectionStore();
+  const queryStore = useQueryStore();
+  connectionStore.activeConnectionId = target.connectionId;
+  const tabTitle = `${target.database}.${target.tableName}`;
+  const sameCollectionTab = reuseMode === "always-new" ? undefined : queryStore.tabs.find((tab) => tab.mode === "mongo" && tab.connectionId === target.connectionId && tab.database === target.database && tab.sql === target.tableName);
+  const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+  const reusableActiveTab = reuseMode === "active-tab" && !sameCollectionTab && canReuseActiveMongoTab(activeTab, target) ? activeTab : undefined;
+  const reusableTab = sameCollectionTab ?? reusableActiveTab;
+  const tabId = reusableTab?.id ?? queryStore.createTab(target.connectionId, target.database, tabTitle, "mongo", undefined, undefined, undefined, { forceNew: true });
+  if (reusableTab) {
+    queryStore.switchTab(tabId);
+    reusableTab.title = tabTitle;
+  }
+  queryStore.updateSql(tabId, target.tableName);
+  queryStore.setTableMeta(tabId, {
+    database: target.database,
+    tableName: target.tableName,
+    tableType: target.tableType || "TABLE",
+    columns: [],
+    primaryKeys: [],
+  });
+}
 
 async function openTableTarget(target: NavigationTarget, options: { tableInfoTab?: TableInfoTab } = {}) {
   const connectionStore = useConnectionStore();
@@ -34,6 +59,10 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
 
   connectionStore.activeConnectionId = target.connectionId;
   const config = connectionStore.getConfig(target.connectionId);
+  if (config?.db_type === "mongodb") {
+    openMongoCollectionTarget(target, settingsStore.editorSettings.dataTabReuseMode);
+    return;
+  }
   const tableSchema = connectionObjectTreeNodeSchema(config, target.database, target.schema);
   const tabTitle = target.catalog ? `${target.catalog}.${tableSchema || target.database}.${target.tableName}` : tableSchema ? `${tableSchema}.${target.tableName}` : target.tableName;
   if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
@@ -44,7 +73,10 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
   }
   const tabId = queryStore.createTab(target.connectionId, target.database, tabTitle, "data", tableSchema, undefined, undefined, { forceNew: true });
   const targetTab = queryStore.tabs.find((tab) => tab.id === tabId);
-  if (targetTab) targetTab.tableInfoTab = options.tableInfoTab;
+  if (targetTab) {
+    targetTab.tableInfoTab = options.tableInfoTab;
+    targetTab.tableComment = target.comment;
+  }
   // Stamp the new table identity synchronously so SQL rebuilds (refresh,
   // filters, row count) never read a stale tableMeta from a reused tab or
   // fall back to parsing the schema-qualified tab title (issue #3613).
@@ -118,6 +150,8 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
         catalog: target.catalog,
         database: target.database,
         tableName: target.tableName,
+        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+        injectDefaultTimeSeriesWhere: true,
         tableType: targetTableType,
         columns: columns.map((column) => column.name),
         primaryKeys,
@@ -162,6 +196,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       catalog: target.catalog,
       database: target.database,
       tableName: target.tableName,
+      includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       tableType: targetTableType,
       columns: eagerColumns.map((column) => column.name),
       primaryKeys: eagerPrimaryKeys,
@@ -209,6 +244,8 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
         catalog: target.catalog,
         database: target.database,
         tableName: target.tableName,
+        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+        injectDefaultTimeSeriesWhere: true,
         tableType: targetTableType,
         whereInput: target.whereInput,
         limit: 0,
@@ -235,7 +272,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       // 异步窗口内 tab 可能已被复用为其他目标：旧请求的元数据不得落地、
       // 不得解除新目标的 pending
       if (!isCurrentTarget() || !isCurrentGeneration()) return;
-      const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, targetTableType);
+      const useRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, targetTableType);
       queryStore.setTableMeta(tabId, {
         schema: tableSchema,
         catalog: target.catalog,
@@ -254,6 +291,8 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
           catalog: target.catalog,
           database: target.database,
           tableName: target.tableName,
+          includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+          injectDefaultTimeSeriesWhere: true,
           tableType: targetTableType,
           whereInput: target.whereInput,
           primaryKeys,
@@ -283,6 +322,10 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
   const { openData } = useSidebarDataOpenRuntime();
 
   async function openObjectBrowserTableTarget(target: NavigationTarget) {
+    if (connectionStore.getConfig(target.connectionId)?.db_type === "mongodb") {
+      openMongoCollectionTarget(target, settingsStore.editorSettings.dataTabReuseMode);
+      return;
+    }
     if (settingsStore.editorSettings.dataTabReuseMode === "always-new") {
       await openTableTarget(target);
       return;
@@ -300,6 +343,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         schema: target.schema,
         catalog: target.catalog,
         tableType: target.tableType,
+        comment: target.comment,
       },
       undefined,
       "default",

@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch, watchEffect } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
-import { Play, CirclePlay, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, X, Shield, Download, RotateCcw, AlertTriangle, ClipboardPaste, Minimize2, SpellCheck2 } from "@lucide/vue";
+import { Play, CirclePlay, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, X, Shield, Download, RotateCcw, AlertTriangle, ClipboardPaste, Minimize2, SpellCheck2, Layers, MoreHorizontal, BetweenVerticalStart, Eye } from "@lucide/vue";
+import { supportsInsertValueHints } from "@/lib/editor/codemirrorInsertValueHints";
 import { Button } from "@/components/ui/button";
 import { SearchableSelect } from "@/components/ui/searchable-select";
+import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import TruncatedTextTooltip from "@/components/ui/TruncatedTextTooltip.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
@@ -21,12 +23,18 @@ import { connectionIsDorisFamilyCatalogCapable } from "@/lib/database/databaseFe
 import { hexToRgba } from "@/lib/common/color";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
+import { resolveNextEditorToolbarTier, type EditorToolbarTier } from "@/lib/tabs/editorToolbarLayout";
+import { canSaveSqlTab } from "@/lib/tabs/sqlTabSaveTarget";
+import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
+import { canFormatSqlForDatabaseType } from "@/lib/sql/sqlFormatter";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 
 const props = defineProps<{
   activeTab: QueryTab;
   activeConnection?: ConnectionConfig;
   executableSql: string;
+  /** 来自 QueryEditor 的实时“当前语句是否为可预览 DML”信号；未提供时退回可编辑文档启发式。 */
+  canPreviewChanges?: boolean;
   explainMode?: string;
   blockDangerousRedisCommands?: boolean;
   sqlKeywordCase: "preserve" | "upper" | "lower";
@@ -34,17 +42,25 @@ const props = defineProps<{
   autoCommit?: boolean;
   txnSessionId?: string;
   txnAutoRolledBack?: boolean;
+  /** Oracle-only: whether the current manual Oracle session executed a statement
+   *  DBX cannot prove read-only. Commit/Rollback are hidden while false. */
+  txnPossiblyDirty?: boolean;
+  /** Oracle manual mode derived from the resolved database type (not raw
+   *  db_type, which can be the agent transport). */
+  stickyProvenReadOnlyState?: boolean;
 }>();
 
 const emit = defineEmits<{
-  execute: [];
+  toolbarExecute: [source: "pointer" | "keyboard"];
+  executePointerDown: [];
   cancel: [];
+  previewChanges: [];
   explain: [];
   "update:explainMode": [mode: "explain" | "autotrace"];
   formatSql: [];
   compressSql: [];
   toggleSqlKeywordCase: [];
-  saveSql: [];
+  saveSql: [tabId: string];
   openSql: [];
   importResultArchive: [];
   pasteSqlInCondition: [];
@@ -68,12 +84,101 @@ const settingsStore = useSettingsStore();
 const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions, catalogOptions, loadingCatalogOptions, loadCatalogOptions, catalogDatabaseOptions, loadingCatalogDatabaseOptions, loadCatalogDatabaseOptions } = useDatabaseOptions();
 const { loadSchemaOptions, getSchemaOptionsForDb, isLoadingSchemas, isSchemaAware } = useSchemaOptions();
 
+const toolbarRootRef = ref<HTMLElement | null>(null);
+const toolbarActionsRef = ref<HTMLElement | null>(null);
+const toolbarTier = ref<EditorToolbarTier>(0);
+// Available width when the current tier was condensed into; anchors the
+// step-down hysteresis so a static narrow layout cannot oscillate.
+const condensedAtWidth = ref(0);
+const expandedTierRequiredWidths: Partial<Record<EditorToolbarTier, number>> = {};
+let toolbarResizeObserver: ResizeObserver | undefined;
+let toolbarMeasureRaf = 0;
+
+function measureToolbarTier() {
+  const element = toolbarActionsRef.value;
+  const root = toolbarRootRef.value;
+  if (!element || !root) {
+    return;
+  }
+  const availableWidth = root.clientWidth;
+  // Use the stable full-row coordinate space, including the right controls.
+  // Tier-dependent helpers must not appear to grow the pane when they hide.
+  const contentWidth = element.scrollWidth + availableWidth - element.clientWidth;
+  const next = resolveNextEditorToolbarTier({
+    tier: toolbarTier.value,
+    availableWidth,
+    contentWidth,
+    condensedAtWidth: condensedAtWidth.value,
+    expandedTierRequiredWidths,
+  });
+  if (next !== toolbarTier.value) {
+    if (next > toolbarTier.value) {
+      const currentTier = toolbarTier.value;
+      expandedTierRequiredWidths[currentTier] = Math.max(expandedTierRequiredWidths[currentTier] ?? 0, contentWidth);
+      condensedAtWidth.value = availableWidth;
+    }
+    toolbarTier.value = next;
+  }
+}
+
+function scheduleToolbarMeasurement() {
+  if (toolbarMeasureRaf) {
+    return;
+  }
+  toolbarMeasureRaf = requestAnimationFrame(() => {
+    toolbarMeasureRaf = 0;
+    measureToolbarTier();
+  });
+}
+
+// Hiding or restoring controls changes the row content without resizing the
+// toolbar box, so every tier change re-measures until the row settles.
+watch(toolbarTier, () => {
+  void nextTick(scheduleToolbarMeasurement);
+});
+
+// The visible control set also changes with connection type and transaction
+// state; re-measure when those do.
+watch(
+  () => [props.activeConnection?.id, props.activeConnection?.db_type, props.txnSessionId, props.activeTab.isExecuting, props.activeTab.isExplaining] as const,
+  () => {
+    void nextTick(scheduleToolbarMeasurement);
+  },
+);
+
+watch(
+  toolbarRootRef,
+  (element) => {
+    toolbarResizeObserver?.disconnect();
+    toolbarResizeObserver = undefined;
+    if (element && typeof ResizeObserver !== "undefined") {
+      toolbarResizeObserver = new ResizeObserver(scheduleToolbarMeasurement);
+      toolbarResizeObserver.observe(element);
+    }
+    void nextTick(scheduleToolbarMeasurement);
+  },
+  { flush: "post" },
+);
+
+onUnmounted(() => {
+  if (toolbarMeasureRaf) {
+    cancelAnimationFrame(toolbarMeasureRaf);
+    toolbarMeasureRaf = 0;
+  }
+  toolbarResizeObserver?.disconnect();
+  toolbarResizeObserver = undefined;
+});
+
 const activeCatalogs = computed(() => {
   const connection = props.activeConnection;
   return connection ? (catalogOptions.value[connection.id] ?? []) : [];
 });
 const activeCatalogNames = computed(() => activeCatalogs.value.map((catalog) => catalog.name));
-const showCatalogSelector = computed(() => connectionIsDorisFamilyCatalogCapable(props.activeConnection) && queryCatalogSelectorVisible(activeCatalogs.value));
+const catalogSelectorAvailable = computed(() => connectionIsDorisFamilyCatalogCapable(props.activeConnection) && queryCatalogSelectorVisible(activeCatalogs.value));
+// Keep connection context controls mounted while the action group condenses.
+// Removing them changes the action group's available width and can make the
+// tier immediately expand again at the boundary, causing visible flicker.
+const showCatalogSelector = computed(() => catalogSelectorAvailable.value);
 const activeCatalogValue = computed(() => selectedQueryCatalogName(activeCatalogs.value, props.activeTab.catalog));
 const activeCatalogDatabaseKey = computed(() => (props.activeConnection && props.activeTab.catalog ? catalogDatabaseOptionsKey(props.activeConnection.id, props.activeTab.catalog) : ""));
 const activeDatabaseOptions = computed(() => {
@@ -121,9 +226,18 @@ const supportsExPaste = computed(() => supportsSqlInListPaste(props.activeConnec
 const supportsTransaction = computed(() => supportsTransactionFeature(props.activeConnection?.db_type));
 const hasDefaultDatabaseOption = computed(() => activeDatabaseOptions.value.includes(""));
 const schemaDatabaseKey = computed(() => props.activeTab.database || (isSingleDb.value ? "_" : ""));
-const saveTooltip = computed(() => (props.activeTab.objectSource ? t("objects.saveSource") : t("toolbar.saveSql")));
+const saveTooltip = computed(() => {
+  if (props.activeTab.objectSource) return t("objects.saveSource");
+  if (props.activeTab.externalSqlPath) return t("toolbar.saveSqlFile");
+  return t("toolbar.saveSql");
+});
 const executeShortcutDisplay = computed(() => formatShortcutDisplay(settingsStore.editorSettings.shortcuts.executeSql));
 const executeShortcutTooltip = computed(() => t("toolbar.executeShortcut", { shortcut: executeShortcutDisplay.value }));
+// executableSql 在无选区时可能是整篇文档；只要有 DML 语句出现就显示预览按钮，
+// 具体"当前语句"由编辑器（QueryEditor）按执行模式解析。
+const DML_KEYWORD_RE = /(^|\s)(update|insert|delete)\s/i;
+const canPreviewDml = computed(() => looksLikeDmlStatement(props.executableSql) || DML_KEYWORD_RE.test(props.executableSql));
+const previewButtonVisible = computed(() => props.canPreviewChanges ?? canPreviewDml.value);
 // DM calls it autotrace, Postgres EXPLAIN ANALYZE, SQL Server the actual execution
 // plan (SET STATISTICS XML); all three execute the statement.
 const supportsExplainAnalyze = computed(() => {
@@ -136,7 +250,7 @@ const explainAnalyzeTooltip = computed(() => {
   if (dbType === "sqlserver") return t("toolbar.actualPlan");
   return t("toolbar.autotrace");
 });
-const canSaveSql = computed(() => !!props.activeTab.externalSqlPath || !!props.activeTab.sql.trim());
+const canSaveSql = computed(() => canSaveSqlTab(props.activeTab));
 const keywordCaseIsLower = computed(() => props.sqlKeywordCase === "lower");
 const keywordCaseToggleTooltip = computed(() => (keywordCaseIsLower.value ? t("toolbar.keywordCaseUpper") : t("toolbar.keywordCaseLower")));
 const sqlSemanticDiagnosticsEnabled = computed(() => settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
@@ -150,9 +264,22 @@ function toggleSqlSemanticDiagnostics() {
     sqlSemanticDiagnosticsMode: sqlSemanticDiagnosticsEnabled.value ? "disabled" : "enabled",
   });
 }
+const insertValueHintsEnabled = computed(() => settingsStore.editorSettings.showInsertValueHints);
+const insertValueHintsToggleTooltip = computed(() => (insertValueHintsEnabled.value ? t("toolbar.insertValueHintsToggleOn") : t("toolbar.insertValueHintsToggleOff")));
+const supportsInsertValueHintsToggle = computed(() => supportsInsertValueHints(props.activeConnection?.db_type));
+function toggleInsertValueHints() {
+  settingsStore.updateEditorSettings({ showInsertValueHints: !insertValueHintsEnabled.value });
+}
 const isTransactionActive = computed(() => !!props.txnSessionId);
 const isManualTransactionMode = computed(() => props.autoCommit === false || isTransactionActive.value);
 const transactionModeBadge = computed(() => (isManualTransactionMode.value ? "M" : "A"));
+// Sticky proven-read-only dialects (Oracle/OceanBase-Oracle/MySQL/PostgreSQL)
+// hide Commit/Rollback while the session is clean (no unproven statement
+// executed). Every other database keeps the existing rule.
+const showTxnActions = computed(() => {
+  if (props.stickyProvenReadOnlyState) return isTransactionActive.value && props.txnPossiblyDirty === true;
+  return isTransactionActive.value;
+});
 const transactionTooltip = computed(() => {
   const isAgent = (props.activeConnection?.db_type as string) === "agent";
   const isManual = isManualTransactionMode.value;
@@ -172,10 +299,11 @@ const canMultiExecute = computed(() => {
   return !!props.executableSql.trim();
 });
 
-const showSchemaSelector = computed(() => {
+const schemaSelectorAvailable = computed(() => {
   const connection = props.activeConnection;
   return connection && isSchemaAware(connection.id) && (props.activeTab.database || isSingleDb.value || hasDefaultDatabaseOption.value);
 });
+const showSchemaSelector = computed(() => schemaSelectorAvailable.value);
 
 const activeSchemaOptions = computed(() => {
   const connection = props.activeConnection;
@@ -219,6 +347,25 @@ watchEffect(() => {
 });
 
 const isActiveDatabaseDefault = computed(() => isDefaultDatabase(props.activeConnection, activeDatabaseValue.value));
+
+// Narrow panes (multi-group splits) condense the toolbar by measured width
+// instead of overflowing or scrolling. See resolveEditorToolbarTier for the
+// tier contract.
+
+const showOverflowMenu = computed(() => toolbarTier.value >= 1);
+const canFormatSql = computed(() => canFormatSqlForDatabaseType(props.activeConnection?.db_type));
+const showFormatButton = computed(() => canFormatSql.value && toolbarTier.value < 2);
+const showExplainAnalyzeToggle = computed(() => toolbarTier.value < 3);
+const showCompressButton = computed(() => toolbarTier.value < 1);
+const showKeywordCaseButton = computed(() => toolbarTier.value < 1);
+const showSemanticDiagnosticsButton = computed(() => supportsSqlSemanticDiagnosticsToggle.value && toolbarTier.value < 1);
+const showPreviewButton = computed(() => previewButtonVisible.value && toolbarTier.value < 1);
+const showInsertValueHintsButton = computed(() => supportsInsertValueHintsToggle.value && toolbarTier.value < 1);
+const showOpenSqlButton = computed(() => toolbarTier.value < 1);
+const showImportArchiveButton = computed(() => toolbarTier.value < 1);
+const showPasteSqlButton = computed(() => toolbarTier.value < 1);
+const showMultiExecuteButton = computed(() => toolbarTier.value < 1);
+const showDatabaseHelperButtons = computed(() => toolbarTier.value < 2);
 const toolbarStyle = computed(() => {
   const color = props.activeConnection?.color;
   if (!color) return undefined;
@@ -239,6 +386,20 @@ function databaseOptionIsProduction(database: string): boolean {
   if (!database || props.activeConnection?.is_production) return false;
   return productionContextForDatabase(props.activeConnection, database).reason === "database";
 }
+
+function onExecutePointerDown(event: MouseEvent) {
+  if (props.activeTab.isExecuting || event.button !== 0) return;
+  emit("executePointerDown");
+}
+
+function onExecuteClick(event: MouseEvent) {
+  if (props.activeTab.isExecuting) {
+    emit("cancel");
+    return;
+  }
+  emit("toolbarExecute", event.detail > 0 ? "pointer" : "keyboard");
+}
+
 async function changeCatalog(selectedCatalog: string) {
   const connection = props.activeConnection;
   if (!connection) return;
@@ -254,8 +415,8 @@ async function changeCatalog(selectedCatalog: string) {
 </script>
 
 <template>
-  <div class="app-editor-toolbar h-9 shrink-0 border-b bg-background/80 px-3 flex items-center gap-1 text-xs text-muted-foreground relative z-10" :style="toolbarStyle">
-    <div class="flex items-center gap-0.5">
+  <div ref="toolbarRootRef" class="app-editor-toolbar h-9 min-w-0 shrink-0 border-b bg-background/80 px-3 flex items-center gap-1 text-xs text-muted-foreground relative z-10 overflow-hidden" :style="toolbarStyle">
+    <div ref="toolbarActionsRef" class="min-w-0 flex flex-1 items-center gap-0.5 overflow-hidden">
       <Tooltip>
         <TooltipTrigger as-child>
           <Button
@@ -264,8 +425,8 @@ async function changeCatalog(selectedCatalog: string) {
             class="h-6 w-6"
             :class="executeButtonClass"
             :disabled="activeTab.isCancelling || activeTab.isExplaining || (!activeTab.isExecuting && !executableSql.trim())"
-            @mousedown.prevent
-            @click="activeTab.isExecuting ? emit('cancel') : emit('execute')"
+            @mousedown.prevent="onExecutePointerDown"
+            @click="onExecuteClick"
           >
             <Loader2 v-if="activeTab.isCancelling" class="h-3.5 w-3.5 animate-spin" />
             <Square v-else-if="activeTab.isExecuting" class="h-3.5 w-3.5 fill-current" />
@@ -273,6 +434,14 @@ async function changeCatalog(selectedCatalog: string) {
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ activeTab.isExecuting ? t("toolbar.stopQuery") : executeShortcutTooltip }}</TooltipContent>
+      </Tooltip>
+      <Tooltip v-if="showPreviewButton">
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-sky-600 hover:bg-sky-500/10 hover:text-sky-700" :disabled="activeTab.isExecuting || activeTab.isCancelling" :aria-label="t('editor.previewChanges')" @mousedown.prevent @click="emit('previewChanges')">
+            <Eye class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("editor.previewChanges") }}</TooltipContent>
       </Tooltip>
       <Tooltip v-if="supportsExplain">
         <TooltipTrigger as-child>
@@ -291,7 +460,7 @@ async function changeCatalog(selectedCatalog: string) {
         <TooltipContent>{{ activeTab.isExplaining ? t("toolbar.stopExplain") : t("toolbar.explainPlan") }}</TooltipContent>
       </Tooltip>
       <!-- Autotrace (DM) / EXPLAIN ANALYZE (Postgres) / actual plan (SQL Server) toggle -->
-      <Tooltip v-if="supportsExplainAnalyze">
+      <Tooltip v-if="showExplainAnalyzeToggle">
         <TooltipTrigger as-child>
           <Button
             variant="ghost"
@@ -308,7 +477,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ explainAnalyzeTooltip }}</TooltipContent>
       </Tooltip>
-      <Tooltip>
+      <Tooltip v-if="showFormatButton">
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @click="emit('formatSql')">
             <AlignLeft class="h-3.5 w-3.5" />
@@ -316,7 +485,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.formatSql") }}</TooltipContent>
       </Tooltip>
-      <Tooltip>
+      <Tooltip v-if="showCompressButton">
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @click="emit('compressSql')">
             <Minimize2 class="h-3.5 w-3.5" />
@@ -324,7 +493,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.compressSql") }}</TooltipContent>
       </Tooltip>
-      <Tooltip>
+      <Tooltip v-if="showKeywordCaseButton">
         <TooltipTrigger as-child>
           <Button
             variant="ghost"
@@ -339,7 +508,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ keywordCaseToggleTooltip }}</TooltipContent>
       </Tooltip>
-      <Tooltip v-if="supportsSqlSemanticDiagnosticsToggle">
+      <Tooltip v-if="showSemanticDiagnosticsButton">
         <TooltipTrigger as-child>
           <Button
             variant="ghost"
@@ -354,6 +523,22 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ sqlSemanticDiagnosticsToggleTooltip }}</TooltipContent>
       </Tooltip>
+      <Tooltip v-if="showInsertValueHintsButton">
+        <TooltipTrigger as-child>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-6 w-6"
+            :class="insertValueHintsEnabled ? 'text-sky-600 bg-sky-500/10 hover:bg-sky-500/20 hover:text-sky-700 dark:text-sky-300 dark:hover:text-sky-200' : 'text-muted-foreground/50 hover:bg-muted hover:text-muted-foreground'"
+            :aria-label="insertValueHintsToggleTooltip"
+            :aria-pressed="insertValueHintsEnabled"
+            @click="toggleInsertValueHints"
+          >
+            <BetweenVerticalStart class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ insertValueHintsToggleTooltip }}</TooltipContent>
+      </Tooltip>
       <Tooltip v-if="activeConnection?.db_type === 'redis'">
         <TooltipTrigger as-child>
           <Button
@@ -361,6 +546,8 @@ async function changeCatalog(selectedCatalog: string) {
             size="icon"
             class="h-6 w-6"
             :class="blockDangerousRedisCommands !== false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'"
+            :aria-label="t('toolbar.blockDangerousRedisCommands')"
+            :aria-pressed="blockDangerousRedisCommands !== false"
             @click="emit('update:blockDangerousRedisCommands', blockDangerousRedisCommands === false)"
           >
             <Shield class="h-3.5 w-3.5" />
@@ -370,13 +557,13 @@ async function changeCatalog(selectedCatalog: string) {
       </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-blue-600 hover:bg-blue-500/10 hover:text-blue-700 dark:text-blue-300 dark:hover:text-blue-200" :disabled="!canSaveSql" @click="emit('saveSql')">
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-blue-600 hover:bg-blue-500/10 hover:text-blue-700 dark:text-blue-300 dark:hover:text-blue-200" :disabled="!canSaveSql" @click="emit('saveSql', props.activeTab.id)">
             <Save class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ saveTooltip }}</TooltipContent>
       </Tooltip>
-      <Tooltip>
+      <Tooltip v-if="showOpenSqlButton">
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-sky-600 hover:bg-sky-500/10 hover:text-sky-700 dark:text-sky-300 dark:hover:text-sky-200" @click="emit('openSql')">
             <FolderOpen class="h-3.5 w-3.5" />
@@ -384,7 +571,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.openSql") }}</TooltipContent>
       </Tooltip>
-      <Tooltip>
+      <Tooltip v-if="showImportArchiveButton">
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-cyan-600 hover:bg-cyan-500/10 hover:text-cyan-700 dark:text-cyan-300 dark:hover:text-cyan-200" @click="emit('importResultArchive')">
             <Download class="h-3.5 w-3.5" />
@@ -392,7 +579,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ t("tabs.importResultArchive") }}</TooltipContent>
       </Tooltip>
-      <Tooltip v-if="supportsExPaste">
+      <Tooltip v-if="showPasteSqlButton">
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-teal-600 hover:bg-teal-500/10 hover:text-teal-700 dark:text-teal-300 dark:hover:text-teal-200" @click="emit('pasteSqlInCondition')">
             <ClipboardPaste class="h-3.5 w-3.5" />
@@ -400,7 +587,7 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.exPasteSqlInCondition") }}</TooltipContent>
       </Tooltip>
-      <Tooltip>
+      <Tooltip v-if="showMultiExecuteButton">
         <TooltipTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-6 text-primary hover:bg-primary/10" :disabled="!canMultiExecute" :aria-label="t('toolbar.multiDbExecute')" @click="emit('multiExecute')">
             <CirclePlay class="h-3.5 w-3.5" />
@@ -408,6 +595,71 @@ async function changeCatalog(selectedCatalog: string) {
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.multiDbExecute") }}</TooltipContent>
       </Tooltip>
+      <DropdownMenu v-if="showOverflowMenu">
+        <DropdownMenuTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:text-foreground" :aria-label="t('toolbar.moreActions')" :title="t('toolbar.moreActions')">
+            <MoreHorizontal class="h-3.5 w-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" class="w-max min-w-56 max-w-[calc(100vw-1rem)]">
+          <DropdownMenuItem :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @select="emit('compressSql')">
+            <Minimize2 class="h-3.5 w-3.5" />
+            {{ t("toolbar.compressSql") }}
+          </DropdownMenuItem>
+          <DropdownMenuItem @select="emit('toggleSqlKeywordCase')">
+            <span class="inline-flex h-4 w-4 shrink-0 items-center justify-center font-mono text-xs font-semibold" aria-hidden="true">
+              {{ keywordCaseIsLower ? "A" : "a" }}
+            </span>
+            {{ keywordCaseToggleTooltip }}
+          </DropdownMenuItem>
+          <DropdownMenuCheckboxItem v-if="supportsSqlSemanticDiagnosticsToggle" :model-value="sqlSemanticDiagnosticsEnabled" @select.prevent="toggleSqlSemanticDiagnostics">
+            <SpellCheck2 class="h-3.5 w-3.5" />
+            {{ t("settings.sqlSemanticDiagnosticsEnabled") }}
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuItem @select="emit('openSql')">
+            <FolderOpen class="h-3.5 w-3.5" />
+            {{ t("toolbar.openSql") }}
+          </DropdownMenuItem>
+          <DropdownMenuItem @select="emit('importResultArchive')">
+            <Download class="h-3.5 w-3.5" />
+            {{ t("tabs.importResultArchive") }}
+          </DropdownMenuItem>
+          <DropdownMenuItem v-if="supportsExPaste" @select="emit('pasteSqlInCondition')">
+            <ClipboardPaste class="h-3.5 w-3.5" />
+            {{ t("toolbar.exPasteSqlInCondition") }}
+          </DropdownMenuItem>
+          <DropdownMenuItem :disabled="!canMultiExecute" @select="emit('multiExecute')">
+            <CirclePlay class="h-3.5 w-3.5" />
+            {{ t("toolbar.multiDbExecute") }}
+          </DropdownMenuItem>
+          <DropdownMenuItem v-if="previewButtonVisible" :disabled="activeTab.isExecuting || activeTab.isCancelling" @select="emit('previewChanges')">
+            <Eye class="h-3.5 w-3.5" />
+            {{ t("editor.previewChanges") }}
+          </DropdownMenuItem>
+          <DropdownMenuCheckboxItem v-if="supportsInsertValueHintsToggle" :model-value="insertValueHintsEnabled" @select.prevent="toggleInsertValueHints">
+            <BetweenVerticalStart class="h-3.5 w-3.5" />
+            {{ t("settings.showInsertValueHints") }}
+          </DropdownMenuCheckboxItem>
+          <template v-if="toolbarTier >= 2">
+            <DropdownMenuItem v-if="canFormatSql" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @select="emit('formatSql')">
+              <AlignLeft class="h-3.5 w-3.5" />
+              {{ t("toolbar.formatSql") }}
+            </DropdownMenuItem>
+            <DropdownMenuItem v-if="activeDatabaseValue" :disabled="!activeConnection" @select="emit('changeDatabase', '')">
+              <X class="h-3.5 w-3.5" />
+              {{ t("editor.clearDatabase") }}
+            </DropdownMenuItem>
+            <DropdownMenuItem v-if="activeDatabaseValue && !activeTab.catalog" @select="isActiveDatabaseDefault ? emit('clearDefaultDatabase') : emit('setDefaultDatabase')">
+              <Check v-if="isActiveDatabaseDefault" class="h-3 w-3" />
+              {{ isActiveDatabaseDefault ? t("editor.defaultDatabase") : t("editor.setDefaultDatabase") }}
+            </DropdownMenuItem>
+          </template>
+          <DropdownMenuCheckboxItem v-if="toolbarTier >= 3 && supportsExplainAnalyze" :model-value="props.explainMode === 'autotrace'" @select.prevent="emit('update:explainMode', props.explainMode === 'autotrace' ? 'explain' : 'autotrace')">
+            <span class="font-bold" style="font-size: 9px">A</span>
+            {{ explainAnalyzeTooltip }}
+          </DropdownMenuCheckboxItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <div v-if="supportsTransaction" class="ml-1 flex items-center gap-0.5 border-l border-border/60 pl-1" role="group" :aria-label="transactionTooltip">
         <!-- Transaction toggle -->
         <Tooltip>
@@ -430,8 +682,8 @@ async function changeCatalog(selectedCatalog: string) {
           </TooltipTrigger>
           <TooltipContent>{{ transactionTooltip }}</TooltipContent>
         </Tooltip>
-        <!-- Commit button (only when transaction is active) -->
-        <Tooltip v-if="isTransactionActive">
+        <!-- Commit button (only when a transaction action is warranted) -->
+        <Tooltip v-if="showTxnActions">
           <TooltipTrigger as-child>
             <Button variant="ghost" size="icon" class="h-6 w-6 text-green-600 hover:bg-green-500/10 hover:text-green-700 dark:text-green-300 dark:hover:text-green-200" :disabled="activeTab.isExecuting" :aria-label="t('toolbar.commit')" @click="emit('commit')">
               <Check class="h-3.5 w-3.5" />
@@ -440,8 +692,8 @@ async function changeCatalog(selectedCatalog: string) {
           <TooltipContent>{{ t("toolbar.commit") }}</TooltipContent>
         </Tooltip>
 
-        <!-- Rollback button (only when transaction is active) -->
-        <Tooltip v-if="isTransactionActive">
+        <!-- Rollback button (only when a transaction action is warranted) -->
+        <Tooltip v-if="showTxnActions">
           <TooltipTrigger as-child>
             <Button variant="ghost" size="icon" class="h-6 w-6 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" :disabled="activeTab.isExecuting" :aria-label="t('toolbar.rollback')" @click="emit('rollback')">
               <RotateCcw class="h-3.5 w-3.5" />
@@ -451,9 +703,8 @@ async function changeCatalog(selectedCatalog: string) {
         </Tooltip>
       </div>
     </div>
-    <span class="flex-1 min-w-0" />
-    <div class="flex items-center gap-2 shrink-0">
-      <div class="flex items-center gap-1">
+    <div class="flex shrink-0 items-center gap-2">
+      <div class="flex shrink-0 items-center gap-1">
         <span v-if="activeConnection?.color" class="h-4 w-1 rounded-full shrink-0" :style="{ backgroundColor: activeConnection.color }" />
         <ConnectionTreeSelect
           :model-value="activeConnectionValue"
@@ -477,7 +728,7 @@ async function changeCatalog(selectedCatalog: string) {
           </template>
         </ConnectionTreeSelect>
       </div>
-      <div v-if="showCatalogSelector" class="flex items-center gap-1">
+      <div v-if="showCatalogSelector" class="flex shrink-0 items-center gap-1">
         <SearchableSelect
           :model-value="activeCatalogValue"
           :options="activeCatalogNames"
@@ -515,7 +766,7 @@ async function changeCatalog(selectedCatalog: string) {
           activeConnection?.db_type !== 'consul' &&
           !isSingleDb
         "
-        class="flex items-center gap-1"
+        class="flex shrink-0 items-center gap-1"
         :class="{ 'database-required-prompt': databaseRequiredVisible }"
       >
         <SearchableSelect
@@ -551,7 +802,7 @@ async function changeCatalog(selectedCatalog: string) {
             </div>
           </template>
         </SearchableSelect>
-        <Tooltip v-if="activeDatabaseValue && !isSingleDb">
+        <Tooltip v-if="showDatabaseHelperButtons && activeDatabaseValue && !isSingleDb">
           <TooltipTrigger as-child>
             <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:text-foreground" @click="emit('changeDatabase', '')">
               <X class="h-3.5 w-3.5" />
@@ -559,12 +810,12 @@ async function changeCatalog(selectedCatalog: string) {
           </TooltipTrigger>
           <TooltipContent>{{ t("editor.clearDatabase") }}</TooltipContent>
         </Tooltip>
-        <Button v-if="activeDatabaseValue && !activeTab.catalog" variant="ghost" size="sm" class="h-6 px-2 text-[11px]" @click="isActiveDatabaseDefault ? emit('clearDefaultDatabase') : emit('setDefaultDatabase')">
+        <Button v-if="showDatabaseHelperButtons && activeDatabaseValue && !activeTab.catalog" variant="ghost" size="sm" class="h-6 px-2 text-[11px]" @click="isActiveDatabaseDefault ? emit('clearDefaultDatabase') : emit('setDefaultDatabase')">
           <Check v-if="isActiveDatabaseDefault" class="h-3 w-3" />
           {{ isActiveDatabaseDefault ? t("editor.defaultDatabase") : t("editor.setDefaultDatabase") }}
         </Button>
       </div>
-      <div v-if="showSchemaSelector" class="flex items-center gap-1">
+      <div v-if="showSchemaSelector" class="flex shrink-0 items-center gap-1">
         <SearchableSelect
           :model-value="activeSchemaValue"
           :options="activeSchemaOptions.length ? activeSchemaOptions : activeSchemaValue ? [activeSchemaValue] : []"

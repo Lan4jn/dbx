@@ -129,7 +129,7 @@ pub fn analyze_editable_query(sql: &str) -> Option<EditableQueryInfo> {
 }
 
 pub fn analyze_editable_query_editability(sql: &str) -> QueryEditability {
-    let normalized = strip_sql_comments(sql).trim_end_matches(';').trim().to_string();
+    let normalized = strip_sql_comments(sql).trim().trim_end_matches(';').trim().to_string();
     if normalized.is_empty() {
         return not_editable(QueryEditabilityReason::NotSelect);
     }
@@ -142,7 +142,7 @@ pub fn analyze_editable_query_editability(sql: &str) -> QueryEditability {
     if has_top_level_keyword(&normalized, &["UNION", "INTERSECT", "EXCEPT", "MINUS"]) {
         return not_editable(QueryEditabilityReason::SetOperation);
     }
-    if normalized.contains(';') {
+    if has_top_level_semicolon(&normalized) {
         return not_editable(QueryEditabilityReason::ComplexSource);
     }
 
@@ -310,11 +310,23 @@ fn parse_select_column(column: &str, sources: &[FromSource]) -> Option<EditableQ
 fn parse_star_select_column(column: &str, sources: &[FromSource]) -> Option<EditableQueryColumn> {
     let trimmed = column.trim();
     if trimmed == "*" {
+        // An unqualified `*` is unambiguous when the query has exactly one
+        // source, so it can bind to that source like a qualified `alias.*`
+        // would. Without this, the star projection carries no source_key and
+        // the ordinal column-comment resolver (apps/desktop TS side) cannot
+        // expand it against the table's columns, misaligning every result
+        // column from that point on — e.g. `SELECT *, amount FROM orders`
+        // loses all result-column comments even though the table has no
+        // ambiguity to resolve.
+        let source_key = match sources {
+            [only] => Some(only.key.clone()),
+            _ => None,
+        };
         return Some(EditableQueryColumn {
             source_name: None,
             source_name_quoted: false,
             source_qualifier: None,
-            source_key: None,
+            source_key,
             star: true,
             result_name: "*".to_string(),
             expression: trimmed.to_string(),
@@ -682,7 +694,7 @@ fn is_select_star(body: &str, alias: Option<&str>) -> bool {
 }
 
 fn parse_from_sources(body: &str) -> Vec<FromSource> {
-    if body.is_empty() || body.contains('(') || body.contains(')') {
+    if body.is_empty() {
         return Vec::new();
     }
 
@@ -730,6 +742,9 @@ fn parse_table_source_at(text: &str, start: usize, index: usize) -> Option<(From
     }
     let mut end = pos + ident.end;
     let tail_pos = skip_whitespace(text, end);
+    if text[tail_pos..].starts_with('(') {
+        return None;
+    }
     let alias = if starts_with_keyword_at(text, tail_pos, "AS") {
         let alias_ident = read_identifier(text, tail_pos + 2)?;
         end = alias_ident.end;
@@ -967,6 +982,28 @@ fn has_top_level_keyword(sql: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|keyword| find_top_level_keyword(sql, keyword, 0).is_some())
 }
 
+fn has_top_level_semicolon(sql: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for ch in sql.chars() {
+        if let Some(close) = quote {
+            if ch == close {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '[' => quote = Some(']'),
+            '(' => depth += 1,
+            ')' => depth = 0.max(depth - 1),
+            ';' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn first_top_level_keyword_index(sql: &str, keywords: &[&str], start: usize) -> Option<usize> {
     keywords.iter().filter_map(|keyword| find_top_level_keyword(sql, keyword, start)).min()
 }
@@ -1067,6 +1104,18 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_oracle_num_column_and_alias_as_editable() {
+        for sql in ["select id, num from users", "select id, amount as num from users"] {
+            let result = analyze_editable_query_editability(sql);
+            assert!(result.editable, "{sql}");
+            assert_eq!(result.reason, None, "{sql}");
+            let analysis = result.analysis.unwrap();
+            assert_eq!(analysis.table_name, "users", "{sql}");
+            assert_eq!(analysis.columns.last().unwrap().result_name, "num", "{sql}");
+        }
+    }
+
+    #[test]
     fn recognizes_sql_server_top_selects_as_editable() {
         for sql in [
             "SELECT TOP 2 name, note FROM dbo.users ORDER BY name",
@@ -1133,6 +1182,43 @@ mod tests {
 
             assert!(result.editable, "{sql}: {:?}", result.reason);
             assert_eq!(result.analysis.unwrap().table_name, "users", "{sql}");
+        }
+    }
+
+    #[test]
+    fn ignores_semicolons_inside_literals_identifiers_and_comments() {
+        for sql in [
+            "SELECT c.* FROM CONTAINER c WHERE c.CONTAINERNAME = '00390360;081111'",
+            "SELECT c.* FROM CONTAINER c WHERE c.CONTAINERNAME = '00390360;081111';",
+            "SELECT * FROM users WHERE name = 'a;b'  ",
+            r#"SELECT * FROM "weird;name""#,
+            "SELECT * FROM `weird;name`",
+            "SELECT * FROM [weird;name]",
+            "SELECT * FROM users -- keep; going\nWHERE active = 1",
+            "SELECT * FROM users /* keep; going */ WHERE active = 1",
+        ] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(result.editable, "{sql}: {:?}", result.reason);
+        }
+
+        let issue = analyze_editable_query_editability(
+            "SELECT c.*  FROM CONTAINER c WHERE c.CONTAINERNAME = '00390360;081111';",
+        );
+        assert!(issue.editable);
+        let analysis = issue.analysis.unwrap();
+        assert_eq!(analysis.table_name, "CONTAINER");
+        assert_eq!(analysis.table_alias.as_deref(), Some("c"));
+        assert!(analysis.select_star);
+    }
+
+    #[test]
+    fn treats_top_level_semicolons_as_complex_source() {
+        for sql in ["SELECT * FROM users; SELECT * FROM orders", "SELECT * FROM users WHERE name = 'a;b'; SELECT 1"] {
+            let result = analyze_editable_query_editability(sql);
+
+            assert!(!result.editable, "{sql}");
+            assert_eq!(result.reason, Some(QueryEditabilityReason::ComplexSource), "{sql}");
         }
     }
 
@@ -1222,6 +1308,49 @@ mod tests {
             vec![
                 column(Some("create_date"), false, Some("t"), Some("t:0"), "create_date", "t.create_date"),
                 star_column(Some("t"), Some("t:0"), "t.*"),
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_single_table_bare_star_mixed_with_explicit_column() {
+        // Regression for #8015: a bare, unqualified `*` mixed with another
+        // projected column is unambiguous when the query has exactly one
+        // source, so it must bind to that source (source_key) the same way
+        // a qualified `t.*` does. Previously it carried no source_key,
+        // which made the ordinal column-comment resolver drop the star
+        // expansion entirely and lose comments for the whole result set.
+        let result = analyze_editable_query_editability("SELECT *, amount FROM orders");
+
+        assert!(result.editable);
+        let analysis = result.analysis.unwrap();
+        assert_eq!(analysis.table_name, "orders");
+        assert_eq!(
+            analysis.columns,
+            vec![
+                star_column(None, Some("orders:0"), "*"),
+                column(Some("amount"), false, None, None, "amount", "amount"),
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_single_aliased_table_bare_trailing_star_after_qualified_columns() {
+        // Matches the issue's own repro shape: qualified explicit columns
+        // followed by a trailing bare `*`, single aliased source.
+        let result = analyze_editable_query_editability(
+            "SELECT fl.sqlicenseno, fl.sqtypetext, * FROM flow_licenseapprove AS fl",
+        );
+
+        assert!(result.editable);
+        let analysis = result.analysis.unwrap();
+        assert_eq!(analysis.table_alias.as_deref(), Some("fl"));
+        assert_eq!(
+            analysis.columns,
+            vec![
+                column(Some("sqlicenseno"), false, Some("fl"), Some("fl:0"), "sqlicenseno", "fl.sqlicenseno"),
+                column(Some("sqtypetext"), false, Some("fl"), Some("fl:0"), "sqtypetext", "fl.sqtypetext"),
+                star_column(None, Some("fl:0"), "*"),
             ]
         );
     }
@@ -1527,6 +1656,28 @@ mod tests {
             star: true,
             result_name: "*".to_string(),
             expression: expression.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod joined_predicate_regression {
+    use super::analyze_editable_query_editability;
+
+    #[test]
+    fn parenthesized_join_predicate_preserves_both_sources() {
+        let result = analyze_editable_query_editability("SELECT u.id,u.nickname,p.paper_id,p.paper_name FROM users u JOIN papers p ON (u.id=p.user_id) WHERE u.id=1");
+        assert!(result.editable);
+        assert_eq!(result.analysis.unwrap().sources.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn joined_derived_and_function_sources_remain_read_only() {
+        for sql in [
+            "SELECT u.id,p.id FROM users u JOIN (SELECT id FROM papers) p ON u.id=p.id",
+            "SELECT u.id,p.id FROM users u JOIN generate_series(1,2) p ON u.id=p.id",
+        ] {
+            assert!(!analyze_editable_query_editability(sql).editable, "{sql}");
         }
     }
 }

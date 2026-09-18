@@ -10,6 +10,7 @@ import MqttPublishPanel from "./MqttPublishDialog.vue";
 import { decodePayload, PAYLOAD_ENCODINGS, PAYLOAD_ENCODING_LABELS, type PayloadEncoding } from "@/lib/mqtt/mqttPayloadCodec";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { ChevronDown, ChevronUp, Pause, Play } from "@lucide/vue";
+import { useTabUiState } from "@/lib/tabs/tabUiState";
 
 interface Props {
   connectionId: string;
@@ -18,27 +19,60 @@ interface Props {
 const props = defineProps<Props>();
 const { t } = useI18n();
 
+interface MqttTabUiState {
+  selectedTopic?: string;
+  messagesPaused?: boolean;
+  displayEncoding?: PayloadEncoding;
+  topicSearch?: string;
+  payloadSearch?: string;
+  showSubscriptionDialog?: boolean;
+  formTopic?: string;
+  formQos?: MqttQoS;
+  formNoLocal?: boolean;
+  formEnabled?: boolean;
+  editingTopic?: string | null;
+  publishPanelCollapsed?: boolean;
+}
+
+const { initialState: restoredUiState, track: trackUiState } = useTabUiState<MqttTabUiState>({}, "MqttAdminConsole");
+
 const brokerInfo = ref<MqttBrokerInfo | null>(null);
 const savedTopics = ref<MqttSavedTopic[]>([]);
 const subscribedTopics = ref<[string, string][]>([]);
 const messages = ref<MqttMessage[]>([]);
 const noLocalSubscribe = ref(false);
-const selectedTopic = ref<string>(props.initialTopic ?? "");
+const selectedTopic = ref<string>(restoredUiState.selectedTopic ?? props.initialTopic ?? "");
 const loading = ref(true);
 const error = ref<string | null>(null);
 const pollingTimer = ref<ReturnType<typeof setInterval> | null>(null);
-const messagesPaused = ref(false);
-const displayEncoding = ref<PayloadEncoding>("plaintext");
-const topicSearch = ref("");
-const showSubscriptionDialog = ref(false);
+const messagesPaused = ref(restoredUiState.messagesPaused ?? false);
+const displayEncoding = ref<PayloadEncoding>(restoredUiState.displayEncoding ?? "plaintext");
+const topicSearch = ref(restoredUiState.topicSearch ?? "");
+const payloadSearch = ref(restoredUiState.payloadSearch ?? "");
+const showSubscriptionDialog = ref(restoredUiState.showSubscriptionDialog ?? false);
 const savingSubscription = ref(false);
-const formTopic = ref("");
-const formQos = ref<MqttQoS>("atmostonce");
-const formNoLocal = ref(false);
-const formEnabled = ref(true);
-const editingTopic = ref<string | null>(null);
+const formTopic = ref(restoredUiState.formTopic ?? "");
+const formQos = ref<MqttQoS>(restoredUiState.formQos ?? "atmostonce");
+const formNoLocal = ref(restoredUiState.formNoLocal ?? false);
+const formEnabled = ref(restoredUiState.formEnabled ?? true);
+const editingTopic = ref<string | null>(restoredUiState.editingTopic ?? null);
 const MQTT_PUBLISH_PANEL_COLLAPSED_STORAGE_KEY = "dbx-mqtt-publish-panel-collapsed";
-const publishPanelCollapsed = ref(safeLocalStorageGet(MQTT_PUBLISH_PANEL_COLLAPSED_STORAGE_KEY) === "true");
+const publishPanelCollapsed = ref(restoredUiState.publishPanelCollapsed ?? safeLocalStorageGet(MQTT_PUBLISH_PANEL_COLLAPSED_STORAGE_KEY) === "true");
+
+trackUiState(() => ({
+  selectedTopic: selectedTopic.value,
+  messagesPaused: messagesPaused.value,
+  displayEncoding: displayEncoding.value,
+  topicSearch: topicSearch.value,
+  payloadSearch: payloadSearch.value,
+  showSubscriptionDialog: showSubscriptionDialog.value,
+  formTopic: formTopic.value,
+  formQos: formQos.value,
+  formNoLocal: formNoLocal.value,
+  formEnabled: formEnabled.value,
+  editingTopic: editingTopic.value,
+  publishPanelCollapsed: publishPanelCollapsed.value,
+}));
 
 const connected = computed(() => brokerInfo.value?.connected ?? false);
 const mqtt5 = computed(() => brokerInfo.value?.protocolVersion?.includes("5") ?? false);
@@ -68,6 +102,16 @@ function buildTopicTree(topics: MqttSavedTopic[]): MqttTopicNode {
 }
 
 const topicTree = computed(() => buildTopicTree(savedTopics.value));
+
+function messagePayloadText(msg: MqttMessage): string {
+  return msg.payloadText ?? decodePayload(msg.payloadBase64, "plaintext");
+}
+
+const filteredMessages = computed(() => {
+  const query = payloadSearch.value.trim().toLowerCase();
+  if (!query) return messages.value;
+  return messages.value.filter((msg) => messagePayloadText(msg).toLowerCase().includes(query));
+});
 
 async function refreshData() {
   try {
@@ -198,6 +242,11 @@ function handleTopicClick(topic: string) {
   void refreshData();
 }
 
+function handleMessageClick(topic: string) {
+  if (messagesPaused.value) return;
+  handleTopicClick(topic);
+}
+
 function handleMessagePublished() {
   void refreshData();
 }
@@ -241,7 +290,7 @@ function toggleMessagesPaused() {
 }
 
 function formatMessagePayload(msg: MqttMessage): string {
-  if (displayEncoding.value === "plaintext" && msg.payloadText != null) return msg.payloadText;
+  if (displayEncoding.value === "plaintext") return messagePayloadText(msg);
   return decodePayload(msg.payloadBase64, displayEncoding.value);
 }
 
@@ -325,11 +374,21 @@ onUnmounted(stopPolling);
 
       <div class="flex min-w-0 flex-1 flex-col">
         <div class="flex min-h-0 flex-1 flex-col">
-          <div class="flex shrink-0 items-center justify-between border-b px-3 py-2 text-xs font-semibold uppercase text-muted-foreground">
-            <span v-if="selectedTopic">{{ t("connection.mqttMessagesForTopic", { topic: selectedTopic }) }}</span>
-            <span v-else>{{ t("connection.mqttAllMessages") }}</span>
-            <div class="flex items-center gap-2">
-              <span class="font-normal">{{ messages.length }}</span>
+          <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-3 py-2 text-xs font-semibold uppercase text-muted-foreground">
+            <span v-if="selectedTopic" class="min-w-0 truncate">{{ t("connection.mqttMessagesForTopic", { topic: selectedTopic }) }}</span>
+            <span v-else class="min-w-0 truncate">{{ t("connection.mqttAllMessages") }}</span>
+            <div class="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
+              <input
+                v-model="payloadSearch"
+                data-testid="mqtt-payload-search"
+                class="h-6 min-w-[10rem] flex-1 rounded border bg-transparent px-1.5 text-[11px] font-normal normal-case outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                :placeholder="t('connection.mqttSearchPayloadPlaceholder')"
+                :aria-label="t('connection.mqttSearchPayloadPlaceholder')"
+              />
+              <span data-testid="mqtt-message-count" class="font-normal" aria-live="polite">
+                <template v-if="payloadSearch.trim()">{{ filteredMessages.length }} / {{ messages.length }}</template>
+                <template v-else>{{ messages.length }}</template>
+              </span>
               <select v-model="displayEncoding" class="h-6 rounded border bg-transparent px-1.5 text-[11px] text-muted-foreground outline-none">
                 <option v-for="enc in PAYLOAD_ENCODINGS" :key="enc" :value="enc">{{ PAYLOAD_ENCODING_LABELS[enc] }}</option>
               </select>
@@ -355,8 +414,9 @@ onUnmounted(stopPolling);
           </div>
           <div class="flex min-h-0 flex-1 flex-col overflow-auto">
             <div v-if="messages.length === 0" class="p-4 text-center text-xs text-muted-foreground">{{ t("connection.mqttNoMessages") }}</div>
+            <div v-else-if="filteredMessages.length === 0" data-testid="mqtt-no-matching-messages" class="p-4 text-center text-xs text-muted-foreground">{{ t("connection.mqttNoMatchingMessages") }}</div>
             <div
-              v-for="(msg, i) in messages"
+              v-for="(msg, i) in filteredMessages"
               :key="i"
               class="w-full cursor-pointer border-b px-3 py-2 text-xs"
               :class="
@@ -364,7 +424,7 @@ onUnmounted(stopPolling);
                   ? 'ml-auto max-w-[85%] rounded-l-md border-r-2 border-emerald-400 bg-emerald-50/70 hover:bg-emerald-100/70 dark:border-emerald-500 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50'
                   : 'mr-auto max-w-[85%] rounded-r-md border-l-2 border-blue-400 bg-blue-50/70 hover:bg-blue-100/70 dark:border-blue-500 dark:bg-blue-950/30 dark:hover:bg-blue-950/50'
               "
-              @click="handleTopicClick(msg.topic)"
+              @click="handleMessageClick(msg.topic)"
             >
               <div class="mb-0.5 flex items-center gap-2">
                 <span v-if="msg.direction === 'sent'" class="shrink-0 text-[10px] font-bold text-emerald-600 dark:text-emerald-400">{{ t("connection.mqttSent") }}</span>

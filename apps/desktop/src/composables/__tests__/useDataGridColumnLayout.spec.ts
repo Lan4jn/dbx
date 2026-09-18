@@ -2,7 +2,7 @@
 
 import { effectScope, nextTick, ref } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dataGridColumnOffsets, dataGridHorizontalColumnWindow, useDataGridColumnLayout, useDataGridColumnLayoutState } from "@/composables/useDataGridColumnLayout";
+import { dataGridColumnOffsets, dataGridHorizontalColumnWindow, useDataGridColumnLayout, useDataGridColumnLayoutState, type ColumnHeaderReferenceDragController } from "@/composables/useDataGridColumnLayout";
 import { columnHeaderDragAutoScrollDelta, columnHeaderDropTargetIndex } from "@/lib/dataGrid/dataGridColumnHeaderInteraction";
 import { loadDataGridColumnLayout, saveDataGridColumnLayout } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 
@@ -232,6 +232,83 @@ describe("useDataGridColumnLayout", () => {
     expect(JSON.parse(localStorage.getItem("dbx-data-grid-column-layout:visibility-null-column-layout")!)).toMatchObject({ hiddenKeys: ["empty\0\0"] });
   });
 
+  it("hides a batch of columns in one commit and persists the hidden keys", () => {
+    const scope = effectScope();
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["id", "name", "email", "phone"]),
+        sourceColumns: ref(undefined),
+        commentByColumn: ref(new Map()),
+        displayableColumnIndexes: ref([0, 1, 2, 3]),
+        allNullColumnIndexes: ref([]),
+        columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0", "phone\0\0"]),
+        layoutScopeKey: ref("batch-hide-layout"),
+        tableScopeKey: ref(""),
+      }),
+    )!;
+
+    state.hideColumns([1, 2]);
+    expect(state.visibleColumnIndexes.value).toEqual([0, 3]);
+    expect(state.hiddenColumnCount.value).toBe(2);
+
+    // 重复索引与已隐藏索引不会改变结果（幂等）
+    state.hideColumns([1, 2]);
+    expect(state.visibleColumnIndexes.value).toEqual([0, 3]);
+
+    state.showAllColumns();
+    expect(state.visibleColumnIndexes.value).toEqual([0, 1, 2, 3]);
+
+    state.hideColumns([3]);
+    state.toggleColumnVisibility(0);
+    scope.stop();
+
+    expect(loadDataGridColumnLayout("batch-hide-layout")?.hiddenKeys).toEqual(["id\0\0", "phone\0\0"]);
+  });
+
+  it("keeps at least one column visible when a batch would hide every column", () => {
+    const scope = effectScope();
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["id", "name", "email"]),
+        sourceColumns: ref(undefined),
+        commentByColumn: ref(new Map()),
+        displayableColumnIndexes: ref([0, 1, 2]),
+        allNullColumnIndexes: ref([]),
+        columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+        layoutScopeKey: ref("batch-hide-last-layout"),
+        tableScopeKey: ref(""),
+      }),
+    )!;
+
+    state.hideColumns([1, 2]);
+    expect(state.visibleColumnIndexes.value).toEqual([0]);
+
+    // 只剩一列可见时再隐藏它：保持不变，不会变成空网格
+    state.hideColumns([0]);
+    expect(state.visibleColumnIndexes.value).toEqual([0]);
+    scope.stop();
+  });
+
+  it("treats an empty batch hide as a no-op", () => {
+    const scope = effectScope();
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["id", "name", "email"]),
+        sourceColumns: ref(undefined),
+        commentByColumn: ref(new Map()),
+        displayableColumnIndexes: ref([0, 1, 2]),
+        allNullColumnIndexes: ref([]),
+        columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+        layoutScopeKey: ref("batch-hide-empty-layout"),
+        tableScopeKey: ref(""),
+      }),
+    )!;
+
+    state.hideColumns([]);
+    expect(state.visibleColumnIndexes.value).toEqual([0, 1, 2]);
+    scope.stop();
+  });
+
   it("returns ordered layout options with visibility state and reorders hidden fields", () => {
     const scope = effectScope();
     const state = scope.run(() =>
@@ -252,6 +329,28 @@ describe("useDataGridColumnLayout", () => {
 
     expect(state.filteredColumnLayoutOptions("line")).toMatchObject([{ column: "goodsList", visible: false, displayPosition: 1 }]);
     expect(state.orderedDisplayableColumnIndexes.value).toEqual([0, 2, 1]);
+    scope.stop();
+  });
+
+  it("uses grouped result comments in field filtering without name-map fallback", () => {
+    const scope = effectScope();
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["asin_url", "total"]),
+        sourceColumns: ref(undefined),
+        columnComments: ref(["asin亚马逊前台地址", undefined]),
+        commentByColumn: ref(new Map([["total", "Wrong aggregate comment"]])),
+        displayableColumnIndexes: ref([0, 1]),
+        allNullColumnIndexes: ref([]),
+        columnOrderKeys: ref(["asin_url\0\0", "total\0\0"]),
+        layoutScopeKey: ref("grouped-result-comments"),
+        tableScopeKey: ref(""),
+      }),
+    )!;
+
+    expect(state.orderedColumnLayoutOptions.value.map((option) => option.comment)).toEqual(["asin亚马逊前台地址", undefined]);
+    expect(state.filteredColumnLayoutOptions("亚马逊").map((option) => option.column)).toEqual(["asin_url"]);
+    expect(state.filteredColumnLayoutOptions("wrong")).toEqual([]);
     scope.stop();
   });
 
@@ -523,6 +622,280 @@ describe("useDataGridColumnLayout", () => {
     window.dispatchEvent(new PointerEvent("pointerup", { clientX: 2, clientY: 10 }));
     expect(persist).toHaveBeenLastCalledWith([4, 0, 1, 2, 3]);
     expect(frames.size).toBe(0);
+    scope.stop();
+  });
+
+  it("switches to reference mode over the editor and drops without reordering", () => {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(0);
+        return 0;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const header = document.createElement("div");
+    for (let index = 0; index < 2; index++) {
+      const column = document.createElement("div");
+      column.dataset.visibleColIndex = String(index);
+      column.getBoundingClientRect = () => ({ left: index * 100, width: 100, right: (index + 1) * 100, top: 0, bottom: 20, height: 20, x: index * 100, y: 0, toJSON: () => ({}) });
+      header.append(column);
+    }
+    const controller: ColumnHeaderReferenceDragController = {
+      isOverEditorTarget: (clientX) => clientX > 300,
+      onEnter: vi.fn(() => "id"),
+      onMove: vi.fn(),
+      onDrop: vi.fn(() => true),
+      onCancel: vi.fn(),
+    };
+    const persist = vi.fn();
+    const scope = effectScope();
+    const layout = scope.run(() =>
+      useDataGridColumnLayout({
+        columnNames: ref(["id", "name"]),
+        visibleColumnIndexes: ref([0, 1]),
+        renderedColumnWidths: ref([100, 100]),
+        scrollLeft: ref(0),
+        viewportWidth: ref(400),
+        rowNumberWidth: 40,
+        headerRef: ref(header),
+        onPersistColumnOrder: persist,
+        columnReferenceDrag: controller,
+      }),
+    )!;
+
+    layout.startColumnHeaderDrag(0, new PointerEvent("pointerdown", { button: 0, clientX: 50, clientY: 10 }));
+    // 网格内：仍是重排序预览
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 120, clientY: 10 }));
+    expect(controller.onEnter).not.toHaveBeenCalled();
+    expect(document.body.querySelector("[data-column-header-drag-preview]")).not.toBeNull();
+
+    // 进入编辑器区域：切换为引用模式，重排序预览移除
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 320, clientY: 10 }));
+    expect(controller.onEnter).toHaveBeenCalledWith(0);
+    expect(controller.onMove).toHaveBeenCalledWith(0, 320, 10);
+    expect(document.body.querySelector("[data-column-header-drag-preview]")).toBeNull();
+    expect(layout.columnHeaderPreviewOffsets.value).toEqual([0, 0]);
+
+    // 在编辑器内释放：插入但不重排列
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 320, clientY: 10 }));
+    expect(controller.onDrop).toHaveBeenCalledWith(0, 320, 10);
+    expect(controller.onCancel).toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    scope.stop();
+  });
+
+  it("cancels the reference drag and restores reorder preview when leaving the editor", () => {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(0);
+        return 0;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const header = document.createElement("div");
+    for (let index = 0; index < 2; index++) {
+      const column = document.createElement("div");
+      column.dataset.visibleColIndex = String(index);
+      column.getBoundingClientRect = () => ({ left: index * 100, width: 100, right: (index + 1) * 100, top: 0, bottom: 20, height: 20, x: index * 100, y: 0, toJSON: () => ({}) });
+      header.append(column);
+    }
+    const controller: ColumnHeaderReferenceDragController = {
+      isOverEditorTarget: (clientX) => clientX > 300,
+      onEnter: vi.fn(() => "id"),
+      onMove: vi.fn(),
+      onDrop: vi.fn(() => true),
+      onCancel: vi.fn(),
+    };
+    const persist = vi.fn();
+    const scope = effectScope();
+    const layout = scope.run(() =>
+      useDataGridColumnLayout({
+        columnNames: ref(["id", "name"]),
+        visibleColumnIndexes: ref([0, 1]),
+        renderedColumnWidths: ref([100, 100]),
+        scrollLeft: ref(0),
+        viewportWidth: ref(400),
+        rowNumberWidth: 40,
+        headerRef: ref(header),
+        onPersistColumnOrder: persist,
+        columnReferenceDrag: controller,
+      }),
+    )!;
+
+    layout.startColumnHeaderDrag(0, new PointerEvent("pointerdown", { button: 0, clientX: 50, clientY: 10 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 320, clientY: 10 }));
+    expect(controller.onEnter).toHaveBeenCalledTimes(1);
+
+    // 拖回网格：还原重排序预览，引用反馈被取消
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 120, clientY: 10 }));
+    expect(controller.onCancel).toHaveBeenCalledTimes(1);
+    expect(document.body.querySelector("[data-column-header-drag-preview]")).not.toBeNull();
+
+    // 拖出后释放（不在编辑器内）：整体取消，不重排也不插入
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 320, clientY: 10 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 120, clientY: 10 }));
+    expect(controller.onDrop).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    scope.stop();
+  });
+
+  it("keeps reorder mode when the controller refuses the reference drag", () => {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(0);
+        return 0;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const header = document.createElement("div");
+    for (let index = 0; index < 2; index++) {
+      const column = document.createElement("div");
+      column.dataset.visibleColIndex = String(index);
+      column.getBoundingClientRect = () => ({ left: index * 100, width: 100, right: (index + 1) * 100, top: 0, bottom: 20, height: 20, x: index * 100, y: 0, toJSON: () => ({}) });
+      header.append(column);
+    }
+    const controller: ColumnHeaderReferenceDragController = {
+      isOverEditorTarget: () => true,
+      onEnter: vi.fn(() => null),
+      onMove: vi.fn(),
+      onDrop: vi.fn(() => true),
+      onCancel: vi.fn(),
+    };
+    const persist = vi.fn();
+    const scope = effectScope();
+    const layout = scope.run(() =>
+      useDataGridColumnLayout({
+        columnNames: ref(["id", "name"]),
+        visibleColumnIndexes: ref([0, 1]),
+        renderedColumnWidths: ref([100, 100]),
+        scrollLeft: ref(0),
+        viewportWidth: ref(400),
+        rowNumberWidth: 40,
+        headerRef: ref(header),
+        onPersistColumnOrder: persist,
+        columnReferenceDrag: controller,
+      }),
+    )!;
+
+    layout.startColumnHeaderDrag(0, new PointerEvent("pointerdown", { button: 0, clientX: 50, clientY: 10 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 320, clientY: 10 }));
+    expect(controller.onEnter).toHaveBeenCalled();
+    expect(controller.onMove).not.toHaveBeenCalled();
+    expect(document.body.querySelector("[data-column-header-drag-preview]")).not.toBeNull();
+
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 320, clientY: 10 }));
+    expect(controller.onDrop).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalled();
+    scope.stop();
+  });
+
+  it("cancels a plain reorder drag released outside both the grid and the editor", () => {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(0);
+        return 0;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const header = document.createElement("div");
+    header.getBoundingClientRect = () => ({ left: 0, width: 200, right: 200, top: 0, bottom: 20, height: 20, x: 0, y: 0, toJSON: () => ({}) });
+    for (let index = 0; index < 2; index++) {
+      const column = document.createElement("div");
+      column.dataset.visibleColIndex = String(index);
+      column.getBoundingClientRect = () => ({ left: index * 100, width: 100, right: (index + 1) * 100, top: 0, bottom: 20, height: 20, x: index * 100, y: 0, toJSON: () => ({}) });
+      header.append(column);
+    }
+    const controller: ColumnHeaderReferenceDragController = {
+      isOverEditorTarget: () => false,
+      onEnter: vi.fn(() => null),
+      onMove: vi.fn(),
+      onDrop: vi.fn(() => true),
+      onCancel: vi.fn(),
+    };
+    const persist = vi.fn();
+    const scope = effectScope();
+    const layout = scope.run(() =>
+      useDataGridColumnLayout({
+        columnNames: ref(["id", "name"]),
+        visibleColumnIndexes: ref([0, 1]),
+        renderedColumnWidths: ref([100, 100]),
+        scrollLeft: ref(0),
+        viewportWidth: ref(400),
+        rowNumberWidth: 40,
+        headerRef: ref(header),
+        onPersistColumnOrder: persist,
+        columnReferenceDrag: controller,
+      }),
+    )!;
+
+    layout.startColumnHeaderDrag(0, new PointerEvent("pointerdown", { button: 0, clientX: 50, clientY: 10 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 120, clientY: 10 }));
+    // 释放点 (320, 500) 不在表头/滚动区，也不在编辑器内：整体取消
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 320, clientY: 500 }));
+    expect(persist).not.toHaveBeenCalled();
+
+    // 对照：网格内释放仍提交重排序
+    layout.startColumnHeaderDrag(0, new PointerEvent("pointerdown", { button: 0, clientX: 50, clientY: 10 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 180, clientY: 10 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 180, clientY: 10 }));
+    expect(persist).toHaveBeenCalledWith([1, 0]);
+    scope.stop();
+  });
+
+  it("blocks native selection and drag while dragging columns", () => {
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        callback(0);
+        return 0;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const header = document.createElement("div");
+    const column = document.createElement("div");
+    column.dataset.visibleColIndex = "0";
+    column.getBoundingClientRect = () => ({ left: 0, width: 100, right: 100, top: 0, bottom: 20, height: 20, x: 0, y: 0, toJSON: () => ({}) });
+    header.append(column);
+
+    const scope = effectScope();
+    const layout = scope.run(() =>
+      useDataGridColumnLayout({
+        columnNames: ref(["id", "name"]),
+        visibleColumnIndexes: ref([0, 1]),
+        renderedColumnWidths: ref([100, 100]),
+        scrollLeft: ref(0),
+        viewportWidth: ref(400),
+        rowNumberWidth: 40,
+        headerRef: ref(header),
+      }),
+    )!;
+
+    layout.startColumnHeaderDrag(0, new PointerEvent("pointerdown", { button: 0, clientX: 50, clientY: 10 }));
+
+    // 拖拽期间原生选择与拖拽启动被拦截
+    const selectStart = new Event("selectstart", { cancelable: true });
+    document.dispatchEvent(selectStart);
+    expect(selectStart.defaultPrevented).toBe(true);
+    const dragStart = new Event("dragstart", { cancelable: true });
+    document.dispatchEvent(dragStart);
+    expect(dragStart.defaultPrevented).toBe(true);
+
+    window.dispatchEvent(new PointerEvent("pointerup", { clientX: 150, clientY: 10 }));
+    expect(document.body.style.userSelect).toBe("");
+
+    // 手势结束后恢复原生效行为
+    const laterSelect = new Event("selectstart", { cancelable: true });
+    document.dispatchEvent(laterSelect);
+    expect(laterSelect.defaultPrevented).toBe(false);
     scope.stop();
   });
 

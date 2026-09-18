@@ -1,10 +1,38 @@
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { isProxy } from "vue";
-import { DEFAULT_EDITOR_SETTINGS, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, enforceRightSidebarPanelExclusivity, normalizeAiConfig, normalizeDesktopSettings, normalizeEditorSettings, normalizeMcpGlobalPolicy, type RightSidebarPanelState, transitionRightSidebarPanels } from "@/stores/settingsStore";
+import {
+  AI_PROVIDER_PRESETS,
+  DEFAULT_EDITOR_SETTINGS,
+  EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+  SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
+  enforceRightSidebarPanelExclusivity,
+  getAiProviderPresetDefaultEndpoint,
+  normalizeAiConfig,
+  normalizeDesktopSettings,
+  normalizeEditorSettings,
+  normalizeMcpGlobalPolicy,
+  type RightSidebarPanelState,
+  transitionRightSidebarPanels,
+} from "@/stores/settingsStore";
 import type { AiConfigItem } from "@/types/ai";
+import { DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION } from "@/lib/dataGrid/dataGridCopyExtractor";
 
 describe("normalizeEditorSettings", () => {
+  it("keeps automatic DDL refresh disabled unless explicitly enabled", () => {
+    expect(normalizeEditorSettings({}).refreshDdlOnOpen).toBe(false);
+    expect(normalizeEditorSettings({ refreshDdlOnOpen: true }).refreshDdlOnOpen).toBe(true);
+    expect(normalizeEditorSettings({ refreshDdlOnOpen: false }).refreshDdlOnOpen).toBe(false);
+    expect(normalizeEditorSettings({ refreshDdlOnOpen: "true" } as any).refreshDdlOnOpen).toBe(false);
+  });
+
+  it("keeps table-info drawer pinning disabled unless explicitly enabled", () => {
+    expect(normalizeEditorSettings({}).tableInfoDrawerPinned).toBe(false);
+    expect(normalizeEditorSettings({ tableInfoDrawerPinned: true }).tableInfoDrawerPinned).toBe(true);
+    expect(normalizeEditorSettings({ tableInfoDrawerPinned: false }).tableInfoDrawerPinned).toBe(false);
+    expect(normalizeEditorSettings({ tableInfoDrawerPinned: "true" } as any).tableInfoDrawerPinned).toBe(false);
+  });
+
   it("enables SQL variable substitution by default and only preserves booleans", () => {
     expect(normalizeEditorSettings({}).sqlVariableSubstitutionEnabled).toBe(true);
     expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: true }).sqlVariableSubstitutionEnabled).toBe(true);
@@ -20,11 +48,49 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ dataGridFilterEditorView: "invalid" } as any).dataGridFilterEditorView).toBe("quick");
   });
 
+  it("keeps filter editor expansion disabled unless explicitly enabled", () => {
+    expect(normalizeEditorSettings({}).dataGridKeepFilterEditorExpanded).toBe(false);
+    expect(normalizeEditorSettings({ dataGridKeepFilterEditorExpanded: true }).dataGridKeepFilterEditorExpanded).toBe(true);
+    expect(normalizeEditorSettings({ dataGridKeepFilterEditorExpanded: false }).dataGridKeepFilterEditorExpanded).toBe(false);
+    expect(normalizeEditorSettings({ dataGridKeepFilterEditorExpanded: "true" } as any).dataGridKeepFilterEditorExpanded).toBe(false);
+    expect(normalizeEditorSettings({ dataGridKeepFilterEditorExpanded: null } as any).dataGridKeepFilterEditorExpanded).toBe(false);
+    expect(normalizeEditorSettings({ dataGridKeepFilterEditorExpanded: "true", dataGridAutoHideFilterBuilder: false } as any).dataGridKeepFilterEditorExpanded).toBe(false);
+  });
+
+  it("migrates the legacy auto-hide preference when the current preference is absent", () => {
+    expect(normalizeEditorSettings({ dataGridAutoHideFilterBuilder: false } as any).dataGridKeepFilterEditorExpanded).toBe(true);
+    expect(normalizeEditorSettings({ dataGridAutoHideFilterBuilder: true } as any).dataGridKeepFilterEditorExpanded).toBe(false);
+    expect(normalizeEditorSettings({ dataGridKeepFilterEditorExpanded: false, dataGridAutoHideFilterBuilder: false } as any).dataGridKeepFilterEditorExpanded).toBe(false);
+  });
+
+  it("normalizes persisted tab group names and colors", () => {
+    expect(normalizeEditorSettings({}).tabGroupCustomizations).toEqual({});
+    expect(
+      normalizeEditorSettings({
+        tabGroupCustomizations: {
+          "connection:local": { name: " Local services ", color: "#E11D48" },
+          "database-type:mysql": { name: "", color: "invalid" },
+          broken: "value",
+        },
+      } as any).tabGroupCustomizations,
+    ).toEqual({
+      "connection:local": { name: "Local services", color: "#e11d48" },
+    });
+  });
+
   it("defaults and bounds the persisted text filter panel height", () => {
     expect(normalizeEditorSettings({}).dataGridTextFilterPanelHeight).toBe(168);
     expect(normalizeEditorSettings({ dataGridTextFilterPanelHeight: 236.4 }).dataGridTextFilterPanelHeight).toBe(236);
     expect(normalizeEditorSettings({ dataGridTextFilterPanelHeight: 20 }).dataGridTextFilterPanelHeight).toBe(96);
     expect(normalizeEditorSettings({ dataGridTextFilterPanelHeight: 900 }).dataGridTextFilterPanelHeight).toBe(420);
+  });
+
+  it("defaults and bounds the persisted local filter popover width", () => {
+    expect(normalizeEditorSettings({}).localFilterPopoverWidth).toBe(360);
+    expect(normalizeEditorSettings({ localFilterPopoverWidth: 412.6 }).localFilterPopoverWidth).toBe(413);
+    expect(normalizeEditorSettings({ localFilterPopoverWidth: 120 }).localFilterPopoverWidth).toBe(240);
+    expect(normalizeEditorSettings({ localFilterPopoverWidth: 5000 }).localFilterPopoverWidth).toBe(900);
+    expect(normalizeEditorSettings({ localFilterPopoverWidth: "wide" }).localFilterPopoverWidth).toBe(360);
   });
 
   it("keeps data type colors disabled by default and preserves an explicit opt-in", () => {
@@ -48,6 +114,21 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ openDataTabsNextToActive: false }).openDataTabsNextToActive).toBe(false);
     expect(normalizeEditorSettings({ openDataTabsNextToActive: "true" } as any).openDataTabsNextToActive).toBe(false);
     expect(normalizeEditorSettings({ openDataTabsNextToActive: null } as any).openDataTabsNextToActive).toBe(false);
+  });
+
+  it("quotes generated SQL identifiers by default and preserves an explicit opt-out", () => {
+    expect(normalizeEditorSettings({}).generateSqlQuoteIdentifiers).toBe(true);
+    expect(normalizeEditorSettings({ generateSqlQuoteIdentifiers: true }).generateSqlQuoteIdentifiers).toBe(true);
+    expect(normalizeEditorSettings({ generateSqlQuoteIdentifiers: false }).generateSqlQuoteIdentifiers).toBe(false);
+    expect(normalizeEditorSettings({ generateSqlQuoteIdentifiers: "false" } as any).generateSqlQuoteIdentifiers).toBe(true);
+  });
+
+  it("keeps SQL-file save formatting disabled unless explicitly enabled", () => {
+    expect(normalizeEditorSettings({}).formatSqlOnSqlFileSave).toBe(false);
+    expect(normalizeEditorSettings({ formatSqlOnSqlFileSave: true }).formatSqlOnSqlFileSave).toBe(true);
+    expect(normalizeEditorSettings({ formatSqlOnSqlFileSave: false }).formatSqlOnSqlFileSave).toBe(false);
+    expect(normalizeEditorSettings({ formatSqlOnSqlFileSave: "true" } as any).formatSqlOnSqlFileSave).toBe(false);
+    expect(normalizeEditorSettings({ formatSqlOnSqlFileSave: null } as any).formatSqlOnSqlFileSave).toBe(false);
   });
 
   it("defaults and bounds the regular expression match limit", () => {
@@ -94,6 +175,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ sidebarShowConnectionNotes: false }).sidebarShowConnectionNotes).toBe(false);
   });
 
+  it("shows sidebar tooltips by default and preserves an explicit opt-out", () => {
+    expect(normalizeEditorSettings({}).sidebarShowTooltips).toBe(true);
+    expect(normalizeEditorSettings({ sidebarShowTooltips: false }).sidebarShowTooltips).toBe(false);
+    expect(normalizeEditorSettings({ sidebarShowTooltips: true }).sidebarShowTooltips).toBe(true);
+  });
+
   it("defaults SQL execution to the current statement and migrates legacy execute-all settings", () => {
     expect(normalizeEditorSettings({}).executeMode).toBe("current");
     expect(normalizeEditorSettings({ executeMode: "all" }).executeMode).toBe("current");
@@ -124,11 +211,24 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ insertSpaceAfterCompletion: false }).insertSpaceAfterCompletion).toBe(false);
   });
 
+  it("selects the first completion candidate by default and preserves the opt-out", () => {
+    expect(normalizeEditorSettings({}).selectFirstCompletionOnOpen).toBe(true);
+    expect(normalizeEditorSettings({ selectFirstCompletionOnOpen: true }).selectFirstCompletionOnOpen).toBe(true);
+    expect(normalizeEditorSettings({ selectFirstCompletionOnOpen: false }).selectFirstCompletionOnOpen).toBe(false);
+    expect(normalizeEditorSettings({ selectFirstCompletionOnOpen: "true" } as any).selectFirstCompletionOnOpen).toBe(true);
+  });
+
   it("defaults sidebar connection sorting to manual order and preserves valid alphabetical modes", () => {
     expect(normalizeEditorSettings({}).sidebarConnectionSortMode).toBe("manual");
     expect(normalizeEditorSettings({ sidebarConnectionSortMode: "asc" }).sidebarConnectionSortMode).toBe("asc");
     expect(normalizeEditorSettings({ sidebarConnectionSortMode: "desc" }).sidebarConnectionSortMode).toBe("desc");
     expect(normalizeEditorSettings({ sidebarConnectionSortMode: "invalid" as any }).sidebarConnectionSortMode).toBe("manual");
+  });
+
+  it("shows line numbers by default and preserves an explicit opt-out", () => {
+    expect(normalizeEditorSettings({}).showLineNumbers).toBe(true);
+    expect(normalizeEditorSettings({ showLineNumbers: false }).showLineNumbers).toBe(false);
+    expect(normalizeEditorSettings({ showLineNumbers: "false" } as any).showLineNumbers).toBe(true);
   });
 
   it("shows the current statement frame by default", () => {
@@ -163,8 +263,21 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ sqlSemanticDiagnosticsEnabled: false } as any).sqlSemanticDiagnosticsMode).toBe("disabled");
   });
 
+  it("defaults the transaction commit mode to auto and preserves manual", () => {
+    expect(normalizeEditorSettings({}).defaultTransactionMode).toBe("auto");
+    expect(normalizeEditorSettings({ defaultTransactionMode: "manual" }).defaultTransactionMode).toBe("manual");
+    expect(normalizeEditorSettings({ defaultTransactionMode: "bogus" } as any).defaultTransactionMode).toBe("auto");
+  });
+
   it("defaults update downloads to the official source", () => {
     expect(normalizeEditorSettings({}).updateDownloadSource).toBe("official");
+  });
+
+  it("requires opting into automatic update downloads and preserves the preference", () => {
+    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(false);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: true }).autoDownloadUpdates).toBe(true);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoDownloadUpdates).toBe(false);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: "true" } as any).autoDownloadUpdates).toBe(false);
   });
 
   it("preserves explicit editor themes from saved settings", () => {
@@ -186,6 +299,13 @@ describe("normalizeEditorSettings", () => {
   it("migrates legacy open tab restore booleans", () => {
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: false } as any).openTabsRestoreMode).toBe("none");
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: true } as any).openTabsRestoreMode).toBe("all");
+  });
+
+  it("keeps unsaved SQL drafts on quit by default and preserves explicit modes", () => {
+    expect(normalizeEditorSettings({}).appCloseUnsavedTabsMode).toBe("keep-drafts");
+    expect(normalizeEditorSettings({ appCloseUnsavedTabsMode: "prompt" }).appCloseUnsavedTabsMode).toBe("prompt");
+    expect(normalizeEditorSettings({ appCloseUnsavedTabsMode: "keep-drafts" }).appCloseUnsavedTabsMode).toBe("keep-drafts");
+    expect(normalizeEditorSettings({ appCloseUnsavedTabsMode: "invalid" as any }).appCloseUnsavedTabsMode).toBe("keep-drafts");
   });
 
   it("preserves CNB, migrates AtomGit to CNB, and rejects invalid values", () => {
@@ -236,10 +356,34 @@ describe("normalizeEditorSettings", () => {
     expect(configured.json.pretty).toBe(false);
   });
 
+  it("migrates the legacy NULL clipboard sentinel once", () => {
+    const legacy = normalizeEditorSettings({
+      dataGridExtractorOptions: {
+        dsv: { ...DEFAULT_EDITOR_SETTINGS.dataGridExtractorOptions.dsv, nullText: "NULL" },
+      },
+    });
+    expect(legacy.dataGridExtractorOptions.dsv.nullText).toBe("");
+    expect(legacy.dataGridExtractorOptionsMigrationVersion).toBe(DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION);
+
+    const configured = normalizeEditorSettings({
+      dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
+      dataGridExtractorOptions: {
+        dsv: { ...DEFAULT_EDITOR_SETTINGS.dataGridExtractorOptions.dsv, nullText: "NULL" },
+      },
+    });
+    expect(configured.dataGridExtractorOptions.dsv.nullText).toBe("NULL");
+  });
+
   it("defaults retained result runs to tiled tabs and preserves list mode", () => {
     expect(normalizeEditorSettings({}).resultRunDisplayMode).toBe("tabs");
     expect(normalizeEditorSettings({ resultRunDisplayMode: "list" }).resultRunDisplayMode).toBe("list");
     expect(normalizeEditorSettings({ resultRunDisplayMode: "invalid" as any }).resultRunDisplayMode).toBe("tabs");
+  });
+
+  it("defaults multi-statement execution to the result table and preserves the summary option", () => {
+    expect(normalizeEditorSettings({}).multiStatementDefaultView).toBe("result");
+    expect(normalizeEditorSettings({ multiStatementDefaultView: "summary" }).multiStatementDefaultView).toBe("summary");
+    expect(normalizeEditorSettings({ multiStatementDefaultView: "invalid" as any }).multiStatementDefaultView).toBe("result");
   });
 
   it("defaults persistent data grid view options off and preserves enabled values", () => {
@@ -267,6 +411,26 @@ describe("normalizeEditorSettings", () => {
     expect(invalid.dataGridBooleanDisplayMode).toBe("dropdown");
   });
 
+  it("defaults the cell detail hover button on and preserves only boolean values", () => {
+    expect(normalizeEditorSettings({}).dataGridCellDetailButtonVisible).toBe(true);
+    expect(normalizeEditorSettings({ dataGridCellDetailButtonVisible: true }).dataGridCellDetailButtonVisible).toBe(true);
+    expect(normalizeEditorSettings({ dataGridCellDetailButtonVisible: false }).dataGridCellDetailButtonVisible).toBe(false);
+
+    for (const invalidValue of [0, 1, "false", null]) {
+      expect(normalizeEditorSettings({ dataGridCellDetailButtonVisible: invalidValue as never }).dataGridCellDetailButtonVisible).toBe(true);
+    }
+  });
+
+  it("defaults the crosshair highlight off and preserves only boolean values", () => {
+    expect(normalizeEditorSettings({}).dataGridCrosshairHighlight).toBe(false);
+    expect(normalizeEditorSettings({ dataGridCrosshairHighlight: true }).dataGridCrosshairHighlight).toBe(true);
+    expect(normalizeEditorSettings({ dataGridCrosshairHighlight: false }).dataGridCrosshairHighlight).toBe(false);
+
+    for (const invalidValue of [0, 1, "true", null]) {
+      expect(normalizeEditorSettings({ dataGridCrosshairHighlight: invalidValue as never }).dataGridCrosshairHighlight).toBe(false);
+    }
+  });
+
   it("defaults the data grid font and preserves a custom font family", () => {
     const defaultFontFamily = `"Geist Variable Tabular", "Geist Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
     expect(normalizeEditorSettings({}).tableFontFamily).toBe(defaultFontFamily);
@@ -282,7 +446,7 @@ describe("normalizeEditorSettings", () => {
   it("normalizes the global query timeout and inherited connection ids", () => {
     expect(normalizeEditorSettings({}).globalConnectTimeoutSecs).toBe(10);
     expect(normalizeEditorSettings({ globalConnectTimeoutSecs: 0 }).globalConnectTimeoutSecs).toBe(1);
-    expect(normalizeEditorSettings({}).globalQueryTimeoutSecs).toBe(30);
+    expect(normalizeEditorSettings({}).globalQueryTimeoutSecs).toBe(60);
     expect(normalizeEditorSettings({ queryTimeoutSecs: 45 } as any).globalQueryTimeoutSecs).toBe(45);
     expect(normalizeEditorSettings({ globalQueryTimeoutSecs: -1 }).globalQueryTimeoutSecs).toBe(0);
     expect(normalizeEditorSettings({ globalQueryTimeoutSecs: 301 }).globalQueryTimeoutSecs).toBe(301);
@@ -293,6 +457,14 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).timeoutInheritanceMigrationVersion).toBe(0);
     expect(normalizeEditorSettings({ queryTimeoutInheritanceMigrationVersion: 1 } as any).timeoutInheritanceMigrationVersion).toBe(1);
     expect(normalizeEditorSettings({ timeoutInheritanceMigrationVersion: 2 }).timeoutInheritanceMigrationVersion).toBe(2);
+  });
+
+  it("normalizes the external SQL editor size limit", () => {
+    expect(normalizeEditorSettings({}).externalSqlEditorMaxMb).toBe(64);
+    expect(normalizeEditorSettings({ externalSqlEditorMaxMb: 0 }).externalSqlEditorMaxMb).toBe(1);
+    expect(normalizeEditorSettings({ externalSqlEditorMaxMb: 256 }).externalSqlEditorMaxMb).toBe(256);
+    expect(normalizeEditorSettings({ externalSqlEditorMaxMb: 99999 }).externalSqlEditorMaxMb).toBe(4096);
+    expect(normalizeEditorSettings({ externalSqlEditorMaxMb: "128" } as any).externalSqlEditorMaxMb).toBe(128);
   });
 
   it("normalizes toolbar item settings from older saved settings", () => {
@@ -372,7 +544,12 @@ describe("normalizeMcpGlobalPolicy", () => {
       readOnly: false,
       allowDangerousSql: false,
       allowedConnectionIds: null,
+      allowedGroupIds: [],
+      allowedToolNames: null,
+      connectionPolicies: [],
+      groupPolicies: [],
       configured: false,
+      queryTimeoutSecs: null,
     });
   });
 
@@ -388,12 +565,69 @@ describe("normalizeMcpGlobalPolicy", () => {
       readOnly: true,
       allowDangerousSql: true,
       allowedConnectionIds: ["connection-1", "connection-2"],
+      allowedGroupIds: [],
+      allowedToolNames: null,
+      connectionPolicies: [],
+      groupPolicies: [],
       configured: true,
+      queryTimeoutSecs: null,
     });
   });
 
   it("preserves an empty allowlist as deny all", () => {
     expect(normalizeMcpGlobalPolicy({ allowedConnectionIds: [] }).allowedConnectionIds).toEqual([]);
+  });
+
+  it("keeps only selected-database execution policies and normalizes their names", () => {
+    const policy = normalizeMcpGlobalPolicy({
+      connectionPolicies: [
+        {
+          connectionId: " connection-1 ",
+          readOnly: false,
+          allowDangerousSql: true,
+          executionModeConfigured: true,
+          executionModePolicyVersion: 1,
+          databaseScope: "selected",
+          allowedDatabases: [" reporting ", "operations"],
+          databasePolicies: [
+            { databaseName: " reporting ", readOnly: true, allowDangerousSql: true },
+            { databaseName: "outside-scope", readOnly: true, allowDangerousSql: false },
+          ],
+        },
+      ],
+    });
+
+    expect(policy.connectionPolicies[0]).toMatchObject({
+      connectionId: "connection-1",
+      executionModePolicyVersion: 1,
+      allowedDatabases: ["reporting", "operations"],
+      databasePolicies: [{ databaseName: "reporting", readOnly: true, allowDangerousSql: false }],
+    });
+  });
+
+  it("leaves legacy connection rules unmarked until the user edits execution permissions", () => {
+    const policy = normalizeMcpGlobalPolicy({
+      connectionPolicies: [
+        {
+          connectionId: "legacy",
+          readOnly: false,
+          allowDangerousSql: true,
+          executionModeConfigured: true,
+          databaseScope: "all",
+          allowedDatabases: [],
+          databasePolicies: [],
+        } as any,
+      ],
+    });
+
+    expect(policy.connectionPolicies[0].executionModePolicyVersion).toBeNull();
+  });
+
+  it("round-trips queryTimeoutSecs null, undefined and positive numbers", () => {
+    expect(normalizeMcpGlobalPolicy({ queryTimeoutSecs: null }).queryTimeoutSecs).toBeNull();
+    expect(normalizeMcpGlobalPolicy({ queryTimeoutSecs: undefined } as any).queryTimeoutSecs).toBeNull();
+    expect(normalizeMcpGlobalPolicy({ queryTimeoutSecs: 0 }).queryTimeoutSecs).toBe(0);
+    expect(normalizeMcpGlobalPolicy({ queryTimeoutSecs: 300 }).queryTimeoutSecs).toBe(300);
   });
 });
 
@@ -430,6 +664,33 @@ describe("normalizeEditorSettings - clickTableNavigationTarget", () => {
     expect(normalizeEditorSettings({ clickTableNavigationTarget: undefined } as any).clickTableNavigationTarget).toBe("data");
     expect(normalizeEditorSettings({ clickTableNavigationTarget: null } as any).clickTableNavigationTarget).toBe("data");
     expect(normalizeEditorSettings({ clickTableNavigationTarget: 123 } as any).clickTableNavigationTarget).toBe("data");
+  });
+});
+
+describe("normalizeEditorSettings - showTableDdlHoverPreview", () => {
+  it("keeps table DDL hover previews enabled unless explicitly disabled", () => {
+    expect(normalizeEditorSettings({}).showTableDdlHoverPreview).toBe(true);
+    expect(normalizeEditorSettings({ showTableDdlHoverPreview: false }).showTableDdlHoverPreview).toBe(false);
+    expect(normalizeEditorSettings({ showTableDdlHoverPreview: true }).showTableDdlHoverPreview).toBe(true);
+    expect(normalizeEditorSettings({ showTableDdlHoverPreview: "true" } as any).showTableDdlHoverPreview).toBe(true);
+  });
+});
+
+describe("normalizeEditorSettings - tableHoverLookupMode", () => {
+  it("defaults tableHoverLookupMode to fallback", () => {
+    expect(normalizeEditorSettings({}).tableHoverLookupMode).toBe("fallback");
+  });
+
+  it("preserves the three valid modes", () => {
+    expect(normalizeEditorSettings({ tableHoverLookupMode: "current" }).tableHoverLookupMode).toBe("current");
+    expect(normalizeEditorSettings({ tableHoverLookupMode: "fallback" }).tableHoverLookupMode).toBe("fallback");
+    expect(normalizeEditorSettings({ tableHoverLookupMode: "always" }).tableHoverLookupMode).toBe("always");
+  });
+
+  it("falls back to fallback for invalid values", () => {
+    expect(normalizeEditorSettings({ tableHoverLookupMode: "invalid" } as any).tableHoverLookupMode).toBe("fallback");
+    expect(normalizeEditorSettings({ tableHoverLookupMode: undefined } as any).tableHoverLookupMode).toBe("fallback");
+    expect(normalizeEditorSettings({ tableHoverLookupMode: null } as any).tableHoverLookupMode).toBe("fallback");
   });
 });
 
@@ -517,6 +778,54 @@ describe("settingsStore AI API key normalization", () => {
 
   it("trims API keys when normalizing loaded configurations", () => {
     expect(normalizeAiConfig({ provider: "openai", apiKey: "  secret  " }).apiKey).toBe("secret");
+  });
+  it("preserves and bounds a configured maximum output token budget", () => {
+    expect(normalizeAiConfig({ provider: "deepseek", maxOutputTokens: 32768 }).maxOutputTokens).toBe(32768);
+    expect(normalizeAiConfig({ provider: "deepseek", maxOutputTokens: 1_500_000 }).maxOutputTokens).toBe(1_000_000);
+    expect(normalizeAiConfig({ provider: "deepseek", maxOutputTokens: 128 }).maxOutputTokens).toBeUndefined();
+    expect(normalizeAiConfig({ provider: "deepseek", maxOutputTokens: Number.NaN }).maxOutputTokens).toBeUndefined();
+  });
+
+  it("provides Kimi defaults and recognizes legacy Kimi configurations", () => {
+    expect(AI_PROVIDER_PRESETS.kimi).toMatchObject({
+      provider: "kimi",
+      endpoint: "https://api.moonshot.cn/v1",
+      apiStyle: "completions",
+      authMethod: "bearer",
+      requiresApiKey: true,
+    });
+    expect(normalizeAiConfig({ endpoint: "https://api.moonshot.cn/v1", model: "kimi-k2.5" }).provider).toBe("kimi");
+  });
+
+  it("provides Zhipu defaults and recognizes legacy Zhipu configurations", () => {
+    expect(AI_PROVIDER_PRESETS.zhipu).toMatchObject({
+      provider: "zhipu",
+      endpoint: "https://open.bigmodel.cn/api/paas/v4",
+      model: "glm-5.3",
+      apiStyle: "completions",
+      authMethod: "bearer",
+      requiresApiKey: true,
+    });
+    expect(normalizeAiConfig({ endpoint: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.6" }).provider).toBe("zhipu");
+    expect(normalizeAiConfig({ endpoint: "https://api.z.ai/api/paas/v4", model: "glm-5.2" }).provider).toBe("zhipu");
+  });
+
+  it("uses the mainland MiniMax endpoint only for new zh-CN presets", () => {
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.minimax, "zh-CN")).toBe("https://api.minimaxi.com/v1");
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.minimax, "zh-TW")).toBe("https://api.minimax.io/v1");
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.minimax, "en")).toBe("https://api.minimax.io/v1");
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.openai, "zh-CN")).toBe(AI_PROVIDER_PRESETS.openai.endpoint);
+  });
+
+  it("uses the international Zhipu endpoint for non-zh-CN presets", () => {
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.zhipu, "zh-CN")).toBe("https://open.bigmodel.cn/api/paas/v4");
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.zhipu, "zh-TW")).toBe("https://api.z.ai/api/paas/v4");
+    expect(getAiProviderPresetDefaultEndpoint(AI_PROVIDER_PRESETS.zhipu, "en")).toBe("https://api.z.ai/api/paas/v4");
+  });
+
+  it("preserves saved MiniMax endpoints during normalization", () => {
+    expect(normalizeAiConfig({ provider: "minimax", endpoint: "https://api.minimaxi.com/v1" }).endpoint).toBe("https://api.minimaxi.com/v1");
+    expect(normalizeAiConfig({ provider: "minimax", endpoint: "https://minimax.example.com/v1" }).endpoint).toBe("https://minimax.example.com/v1");
   });
 
   it("normalizes OpenCode CLI path and environment settings", () => {
@@ -606,7 +915,12 @@ describe("settingsStore MCP policy persistence", () => {
       readOnly: true,
       allowDangerousSql: false,
       allowedConnectionIds: ["connection-1"],
+      allowedGroupIds: [],
+      allowedToolNames: null,
+      connectionPolicies: [],
+      groupPolicies: [],
       configured: true,
+      queryTimeoutSecs: null,
     };
     store.mcpGlobalPolicy = previous;
 
@@ -618,7 +932,12 @@ describe("settingsStore MCP policy persistence", () => {
       readOnly: false,
       allowDangerousSql: false,
       allowedConnectionIds: [],
+      allowedGroupIds: [],
+      allowedToolNames: null,
+      connectionPolicies: [],
+      groupPolicies: [],
       configured: true,
+      queryTimeoutSecs: null,
     });
 
     rejectSave(new Error("save failed"));
@@ -676,6 +995,26 @@ describe("settingsStore persisted settings initialization", () => {
     expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ fontSize: 17, theme: "xcode-dark", appLayout: "separated" }));
   });
 
+  it("migrates the legacy filter-editor preference in incremental settings updates", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({});
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    saveEditorSettings.mockClear();
+
+    store.updateEditorSettings({ dataGridAutoHideFilterBuilder: false } as any);
+    await vi.waitFor(() => expect(saveEditorSettings).toHaveBeenCalledOnce());
+    expect(store.editorSettings.dataGridKeepFilterEditorExpanded).toBe(true);
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ dataGridKeepFilterEditorExpanded: true }));
+
+    await store.updateEditorSettingsAndPersist({ dataGridAutoHideFilterBuilder: true } as any);
+    expect(store.editorSettings.dataGridKeepFilterEditorExpanded).toBe(false);
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ dataGridKeepFilterEditorExpanded: false }));
+  });
+
   it("loads and persists the substitution switch without discarding syntax overrides", async () => {
     const loadEditorSettings = vi.fn().mockResolvedValue({
       sqlVariableSubstitutionEnabled: false,
@@ -718,6 +1057,108 @@ describe("settingsStore persisted settings initialization", () => {
 
     expect(store.editorSettings.openDataTabsNextToActive).toBe(false);
     expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ openDataTabsNextToActive: false }));
+  });
+
+  it("persists tab placement, grouping, sorting, and group customizations across restart", async () => {
+    let persistedSettings: Record<string, unknown> = {};
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const firstStore = useSettingsStore();
+    await firstStore.initEditorSettings();
+    await firstStore.updateEditorSettingsAndPersist({
+      tabPlacement: "left",
+      tabGroupMode: "connection",
+      tabSortMode: "title-asc",
+      tabGroupCustomizations: {
+        "connection:local": { name: "Local services", color: "#2563eb" },
+      },
+    });
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+
+    expect(restartedStore.editorSettings).toMatchObject({
+      tabPlacement: "left",
+      tabGroupMode: "connection",
+      tabSortMode: "title-asc",
+      tabGroupCustomizations: {
+        "connection:local": { name: "Local services", color: "#2563eb" },
+      },
+    });
+  });
+
+  it("loads, persists, and reloads the cell detail button visibility", async () => {
+    let persistedSettings: Record<string, unknown> = { dataGridCellDetailButtonVisible: false };
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    expect(store.editorSettings.dataGridCellDetailButtonVisible).toBe(false);
+    await store.updateEditorSettingsAndPersist({ dataGridCellDetailButtonVisible: true });
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ dataGridCellDetailButtonVisible: true }));
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+    expect(restartedStore.editorSettings.dataGridCellDetailButtonVisible).toBe(true);
+  });
+
+  it("defaults the crosshair highlight to off, persists an opt-in, and reloads it", async () => {
+    let persistedSettings: Record<string, unknown> = {};
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    expect(store.editorSettings.dataGridCrosshairHighlight).toBe(false);
+
+    await store.updateEditorSettingsAndPersist({ dataGridCrosshairHighlight: true });
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ dataGridCrosshairHighlight: true }));
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+    expect(restartedStore.editorSettings.dataGridCrosshairHighlight).toBe(true);
+  });
+
+  it("loads, persists, and reloads hidden query editor line numbers", async () => {
+    let persistedSettings: Record<string, unknown> = { showLineNumbers: true };
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    await store.updateEditorSettingsAndPersist({ showLineNumbers: false });
+
+    expect(store.editorSettings.showLineNumbers).toBe(false);
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ showLineNumbers: false }));
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+
+    expect(restartedStore.editorSettings.showLineNumbers).toBe(false);
   });
 
   it("shares concurrent initialization and applies startup changes after saved settings load", async () => {
@@ -799,10 +1240,43 @@ describe("settingsStore editor settings persistence", () => {
     setActivePinia(createPinia());
   });
 
+  it("initializes legacy settings before queueing formatter mutations", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({
+      updateDownloadSource: "atomgit",
+      customColumnFormatters: {},
+      executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+    });
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    const formatter = { id: "fmt_pre_init", name: "Pre-init", template: "legacy:${value}" };
+
+    await store.upsertCustomColumnFormatter(formatter);
+
+    expect(loadEditorSettings).toHaveBeenCalledOnce();
+    expect(saveEditorSettings).toHaveBeenCalledTimes(2);
+    expect(saveEditorSettings.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        updateDownloadSource: "cnb",
+        customColumnFormatters: {},
+      }),
+    );
+    expect(saveEditorSettings.mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        updateDownloadSource: "cnb",
+        customColumnFormatters: { fmt_pre_init: formatter },
+      }),
+    );
+    expect(store.editorSettings.customColumnFormatters.fmt_pre_init).toEqual(formatter);
+  });
+
   it("rolls back a failed atomic update and allows retry", async () => {
     const loadEditorSettings = vi.fn().mockResolvedValue({
       ignoredUpdateVersion: "",
       executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+      sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
     });
     const saveEditorSettings = vi.fn().mockRejectedValueOnce(new Error("save failed")).mockResolvedValueOnce(undefined);
     vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
@@ -849,6 +1323,7 @@ describe("settingsStore editor settings persistence", () => {
     const loadEditorSettings = vi.fn().mockResolvedValue({
       ignoredUpdateVersion: "",
       executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+      sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
     });
     const saveEditorSettings = vi.fn().mockImplementationOnce(
       () =>
@@ -884,6 +1359,7 @@ describe("settingsStore editor settings persistence", () => {
       ignoredUpdateVersion: "",
       theme: "system",
       executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+      sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
     });
     const saveEditorSettings = vi.fn().mockImplementationOnce(
       () =>
@@ -908,6 +1384,65 @@ describe("settingsStore editor settings persistence", () => {
 
     expect(store.editorSettings).toMatchObject({ ignoredUpdateVersion: "", theme: "xcode-dark" });
     expect(saveEditorSettings.mock.calls[1][0]).toEqual(expect.objectContaining({ ignoredUpdateVersion: "", theme: "xcode-dark" }));
+  });
+
+  it("serializes queued saves before a failed formatter delete", async () => {
+    let persistedSettings: Record<string, unknown> = {
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+      },
+      executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+    };
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    saveEditorSettings.mockClear();
+
+    let resolveFirstSave!: () => void;
+    let saveCall = 0;
+    saveEditorSettings.mockImplementation(async (settings: Record<string, unknown>) => {
+      saveCall += 1;
+      if (saveCall === 1) {
+        await new Promise<void>((resolve) => {
+          resolveFirstSave = resolve;
+        });
+      }
+      if (saveCall === 3) throw new Error("delete save failed");
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+
+    store.updateEditorSettings({ theme: "xcode-dark" });
+    await vi.waitFor(() => expect(saveEditorSettings).toHaveBeenCalledOnce());
+    store.updateEditorSettings({ resultRunDisplayMode: "list" });
+    const deletePromise = store.deleteCustomColumnFormatter("fmt_a");
+    const deleteRejected = expect(deletePromise).rejects.toThrow("delete save failed");
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.editorSettings.customColumnFormatters.fmt_a).toBeDefined();
+
+    resolveFirstSave();
+    await deleteRejected;
+
+    expect(saveEditorSettings).toHaveBeenCalledTimes(3);
+    expect(store.editorSettings.customColumnFormatters.fmt_a).toBeDefined();
+    expect(store.editorSettings.columnFormatters.first).toEqual({ kind: "custom-ref", formatterId: "fmt_a" });
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+
+    expect(restartedStore.editorSettings.customColumnFormatters.fmt_a).toEqual({ id: "fmt_a", name: "A", template: "a:${value}" });
+    expect(restartedStore.editorSettings.columnFormatters.first).toEqual({ kind: "custom-ref", formatterId: "fmt_a" });
   });
 });
 
@@ -1161,12 +1696,32 @@ describe("settingsStore activeModel lifecycle", () => {
         active: undefined,
         effortPreferences: [],
         defaultMode: "ask",
+        defaultAutoRouting: false,
+        restoreLastConversation: false,
       }),
     );
 
     expect(saveAiConfigItem).toHaveBeenCalledWith(expect.objectContaining({ id: "c1", provider: "gemini" }));
     expect(store.activeModel).toBeNull();
     expect(store.activeEffort).toBeNull();
+  });
+
+  it("deletes the active default config and clears the active selection when it was the last config", async () => {
+    const deleteAiConfig = vi.fn().mockResolvedValue(undefined);
+    const saveAiChatSelection = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ deleteAiConfig, saveAiChatSelection }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.aiConfigs = [makeTestConfig({ id: "c1", model: "model-a", isDefault: true })];
+    store.updateActiveModel({ configId: "c1", modelId: "model-a" });
+
+    await store.deleteAiConfig("c1");
+
+    expect(deleteAiConfig).toHaveBeenCalledWith("c1");
+    expect(store.aiConfigs).toEqual([]);
+    expect(store.activeModel).toBeNull();
+    await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenCalledWith(expect.objectContaining({ active: undefined })));
   });
 
   it("preserves the active model and effort when connection details change within the same provider", async () => {
@@ -1230,6 +1785,8 @@ describe("settingsStore activeModel lifecycle", () => {
         },
       ],
       defaultMode: "ask",
+      defaultAutoRouting: false,
+      restoreLastConversation: false,
     });
   });
 
@@ -1297,6 +1854,27 @@ describe("settingsStore defaultAiMode lifecycle", () => {
     expect(store.defaultAiMode).toBe("agent");
   });
 
+  it("restores and persists the last conversation preference", async () => {
+    const saveAiChatSelection = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      loadAiChatSelection: vi.fn().mockResolvedValue({ version: 1, effortPreferences: [], restoreLastConversation: true }),
+      saveAiChatSelection,
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initAiConfigs();
+
+    expect(store.restoreLastConversation).toBe(true);
+    store.setRestoreLastConversation(false);
+    store.setRestoreLastConversation(true);
+
+    await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenLastCalledWith(expect.objectContaining({ restoreLastConversation: true })));
+  });
+
   it("setDefaultAiMode updates state and persists the mode", async () => {
     const saveAiChatSelection = vi.fn().mockResolvedValue(undefined);
     vi.doMock("@/lib/backend/api", () => ({
@@ -1316,5 +1894,43 @@ describe("settingsStore defaultAiMode lifecycle", () => {
 
     await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenCalled());
     expect(saveAiChatSelection.mock.calls[0][0]).toMatchObject({ defaultMode: "agent" });
+  });
+
+  it("falls back to disabled auto routing when the saved chat selection has none", async () => {
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      loadAiChatSelection: vi.fn().mockResolvedValue(null),
+      saveAiChatSelection: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+
+    await store.initAiConfigs();
+
+    expect(store.defaultAutoRouting).toBe(false);
+  });
+
+  it("restores and persists the default auto-routing preference", async () => {
+    const saveAiChatSelection = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      loadAiChatSelection: vi.fn().mockResolvedValue({ version: 1, effortPreferences: [], defaultAutoRouting: true }),
+      saveAiChatSelection,
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initAiConfigs();
+
+    expect(store.defaultAutoRouting).toBe(true);
+    store.setDefaultAutoRouting(false);
+    store.setDefaultAutoRouting(true);
+
+    await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenLastCalledWith(expect.objectContaining({ defaultAutoRouting: true })));
   });
 });

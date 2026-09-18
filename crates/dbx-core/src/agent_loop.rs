@@ -76,6 +76,7 @@ pub struct AgentLoopContext {
     pub state: Arc<AppState>,
     pub connection_id: String,
     pub database: String,
+    pub selected_databases: Vec<String>,
     /// Selected schema that scopes Agent metadata and SQL execution.
     pub schema: Option<String>,
     pub db_type: DatabaseType,
@@ -84,6 +85,9 @@ pub struct AgentLoopContext {
     /// Turn limit for this run, already clamped by the settings layer.
     /// Callers that have no user setting should pass [`DEFAULT_MAX_AGENT_TURNS`].
     pub max_agent_turns: u32,
+    /// Stable per-conversation key forwarded to providers that support prompt
+    /// caching (OpenAI Responses API). `None` disables the field entirely.
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +155,7 @@ pub async fn run_agent_loop(
             connection_id: agent_ctx.connection_id.clone(),
             connection_name,
             database: agent_ctx.database.clone(),
+            selected_databases: agent_ctx.selected_databases.clone(),
             schema: agent_ctx.schema.clone(),
             agent_mode: is_agent_mode,
             allow_writes: agent_ctx.sql_permissions.allow_writes,
@@ -248,8 +253,9 @@ pub async fn run_agent_loop(
         )
         .await;
     }
+    let mut sql_permissions = agent_ctx.sql_permissions.clone();
     let tools = if is_agent_mode {
-        agent_tools::all_tools(agent_ctx.db_type, agent_ctx.sql_permissions.clone())
+        agent_tools::all_tools(agent_ctx.db_type, sql_permissions.clone())
     } else {
         agent_tools::read_only_tools(agent_ctx.db_type)
     };
@@ -280,6 +286,7 @@ pub async fn run_agent_loop(
                 &on_event,
                 cancelled,
                 false,
+                agent_ctx.prompt_cache_key.as_deref(),
             )
             .await,
             CompactResult::Cancelled
@@ -303,6 +310,7 @@ pub async fn run_agent_loop(
                 &tools,
                 max_tokens,
                 task_contract.clone(),
+                agent_ctx.prompt_cache_key.clone(),
             );
 
             // Stream the LLM response, collecting text and tool_calls.
@@ -369,6 +377,7 @@ pub async fn run_agent_loop(
                         &on_event,
                         cancelled,
                         true,
+                        agent_ctx.prompt_cache_key.as_deref(),
                     )
                     .await;
                     match compacted {
@@ -469,6 +478,33 @@ pub async fn run_agent_loop(
             break;
         }
 
+        // Some models call execute_query for a write despite the prompt requiring
+        // a proposal first. Stop before dispatch so DBX can return an exact SQL
+        // proposal for non-production targets, or a non-confirmable production
+        // block rather than an impossible confirmation loop.
+        if let Some(sql) = unconfirmed_write_sql(&collected_tool_calls, agent_ctx.db_type, &sql_permissions) {
+            let targets_production = {
+                let configs = agent_ctx.state.configs.read().await;
+                configs.get(&agent_ctx.connection_id).is_some_and(|config| {
+                    crate::production_safety::targets_production_database(config, &agent_ctx.database, sql)
+                })
+            };
+            let response = write_attempt_response(sql, targets_production);
+            on_event(match &response {
+                WriteAttemptResponse::ConfirmationRequired { sql } => {
+                    AgentEvent::WriteSqlConfirmationRequired { sql: sql.clone() }
+                }
+                WriteAttemptResponse::ProductionBlocked { sql } => {
+                    AgentEvent::ProductionWriteBlocked { sql: sql.clone() }
+                }
+            });
+            // The frontend localizes this semantic event before persisting it in
+            // chat history. Keep a non-user-facing result for API consumers.
+            final_text = response.result_text();
+            loop_exit = LoopExit::Completed;
+            break;
+        }
+
         // Execute each tool call
         // Emit all ToolCallStart events first
         for tc in &collected_tool_calls {
@@ -485,7 +521,7 @@ pub async fn run_agent_loop(
         let db2 = agent_ctx.database.clone();
         let schema2 = agent_ctx.schema.clone();
         let db_type = agent_ctx.db_type;
-        let sql_permissions = agent_ctx.sql_permissions.clone();
+        let parallel_sql_permissions = sql_permissions.clone();
 
         // Split by index into parallel and sequential groups using tool metadata
         let tool_parallel_map: std::collections::HashMap<&str, bool> =
@@ -510,7 +546,7 @@ pub async fn run_agent_loop(
                     let conn = conn2.clone();
                     let db = db2.clone();
                     let schema = schema2.clone();
-                    let perms = sql_permissions.clone();
+                    let perms = parallel_sql_permissions.clone();
                     async move {
                         agent_tools::execute_tool(&tc, &state, &conn, &db, schema.as_deref(), &db_type, perms).await
                     }
@@ -522,6 +558,7 @@ pub async fn run_agent_loop(
         let mut sequential_results = Vec::with_capacity(sequential_indices.len());
         for &i in &sequential_indices {
             let tc = make_tc(&collected_tool_calls[i]);
+            let execution_permissions = sequential_tool_permissions(&tc, db_type, &mut sql_permissions);
             sequential_results.push(
                 agent_tools::execute_tool(
                     &tc,
@@ -530,7 +567,7 @@ pub async fn run_agent_loop(
                     &db2,
                     schema2.as_deref(),
                     &db_type,
-                    sql_permissions.clone(),
+                    execution_permissions,
                 )
                 .await,
             );
@@ -579,6 +616,19 @@ pub async fn run_agent_loop(
             final_text.push_str(&message);
         }
         LoopExit::Interrupted(error) => {
+            // The retry layer records the HTTP-level cause; this records the
+            // agent-level exit so a failure still leaves a trace even after the
+            // user dismisses the on-screen message. Cancellation has its own arm
+            // above and never reaches here. The error is re-scrubbed here so a
+            // credential cannot reach the log file even if a provider echo slipped
+            // past the source-side redaction.
+            let error = ai::redact_secrets(&error, &ai::sensitive_values(config));
+            log::warn!(
+                "[agent] stream interrupted; provider={:?} model={} agent_mode={} error={error}",
+                config.provider,
+                config.model,
+                is_agent_mode
+            );
             let message = if final_text.trim().is_empty() {
                 format!("Agent stream stopped before completion: {error}.")
             } else {
@@ -615,6 +665,7 @@ fn build_tool_request(
     _tools: &[ToolDefinition], // Tools are injected in ai::stream_with_tools, not via AiCompletionRequest.
     max_tokens: Option<u32>,
     task_contract: Option<AiTaskContract>,
+    prompt_cache_key: Option<String>,
 ) -> AiCompletionRequest {
     // Note: tools are passed via the body, not via AiCompletionRequest.
     // The actual injection happens in stream_with_tools.
@@ -624,6 +675,7 @@ fn build_tool_request(
         messages: messages.to_vec(),
         task_contract,
         max_tokens: max_tokens.or(Some(4096)),
+        prompt_cache_key,
     }
 }
 
@@ -876,6 +928,7 @@ async fn run_agent_loop_text_only(
         messages: messages.to_vec(),
         task_contract: task_contract.cloned(),
         max_tokens: max_tokens.or(Some(4096)),
+        prompt_cache_key: agent_ctx.prompt_cache_key.clone(),
     };
 
     for attempt in 0..=MAX_CONTRACT_REPAIR_ATTEMPTS {
@@ -1083,6 +1136,7 @@ async fn maybe_compact(
     on_event: &(impl Fn(AgentEvent) + Send + Sync),
     cancelled: &Notify,
     force: bool,
+    prompt_cache_key: Option<&str>,
 ) -> CompactResult {
     let window = effective_context_window(config);
     let budget = prompt_budget(window, max_tokens);
@@ -1139,6 +1193,7 @@ async fn maybe_compact(
         }],
         task_contract: None,
         max_tokens: Some(1024),
+        prompt_cache_key: prompt_cache_key.map(str::to_string),
     };
 
     let summary = match cancelled.notified().now_or_never() {
@@ -1182,6 +1237,72 @@ async fn maybe_compact(
         estimated_after,
     });
     CompactResult::Compacted
+}
+
+/// Semantic write-attempt outcomes. Keep user-visible language in the desktop
+/// i18n catalog rather than hard-coding English into a backend event.
+enum WriteAttemptResponse {
+    ConfirmationRequired { sql: String },
+    ProductionBlocked { sql: String },
+}
+
+impl WriteAttemptResponse {
+    fn result_text(&self) -> String {
+        match self {
+            Self::ConfirmationRequired { sql } | Self::ProductionBlocked { sql } => sql.clone(),
+        }
+    }
+}
+
+fn write_attempt_response(sql: &str, targets_production: bool) -> WriteAttemptResponse {
+    let sql = sql.trim().to_string();
+    if targets_production {
+        WriteAttemptResponse::ProductionBlocked { sql }
+    } else {
+        WriteAttemptResponse::ConfirmationRequired { sql }
+    }
+}
+
+fn sequential_tool_permissions(
+    tool_call: &ToolCall,
+    db_type: DatabaseType,
+    permissions: &mut agent_tools::AgentSqlPermissions,
+) -> agent_tools::AgentSqlPermissions {
+    if tool_call.name == "execute_query" {
+        if let Some(sql) = tool_call.arguments.get("sql").and_then(|value| value.as_str()) {
+            return agent_tools::take_sql_permissions_for_execution(sql, db_type, permissions);
+        }
+    }
+    permissions.clone()
+}
+
+/// Returns a deterministic confirmation proposal when the current turn contains
+/// an unconfirmed write/DDL tool call. The caller must stop before dispatching
+/// any tools so the database never sees the attempted SQL.
+fn unconfirmed_write_sql<'a>(
+    tool_calls: &'a [ToolCall],
+    db_type: DatabaseType,
+    permissions: &agent_tools::AgentSqlPermissions,
+) -> Option<&'a str> {
+    // Mongo execute_query is a read-only shell-command tool; mutating commands
+    // are rejected by the tool itself, so a confirmation proposal could never
+    // be executed. And because Mongo commands are not SQL, the risk classifier
+    // would flag even reads (db.collection.find(...)) as writes, turning every
+    // Mongo agent query into an impossible confirmation. Preserve the previous
+    // behavior: Mongo writes keep failing with a clear read-only error.
+    if db_type == DatabaseType::MongoDb {
+        return None;
+    }
+    tool_calls.iter().find_map(|tool_call| {
+        if tool_call.name != "execute_query" {
+            return None;
+        }
+        let sql = tool_call.arguments.get("sql").and_then(|value| value.as_str())?;
+        agent_tools::write_requires_confirmation(sql, db_type, permissions)
+            .ok()
+            .filter(|required| *required)
+            .map(|_| sql)
+    })
 }
 
 fn tool_result_for_followup_context(tool_name: &str, content: &str) -> String {
@@ -1407,6 +1528,23 @@ mod tests {
     }
 
     #[test]
+    fn build_tool_request_carries_prompt_cache_key() {
+        let config: AiConfig = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "model": "test-model",
+        }))
+        .unwrap();
+
+        // Every agent turn rebuilds the request here, so this is the join that
+        // used to drop the conversation key before it reached the provider.
+        let with_key = build_tool_request(&config, "system", &[], &[], Some(128), None, Some("conv-1".to_string()));
+        assert_eq!(with_key.prompt_cache_key.as_deref(), Some("conv-1"));
+
+        let without_key = build_tool_request(&config, "system", &[], &[], Some(128), None, None);
+        assert!(without_key.prompt_cache_key.is_none());
+    }
+
+    #[test]
     fn identifies_explicit_tool_rejection_errors() {
         for error in [
             "model does not support tools",
@@ -1438,6 +1576,160 @@ mod tests {
             mode: Some(mode.to_string()),
             user_request: Some(user_request.to_string()),
         }
+    }
+
+    #[test]
+    fn unconfirmed_write_attempt_requests_confirmation_with_exact_sql() {
+        let sql = "CREATE TABLE users (id INT);";
+        let response = write_attempt_response(sql, false);
+
+        assert!(
+            matches!(response, WriteAttemptResponse::ConfirmationRequired { sql: response_sql } if response_sql == sql)
+        );
+    }
+
+    #[test]
+    fn production_write_attempt_is_not_an_executable_confirmation() {
+        let response = write_attempt_response("DELETE FROM users WHERE id = 7;", true);
+
+        assert!(
+            matches!(response, WriteAttemptResponse::ProductionBlocked { sql } if sql == "DELETE FROM users WHERE id = 7;")
+        );
+    }
+
+    #[test]
+    fn direct_unconfirmed_ddl_tool_call_becomes_a_confirmation_proposal() {
+        let tool_calls = vec![ToolCall {
+            id: "create-table".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "CREATE TABLE users (id INT);" }),
+            provider_payload: None,
+        }];
+
+        let sql =
+            unconfirmed_write_sql(&tool_calls, DatabaseType::Postgres, &agent_tools::AgentSqlPermissions::default())
+                .expect("unconfirmed DDL must be intercepted before tool dispatch");
+        assert!(
+            matches!(write_attempt_response(sql, false), WriteAttemptResponse::ConfirmationRequired { sql } if sql == "CREATE TABLE users (id INT);")
+        );
+    }
+
+    #[test]
+    fn confirmed_or_read_only_tool_calls_do_not_become_confirmation_proposals() {
+        let create = ToolCall {
+            id: "create-table".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "CREATE TABLE users (id INT);" }),
+            provider_payload: None,
+        };
+        let select = ToolCall {
+            id: "select-users".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "SELECT * FROM users" }),
+            provider_payload: None,
+        };
+        let confirmed =
+            agent_tools::confirmed_write_sql_permissions(false, true, Some("CREATE TABLE users (id INT);".to_string()));
+
+        assert!(unconfirmed_write_sql(&[create], DatabaseType::Postgres, &confirmed).is_none());
+        assert!(unconfirmed_write_sql(&[select], DatabaseType::Postgres, &agent_tools::AgentSqlPermissions::default())
+            .is_none());
+    }
+
+    #[test]
+    fn duplicate_confirmed_writes_in_one_batch_receive_one_grant() {
+        let sql = "DELETE FROM users WHERE id = 7;";
+        let call = ToolCall {
+            id: "delete-user".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": sql }),
+            provider_payload: None,
+        };
+        let mut permissions = agent_tools::confirmed_write_sql_permissions(false, true, Some(sql.to_string()));
+
+        let first = sequential_tool_permissions(&call, DatabaseType::Postgres, &mut permissions);
+        let second = sequential_tool_permissions(&call, DatabaseType::Postgres, &mut permissions);
+
+        assert!(first.allow_writes);
+        assert_eq!(first.confirmed_write_sql.as_deref(), Some(sql));
+        assert!(!second.allow_writes);
+        assert_eq!(second.confirmed_write_sql, None);
+        assert_eq!(permissions, agent_tools::AgentSqlPermissions::default());
+    }
+
+    #[test]
+    fn confirmed_write_grant_stays_consumed_across_turns() {
+        let sql = "DELETE FROM users WHERE id = 7;";
+        let call = ToolCall {
+            id: "delete-user".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": sql }),
+            provider_payload: None,
+        };
+        let mut permissions = agent_tools::confirmed_write_sql_permissions(false, true, Some(sql.to_string()));
+
+        let _ = sequential_tool_permissions(&call, DatabaseType::Postgres, &mut permissions);
+
+        assert_eq!(unconfirmed_write_sql(std::slice::from_ref(&call), DatabaseType::Postgres, &permissions), Some(sql));
+    }
+
+    #[test]
+    fn read_before_confirmed_write_does_not_consume_the_grant() {
+        let confirmed_sql = "DELETE FROM users WHERE id = 7;";
+        let read = ToolCall {
+            id: "read-user".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "SELECT * FROM users WHERE id = 7" }),
+            provider_payload: None,
+        };
+        let write = ToolCall {
+            id: "delete-user".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": confirmed_sql }),
+            provider_payload: None,
+        };
+        let mut permissions =
+            agent_tools::confirmed_write_sql_permissions(false, true, Some(confirmed_sql.to_string()));
+
+        let read_permissions = sequential_tool_permissions(&read, DatabaseType::Postgres, &mut permissions);
+        let write_permissions = sequential_tool_permissions(&write, DatabaseType::Postgres, &mut permissions);
+
+        assert!(read_permissions.allow_writes);
+        assert!(write_permissions.allow_writes);
+        assert_eq!(write_permissions.confirmed_write_sql.as_deref(), Some(confirmed_sql));
+        assert_eq!(permissions, agent_tools::AgentSqlPermissions::default());
+    }
+
+    #[test]
+    fn mongo_agent_commands_are_never_intercepted_as_write_confirmations() {
+        // Mongo execute_query is read-only at the tool level, and its commands are
+        // not SQL — the risk classifier would flag even reads as writes. Neither a
+        // read nor a mutating command may become an impossible confirmation.
+        let read = ToolCall {
+            id: "mongo-read".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "db.collection.find({})" }),
+            provider_payload: None,
+        };
+        let write = ToolCall {
+            id: "mongo-write".to_string(),
+            name: "execute_query".to_string(),
+            arguments: json!({ "sql": "db.collection.insertOne({ name: \"x\" })" }),
+            provider_payload: None,
+        };
+        let permissions = agent_tools::AgentSqlPermissions::default();
+        // Without the Mongo exclusion this read would be flagged as an unconfirmed
+        // write (Mongo commands are not SQL), producing a confirmation for every
+        // agent query. Assert the misclassification so the exclusion's necessity
+        // stays explicit.
+        assert!(agent_tools::write_requires_confirmation(
+            "db.collection.find({})",
+            DatabaseType::MongoDb,
+            &permissions
+        )
+        .unwrap());
+        assert!(unconfirmed_write_sql(&[read], DatabaseType::MongoDb, &permissions).is_none());
+        assert!(unconfirmed_write_sql(&[write], DatabaseType::MongoDb, &permissions).is_none());
     }
 
     #[test]

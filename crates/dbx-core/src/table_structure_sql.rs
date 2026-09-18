@@ -6,6 +6,8 @@ mod create_table;
 mod dialect;
 mod foreign_keys;
 mod indexes;
+mod mysql_engine;
+mod owner;
 mod sqlite_rebuild;
 mod triggers;
 mod types;
@@ -17,23 +19,41 @@ mod tests;
 
 pub use column_alter::build_single_column_alter_sql;
 pub use create_table::build_create_table_sql;
+pub use owner::build_table_owner_change_sql;
 pub use sqlite_rebuild::{apply_sqlite_table_structure_change, preview_sqlite_table_structure_change};
 pub use types::*;
 
+pub(crate) use column_alter::{
+    build_sqlserver_alter_column_preserving_default_sql, build_sqlserver_drop_default_constraint_sql,
+};
+pub(crate) use comments::{build_sqlserver_column_comment_sql, build_sqlserver_table_comment_sql};
+pub(crate) use util::{oracle_new_object_reference, sqlserver_unicode_string_literal};
+
 use crate::models::connection::DatabaseType;
 
-use columns::build_column_sql;
+use column_format::strip_inherited_mysql_column_charsets;
+use columns::{build_column_sql, validate_primary_key_change_scope};
 use comments::build_table_comment_sql;
 use foreign_keys::build_foreign_key_sql;
 use indexes::build_index_sql;
+use mysql_engine::{build_mysql_engine_change_sql, validate_mysql_engine};
 use triggers::build_trigger_sql;
 use validation::{validate_concurrent_index_scope, validate_draft};
 
 pub fn build_table_structure_change_sql(mut options: TableStructureSqlOptions) -> TableStructureSqlResult {
+    let mysql_engine_errors = validate_mysql_engine(&options);
+    if !mysql_engine_errors.is_empty() {
+        return TableStructureSqlResult { statements: Vec::new(), warnings: mysql_engine_errors };
+    }
     // GaussDB M-mode uses MySQL-compatible SQL dialect with backtick quoting.
     // Map to StructureDialect::Mysql so DDL is generated correctly.
     if options.is_gaussdb_m_mode {
         options.database_type = Some(DatabaseType::Mysql);
+    }
+    strip_inherited_mysql_column_charsets(&mut options);
+    let primary_key_errors = validate_primary_key_change_scope(&options);
+    if !primary_key_errors.is_empty() {
+        return TableStructureSqlResult { statements: Vec::new(), warnings: primary_key_errors };
     }
     // Fail closed: an unsupported concurrent-index request (existing index, or
     // partitioned parent table) must never degrade into blocking index DDL
@@ -48,6 +68,7 @@ pub fn build_table_structure_change_sql(mut options: TableStructureSqlOptions) -
     statements.extend(build_foreign_key_sql(&options, &mut warnings));
     statements.extend(build_trigger_sql(&options, &mut warnings));
     statements.extend(build_table_comment_sql(&options, &mut warnings));
+    statements.extend(build_mysql_engine_change_sql(&options));
     TableStructureSqlResult { statements, warnings }
 }
 
@@ -61,7 +82,7 @@ pub fn build_table_structure_change_sql(mut options: TableStructureSqlOptions) -
 /// Callers using this as an introspection signal must corroborate it against
 /// what was actually collected rather than trust the flag alone.
 pub(crate) fn supports_comments(database_type: crate::models::connection::DatabaseType) -> bool {
-    dialect::capabilities_for(Some(database_type)).comment
+    dialect::capabilities_for(Some(database_type), None).comment
 }
 
 /// Whether this engine's structure editor can generate foreign key DDL — a
@@ -73,7 +94,7 @@ pub(crate) fn supports_comments(database_type: crate::models::connection::Databa
 /// engine where DDL support and introspection support diverge — callers
 /// should corroborate against what was actually collected.
 pub(crate) fn supports_foreign_keys(database_type: crate::models::connection::DatabaseType) -> bool {
-    dialect::capabilities_for(Some(database_type)).foreign_key
+    dialect::capabilities_for(Some(database_type), None).foreign_key
 }
 
 /// Canonical display label for a database engine (e.g. `postgres`,

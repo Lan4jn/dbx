@@ -14,7 +14,9 @@ use dbx_core::query_result_export::{export_query_result_core, ExportStatus, Quer
 use dbx_core::sql::{split_sql_statements_for_database, SqlFileRequest};
 use dbx_core::sql_file_import::execute_sql_file_path;
 use dbx_core::storage::Storage;
-use dbx_core::table_import::parse_xlsx_file;
+use dbx_core::table_import::{
+    build_import_insert_batch_from_rows, parse_csv_bytes, parse_xlsx_file, TableImportColumnMapping,
+};
 use mysql_async::prelude::Queryable;
 use tokio_util::sync::CancellationToken;
 
@@ -388,7 +390,7 @@ async fn live_mysql_single_call_public_route_preserves_all_result_sets() {
     assert!(sql_error[0].execution_error);
     let sql_error_message = sql_error[0].result.rows[0][0].as_str().expect("missing procedure error message");
     assert!(sql_error_message.contains("does not exist"), "unexpected SQL error: {sql_error_message}");
-    assert_eq!(sql_error[0].error.as_ref().map(|error| error.code()), Some("DBX-LEGACY-0001"));
+    assert_eq!(sql_error[0].error.as_ref().map(|error| error.code()), Some("DBX-JDBC-4001"));
     assert!(read_only_error.into_legacy_string().to_ascii_lowercase().contains("read-only"));
     assert_eq!(timeout_results.len(), 1);
     assert!(timeout_results[0].execution_error);
@@ -465,6 +467,7 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         use_agent_cursor: false,
         file_path: file_path.to_string_lossy().to_string(),
         format: "xlsx".to_string(),
+        insert_mode: Default::default(),
         include_sql_sheet: false,
         page_size: 50,
         row_limit: None,
@@ -474,11 +477,15 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         client_session_id: None,
         execution_id: Some(format!("live-mysql-query-export-{suffix}")),
         date_time_format: None,
+        csv_quote_mode: Default::default(),
         export_table_name: None,
         export_column_types: None,
         column_comments: None,
+        auto_filter: None,
         identifier_quote: None,
         numeric_column_right_align: false,
+        exclude_primary_keys: false,
+        primary_keys: Vec::new(),
     };
     let done_seen = AtomicBool::new(false);
     let result = export_query_result_core(&state, &request, None, |progress| {
@@ -506,6 +513,120 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         .collect::<BTreeSet<_>>();
     let expected_ids = (1..=250).collect::<BTreeSet<_>>();
     assert_eq!(exported_ids, expected_ids);
+}
+
+#[tokio::test]
+#[ignore = "requires a writable MySQL endpoint for issue #8803 regression coverage"]
+async fn live_mysql_csv_temporal_export_round_trip_preserves_dbx_force_text_values() {
+    let host = std::env::var("DBX_LIVE_MYSQL_EXPORT_HOST").expect("DBX_LIVE_MYSQL_EXPORT_HOST");
+    let port = std::env::var("DBX_LIVE_MYSQL_EXPORT_PORT").expect("DBX_LIVE_MYSQL_EXPORT_PORT").parse::<u16>().unwrap();
+    let user = std::env::var("DBX_LIVE_MYSQL_EXPORT_USER").expect("DBX_LIVE_MYSQL_EXPORT_USER");
+    let password = std::env::var("DBX_LIVE_MYSQL_EXPORT_PASSWORD").expect("DBX_LIVE_MYSQL_EXPORT_PASSWORD");
+    let database = std::env::var("DBX_LIVE_MYSQL_EXPORT_DATABASE").expect("DBX_LIVE_MYSQL_EXPORT_DATABASE");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table = format!("dbx_issue_8803_{}", &suffix[..8]);
+    let target_table = format!("dbx_issue_8803_target_{}", &suffix[..8]);
+    let connection_id = format!("live-mysql-issue-8803-{suffix}");
+    let config = live_mysql_query_export_config(&connection_id, &host, port, &user, &password, &database);
+    let dir = std::env::temp_dir().join(format!("dbx-live-issue-8803-{suffix}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+    let state = AppState::new(storage);
+    state.configs.write().await.insert(config.id.clone(), config);
+
+    let cleanup_sql = format!("DROP TABLE IF EXISTS `{table}`, `{target_table}`");
+    let create_sql = format!("CREATE TABLE `{table}` (insert_time DATETIME NOT NULL, id INT NOT NULL)");
+    let create_target_sql = format!("CREATE TABLE `{target_table}` (insert_time DATETIME NOT NULL, id INT NOT NULL)");
+    let insert_sql = format!("INSERT INTO `{table}` (insert_time, id) VALUES ('2026-06-24 02:00:07', 695350)");
+    let _ = execute_sql_statement(&state, &connection_id, &database, &cleanup_sql, None, None).await;
+    execute_sql_statement(&state, &connection_id, &database, &create_sql, None, None).await.expect("create fixture");
+    execute_sql_statement(&state, &connection_id, &database, &insert_sql, None, None).await.expect("insert fixture");
+    execute_sql_statement(&state, &connection_id, &database, &create_target_sql, None, None)
+        .await
+        .expect("create import target");
+
+    let file_path = dir.join("issue-8803.csv");
+    let sql = format!("SELECT insert_time, id FROM `{table}`");
+    let request = QueryResultExportRequest {
+        export_id: format!("live-mysql-issue-8803-{suffix}"),
+        connection_id: connection_id.clone(),
+        database: database.clone(),
+        schema: None,
+        catalog: None,
+        sql: sql.clone(),
+        query_base_sql: sql,
+        setup_sql: Vec::new(),
+        database_type: DatabaseType::Mysql,
+        use_agent_cursor: false,
+        file_path: file_path.to_string_lossy().to_string(),
+        format: "csv".to_string(),
+        insert_mode: Default::default(),
+        include_sql_sheet: false,
+        page_size: 100,
+        row_limit: None,
+        total_rows: Some(1),
+        timeout_secs: Some(30),
+        keyset_optimization_enabled: false,
+        client_session_id: None,
+        execution_id: Some(format!("live-mysql-issue-8803-{suffix}")),
+        date_time_format: None,
+        csv_quote_mode: Default::default(),
+        export_table_name: None,
+        export_column_types: None,
+        column_comments: None,
+        auto_filter: None,
+        identifier_quote: None,
+        numeric_column_right_align: false,
+        exclude_primary_keys: false,
+        primary_keys: Vec::new(),
+    };
+    export_query_result_core(&state, &request, None, |_| {}).await.expect("export fixture");
+
+    let csv = std::fs::read(&file_path).unwrap();
+    let parsed = parse_csv_bytes(&csv, 10).expect("DBX should parse its own CSV");
+    let mappings = parsed
+        .columns
+        .iter()
+        .map(|column| TableImportColumnMapping {
+            source_column: column.clone(),
+            target_column: column.clone(),
+            target_data_type: None,
+        })
+        .collect::<Vec<_>>();
+    let batch = build_import_insert_batch_from_rows(
+        &parsed.rows,
+        &parsed.columns,
+        &mappings,
+        &[("insert_time".to_string(), "DATETIME".to_string()), ("id".to_string(), "INT".to_string())],
+        &target_table,
+        &database,
+        &DatabaseType::Mysql,
+    )
+    .expect("build import batch")
+    .expect("import batch should exist");
+
+    eprintln!("issue #8803 raw CSV: {}", String::from_utf8_lossy(&csv));
+    eprintln!("issue #8803 import SQL: {}", batch.sql);
+    assert!(String::from_utf8_lossy(&csv).contains("=\"\"2026-06-24 02:00:07\"\""));
+    assert!(batch.sql.contains("'2026-06-24 02:00:07'"));
+    execute_sql_statement(&state, &connection_id, &database, &batch.sql, None, None)
+        .await
+        .expect("import exported temporal CSV");
+    let imported = execute_sql_statement(
+        &state,
+        &connection_id,
+        &database,
+        &format!("SELECT DATE_FORMAT(insert_time, '%Y-%m-%d %H:%i:%s'), id FROM `{target_table}`"),
+        None,
+        None,
+    )
+    .await
+    .expect("query imported temporal row");
+    assert_eq!(imported.rows, vec![vec![serde_json::json!("2026-06-24 02:00:07"), serde_json::json!("695350")]]);
+
+    let cleanup_result = execute_sql_statement(&state, &connection_id, &database, &cleanup_sql, None, None).await;
+    cleanup_result.expect("cleanup fixture");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -556,6 +677,7 @@ async fn live_mysql_xlsx_export_can_outlive_query_timeout_while_rows_keep_arrivi
         use_agent_cursor: false,
         file_path: file_path.to_string_lossy().to_string(),
         format: "xlsx".to_string(),
+        insert_mode: Default::default(),
         include_sql_sheet: false,
         page_size: 10_000,
         row_limit: None,
@@ -565,11 +687,15 @@ async fn live_mysql_xlsx_export_can_outlive_query_timeout_while_rows_keep_arrivi
         client_session_id: None,
         execution_id: Some(format!("live-mysql-query-export-timeout-{suffix}")),
         date_time_format: None,
+        csv_quote_mode: Default::default(),
         export_table_name: None,
         export_column_types: None,
         column_comments: None,
+        auto_filter: None,
         identifier_quote: None,
         numeric_column_right_align: false,
+        exclude_primary_keys: false,
+        primary_keys: Vec::new(),
     };
     let rows_exported = AtomicU64::new(0);
     let done_seen = AtomicBool::new(false);
@@ -1167,6 +1293,9 @@ INSERT INTO install_check (id) VALUES (1), (2);
             .to_string_lossy()
             .into_owned(),
         continue_on_error: false,
+        selected_tables: None,
+        part_cooldown_ms: 0,
+        skip_relational_constraints: false,
     };
 
     let _ = execute_sql_statement(
@@ -1214,4 +1343,153 @@ INSERT INTO install_check (id) VALUES (1), (2);
     let verify = verify.expect("verify imported rows");
     assert_eq!(verify.columns, vec!["count"]);
     assert_eq!(verify.rows, vec![vec![serde_json::json!("2")]]);
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_SQL_FILE_MYSQL_* env vars pointing at a writable MySQL connection without a required default database"]
+async fn live_sql_file_import_preserves_last_insert_id_across_adjacent_inserts() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("sql-file-order-{suffix}");
+    let config = live_mysql_sql_file_config(&connection_id);
+    let (state, db_path) = app_state_with_config(config.clone()).await;
+    let database_name = format!("dbx_issue_7738_{suffix}");
+    let script = format!(
+        r#"
+CREATE DATABASE `{database_name}`;
+USE `{database_name}`;
+CREATE TABLE parents (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(32) NOT NULL
+);
+CREATE TABLE children (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    parent_id INT NOT NULL,
+    CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+);
+INSERT INTO parents (name) VALUES ('first');
+INSERT INTO parents (name) VALUES ('second');
+DELETE FROM parents WHERE name = 'first';
+INSERT INTO children (parent_id) VALUES (LAST_INSERT_ID());
+"#
+    );
+    let request = SqlFileRequest {
+        execution_id: format!("exec-{suffix}"),
+        connection_id: config.id.clone(),
+        database: String::new(),
+        file_path: std::env::temp_dir()
+            .join(format!("issue-7738-mysql-order-{suffix}.sql"))
+            .to_string_lossy()
+            .into_owned(),
+        continue_on_error: false,
+        selected_tables: None,
+        part_cooldown_ms: 0,
+        skip_relational_constraints: false,
+    };
+
+    let _ = execute_sql_statement(
+        &state,
+        &config.id,
+        "",
+        &format!("DROP DATABASE IF EXISTS `{database_name}`"),
+        None,
+        None,
+    )
+    .await;
+
+    tokio::fs::write(&request.file_path, &script).await.unwrap();
+    let result = execute_sql_file_path(
+        &state,
+        &request,
+        std::path::Path::new(&request.file_path),
+        CancellationToken::new(),
+        std::time::Instant::now(),
+        |_| {},
+    )
+    .await;
+    let verify = execute_sql_statement(
+        &state,
+        &config.id,
+        &database_name,
+        "SELECT p.name FROM children c JOIN parents p ON p.id = c.parent_id",
+        None,
+        None,
+    )
+    .await;
+    let _ = execute_sql_statement(
+        &state,
+        &config.id,
+        "",
+        &format!("DROP DATABASE IF EXISTS `{database_name}`"),
+        None,
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(&request.file_path);
+
+    result.expect("SQL file import should preserve LAST_INSERT_ID() semantics between statements");
+    let verify = verify.expect("verify the child references the second inserted parent");
+    assert_eq!(verify.columns, vec!["name"]);
+    assert_eq!(verify.rows, vec![vec![serde_json::json!("second")]]);
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_SQL_FILE_MYSQL_* env vars pointing at a writable MySQL connection without a required default database"]
+async fn live_sql_file_import_preserves_raw_mysql_binary_literal_bytes() {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let config = live_mysql_sql_file_config(&format!("sql-file-binary-{suffix}"));
+    let (state, db_path) = app_state_with_config(config.clone()).await;
+    let database_name = std::env::var("DBX_LIVE_SQL_FILE_MYSQL_DATABASE").unwrap_or_else(|_| "dbx_test".to_string());
+    let table_name = format!("binary_dump_{suffix}");
+    let mut script = format!(
+        "USE `{database_name}`;\nCREATE TABLE `{table_name}` (id INT PRIMARY KEY, value LONGBLOB);\nINSERT INTO `{table_name}` VALUES (1, _binary '"
+    )
+    .into_bytes();
+    script.extend_from_slice(&[0xAC, b'\\', 0xED, b'\\', b'0', 0x05]);
+    script.extend_from_slice(b"');\n");
+    let request = SqlFileRequest {
+        execution_id: format!("exec-{suffix}"),
+        connection_id: config.id.clone(),
+        database: String::new(),
+        file_path: std::env::temp_dir().join(format!("mysql-binary-dump-{suffix}.sql")).to_string_lossy().into_owned(),
+        continue_on_error: false,
+        selected_tables: None,
+        part_cooldown_ms: 0,
+        skip_relational_constraints: false,
+    };
+
+    tokio::fs::write(&request.file_path, script).await.unwrap();
+    let result = execute_sql_file_path(
+        &state,
+        &request,
+        std::path::Path::new(&request.file_path),
+        CancellationToken::new(),
+        Instant::now(),
+        |_| {},
+    )
+    .await;
+    let verify = execute_sql_statement(
+        &state,
+        &config.id,
+        &database_name,
+        &format!("SELECT HEX(value) AS value_hex FROM `{table_name}` WHERE id = 1"),
+        None,
+        None,
+    )
+    .await;
+    let _ = execute_sql_statement(
+        &state,
+        &config.id,
+        &database_name,
+        &format!("DROP TABLE IF EXISTS `{table_name}`"),
+        None,
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(&request.file_path);
+
+    result.expect("binary SQL file import should succeed");
+    let verify = verify.expect("verify imported binary bytes");
+    assert_eq!(verify.rows, vec![vec![serde_json::json!("ACED0005")]]);
 }

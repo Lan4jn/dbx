@@ -9,7 +9,7 @@ export interface SchemaDiffTableIdentity {
 }
 
 export interface SchemaDiffTableListLoader {
-  load(identity: SchemaDiffTableIdentity): Promise<TableInfo[]>;
+  load(identity: SchemaDiffTableIdentity, options?: { refresh?: boolean }): Promise<TableInfo[]>;
 }
 
 interface SchemaDiffTableListLoaderDependencies {
@@ -22,6 +22,7 @@ interface SchemaDiffTableListCoordinatorOptions {
   getIdentity(side: SchemaDiffTableSide): SchemaDiffTableIdentity;
   setTables(side: SchemaDiffTableSide, tables: TableInfo[]): void;
   onSourceTablesLoaded?(tables: TableInfo[]): void;
+  onTargetTablesLoaded?(tables: TableInfo[]): void;
 }
 
 function identityKey(identity: SchemaDiffTableIdentity): string {
@@ -46,12 +47,12 @@ export function createSchemaDiffTableListLoader(dependencies: SchemaDiffTableLis
   const pending = new Map<string, Promise<TableInfo[]>>();
 
   return {
-    async load(identity) {
+    async load(identity, options) {
       const key = identityKey(identity);
       const inFlight = pending.get(key);
       if (inFlight) return inFlight;
 
-      const cached = successful.get(key);
+      const cached = options?.refresh ? undefined : successful.get(key);
       if (cached) {
         await dependencies.ensureConnected(identity.connectionId);
         return cached;
@@ -89,6 +90,7 @@ export function createSchemaDiffTableListCoordinator(options: SchemaDiffTableLis
 
         options.setTables(side, tables);
         if (side === "source") options.onSourceTablesLoaded?.(tables);
+        else options.onTargetTablesLoaded?.(tables);
         return true;
       } catch {
         if (generation === generations[side] && sameSchemaDiffTableIdentity(identity, options.getIdentity(side))) {

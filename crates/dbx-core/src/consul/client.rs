@@ -19,7 +19,12 @@ pub struct ConsulClient {
 
 impl ConsulClient {
     pub async fn new(mut config: ConsulConfig) -> Result<Self, String> {
+        // The desktop build unifies reqwest with both `default-tls` and `rustls-tls`,
+        // and `TlsBackend` defaults to native-tls there, which rejects the PEM identity
+        // below with `incompatible TLS identity type`. Pin rustls like the etcd metrics
+        // client so mTLS Consul works in every target.
         let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs.max(1)))
             .redirect(reqwest::redirect::Policy::none());
         if config.request_timeout_secs > 0 {
@@ -224,8 +229,8 @@ impl ConsulClient {
 
 pub(super) async fn client_for_state(state: &AppState, connection_id: &str) -> Result<ConsulClient, String> {
     state.get_or_create_pool(connection_id, None).await?;
-    let connections = state.connections.read().await;
-    match connections.get(connection_id) {
+    let pool_handle = state.pool_handle(connection_id).await;
+    match pool_handle.as_ref() {
         Some(PoolKind::Consul(client)) => Ok(client.clone()),
         Some(_) => Err("Connection is not a Consul connection".to_string()),
         None => Err("Connection not found".to_string()),

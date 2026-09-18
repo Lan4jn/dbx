@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,13 +112,14 @@ func (service *server) connect(params json.RawMessage) (map[string]bool, error) 
 	}
 	previousClient := service.activeClient
 	service.activeClient = nextClient
+	service.activeConfig = config
 	if previousClient != nil {
 		previousClient.Close()
 	}
 	return map[string]bool{"ok": true}, nil
 }
 
-func (service *server) testConnection(params json.RawMessage) (map[string]bool, error) {
+func (service *server) testConnection(params json.RawMessage) (map[string]any, error) {
 	config, err := decodeConnectionConfig(params)
 	if err != nil {
 		return nil, err
@@ -127,12 +129,28 @@ func (service *server) testConnection(params json.RawMessage) (map[string]bool, 
 		return nil, err
 	}
 	probe.Close()
-	return map[string]bool{"ok": true}, nil
+	result := map[string]any{"ok": true}
+	if info := databaseInfo(config); info != nil {
+		result["databaseInfo"] = info
+	}
+	return result, nil
+}
+
+func (service *server) connectionInfo() (map[string]any, error) {
+	if _, err := service.requireClient(); err != nil {
+		return nil, err
+	}
+	result := map[string]any{}
+	if info := databaseInfo(service.activeConfig); info != nil {
+		result["databaseInfo"] = info
+	}
+	return result, nil
 }
 
 func openClient(config connectionConfig) (*clientSession, error) {
-	if hasTLSOptions(config) {
-		return nil, errors.New("ZooKeeper TLS is not supported")
+	tlsConfig, err := buildZooKeeperTLSConfig(config)
+	if err != nil {
+		return nil, err
 	}
 	authScheme := resolveAuthScheme(config)
 	if authScheme != defaultAuthScheme && authScheme != saslDigestAuthScheme {
@@ -163,16 +181,16 @@ func openClient(config connectionConfig) (*clientSession, error) {
 	}
 	connectionTimeout := millisecondsOrDefault(config.ConnectionTimeoutMS, defaultConnectionTimeout)
 	probeTimeout := minDuration(defaultProbeTimeout, connectionTimeout)
-	if err := requireReachableServer(target.Servers, probeTimeout); err != nil {
+	if err := requireReachableServer(target.Servers, probeTimeout, tlsConfig); err != nil {
 		return nil, err
 	}
 
-	dialer := newZooKeeperDialer(connectionTimeout, nil)
+	dialer := newZooKeeperDialer(connectionTimeout, nil, tlsConfig)
 	if authScheme == saslDigestAuthScheme {
 		dialer = newZooKeeperDialer(connectionTimeout, &saslDigestCredentials{
 			Username: strings.TrimSpace(config.Username),
 			Password: config.Password,
-		})
+		}, tlsConfig)
 	}
 
 	sessionTimeout := millisecondsOrDefault(config.SessionTimeoutMS, defaultSessionTimeout)
@@ -238,13 +256,13 @@ func openClient(config connectionConfig) (*clientSession, error) {
 	return session, nil
 }
 
-func newZooKeeperDialer(connectionTimeout time.Duration, credentials *saslDigestCredentials) zk.Dialer {
+func newZooKeeperDialer(connectionTimeout time.Duration, credentials *saslDigestCredentials, tlsConfig *tls.Config) zk.Dialer {
 	return func(network, address string, libraryTimeout time.Duration) (net.Conn, error) {
 		timeout := libraryTimeout
 		if timeout <= 0 || connectionTimeout < timeout {
 			timeout = connectionTimeout
 		}
-		connection, err := net.DialTimeout(network, address, timeout)
+		connection, err := dialZooKeeperConnection(address, timeout, tlsConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -272,6 +290,78 @@ func connectionString(config connectionConfig) string {
 	return net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(port))
 }
 
+func databaseInfo(config connectionConfig) map[string]any {
+	info := map[string]any{"productName": "ZooKeeper"}
+	target, err := parseConnectTarget(connectionString(config))
+	if err != nil {
+		return info
+	}
+	tlsConfig, err := buildZooKeeperTLSConfig(config)
+	if err != nil {
+		return info
+	}
+	if version := detectServerVersion(target.Servers, millisecondsOrDefault(config.ConnectionTimeoutMS, defaultConnectionTimeout), tlsConfig); version != "" {
+		info["productVersion"] = version
+	}
+	return info
+}
+
+func detectServerVersion(servers []string, timeout time.Duration, tlsConfig *tls.Config) string {
+	deadline := timeout
+	if deadline <= 0 || deadline > 2*time.Second {
+		deadline = 2 * time.Second
+	}
+	for _, server := range servers {
+		address, err := endpointAddress(server)
+		if err != nil {
+			continue
+		}
+		// ZooKeeper 3.5+ whitelists only "srvr" by default; "envi"/"stat"
+		// are opt-in, so probe srvr first for default-config clusters.
+		for _, command := range []string{"srvr", "envi", "stat"} {
+			connection, err := dialZooKeeperConnection(address, deadline, tlsConfig)
+			if err != nil {
+				continue
+			}
+			_ = connection.SetDeadline(time.Now().Add(deadline))
+			if _, err := connection.Write([]byte(command)); err != nil {
+				connection.Close()
+				continue
+			}
+			buffer := make([]byte, 16*1024)
+			count, _ := connection.Read(buffer)
+			if version := parseServerVersion(string(buffer[:count])); version != "" {
+				connection.Close()
+				return version
+			}
+			connection.Close()
+		}
+	}
+	return ""
+}
+
+func parseServerVersion(response string) string {
+	for _, line := range strings.Split(response, "\n") {
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			parts = strings.SplitN(line, ":", 2)
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		key = strings.NewReplacer(" ", ".", "_", ".").Replace(key)
+		if len(parts) == 2 && key == "zookeeper.version" {
+			version := strings.TrimSpace(parts[1])
+			// Drop the ", built on ..." suffix envi/stat/srvr carry so only
+			// the version itself is shown.
+			if idx := strings.Index(version, ","); idx >= 0 {
+				version = strings.TrimSpace(version[:idx])
+			}
+			return version
+		}
+	}
+	return ""
+}
+
 func parseConnectTarget(value string) (connectTarget, error) {
 	connectString := strings.TrimSpace(strings.TrimPrefix(value, "zookeeper://"))
 	slash := strings.Index(connectString, "/")
@@ -294,7 +384,7 @@ func parseConnectTarget(value string) (connectTarget, error) {
 	return connectTarget{Servers: servers, Chroot: chroot}, nil
 }
 
-func requireReachableServer(servers []string, timeout time.Duration) error {
+func requireReachableServer(servers []string, timeout time.Duration, tlsConfig *tls.Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+500*time.Millisecond)
 	defer cancel()
 	workers := minInt(len(servers), maximumReachabilityWorkers)
@@ -310,7 +400,7 @@ func requireReachableServer(servers []string, timeout time.Duration) error {
 				if err != nil {
 					continue
 				}
-				connection, err := net.DialTimeout("tcp", address, timeout)
+				connection, err := dialZooKeeperConnection(address, timeout, tlsConfig)
 				if err == nil {
 					connection.Close()
 					select {
@@ -401,16 +491,6 @@ func connectionURLParams(config connectionConfig) url.Values {
 	return parsed
 }
 
-func hasTLSOptions(config connectionConfig) bool {
-	return config.SSL || firstNonBlank(
-		config.CACertPath,
-		config.ClientCertPath,
-		config.ClientKeyPath,
-		config.CertPath,
-		config.KeyPath,
-	) != ""
-}
-
 func joinPrefix(chroot, namespace string) string {
 	parts := make([]string, 0, 2)
 	if normalized := normalizePrefix(chroot); normalized != "" {
@@ -460,6 +540,7 @@ func (service *server) closeClient() {
 		service.activeClient.Close()
 		service.activeClient = nil
 	}
+	service.activeConfig = connectionConfig{}
 }
 
 func (session *clientSession) Close() {
