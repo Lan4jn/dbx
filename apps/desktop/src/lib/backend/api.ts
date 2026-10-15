@@ -1216,4 +1216,5 @@ export const mqttListSavedTopicConfigs = forward("mqttListSavedTopicConfigs");
 export const mqttGetTopicTree = forward("mqttGetTopicTree");
 export const mqttGetMessages = forward("mqttGetMessages");
 export const mqttClearMessages = forward("mqttClearMessages");
+export const useNativeWindowDecorations = forward("useNativeWindowDecorations");
 export const mqttDeleteMessage = forward("mqttDeleteMessage");

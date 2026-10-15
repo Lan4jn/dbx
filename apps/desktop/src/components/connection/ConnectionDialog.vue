@@ -6625,7 +6625,7 @@ function addHttpTunnel() {
 function addGatewayTunnel() {
   if (hasGatewayLayer.value) return;
   const next: TransportLayerConfig = { type: "dbx_gateway", ...defaultGatewayTunnel(), name: t("connection.gatewayDefaultName") };
-  form.value.transport_layers = [...transportLayers.value, next];
+  form.value.transport_layers = normalizeGatewayLayerOrder([...transportLayers.value, next]);
   selectedTransportLayerId.value = next.id;
   resetTestState();
 }

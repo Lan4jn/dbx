@@ -32,8 +32,8 @@ export function shouldReserveMacTrafficLightInset(isMac: boolean, isFullscreen: 
   return isDesktop && isMac && !isFullscreen;
 }
 
-export function shouldShowWindowControls(isMac: boolean, isDesktop = true): boolean {
-  return isDesktop && !isMac;
+export function shouldShowWindowControls(isMac: boolean, isDesktop = true, nativeDecorations = false): boolean {
+  return isDesktop && !isMac && !nativeDecorations;
 }
 
 export function shouldDrawDesktopWindowFrame(isMac: boolean, isDesktop = true, isWindows = false): boolean {
@@ -69,7 +69,8 @@ export function useWindowControls() {
   const isAlwaysOnTop = ref(false);
   const isMac = isMacOS();
   const isDesktop = isTauriRuntime();
-  const showControls = shouldShowWindowControls(isMac, isDesktop);
+  const nativeDecorations = ref(false);
+  const showControls = ref(shouldShowWindowControls(isMac, isDesktop, nativeDecorations.value));
 
   let unlistenResize: (() => void) | null = null;
   let unlistenFocus: (() => void) | null = null;
@@ -89,6 +90,18 @@ export function useWindowControls() {
     if (!isDesktop) return;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     isAlwaysOnTop.value = await getCurrentWindow().isAlwaysOnTop();
+  }
+
+  async function updateDecorations() {
+    if (!isDesktop) return;
+    try {
+      const usesNative = await api.useNativeWindowDecorations();
+      nativeDecorations.value = usesNative;
+      showControls.value = shouldShowWindowControls(isMac, isDesktop, usesNative);
+    } catch {
+      nativeDecorations.value = false;
+      showControls.value = shouldShowWindowControls(isMac, isDesktop, false);
+    }
   }
 
   async function minimize() {
@@ -121,6 +134,7 @@ export function useWindowControls() {
 
   onMounted(async () => {
     if (!isDesktop) return;
+    await updateDecorations();
     await updateWindowState();
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const currentWindow = getCurrentWindow();

@@ -16,6 +16,8 @@ const appBuildScript = readFileSync(resolve(process.cwd(), "src-tauri/build.rs")
 const wryWebView2Source = readFileSync(resolve(process.cwd(), "vendor/wry/src/webview2/mod.rs"), "utf8");
 const ciWorkflow = readFileSync(resolve(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const releaseWorkflow = readFileSync(resolve(process.cwd(), ".github/workflows/release.yml"), "utf8");
+const windowsPortableBuildScript = readFileSync(resolve(process.cwd(), "scripts/build-windows-portable.ps1"), "utf8");
+const appLibRs = readFileSync(resolve(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
 
 describe("Windows offline installer template", () => {
   it("routes supported legacy Windows users from generic installers to the fixed-runtime package", () => {
@@ -183,16 +185,31 @@ describe("Windows 7 fixed WebView2 runtime bundle", () => {
     expect(releaseWorkflow).toContain("./.github/scripts/assert-win7-installer-content.ps1");
   });
 
-  it("builds the Windows 7 executable with the production custom protocol", () => {
+  it("builds the Windows 7 executable with the production custom protocol and native decorations", () => {
     expect(appCargoToml).toContain('custom-protocol = ["tauri/custom-protocol"]');
     expect(appBuildScript).toContain("CARGO_FEATURE_CUSTOM_PROTOCOL");
     expect(appBuildScript).toContain("CARGO_CFG_TARGET_VENDOR");
-    expect(ciWorkflow).toContain("build --locked --package dbx --release --features custom-protocol");
+    expect(ciWorkflow).toContain("build --locked --package dbx --release --features custom-protocol,legacy-native-window-decorations");
     expect(ciWorkflow).toContain("--target x86_64-win7-windows-msvc --timings");
-    expect(releaseWorkflow).toContain("--release --features custom-protocol --target x86_64-win7-windows-msvc");
+    expect(releaseWorkflow).toContain("--release --features custom-protocol,legacy-native-window-decorations --target x86_64-win7-windows-msvc");
     expect(ciWorkflow).toContain("TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw");
     expect(releaseWorkflow).toContain("TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw");
     expect(ciWorkflow).toContain("target-feature=+crt-static");
     expect(releaseWorkflow).toContain("target-feature=+crt-static");
+  });
+
+  it("builds both portable Windows executables with the production custom protocol", () => {
+    expect(windowsPortableBuildScript).toContain('Invoke-DbxCargoBuild -Manifest $modernManifest -TargetDir $modernTargetDir -Toolchain "" -BuildTarget $Target -Features "custom-protocol"');
+    expect(windowsPortableBuildScript).toContain('Invoke-DbxCargoBuild -Manifest $legacyManifest -TargetDir $legacyTargetDir -Toolchain $LegacyRustToolchain -BuildTarget $LegacyTarget -Features "custom-protocol,legacy-native-window-decorations" -BuildStd');
+  });
+
+  it("stops portable packaging after frontend or Rust compilation fails", () => {
+    expect(windowsPortableBuildScript).toContain('throw "Cargo build failed for $BuildTarget with exit code $LASTEXITCODE"');
+    expect(windowsPortableBuildScript).toContain('throw "Frontend build failed with exit code $LASTEXITCODE"');
+  });
+
+  it("keeps Windows desktop builds multi-instance", () => {
+    expect(appLibRs).toMatch(/fn should_enable_single_instance\(debug_build: bool\) -> bool \{\r?\n\s+let _ = debug_build;\r?\n\s+false\r?\n\}/);
+    expect(appLibRs).toContain("if should_enable_single_instance(cfg!(debug_assertions))");
   });
 });

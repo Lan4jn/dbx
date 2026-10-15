@@ -162,9 +162,57 @@ pub fn load_config_file(path: &Path) -> Result<GatewayConfig, GatewayError> {
         .map_err(|error| config_error(format!("configuration is invalid: {}", error.message())))?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
+    validate_no_parent_traversal(&config)?;
     resolve_paths(&mut config, base_dir);
     validate_config(&config)?;
     Ok(config)
+}
+
+fn validate_no_parent_traversal(config: &GatewayConfig) -> Result<(), GatewayError> {
+    match config {
+        GatewayConfig::Main(main) => {
+            check_parent_traversal(&main.certificate, "certificate")?;
+            check_parent_traversal(&main.private_key, "private_key")?;
+            check_parent_traversal(&main.edge_ca_certificate, "edge_ca_certificate")?;
+            check_parent_traversal(&main.client_ca_certificate, "client_ca_certificate")?;
+            if let Some(state_file) = &main.state_file {
+                check_parent_traversal(state_file, "state_file")?;
+            }
+            if let Some(enrollment) = &main.enrollment {
+                match &enrollment.pki {
+                    PkiEndpointConfig::Unix { unix_socket } => check_parent_traversal(unix_socket, "unix_socket")?,
+                    PkiEndpointConfig::Remote { ca_certificate, certificate, private_key, .. } => {
+                        check_parent_traversal(ca_certificate, "ca_certificate")?;
+                        check_parent_traversal(certificate, "certificate")?;
+                        check_parent_traversal(private_key, "private_key")?;
+                    }
+                }
+            }
+        }
+        GatewayConfig::Edge(edge) => {
+            check_parent_traversal(&edge.certificate, "certificate")?;
+            check_parent_traversal(&edge.private_key, "private_key")?;
+            check_parent_traversal(&edge.ca_certificate, "ca_certificate")?;
+            if let Some(bootstrap) = &edge.bootstrap {
+                check_parent_traversal(&bootstrap.token_file, "bootstrap token_file")?;
+            }
+            for target in edge.targets.values() {
+                if let TargetAddress::Unix { unix } = &target.address {
+                    check_parent_traversal(unix, "target unix address")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_parent_traversal(path: &Path, field: &str) -> Result<(), GatewayError> {
+    let s = path.to_string_lossy();
+    let normalized = s.replace('\\', "/");
+    if normalized.split('/').any(|segment| segment == "..") {
+        return Err(config_error(format!("configuration {field} path must not contain parent traversal")));
+    }
+    Ok(())
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, GatewayError> {
@@ -455,12 +503,29 @@ fn validate_regular_file(path: &Path, field: &str) -> Result<(), GatewayError> {
 fn validate_no_symlink_components(path: &Path, field: &str) -> Result<(), GatewayError> {
     use std::path::Component;
 
+    #[cfg(windows)]
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    #[cfg(windows)]
+    let check_path = Path::new(&normalized);
+    #[cfg(not(windows))]
+    let check_path = path;
+
     let mut current = PathBuf::new();
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
+    for component in check_path.components() {
+        if matches!(component, Component::ParentDir)
+            || matches!(component, Component::Normal(name) if name == "..")
+        {
             return Err(config_error(format!("configuration {field} path must not contain parent traversal")));
         }
+        if matches!(component, Component::CurDir)
+            || matches!(component, Component::Normal(name) if name == ".")
+        {
+            continue;
+        }
         current.push(component);
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&current)
             .map_err(|_| config_error(format!("configuration {field} path could not be inspected")))?;
         if metadata.file_type().is_symlink() {

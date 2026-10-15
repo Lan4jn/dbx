@@ -6750,6 +6750,10 @@ export async function exportQueryResultMarkdown(filePath: string, columns: strin
   });
 }
 
+export async function useNativeWindowDecorations(): Promise<boolean> {
+  return invoke("use_native_window_decorations");
+}
+
 export async function exportQueryResultHtml(filePath: string, title: string | undefined, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {
   return invoke("export_query_result_html", {
     request: {

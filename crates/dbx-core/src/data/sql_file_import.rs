@@ -26,9 +26,10 @@ use crate::query::{
 };
 use crate::sql::{
     optimize_sql_file_import_statements, optimize_sql_file_import_statements_with_max_insert_batch_statements,
-    prepare_sql_file_statement, split_sql_batches, starts_with_sqlserver_module_ddl, statement_summary,
-    SqlFileImportStatement, SqlFileImportStatementKind, SqlFilePhase, SqlFileProgress, SqlFileRequest,
-    SqlFileStatementAction, SqlFileStatus, SqlParsingOptions, SqlStatementSplitter, SqlStatementWithControl,
+    prepare_sql_file_statement, split_sql_batches, sql_file_statement_fragment, starts_with_sqlserver_module_ddl,
+    statement_summary, SqlFileImportStatement, SqlFileImportStatementKind, SqlFilePhase, SqlFileProgress,
+    SqlFileRequest, SqlFileStatementAction, SqlFileStatus, SqlParsingOptions, SqlStatementSplitter,
+    SqlStatementWithControl,
 };
 use crate::types::QueryResult;
 
@@ -118,6 +119,23 @@ const SQL_FILE_STATEMENT_BATCH_SIZE: usize = 256;
 const SQL_FILE_STATEMENT_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SQL_FILE_PREVIEW_ENCODING_SAMPLE_BYTES: usize = 1024 * 1024;
 const SQL_FILE_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+const SQL_FILE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const SQL_FILE_CURRENT_STATEMENT_MAX_BYTES: usize = 2 * 1024;
+
+async fn await_with_progress_heartbeat<F, T, H>(future: F, interval: Duration, mut heartbeat: H) -> T
+where
+    F: std::future::Future<Output = T>,
+    H: FnMut(),
+{
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = timer.tick() => heartbeat(),
+        }
+    }
+}
 
 struct SqlFileReadProgress {
     bytes_read: Arc<AtomicU64>,
@@ -2503,6 +2521,13 @@ async fn execute_statement_with_progress(
     emit: &mut impl FnMut(SqlFileProgress),
 ) -> Result<bool, String> {
     let statement = &controlled_statement.statement;
+    let emit = &mut |mut progress: SqlFileProgress| {
+        if progress.current_statement.is_none() {
+            progress.current_statement =
+                Some(sql_file_statement_fragment(&statement.sql, SQL_FILE_CURRENT_STATEMENT_MAX_BYTES));
+        }
+        emit(progress);
+    };
     let continue_on_error = request.continue_on_error && !controlled_statement.stop_on_error;
     if token.is_cancelled() {
         let summary = statement_summary(&statement.sql);
@@ -2561,11 +2586,24 @@ async fn execute_statement_with_progress(
         None,
     ));
 
-    let result = {
+    let execution = {
         let mysql_executor = mysql_executor.as_deref_mut();
         execute_sql_file_statement_with_executor(state, request, &statement.sql, token, statement_index, mysql_executor)
-            .await
     };
+    let result = await_with_progress_heartbeat(execution, SQL_FILE_HEARTBEAT_INTERVAL, || {
+        emit(sql_file_progress(
+            &request.execution_id,
+            SqlFileStatus::Running,
+            statement_index,
+            *success_count,
+            *failure_count,
+            *affected_rows,
+            started_at,
+            &summary,
+            None,
+        ));
+    })
+    .await;
 
     match result {
         Ok(result) => {
@@ -2642,6 +2680,11 @@ async fn execute_merged_statement_fallback_with_progress(
     emit: &mut impl FnMut(SqlFileProgress),
 ) -> Result<bool, String> {
     for (offset, source_sql) in statement.source_sqls.iter().enumerate() {
+        let emit = &mut |mut progress: SqlFileProgress| {
+            progress.current_statement =
+                Some(sql_file_statement_fragment(source_sql, SQL_FILE_CURRENT_STATEMENT_MAX_BYTES));
+            emit(progress);
+        };
         let statement_index = first_statement_index + offset;
         if token.is_cancelled() {
             emit(sql_file_progress(
@@ -2671,16 +2714,29 @@ async fn execute_merged_statement_fallback_with_progress(
             None,
         ));
 
-        match execute_sql_file_statement_with_executor(
+        let execution = execute_sql_file_statement_with_executor(
             state,
             request,
             source_sql,
             token,
             statement_index,
             mysql_executor.as_deref_mut(),
-        )
-        .await
-        {
+        );
+        let result = await_with_progress_heartbeat(execution, SQL_FILE_HEARTBEAT_INTERVAL, || {
+            emit(sql_file_progress(
+                &request.execution_id,
+                SqlFileStatus::Running,
+                statement_index,
+                *success_count,
+                *failure_count,
+                *affected_rows,
+                started_at,
+                &summary,
+                None,
+            ));
+        })
+        .await;
+        match result {
             Ok(result) => {
                 *success_count += 1;
                 *affected_rows += result.affected_rows;
@@ -3322,6 +3378,29 @@ mod tests {
                 SqlFileStatus::Done,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn await_with_progress_heartbeat_ticks_until_the_future_completes() {
+        let heartbeat_count = Cell::new(0usize);
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let mut complete_tx = Some(complete_tx);
+        let result = await_with_progress_heartbeat(
+            async {
+                complete_rx.await.unwrap();
+                42
+            },
+            Duration::from_millis(1),
+            || {
+                heartbeat_count.set(heartbeat_count.get() + 1);
+                if heartbeat_count.get() == 3 {
+                    complete_tx.take().unwrap().send(()).unwrap();
+                }
+            },
+        )
+        .await;
+        assert_eq!(result, 42);
+        assert!(heartbeat_count.get() >= 3);
     }
 
     #[test]

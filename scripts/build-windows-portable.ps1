@@ -73,6 +73,9 @@ function Invoke-DbxCargoBuild {
     } else {
       cargo build --manifest-path $Manifest --target $BuildTarget --release @featureArgs
     }
+    if ($LASTEXITCODE -ne 0) {
+      throw "Cargo build failed for $BuildTarget with exit code $LASTEXITCODE"
+    }
   } finally {
     Pop-Location
   }
@@ -291,6 +294,9 @@ if (-not $SkipFrontendBuild) {
   Push-Location $repoRoot
   try {
     pnpm build
+    if ($LASTEXITCODE -ne 0) {
+      throw "Frontend build failed with exit code $LASTEXITCODE"
+    }
   } finally {
     Pop-Location
   }
@@ -319,7 +325,7 @@ if ($buildLegacy) {
   $legacyManifest = Join-Path $repoRoot "src-tauri\Cargo.toml"
   $legacyTargetDir = Join-Path $repoRoot "src-tauri\target-win7-x64"
   if (-not $SkipRustBuild) {
-    Invoke-DbxCargoBuild -Manifest $legacyManifest -TargetDir $legacyTargetDir -Toolchain $LegacyRustToolchain -BuildTarget $LegacyTarget -Features "custom-protocol" -BuildStd
+    Invoke-DbxCargoBuild -Manifest $legacyManifest -TargetDir $legacyTargetDir -Toolchain $LegacyRustToolchain -BuildTarget $LegacyTarget -Features "custom-protocol,legacy-native-window-decorations" -BuildStd
   }
   $legacyReleaseDir = Join-Path $legacyTargetDir "$LegacyTarget\release"
   $legacyExePath = Join-Path $legacyReleaseDir "dbx.exe"

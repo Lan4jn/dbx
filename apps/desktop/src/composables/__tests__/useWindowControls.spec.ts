@@ -14,6 +14,10 @@ describe("window controls", () => {
     expect(shouldShowWindowControls(false, false)).toBe(false);
   });
 
+  it("hides custom controls when Windows uses native decorations", () => {
+    expect(shouldShowWindowControls(false, true, true)).toBe(false);
+  });
+
   it("draws an app frame only for self-decorated non-Windows desktop windows", () => {
     expect(shouldDrawDesktopWindowFrame(false, true, false)).toBe(true);
     expect(shouldDrawDesktopWindowFrame(false, true, true)).toBe(false);

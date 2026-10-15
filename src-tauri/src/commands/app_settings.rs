@@ -553,6 +553,11 @@ fn default_agent_store_dir(app: &AppHandle) -> Result<PathBuf, String> {
     })
 }
 
+#[tauri::command]
+pub fn use_native_window_decorations() -> bool {
+    crate::use_native_window_decorations_for_platform(std::env::consts::OS)
+}
+
 pub(crate) fn resolve_driver_store_dirs_from_settings(
     settings: &DesktopSettings,
     data_dir: &Path,

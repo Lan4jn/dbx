@@ -245,9 +245,14 @@ fn should_fallback_to_native_quit(target: &str, frontend_ready: bool) -> bool {
     target == "quit" && !frontend_ready
 }
 
+pub(crate) fn use_native_window_decorations_for_platform(target_os: &str) -> bool {
+    cfg!(feature = "legacy-native-window-decorations") && target_os == "windows"
+}
+
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
     match target_os {
-        "windows" | "linux" => Some(false),
+        "windows" => Some(use_native_window_decorations_for_platform(target_os)),
+        "linux" => Some(false),
         _ => None,
     }
 }
@@ -1348,7 +1353,10 @@ mod tests {
 
     #[test]
     fn overrides_native_window_decorations_for_desktop_platforms() {
-        assert_eq!(native_window_decorations_override("windows"), Some(false));
+        assert_eq!(
+            native_window_decorations_override("windows"),
+            Some(cfg!(feature = "legacy-native-window-decorations"))
+        );
         assert_eq!(native_window_decorations_override("linux"), Some(false));
         assert_eq!(native_window_decorations_override("macos"), None);
     }
@@ -2090,6 +2098,7 @@ pub fn run() {
             commands::app_settings::complete_app_close,
             commands::app_settings::mark_frontend_ready,
             commands::app_settings::request_app_close_from_window_controls,
+            commands::app_settings::use_native_window_decorations,
             commands::window_controls::set_macos_traffic_light_position,
             commands::window_controls::get_linux_window_control_icons,
             commands::app_settings::set_driver_store_dir,

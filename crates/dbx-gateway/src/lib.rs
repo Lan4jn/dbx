@@ -68,11 +68,50 @@ async fn dispatch_gateway_command(
                                 gateway.shutdown().await;
                                 break;
                             }
-                            GatewaySignal::Reload => {
-                                if let Ok(config::GatewayConfig::Main(config)) = config::load_config_file(config_path) {
-                                    let _ = gateway.reload(*config).await;
+                            GatewaySignal::Reload => match config::load_config_file(config_path) {
+                                Ok(config::GatewayConfig::Main(config)) => match gateway.reload(*config).await {
+                                    Ok(_) => error::log_diagnostic(
+                                        "info",
+                                        "main",
+                                        "reload_succeeded",
+                                        serde_json::json!({ "mode": "main" }),
+                                    ),
+                                    Err(error) => error::log_diagnostic(
+                                        "error",
+                                        "main",
+                                        "reload_failed",
+                                        serde_json::json!({
+                                            "mode": "main",
+                                            "code": error.code,
+                                            "detail": error.message,
+                                        }),
+                                    ),
+                                },
+                                Ok(config::GatewayConfig::Edge(_)) => {
+                                    error::log_diagnostic(
+                                        "error",
+                                        "main",
+                                        "reload_failed",
+                                        serde_json::json!({
+                                            "mode": "main",
+                                            "code": GatewayErrorCode::ConfigInvalid,
+                                            "detail": "reloaded config is not for main mode",
+                                        }),
+                                    );
                                 }
-                            }
+                                Err(error) => {
+                                    error::log_diagnostic(
+                                        "error",
+                                        "main",
+                                        "reload_failed",
+                                        serde_json::json!({
+                                            "mode": "main",
+                                            "code": error.code,
+                                            "detail": error.message,
+                                        }),
+                                    );
+                                }
+                            },
                         }
                     }
                 }
@@ -84,14 +123,58 @@ async fn dispatch_gateway_command(
                                 gateway.shutdown().await;
                                 break;
                             }
-                            GatewaySignal::Reload => {
-                                if let Ok(config::GatewayConfig::Edge(config)) = config::load_config_file(config_path) {
-                                    if let Ok(reloaded) = edge_gateway::EdgeGateway::start(*config) {
-                                        gateway.shutdown().await;
-                                        gateway = reloaded;
+                            GatewaySignal::Reload => match config::load_config_file(config_path) {
+                                Ok(config::GatewayConfig::Edge(config)) => {
+                                    match edge_gateway::EdgeGateway::start(*config) {
+                                        Ok(reloaded) => {
+                                            gateway.shutdown().await;
+                                            gateway = reloaded;
+                                            error::log_diagnostic(
+                                                "info",
+                                                "edge",
+                                                "reload_succeeded",
+                                                serde_json::json!({ "mode": "edge" }),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            error::log_diagnostic(
+                                                "error",
+                                                "edge",
+                                                "reload_failed",
+                                                serde_json::json!({
+                                                    "mode": "edge",
+                                                    "code": error.code,
+                                                    "detail": error.message,
+                                                }),
+                                            );
+                                        }
                                     }
                                 }
-                            }
+                                Ok(config::GatewayConfig::Main(_)) => {
+                                    error::log_diagnostic(
+                                        "error",
+                                        "edge",
+                                        "reload_failed",
+                                        serde_json::json!({
+                                            "mode": "edge",
+                                            "code": GatewayErrorCode::ConfigInvalid,
+                                            "detail": "reloaded config is not for edge mode",
+                                        }),
+                                    );
+                                }
+                                Err(error) => {
+                                    error::log_diagnostic(
+                                        "error",
+                                        "edge",
+                                        "reload_failed",
+                                        serde_json::json!({
+                                            "mode": "edge",
+                                            "code": error.code,
+                                            "detail": error.message,
+                                        }),
+                                    );
+                                }
+                            },
                         }
                     }
                 }

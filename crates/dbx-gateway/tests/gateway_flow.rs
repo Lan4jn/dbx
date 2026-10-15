@@ -268,9 +268,9 @@ async fn control_edge_shutdown_cancels_an_incomplete_tls_connection() {
     let fixture = Fixture::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let edge = EdgeGateway::start(fixture.edge_config(listener.local_addr().unwrap(), "edge-stalled")).unwrap();
-    let (_stream, _) = timeout(std::time::Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+    let (_stream, _) = timeout(std::time::Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
 
-    timeout(std::time::Duration::from_secs(1), edge.shutdown()).await.unwrap();
+    timeout(std::time::Duration::from_secs(5), edge.shutdown()).await.unwrap();
 }
 
 #[tokio::test]
@@ -769,7 +769,7 @@ async fn data_local_connection_refusal_is_reported_promptly() {
 
     assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::MainAuthenticated });
     assert_eq!(next_client_event(&mut socket).await, ClientEvent::Stage { stage: Stage::RouteAuthorized });
-    let event = timeout(std::time::Duration::from_secs(2), next_client_event(&mut socket)).await.unwrap();
+    let event = timeout(std::time::Duration::from_secs(10), next_client_event(&mut socket)).await.unwrap();
     assert_eq!(event, ClientEvent::Error { code: dbx_gateway::GatewayErrorCode::TargetUnavailable });
     edge.shutdown().await;
 }

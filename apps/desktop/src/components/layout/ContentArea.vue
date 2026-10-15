@@ -160,6 +160,8 @@ import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { canCancelQueryExecution, isActiveResultLoading, queryExecutionLabelKey, shouldShowCancelAction } from "@/lib/sql/queryExecutionState";
 import { sqlErrorDisplayPosition, sqlErrorEditorOffset, logSqlErrorPosition } from "@/lib/sql/errorPosition";
+import { buildSqlErrorPresentation } from "@/lib/sql/sqlDiagnostics";
+import QueryErrorDetails from "@/components/common/QueryErrorDetails.vue";
 import {
   databaseDisplayNameForTab,
   executionSummaryItems,
@@ -524,6 +526,14 @@ const activeQueryError = computed(() => {
   const result = props.activeTab.result;
   if (!result || !isQueryExecutionErrorResult(result)) return "";
   return String(result.rows[0]?.[0] ?? "");
+});
+const activeQueryErrorPresentation = computed(() => {
+  if (!activeQueryError.value || props.activeTab.mode !== "query") return null;
+  const options = activeResultErrorOffsetOptions();
+  const mapped = sqlErrorEditorOffset(options);
+  const range = resultSourceRange(options.editorSql, options.result ?? undefined, options.resultIndex, options.databaseType, options.parameterOptions);
+  if (!mapped || !range) return null;
+  return buildSqlErrorPresentation(`Position: ${mapped.offset - range.from + 1}`, range.sql);
 });
 const hasQueryOutput = computed(() => tabHasQueryOutput(props.activeTab));
 // 结果集页签/列表的名称是否带库名，由编辑器设置控制（默认带库名）
@@ -2822,6 +2832,7 @@ defineExpose({
                   />
                 </template>
                 <template v-if="activeTab.result && isQueryExecutionErrorResult(activeTab.result)" #error-actions="{ errorMessage }">
+                  <QueryErrorDetails v-if="activeQueryErrorPresentation" :presentation="activeQueryErrorPresentation" />
                   <QueryErrorActions
                     :error-message="String(errorMessage)"
                     :backend-error="activeTab.result.error"
@@ -3243,7 +3254,8 @@ defineExpose({
           @change-query-timeout="(connectionId: string) => emit('openConnectionSettings', connectionId, 'advanced')"
         >
           <template v-if="activeTab.result && isQueryExecutionErrorResult(activeTab.result)" #error-actions="{ errorMessage }">
-            <QueryErrorActions
+            <QueryErrorDetails v-if="activeQueryErrorPresentation" :presentation="activeQueryErrorPresentation" />
+                  <QueryErrorActions
               :error-message="String(errorMessage)"
               :backend-error="activeTab.result.error"
               :connection-id="activeResultConnectionId"

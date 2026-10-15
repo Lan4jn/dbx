@@ -33,6 +33,7 @@ import { orderConnectionsForSidebarDisplay } from "@/lib/sidebar/connectionListS
 import SqlFileProgressIndicator from "./SqlFileProgressIndicator.vue";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
 import { translateBackendError } from "@/i18n/backend-errors";
+import { sqlFileCurrentStatement } from "@/lib/sql/sqlFileProgress";
 import { Check, CheckSquare, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
 
 const { t } = useI18n();
@@ -1156,12 +1157,12 @@ watch(
             </div>
           </template>
 
-          <div v-if="progress?.statementSummary" class="space-y-1">
-            <Label class="text-xs">{{ t("sqlFile.currentStatement") }}</Label>
-            <div class="max-h-20 max-w-full overflow-auto rounded-md border bg-muted/15 p-2 text-xs font-mono whitespace-pre">
-              {{ progress.statementSummary }}
+          <details v-if="sqlFileCurrentStatement(progress)" class="min-w-0 space-y-1">
+            <summary class="cursor-pointer text-xs text-muted-foreground">{{ t("sqlFile.currentStatement") }}</summary>
+            <div class="max-h-40 max-w-full overflow-auto rounded-md border bg-muted/15 p-2 text-xs font-mono whitespace-pre">
+              {{ sqlFileCurrentStatement(progress) }}
             </div>
-          </div>
+          </details>
 
           <!-- The list is capped in memory while the backend log keeps every
                failed statement, so the export/copy actions live in the shared

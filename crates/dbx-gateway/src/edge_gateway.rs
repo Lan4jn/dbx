@@ -23,6 +23,7 @@ use x509_parser::prelude::parse_x509_certificate;
 use zeroize::Zeroizing;
 
 use crate::config::{EdgeBootstrapConfig, EdgeConfig, TargetAddress};
+use crate::error::log_diagnostic;
 use crate::limits::TargetPolicy;
 use crate::pki::{EnrollCsrRequest, EnrollCsrResponse};
 use crate::protocol::{
@@ -36,6 +37,7 @@ use crate::{GatewayError, GatewayErrorCode};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CLOCK_SKEW_MILLIS: i64 = 10 * 60 * 1_000;
 
 pub struct EdgeGateway {
     shutdown: watch::Sender<bool>,
@@ -97,12 +99,33 @@ async fn run_entry(config: EdgeConfig, tls: Option<Arc<ClientConfig>>, stop: wat
     let mut tls = match tls {
         Some(tls) => tls,
         None => {
-            if bootstrap_edge(&config).await.is_err() {
+            if let Err(error) = bootstrap_edge(&config).await {
+                log_diagnostic(
+                    "error",
+                    "edge",
+                    "bootstrap_failed",
+                    serde_json::json!({
+                        "edge_id": config.edge_id,
+                        "code": error.code,
+                        "detail": error.message,
+                    }),
+                );
                 return;
             }
             match edge_tls(&config) {
                 Ok(tls) => tls,
-                Err(_) => return,
+                Err(error) => {
+                    log_diagnostic(
+                        "error",
+                        "edge",
+                        "credential_reload_failed",
+                        serde_json::json!({
+                            "edge_id": config.edge_id,
+                            "code": error.code,
+                        }),
+                    );
+                    return;
+                }
             }
         }
     };
@@ -110,10 +133,34 @@ async fn run_entry(config: EdgeConfig, tls: Option<Arc<ClientConfig>>, stop: wat
         .bootstrap
         .as_ref()
         .is_some_and(|bootstrap| certificate_needs_renewal(&config.certificate, bootstrap.renew_before_days))
-        && renew_edge_certificate(&config, tls.clone()).await.is_ok()
     {
-        if let Ok(reloaded) = edge_tls(&config) {
-            tls = reloaded;
+        match renew_edge_certificate(&config, tls.clone()).await {
+            Ok(()) => match edge_tls(&config) {
+                Ok(reloaded) => tls = reloaded,
+                Err(error) => {
+                    log_diagnostic(
+                        "error",
+                        "edge",
+                        "credential_reload_failed",
+                        serde_json::json!({
+                            "edge_id": config.edge_id,
+                            "code": error.code,
+                        }),
+                    );
+                }
+            },
+            Err(error) => {
+                log_diagnostic(
+                    "warn",
+                    "edge",
+                    "renewal_failed",
+                    serde_json::json!({
+                        "edge_id": config.edge_id,
+                        "code": error.code,
+                        "detail": error.message,
+                    }),
+                );
+            }
         }
     }
     run(config, tls, stop).await;
@@ -419,17 +466,55 @@ async fn run(config: EdgeConfig, tls: Arc<ClientConfig>, mut stop: watch::Receiv
                 continue;
             }
         };
-        let retry_from = if let Ok(Ok(socket)) = connected {
-            let (registered, disconnected_at) =
-                run_control_session(socket, &config, tls.clone(), stop.clone(), &mut data_tasks).await;
-            data_tasks.abort_all();
-            while data_tasks.join_next().await.is_some() {}
-            backoff.record_registration(registered);
-            disconnected_at
-        } else {
-            Instant::now()
-        };
         let delay = backoff.next_delay(jitter_percent());
+        let retry_from = match connected {
+            Ok(Ok(socket)) => {
+                let (registered, disconnected_at) =
+                    run_control_session(socket, &config, tls.clone(), stop.clone(), &mut data_tasks).await;
+                data_tasks.abort_all();
+                while data_tasks.join_next().await.is_some() {}
+                backoff.record_registration(registered);
+                if !*stop.borrow() {
+                    log_diagnostic(
+                        "warn",
+                        "edge",
+                        "control_disconnected",
+                        serde_json::json!({
+                            "edge_id": config.edge_id,
+                            "registered": registered,
+                            "retry_secs": delay.as_secs(),
+                        }),
+                    );
+                }
+                disconnected_at
+            }
+            Ok(Err(error)) => {
+                log_diagnostic(
+                    "warn",
+                    "edge",
+                    "control_connect_failed",
+                    serde_json::json!({
+                        "edge_id": config.edge_id,
+                        "code": error.code,
+                        "retry_secs": delay.as_secs(),
+                    }),
+                );
+                Instant::now()
+            }
+            Err(_) => {
+                log_diagnostic(
+                    "warn",
+                    "edge",
+                    "control_connect_failed",
+                    serde_json::json!({
+                        "edge_id": config.edge_id,
+                        "code": GatewayErrorCode::Internal,
+                        "retry_secs": delay.as_secs(),
+                    }),
+                );
+                Instant::now()
+            }
+        };
         tokio::select! {
             _ = sleep_until(retry_from + delay) => {}
             changed = stop.changed() => {
@@ -505,16 +590,52 @@ async fn run_control_session(
             .collect(),
     };
     let Ok(frame) = encode_control_frame(&registration) else {
+        log_diagnostic(
+            "warn",
+            "edge",
+            "control_protocol_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "detail": "registration frame could not be encoded",
+            }),
+        );
         return (false, Instant::now());
     };
     if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
+        log_diagnostic(
+            "warn",
+            "edge",
+            "control_protocol_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "detail": "registration frame could not be sent",
+            }),
+        );
         return (false, Instant::now());
     }
     let heartbeat_message = EdgeToMain::Heartbeat { version: ProtocolVersion::current() };
     let Ok(frame) = encode_control_frame(&heartbeat_message) else {
+        log_diagnostic(
+            "warn",
+            "edge",
+            "control_protocol_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "detail": "initial heartbeat could not be encoded",
+            }),
+        );
         return (false, Instant::now());
     };
     if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
+        log_diagnostic(
+            "warn",
+            "edge",
+            "control_protocol_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "detail": "initial heartbeat could not be sent",
+            }),
+        );
         return (false, Instant::now());
     }
 
@@ -532,14 +653,36 @@ async fn run_control_session(
             }
             _ = heartbeat.tick() => {
                 let message = EdgeToMain::Heartbeat { version: ProtocolVersion::current() };
-                let Ok(frame) = encode_control_frame(&message) else { return (registered, Instant::now()) };
+                let Ok(frame) = encode_control_frame(&message) else {
+                    log_diagnostic(
+                        "warn",
+                        "edge",
+                        "control_protocol_failed",
+                        serde_json::json!({
+                            "edge_id": config.edge_id,
+                            "detail": "heartbeat frame could not be encoded",
+                        }),
+                    );
+                    return (registered, Instant::now());
+                };
                 if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
                     return (registered, Instant::now());
                 }
             }
             completed = data_tasks.join_next(), if !data_tasks.is_empty() => {
                 if let Some(Ok(Some(message))) = completed {
-                    let Ok(frame) = encode_control_frame(&message) else { return (registered, Instant::now()) };
+                    let Ok(frame) = encode_control_frame(&message) else {
+                        log_diagnostic(
+                            "warn",
+                            "edge",
+                            "control_protocol_failed",
+                            serde_json::json!({
+                                "edge_id": config.edge_id,
+                                "detail": "data response frame could not be encoded",
+                            }),
+                        );
+                        return (registered, Instant::now());
+                    };
                     if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
                         return (registered, Instant::now());
                     }
@@ -564,7 +707,18 @@ async fn run_control_session(
                                 stop.clone(),
                             ));
                         }
-                        _ => return (registered, Instant::now()),
+                        Err(_) => {
+                            log_diagnostic(
+                                "warn",
+                                "edge",
+                                "control_protocol_failed",
+                                serde_json::json!({
+                                    "edge_id": config.edge_id,
+                                    "detail": "invalid control frame received from main",
+                                }),
+                            );
+                            return (registered, Instant::now());
+                        }
                     },
                     Message::Ping(data) => {
                         if !send_control_message(&mut socket, Message::Pong(data)).await {
@@ -592,33 +746,145 @@ async fn run_data_channel(
     stop: watch::Receiver<bool>,
 ) -> Option<EdgeToMain> {
     let failed = || EdgeToMain::DataChannelFailed { version: ProtocolVersion::current(), session_id };
-    if unix_time_ms() > expires_at_unix_ms {
+    let now = unix_time_ms();
+    if ticket_expired_for_edge(expires_at_unix_ms, now) {
+        log_diagnostic(
+            "warn",
+            "edge",
+            "ticket_expired_locally",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "target_id": target_id,
+                "skew_ms": now.saturating_sub(expires_at_unix_ms),
+            }),
+        );
         return Some(failed());
     }
-    let Some(target) = config.targets.get(&target_id) else { return Some(failed()) };
+    let Some(target) = config.targets.get(&target_id) else {
+        log_diagnostic(
+            "error",
+            "edge",
+            "target_missing",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "target_id": target_id,
+            }),
+        );
+        return Some(failed());
+    };
     match &target.address {
         TargetAddress::Tcp { tcp } => {
-            let Ok(addresses) = TargetPolicy::new(target.allow_remote).resolve_and_validate(tcp).await else {
-                return Some(failed());
+            let addresses = match TargetPolicy::new(target.allow_remote).resolve_and_validate(tcp).await {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    log_diagnostic(
+                        "error",
+                        "edge",
+                        "target_policy_rejected",
+                        serde_json::json!({
+                            "edge_id": config.edge_id,
+                            "target_id": target_id,
+                            "code": error.code,
+                        }),
+                    );
+                    return Some(failed());
+                }
             };
             let mut local = None;
+            let mut last_io_kind = None;
+            let mut last_os_code = None;
+            let mut was_timeout = false;
             for address in addresses {
-                if let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
-                    local = Some(stream);
-                    break;
+                match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+                    Ok(Ok(stream)) => {
+                        local = Some(stream);
+                        break;
+                    }
+                    Ok(Err(err)) => {
+                        last_io_kind = Some(format!("{:?}", err.kind()));
+                        last_os_code = err.raw_os_error();
+                        was_timeout = false;
+                    }
+                    Err(_) => {
+                        last_io_kind = Some("TimedOut".to_string());
+                        last_os_code = None;
+                        was_timeout = true;
+                    }
                 }
             }
-            let Some(local) = local else { return Some(failed()) };
+            let Some(local) = local else {
+                log_diagnostic(
+                    "error",
+                    "edge",
+                    "target_connect_failed",
+                    serde_json::json!({
+                        "edge_id": config.edge_id,
+                        "target_id": target_id,
+                        "io_kind": last_io_kind.unwrap_or_else(|| "Other".to_string()),
+                        "os_code": last_os_code,
+                        "timeout": was_timeout,
+                    }),
+                );
+                return Some(failed());
+            };
             if !relay_data_channel(config, tls, session_id, target_id, local, stop).await {
                 return Some(failed());
             }
         }
         TargetAddress::Unix { unix } => {
             #[cfg(unix)]
-            if let Ok(Ok(local)) = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(unix)).await {
-                if relay_data_channel(config, tls, session_id, target_id, local, stop).await {
-                    return None;
+            {
+                match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(unix)).await {
+                    Ok(Ok(local)) => {
+                        if relay_data_channel(config, tls, session_id, target_id, local, stop).await {
+                            return None;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        log_diagnostic(
+                            "error",
+                            "edge",
+                            "target_connect_failed",
+                            serde_json::json!({
+                                "edge_id": config.edge_id,
+                                "target_id": target_id,
+                                "io_kind": format!("{:?}", err.kind()),
+                                "os_code": err.raw_os_error(),
+                                "timeout": false,
+                            }),
+                        );
+                    }
+                    Err(_) => {
+                        log_diagnostic(
+                            "error",
+                            "edge",
+                            "target_connect_failed",
+                            serde_json::json!({
+                                "edge_id": config.edge_id,
+                                "target_id": target_id,
+                                "io_kind": "TimedOut",
+                                "os_code": serde_json::Value::Null,
+                                "timeout": true,
+                            }),
+                        );
+                    }
                 }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = unix;
+                log_diagnostic(
+                    "error",
+                    "edge",
+                    "target_connect_failed",
+                    serde_json::json!({
+                        "edge_id": config.edge_id,
+                        "target_id": target_id,
+                        "io_kind": "Unsupported",
+                        "os_code": serde_json::Value::Null,
+                        "timeout": false,
+                    }),
+                );
             }
             return Some(failed());
         }
@@ -637,15 +903,76 @@ async fn relay_data_channel<I>(
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let Ok(Ok(mut socket)) = tokio::time::timeout(CONNECT_TIMEOUT, connect_data(&config, tls)).await else {
+    let mut socket = match tokio::time::timeout(CONNECT_TIMEOUT, connect_data(&config, tls)).await {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(error)) => {
+            log_diagnostic(
+                "error",
+                "edge",
+                "data_connect_failed",
+                serde_json::json!({
+                    "edge_id": config.edge_id,
+                    "target_id": target_id,
+                    "code": error.code,
+                    "detail": error.message,
+                }),
+            );
+            return false;
+        }
+        Err(_) => {
+            log_diagnostic(
+                "error",
+                "edge",
+                "data_connect_failed",
+                serde_json::json!({
+                    "edge_id": config.edge_id,
+                    "target_id": target_id,
+                    "code": GatewayErrorCode::Internal,
+                    "detail": "connection to main data endpoint timed out",
+                }),
+            );
+            return false;
+        }
+    };
+    let open = EdgeDataOpen { version: ProtocolVersion::current(), session_id, target_id: target_id.clone() };
+    let Ok(frame) = encode_control_frame(&open) else {
+        log_diagnostic(
+            "error",
+            "edge",
+            "data_open_send_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "target_id": target_id,
+            }),
+        );
         return false;
     };
-    let open = EdgeDataOpen { version: ProtocolVersion::current(), session_id, target_id };
-    let Ok(frame) = encode_control_frame(&open) else { return false };
     if !send_control_message(&mut socket, Message::Binary(frame.into())).await {
+        log_diagnostic(
+            "error",
+            "edge",
+            "data_open_send_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "target_id": target_id,
+            }),
+        );
         return false;
     }
-    let _ = relay_websocket_to_io(socket, local, Duration::from_secs(300), stop).await;
+    if let Err(error) = relay_websocket_to_io(socket, local, Duration::from_secs(300), stop).await {
+        log_diagnostic(
+            "warn",
+            "edge",
+            "data_relay_failed",
+            serde_json::json!({
+                "edge_id": config.edge_id,
+                "target_id": target_id,
+                "code": error.code,
+                "detail": error.message,
+            }),
+        );
+        return false;
+    }
     true
 }
 
@@ -671,6 +998,10 @@ fn unix_time_ms() -> i64 {
         .unwrap_or_default()
 }
 
+fn ticket_expired_for_edge(expires_at_unix_ms: i64, now_unix_ms: i64) -> bool {
+    now_unix_ms > expires_at_unix_ms.saturating_add(MAX_CLOCK_SKEW_MILLIS)
+}
+
 fn tls_error(message: &str) -> GatewayError {
     GatewayError { code: GatewayErrorCode::TlsRejected, message: message.to_string() }
 }
@@ -681,7 +1012,7 @@ fn internal_error(message: &str) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{control_websocket_config, verify_server_pin};
+    use super::{control_websocket_config, ticket_expired_for_edge, verify_server_pin};
     use crate::protocol::MAX_CONTROL_FRAME_SIZE;
     use rcgen::{CertificateParams, KeyPair};
     use sha2::{Digest, Sha256};
@@ -695,6 +1026,16 @@ mod tests {
         assert_eq!(config.max_frame_size, Some(MAX_CONTROL_FRAME_SIZE));
         assert!(config.read_buffer_size <= MAX_CONTROL_FRAME_SIZE);
         assert!(config.max_write_buffer_size <= MAX_CONTROL_FRAME_SIZE * 2);
+    }
+
+    #[test]
+    fn edge_ticket_expiration_allows_ten_minutes_of_positive_clock_skew() {
+        let expires_at = 1_000_000_i64;
+
+        assert!(!ticket_expired_for_edge(expires_at, expires_at - 1));
+        assert!(!ticket_expired_for_edge(expires_at, expires_at + 10 * 60 * 1_000));
+        assert!(ticket_expired_for_edge(expires_at, expires_at + 10 * 60 * 1_000 + 1));
+        assert!(!ticket_expired_for_edge(i64::MAX - 1, i64::MAX));
     }
 
     #[test]

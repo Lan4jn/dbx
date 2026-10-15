@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use crate::config::{MainConfig, MainEnrollmentConfig, PkiEndpointConfig};
 use crate::edge_gateway::{control_websocket_config, data_websocket_config};
+use crate::error::log_diagnostic;
 use crate::health::HealthServer;
 use crate::limits::{BufferBudget, ConnectionRateLimiter, IdentityConcurrency};
 use crate::pki::{
@@ -238,15 +239,34 @@ impl MainGateway {
                 };
                 let (stream, peer) = match accepted {
                     Ok((stream, peer)) => (stream, peer),
-                    Err(_) => {
+                    Err(err) => {
+                        log_diagnostic(
+                            "warn",
+                            "main",
+                            "listener_accept_failed",
+                            serde_json::json!({
+                                "io_kind": format!("{:?}", err.kind()),
+                                "os_code": err.raw_os_error(),
+                            }),
+                        );
                         sleep(Duration::from_millis(50)).await;
                         continue;
                     }
                 };
-                if !connection_rates.allow(&peer.ip().to_string(), std::time::Instant::now()) {
+                let peer_ip = peer.ip().to_string();
+                if !connection_rates.allow(&peer_ip, std::time::Instant::now()) {
+                    log_diagnostic(
+                        "warn",
+                        "main",
+                        "connection_rate_limited",
+                        serde_json::json!({
+                            "peer_ip": peer_ip,
+                        }),
+                    );
                     continue;
                 }
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    log_diagnostic("warn", "main", "connection_capacity_exceeded", serde_json::json!({}));
                     continue;
                 };
                 let runtime = task_runtime.load_full();
@@ -256,11 +276,47 @@ impl MainGateway {
                 let connection_stop = task_shutdown.subscribe();
                 let services = task_services.clone();
                 connections.spawn(async move {
-                    let Ok(Ok(stream)) = timeout(tls_handshake_timeout, acceptor.accept(stream)).await else {
-                        return;
+                    let stream = match timeout(tls_handshake_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(err)) => {
+                            log_diagnostic(
+                                "warn",
+                                "main",
+                                "tls_handshake_failed",
+                                serde_json::json!({
+                                    "peer_ip": peer_ip,
+                                    "detail": err.to_string(),
+                                }),
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            log_diagnostic(
+                                "warn",
+                                "main",
+                                "tls_handshake_failed",
+                                serde_json::json!({
+                                    "peer_ip": peer_ip,
+                                    "detail": "tls handshake timed out",
+                                }),
+                            );
+                            return;
+                        }
                     };
-                    let Ok(identity) = tls.classify(stream.get_ref().1.peer_certificates()) else {
-                        return;
+                    let identity = match tls.classify(stream.get_ref().1.peer_certificates()) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            log_diagnostic(
+                                "warn",
+                                "main",
+                                "peer_identity_rejected",
+                                serde_json::json!({
+                                    "peer_ip": peer_ip,
+                                    "code": error.code,
+                                }),
+                            );
+                            return;
+                        }
                     };
                     let connection_permit = Arc::new(Mutex::new(Some(permit)));
                     let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
@@ -429,6 +485,15 @@ async fn route(
                 let task_services = services.clone();
                 let control = tokio::spawn(async move {
                     let Ok(upgraded) = hyper::upgrade::on(&mut request).await else {
+                        log_diagnostic(
+                            "warn",
+                            "main",
+                            "websocket_upgrade_failed",
+                            serde_json::json!({
+                                "role": if matches!(socket_role, EdgeSocketRole::Data) { "edge_data" } else { "edge_control" },
+                                "path": request.uri().path(),
+                            }),
+                        );
                         return;
                     };
                     let socket =
@@ -462,7 +527,18 @@ async fn route(
                 let version = request.version();
                 let task_services = services.clone();
                 let task = tokio::spawn(async move {
-                    let Ok(upgraded) = hyper::upgrade::on(&mut request).await else { return };
+                    let Ok(upgraded) = hyper::upgrade::on(&mut request).await else {
+                        log_diagnostic(
+                            "warn",
+                            "main",
+                            "websocket_upgrade_failed",
+                            serde_json::json!({
+                                "role": "client",
+                                "path": request.uri().path(),
+                            }),
+                        );
+                        return;
+                    };
                     let socket = WebSocketStream::from_raw_socket(
                         TokioIo::new(upgraded),
                         Role::Server,
@@ -654,14 +730,41 @@ async fn run_edge_control(
     }
     let _permit = permit;
     let Ok(registration) = decode_edge_registration(&frame) else {
+        log_diagnostic(
+            "warn",
+            "main",
+            "edge_registration_rejected",
+            serde_json::json!({
+                "edge_id": certificate_edge_id,
+                "code": "protocol_mismatch",
+            }),
+        );
         close_control_socket(&mut socket).await;
         return;
     };
     if registration.edge_id != certificate_edge_id {
+        log_diagnostic(
+            "warn",
+            "main",
+            "edge_registration_rejected",
+            serde_json::json!({
+                "edge_id": certificate_edge_id,
+                "code": "identity_mismatch",
+            }),
+        );
         close_control_socket(&mut socket).await;
         return;
     }
     let Some(targets) = registration_targets(registration.targets) else {
+        log_diagnostic(
+            "warn",
+            "main",
+            "edge_registration_rejected",
+            serde_json::json!({
+                "edge_id": certificate_edge_id,
+                "code": "invalid_targets",
+            }),
+        );
         close_control_socket(&mut socket).await;
         return;
     };
@@ -669,6 +772,7 @@ async fn run_edge_control(
     let connection_id = Uuid::new_v4();
     let (session_shutdown, mut session_stop) = watch::channel(false);
     let (control_tx, mut control_rx) = mpsc::channel(32);
+    let target_count = targets.len();
     let duplicate = {
         let Some(mut entries) = registry_write_until_stop(&registry, &mut stop).await else {
             close_control_socket(&mut socket).await;
@@ -694,6 +798,15 @@ async fn run_edge_control(
         }
     };
     if duplicate {
+        log_diagnostic(
+            "warn",
+            "main",
+            "edge_registration_rejected",
+            serde_json::json!({
+                "edge_id": certificate_edge_id,
+                "code": "already_connected",
+            }),
+        );
         close_control_socket(&mut socket).await;
         return;
     }
@@ -702,6 +815,15 @@ async fn run_edge_control(
     if let Some(state) = &state {
         let targets = registry.read().await[&certificate_edge_id].targets.clone();
         if state.replace_edge_routes(&certificate_edge_id, &targets).await.is_err() {
+            log_diagnostic(
+                "warn",
+                "main",
+                "edge_registration_rejected",
+                serde_json::json!({
+                    "edge_id": certificate_edge_id,
+                    "code": "state_persist_failed",
+                }),
+            );
             let mut entries = registry.write().await;
             if entries.get(&certificate_edge_id).is_some_and(|entry| entry.connection_id == connection_id) {
                 entries.remove(&certificate_edge_id);
@@ -710,6 +832,16 @@ async fn run_edge_control(
             return;
         }
     }
+
+    log_diagnostic(
+        "info",
+        "main",
+        "edge_registered",
+        serde_json::json!({
+            "edge_id": certificate_edge_id,
+            "target_count": target_count,
+        }),
+    );
 
     loop {
         tokio::select! {
@@ -769,6 +901,15 @@ async fn run_edge_control(
                                 matches.then(|| routes.remove(&session_id)).flatten()
                             };
                             if let Some(route) = route {
+                                log_diagnostic(
+                                    "error",
+                                    "main",
+                                    "edge_data_failed",
+                                    serde_json::json!({
+                                        "edge_id": certificate_edge_id,
+                                        "target_id": route.target_id,
+                                    }),
+                                );
                                 let _ = route.sender.send(Err(GatewayErrorCode::TargetUnavailable));
                             }
                         }
@@ -787,6 +928,14 @@ async fn run_edge_control(
     }
     let _ = session_shutdown.send(true);
     mark_offline(&registry, &certificate_edge_id, connection_id, &mut stop).await;
+    log_diagnostic(
+        "warn",
+        "main",
+        "edge_disconnected",
+        serde_json::json!({
+            "edge_id": certificate_edge_id,
+        }),
+    );
 }
 
 async fn accept_edge_data_channel(
@@ -846,6 +995,16 @@ async fn run_dbx_connection(
         return;
     }
     let Some(_client_stream_permit) = limits.clients.try_acquire(&client_id) else {
+        log_diagnostic(
+            "warn",
+            "main",
+            "route_capacity_exceeded",
+            serde_json::json!({
+                "client_id": client_id,
+                "edge_id": "",
+                "scope": "client",
+            }),
+        );
         send_client_error(&mut socket, GatewayErrorCode::CapacityExceeded).await;
         return;
     };
@@ -886,6 +1045,16 @@ async fn run_dbx_connection(
         return;
     };
     if !client_route_allowed(&routes.client_route_acl, &client_id, &edge_id, &target_id) {
+        log_diagnostic(
+            "warn",
+            "main",
+            "route_denied",
+            serde_json::json!({
+                "client_id": client_id,
+                "edge_id": edge_id,
+                "target_id": target_id,
+            }),
+        );
         send_client_error(&mut socket, GatewayErrorCode::RouteDenied).await;
         return;
     }
@@ -901,15 +1070,58 @@ async fn run_dbx_connection(
     let (control_tx, connection_id, mut edge_stop) = match route_control {
         Ok(route_control) => route_control,
         Err(code) => {
+            if matches!(code, GatewayErrorCode::RouteDenied) {
+                log_diagnostic(
+                    "warn",
+                    "main",
+                    "route_denied",
+                    serde_json::json!({
+                        "client_id": client_id,
+                        "edge_id": edge_id,
+                        "target_id": target_id,
+                    }),
+                );
+            } else if matches!(code, GatewayErrorCode::EdgeOffline) {
+                log_diagnostic(
+                    "warn",
+                    "main",
+                    "edge_offline",
+                    serde_json::json!({
+                        "client_id": client_id,
+                        "edge_id": edge_id,
+                        "target_id": target_id,
+                    }),
+                );
+            }
             send_client_error(&mut socket, code).await;
             return;
         }
     };
     let Some(_edge_stream_permit) = limits.edges.try_acquire(&edge_id) else {
+        log_diagnostic(
+            "warn",
+            "main",
+            "route_capacity_exceeded",
+            serde_json::json!({
+                "client_id": client_id,
+                "edge_id": edge_id,
+                "scope": "edge",
+            }),
+        );
         send_client_error(&mut socket, GatewayErrorCode::CapacityExceeded).await;
         return;
     };
     let Some(_buffer_reservation) = limits.buffers.try_reserve(MAX_DATA_FRAME_SIZE * 2) else {
+        log_diagnostic(
+            "warn",
+            "main",
+            "route_capacity_exceeded",
+            serde_json::json!({
+                "client_id": client_id,
+                "edge_id": edge_id,
+                "scope": "buffer",
+            }),
+        );
         send_client_error(&mut socket, GatewayErrorCode::CapacityExceeded).await;
         return;
     };
@@ -929,7 +1141,7 @@ async fn run_dbx_connection(
         PendingRoute {
             edge_id: edge_id.clone(),
             target_id: target_id.clone(),
-            client_id,
+            client_id: client_id.clone(),
             connection_id,
             edge_stop: edge_stop.clone(),
             sender,
@@ -941,17 +1153,51 @@ async fn run_dbx_connection(
         expires_at_unix_ms: ticket.expires_at_unix_ms,
     };
     if !matches!(timeout(CONTROL_IO_TIMEOUT, control_tx.send(request)).await, Ok(Ok(()))) {
+        log_diagnostic(
+            "warn",
+            "main",
+            "edge_offline",
+            serde_json::json!({
+                "client_id": client_id,
+                "edge_id": edge_id,
+                "target_id": target_id,
+            }),
+        );
         cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
         send_client_error(&mut socket, GatewayErrorCode::EdgeOffline).await;
         return;
     }
     let channel = tokio::select! {
-        channel = timeout(Duration::from_secs(15), receiver) => channel,
+        channel = timeout(Duration::from_secs(15), receiver) => {
+            if channel.is_err() {
+                log_diagnostic(
+                    "error",
+                    "main",
+                    "route_ticket_timeout",
+                    serde_json::json!({
+                        "client_id": client_id,
+                        "edge_id": edge_id,
+                        "target_id": target_id,
+                    }),
+                );
+            }
+            channel
+        },
         _ = wait_for_stop(&mut stop) => {
             cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
             return;
         },
         _ = wait_for_stop(&mut edge_stop) => {
+            log_diagnostic(
+                "warn",
+                "main",
+                "edge_offline",
+                serde_json::json!({
+                    "client_id": client_id,
+                    "edge_id": edge_id,
+                    "target_id": target_id,
+                }),
+            );
             cleanup_pending(ticket.session_id, &pending_routes, &tickets).await;
             send_client_error(&mut socket, GatewayErrorCode::EdgeOffline).await;
             return;
@@ -982,7 +1228,20 @@ async fn run_dbx_connection(
         }
     }
     let (stream_stop, stop_task) = combine_stop(stop.clone(), edge_stop);
-    let _ = relay_websockets(socket, edge_socket, Duration::from_secs(300), stream_stop).await;
+    if let Err(err) = relay_websockets(socket, edge_socket, Duration::from_secs(300), stream_stop).await {
+        log_diagnostic(
+            "warn",
+            "main",
+            "relay_failed",
+            serde_json::json!({
+                "client_id": client_id,
+                "edge_id": edge_id,
+                "target_id": target_id,
+                "code": err.code,
+                "detail": err.message,
+            }),
+        );
+    }
     stop_task.abort();
     let _ = adjust_active_streams(&registry, &edge_id, connection_id, false, &mut stop).await;
 }

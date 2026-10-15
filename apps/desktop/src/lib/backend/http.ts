@@ -5701,6 +5701,10 @@ export async function refreshConnections(): Promise<void> {
   // Web mode doesn't maintain persistent connection pools - no-op
 }
 
+export async function useNativeWindowDecorations(): Promise<boolean> {
+  return false;
+}
+
 export * from "@/lib/backend/mq-http";
 export * from "@/lib/backend/mqtt-http";
 

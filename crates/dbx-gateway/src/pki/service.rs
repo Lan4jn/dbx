@@ -6,7 +6,9 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::extensions::GeneralName;
@@ -14,6 +16,7 @@ use x509_parser::prelude::parse_x509_certificate;
 use zeroize::Zeroizing;
 
 use super::{EdgeIssueRequest, PkiStore};
+use crate::error::log_diagnostic;
 use crate::state::GatewayState;
 use crate::tls::{load_certificates, load_private_key, load_roots};
 use crate::{GatewayError, GatewayErrorCode};
@@ -155,6 +158,7 @@ impl UnixPkiServer {
     }
 }
 
+#[cfg(unix)]
 pub async fn serve_unix(
     path: PathBuf,
     allowed_uid: u32,
@@ -164,18 +168,24 @@ pub async fn serve_unix(
     reject_existing_socket_path(&path)?;
     let listener = UnixListener::bind(&path)
         .map_err(|_| service_error(GatewayErrorCode::ConfigInvalid, "PKI Unix socket could not be bound"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
-            .map_err(|_| service_error(GatewayErrorCode::Internal, "PKI Unix socket permissions could not be set"))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+        .map_err(|_| service_error(GatewayErrorCode::Internal, "PKI Unix socket permissions could not be set"))?;
     let (stop, mut stopping) = watch::channel(false);
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = listener.accept() => {
-                    let Ok((stream, _)) = result else { break };
+                    let stream = match result {
+                        Ok((stream, _)) => stream,
+                        Err(err) => {
+                            log_diagnostic("warn", "pki", "unix_accept_failed", serde_json::json!({
+                                "io_kind": format!("{:?}", err.kind()),
+                                "os_code": err.raw_os_error(),
+                            }));
+                            break;
+                        }
+                    };
                     let service = service.clone();
                     tokio::spawn(async move {
                         let _ = handle_unix(stream, allowed_uid, allowed_gid, service).await;
@@ -188,6 +198,16 @@ pub async fn serve_unix(
         }
     });
     Ok(UnixPkiServer { path, stop, task })
+}
+
+#[cfg(not(unix))]
+pub async fn serve_unix(
+    _path: PathBuf,
+    _allowed_uid: u32,
+    _allowed_gid: u32,
+    _service: PkiEnrollmentService,
+) -> Result<UnixPkiServer, GatewayError> {
+    Err(service_error(GatewayErrorCode::ConfigInvalid, "PKI Unix socket is unsupported on non-unix platforms"))
 }
 
 pub async fn serve_remote(
@@ -222,15 +242,34 @@ pub async fn serve_remote(
         loop {
             tokio::select! {
                 result = listener.accept() => {
-                    let Ok((stream, _)) = result else { break };
+                    let (stream, peer) = match result {
+                        Ok(res) => res,
+                        Err(_) => break,
+                    };
                     let acceptor = acceptor.clone();
                     let service = service.clone();
                     let allowed = allowed_ra_uri_sans.clone();
+                    let peer_ip = peer.ip().to_string();
                     tokio::spawn(async move {
-                        let Ok(stream) = acceptor.accept(stream).await else { return };
+                        let stream = match acceptor.accept(stream).await {
+                            Ok(stream) => stream,
+                            Err(_) => {
+                                log_diagnostic("warn", "pki", "remote_tls_rejected", serde_json::json!({
+                                    "peer_ip": peer_ip,
+                                    "code": GatewayErrorCode::TlsRejected,
+                                }));
+                                return;
+                            }
+                        };
                         let certificates = stream.get_ref().1.peer_certificates();
-                        if validate_ra_identity(certificates, &allowed).is_err() { return; }
-                        let _ = handle_stream(stream, service).await;
+                        if let Err(err) = validate_ra_identity(certificates, &allowed) {
+                            log_diagnostic("warn", "pki", "remote_tls_rejected", serde_json::json!({
+                                "peer_ip": peer_ip,
+                                "code": err.code,
+                            }));
+                            return;
+                        }
+                        let _ = handle_stream(stream, service, "remote").await;
                     });
                 }
                 changed = stopping.changed() => {
@@ -242,6 +281,7 @@ pub async fn serve_remote(
     Ok(RemotePkiServer { address, stop, task })
 }
 
+#[cfg(unix)]
 pub async fn enroll_over_unix(path: &Path, request: &EnrollCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
     let stream = UnixStream::connect(path)
         .await
@@ -249,11 +289,22 @@ pub async fn enroll_over_unix(path: &Path, request: &EnrollCsrRequest) -> Result
     exchange(stream, &ServiceRequest::Enroll { request }).await
 }
 
+#[cfg(not(unix))]
+pub async fn enroll_over_unix(_path: &Path, _request: &EnrollCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
+    Err(service_error(GatewayErrorCode::ConfigInvalid, "PKI Unix socket is unsupported on non-unix platforms"))
+}
+
+#[cfg(unix)]
 pub async fn renew_over_unix(path: &Path, request: &RenewCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
     let stream = UnixStream::connect(path)
         .await
         .map_err(|_| service_error(GatewayErrorCode::EdgeOffline, "PKI service unavailable"))?;
     exchange(stream, &ServiceRequest::Renew { request }).await
+}
+
+#[cfg(not(unix))]
+pub async fn renew_over_unix(_path: &Path, _request: &RenewCsrRequest) -> Result<EnrollCsrResponse, GatewayError> {
+    Err(service_error(GatewayErrorCode::ConfigInvalid, "PKI Unix socket is unsupported on non-unix platforms"))
 }
 
 pub async fn enroll_over_remote(
@@ -304,37 +355,82 @@ pub async fn renew_over_remote(
     exchange(stream, &ServiceRequest::Renew { request }).await
 }
 
+#[cfg(unix)]
 async fn handle_unix(
     stream: UnixStream,
     allowed_uid: u32,
     allowed_gid: u32,
     service: PkiEnrollmentService,
 ) -> Result<(), GatewayError> {
-    let credentials =
-        stream.peer_cred().map_err(|_| service_error(GatewayErrorCode::IdentityRejected, "PKI peer rejected"))?;
+    let credentials = match stream.peer_cred() {
+        Ok(creds) => creds,
+        Err(_) => {
+            log_diagnostic("warn", "pki", "unix_peer_rejected", serde_json::json!({
+                "uid": serde_json::Value::Null,
+                "gid": serde_json::Value::Null,
+            }));
+            return Err(service_error(GatewayErrorCode::IdentityRejected, "PKI peer rejected"));
+        }
+    };
     if credentials.uid() != allowed_uid || credentials.gid() != allowed_gid {
+        log_diagnostic("warn", "pki", "unix_peer_rejected", serde_json::json!({
+            "uid": credentials.uid(),
+            "gid": credentials.gid(),
+        }));
         return Err(service_error(GatewayErrorCode::IdentityRejected, "PKI peer rejected"));
     }
-    handle_stream(stream, service).await
+    handle_stream(stream, service, "unix").await
 }
 
-async fn handle_stream<S>(mut stream: S, service: PkiEnrollmentService) -> Result<(), GatewayError>
+async fn handle_stream<S>(mut stream: S, service: PkiEnrollmentService, transport: &'static str) -> Result<(), GatewayError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let body = read_frame(&mut stream).await?;
-    let result = match serde_json::from_slice::<OwnedServiceRequest>(&body) {
-        Ok(OwnedServiceRequest::Enroll { request }) => service.enroll(request).await,
-        Ok(OwnedServiceRequest::Renew { request }) => service.renew(request).await,
-        Err(_) => Err(service_error(GatewayErrorCode::ProtocolMismatch, "enrollment request rejected")),
+    let body = match read_frame(&mut stream).await {
+        Ok(body) => body,
+        Err(error) => {
+            log_diagnostic("warn", "pki", "request_decode_failed", serde_json::json!({
+                "transport": transport,
+                "code": error.code,
+            }));
+            return Err(error);
+        }
     };
+    let (operation, result) = match serde_json::from_slice::<OwnedServiceRequest>(&body) {
+        Ok(OwnedServiceRequest::Enroll { request }) => ("enroll", service.enroll(request).await),
+        Ok(OwnedServiceRequest::Renew { request }) => ("renew", service.renew(request).await),
+        Err(_) => {
+            log_diagnostic("warn", "pki", "request_decode_failed", serde_json::json!({
+                "transport": transport,
+                "code": GatewayErrorCode::ProtocolMismatch,
+            }));
+            ("unknown", Err(service_error(GatewayErrorCode::ProtocolMismatch, "enrollment request rejected")))
+        }
+    };
+    if let Err(error) = &result {
+        if operation != "unknown" {
+            log_diagnostic("error", "pki", "request_failed", serde_json::json!({
+                "transport": transport,
+                "operation": operation,
+                "code": error.code,
+            }));
+        }
+    }
     let response = match result {
         Ok(response) => WireResponse::Ok { response },
         Err(error) => WireResponse::Error { code: error.code },
     };
     let body = serde_json::to_vec(&response)
         .map_err(|_| service_error(GatewayErrorCode::Internal, "enrollment response could not be encoded"))?;
-    write_frame(&mut stream, &body).await
+    if let Err(error) = write_frame(&mut stream, &body).await {
+        log_diagnostic("warn", "pki", "response_send_failed", serde_json::json!({
+            "transport": transport,
+            "io_kind": "WriteFailed",
+            "os_code": serde_json::Value::Null,
+        }));
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn exchange<S>(mut stream: S, request: &ServiceRequest<'_>) -> Result<EnrollCsrResponse, GatewayError>
@@ -457,3 +553,4 @@ fn reject_existing_socket_path(path: &Path) -> Result<(), GatewayError> {
 fn service_error(code: GatewayErrorCode, message: impl Into<String>) -> GatewayError {
     GatewayError { code, message: message.into() }
 }
+

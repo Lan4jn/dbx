@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { Check, ChevronDown, Copy, Eye, Loader2, Map, Plus, RefreshCcw, RotateCcw, Rows3, Save, TableProperties, Trash2, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -30,6 +30,7 @@ import {
 const props = defineProps<{
   compact?: boolean;
   compactActionCount?: number;
+  navigationVisible?: boolean;
   refresh: DataGridToolbarActionCapability;
   autoRefresh?: DataGridToolbarAutoRefreshCapability;
   addRow?: DataGridToolbarAddRowCapability;
@@ -45,6 +46,9 @@ const props = defineProps<{
 }>();
 
 const autoRefreshIntervals = computed(() => (props.autoRefresh ? dataGridToolbarIntervalOptions(props.autoRefresh.intervalOptions, props.autoRefresh.intervalSeconds) : []));
+const autoRefreshCustomIntervalInput = ref("15");
+const autoRefreshCustomIntervalInputRef = ref<HTMLInputElement | null>(null);
+const autoRefreshUsesCustomInterval = computed(() => !!props.autoRefresh && !props.autoRefresh.intervalOptions.includes(props.autoRefresh.intervalSeconds));
 
 // Each dropdown is wrapped in a Tooltip so its button keeps a hover hint, but a
 // TooltipTrigger claims the popper anchor for its own popper root. Pointing the
@@ -55,6 +59,31 @@ const exportTriggerRef = ref<HTMLElement | { $el?: HTMLElement }>();
 function toolbarTriggerElement(trigger: HTMLElement | { $el?: HTMLElement } | undefined): HTMLElement | undefined {
   if (!trigger) return undefined;
   return trigger instanceof HTMLElement ? trigger : trigger.$el;
+}
+
+async function applyCustomAutoRefreshInterval() {
+  const value = autoRefreshCustomIntervalInput.value.trim();
+  const seconds = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(seconds) || seconds <= 0) {
+    props.autoRefresh?.onInvalidCustomInterval();
+    return;
+  }
+  await props.autoRefresh?.onSelectInterval(seconds);
+}
+
+function activateCustomAutoRefreshIntervalInput() {
+  void applyCustomAutoRefreshInterval();
+  void nextTick(() => {
+    autoRefreshCustomIntervalInputRef.value?.focus({ preventScroll: true });
+    autoRefreshCustomIntervalInputRef.value?.select();
+  });
+}
+
+function onCustomAutoRefreshInputKeydown(event: KeyboardEvent) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  void applyCustomAutoRefreshInterval();
+  (event.currentTarget as HTMLInputElement | null)?.blur();
 }
 
 const visibleActionOrder = computed<DataGridToolbarActionKey[]>(() => {
@@ -135,8 +164,29 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
           <span v-else class="h-3.5 w-3.5" />
           {{ autoRefresh?.intervalLabel(seconds) }}
         </DropdownMenuItem>
+        <div class="relative flex cursor-text select-none items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-1 text-sm outline-hidden focus-within:bg-accent hover:bg-accent" @pointerdown.stop @click.stop.prevent="activateCustomAutoRefreshIntervalInput">
+          <Check v-if="autoRefreshUsesCustomInterval" class="h-3.5 w-3.5 shrink-0" />
+          <span v-else class="h-3.5 w-3.5 shrink-0" />
+          <span class="shrink-0">{{ autoRefresh?.customIntervalLabel }}</span>
+          <input
+            ref="autoRefreshCustomIntervalInputRef"
+            v-model="autoRefreshCustomIntervalInput"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]*"
+            class="h-6 w-12 rounded border border-input bg-background px-1.5 text-right text-xs tabular-nums outline-none focus:border-ring focus:ring-1 focus:ring-ring"
+            :aria-label="autoRefresh?.customIntervalPrompt"
+            @pointerdown.stop
+            @click.stop
+            @keydown.stop="onCustomAutoRefreshInputKeydown"
+            @blur="void applyCustomAutoRefreshInterval()"
+          />
+          <span class="shrink-0 text-xs text-muted-foreground">{{ autoRefresh?.secondsUnitLabel }}</span>
+        </div>
       </DropdownMenuContent>
     </DropdownMenu>
+
+    <slot name="navigation" :compact="compact === true || (navigationVisible === true && (compactActionCount ?? 0) > Number(isDataGridToolbarCapabilityVisible(refresh)) + Number(isDataGridToolbarCapabilityVisible(autoRefresh)))" />
 
     <div v-if="isDataGridToolbarCapabilityVisible(copyData)" class="flex h-5 shrink-0 items-stretch overflow-hidden rounded-md border border-border">
       <Tooltip>

@@ -14075,6 +14075,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_identity_metadata_survives_stale_app_settings_save() {
+        let path = temp_db_path("gateway-identities-stale-save");
+        let storage = crate::persistence::test_storage::open(&path).await.unwrap();
+        let stale_settings = storage.load_app_settings_json().await.unwrap();
+        let identities = vec![crate::db::dbx_gateway::GatewayIdentityMetadata {
+            id: "identity-1".to_string(),
+            name: "Production".to_string(),
+            subject: "CN=desktop".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            fingerprint_sha256: "11".repeat(32),
+        }];
+
+        storage.save_gateway_identity_metadata(&identities).await.unwrap();
+        storage.save_app_settings_json(&stale_settings).await.unwrap();
+
+        assert_eq!(storage.load_gateway_identity_metadata().await.unwrap(), identities);
+    }
+
+    #[tokio::test]
     async fn sql_file_upload_max_mb_defaults_and_persists_clamped() {
         let path = temp_db_path("sql-file-upload-max-mb");
         let storage = crate::persistence::test_storage::open(&path).await.unwrap();
