@@ -22,9 +22,34 @@ function roundTrip(tabs: QueryTab[]) {
 
 describe("openTabsPersistence originalSql round-trip", () => {
   it("preserves per-tab output view state across a round-trip", () => {
-    const [restored] = roundTrip([queryTab({ uiState: { activeOutputView: "chart", resultPaneOpen: false } })]);
+    const [restored] = roundTrip([queryTab({ uiState: { activeOutputView: "chart", redisResultViewMode: "console", resultPaneOpen: false } })]);
 
-    expect(restored.uiState).toEqual({ activeOutputView: "chart", resultPaneOpen: false });
+    expect(restored.uiState).toEqual({ activeOutputView: "chart", redisResultViewMode: "console", resultPaneOpen: false });
+  });
+
+  it("preserves a custom title suffix across a data tab round-trip", () => {
+    const [restored] = roundTrip([queryTab({ mode: "data", titleSuffix: "pending" })]);
+
+    expect(restored.titleSuffix).toBe("pending");
+  });
+
+  it.each(["redis", "mongo", "plugin-workbench", "objects"] as const)("preserves a custom title suffix across a %s tab round-trip", (mode) => {
+    const [restored] = roundTrip([queryTab({ mode, titleSuffix: "待办" })]);
+
+    expect(restored.titleSuffix).toBe("待办");
+  });
+
+  it("does not persist an empty title suffix", () => {
+    const [saved] = serializeOpenTabs([queryTab({ mode: "data", titleSuffix: "  " })]);
+
+    expect(saved).not.toHaveProperty("titleSuffix");
+  });
+
+  it("preserves the structured sort field across a data tab round-trip", () => {
+    const [restored] = roundTrip([queryTab({ mode: "data", orderByInput: '"status" ASC', structuredOrderByInput: '"created_at" DESC' })]);
+
+    expect(restored.orderByInput).toBe('"status" ASC');
+    expect(restored.structuredOrderByInput).toBe('"created_at" DESC');
   });
 
   it("preserves namespaced special-page state across a round-trip", () => {
@@ -60,6 +85,13 @@ describe("openTabsPersistence originalSql round-trip", () => {
     const [restored] = roundTrip([queryTab({ sourceView: true, sql: "CREATE SEQUENCE seq_users" })]);
     expect(restored.sourceView).toBe(true);
     expect(restored.objectSource).toBeUndefined();
+  });
+
+  it("preserves the DDL viewer identity needed for read-only tabs", () => {
+    const ddlViewer = { schema: "public", tableName: "users", objectType: "VIEW" as const, formatDialect: "postgres" as const };
+    const [restored] = roundTrip([queryTab({ sourceView: true, ddlViewer, sql: "CREATE VIEW users AS SELECT 1" })]);
+
+    expect(restored.ddlViewer).toEqual(ddlViewer);
   });
 
   it("does not persist a pending object-source tab without its in-flight request", () => {
@@ -224,6 +256,38 @@ describe("openTabsPersistence originalSql round-trip", () => {
     });
   });
 
+  it("preserves a result-view tab's entry contribution id and result snapshot", () => {
+    const [restored] = roundTrip([
+      queryTab({
+        id: "plugin-result-view",
+        title: "Chart",
+        connectionId: "plugin-connection",
+        database: "dbx_test",
+        mode: "plugin-workbench",
+        pluginWorkbench: {
+          pluginId: "dbx.example.graph",
+          contributionId: "dbx.example.graph.chart",
+          context: {
+            connectionId: "plugin-connection",
+            database: "dbx_test",
+            sql: "SELECT 1",
+            result: { columns: ["id"], rows: [[1]], truncated: false },
+          },
+        },
+      }),
+    ]);
+
+    // `contributionId` names the entry contribution, not a workbench: a restored
+    // result-view tab must keep its own id so the renderer can resolve it again.
+    expect(restored.pluginWorkbench?.contributionId).toBe("dbx.example.graph.chart");
+    expect(restored.pluginWorkbench?.context).toEqual({
+      connectionId: "plugin-connection",
+      database: "dbx_test",
+      sql: "SELECT 1",
+      result: { columns: ["id"], rows: [[1]], truncated: false },
+    });
+  });
+
   it("preserves host-owned plugin filesystem navigation", () => {
     const [restored] = roundTrip([
       queryTab({
@@ -248,5 +312,77 @@ describe("openTabsPersistence originalSql round-trip", () => {
       rootUri: "s3://bucket/",
       currentUri: "s3://bucket/reports/",
     });
+  });
+
+  it("preserves database-search tab state across a round-trip", () => {
+    const [restored] = roundTrip([
+      queryTab({
+        id: "search-tab",
+        title: "Search Database",
+        connectionId: "conn-1",
+        database: "shop",
+        schema: "public",
+        mode: "database-search",
+        databaseSearchState: {
+          keyword: "order_123",
+          perTableLimit: 25,
+          progressDone: 4,
+          progressTotal: 8,
+          results: [
+            {
+              id: "orders:0",
+              tableName: "orders",
+              schema: "public",
+              matchedColumns: ["order_no"],
+              preview: "order_no: order_123",
+              whereInput: "\"order_no\" = 'order_123'",
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(restored.mode).toBe("database-search");
+    expect(restored.databaseSearchState).toEqual({
+      keyword: "order_123",
+      perTableLimit: 25,
+      progressDone: 4,
+      progressTotal: 8,
+      results: [
+        {
+          id: "orders:0",
+          tableName: "orders",
+          schema: "public",
+          matchedColumns: ["order_no"],
+          preview: "order_no: order_123",
+          whereInput: "\"order_no\" = 'order_123'",
+        },
+      ],
+    });
+  });
+});
+
+describe("openTabsPersistence detached connection tabs", () => {
+  it("preserves the original connection name of a kept SQL tab across a round-trip", () => {
+    const [restored] = roundTrip([queryTab({ connectionId: "deleted-conn", detachedConnectionName: "prod" })]);
+
+    expect(restored.connectionId).toBe("deleted-conn");
+    expect(restored.detachedConnectionName).toBe("prod");
+  });
+
+  it("keeps a detached SQL tab even though its connection no longer exists", () => {
+    const saved = serializeOpenTabs([queryTab({ id: "orphan", connectionId: "deleted-conn", detachedConnectionName: "prod" })]);
+
+    const { tabs } = restoreOpenTabsPayload({ tabs: saved, activeTabId: "orphan" }, { validConnectionIds: ["other-conn"] });
+
+    // SQL 页签不受 validConnectionIds 过滤，删除连接后保留下来的草稿页签才能跨重启存活。
+    expect(tabs.map((tab) => tab.id)).toEqual(["orphan"]);
+    expect(tabs[0].detachedConnectionName).toBe("prod");
+  });
+
+  it("omits the detached connection name when the tab is bound to a live connection", () => {
+    const [saved] = serializeOpenTabs([queryTab({})]);
+
+    expect(saved.detachedConnectionName).toBeUndefined();
   });
 });

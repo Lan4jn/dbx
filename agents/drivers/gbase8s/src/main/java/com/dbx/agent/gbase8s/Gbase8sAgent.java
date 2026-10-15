@@ -250,12 +250,21 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
     }
 
     private static String currentLocaleOf(ConnectParams params) {
-        for (String segment : params.getUrl_params().split(";")) {
+        return connectionParameterValue(params.getUrl_params(), "DB_LOCALE");
+    }
+
+    private static String connectionParameterValue(String parameters, String parameterName) {
+        for (String segment : trim(parameters).split(";")) {
             int equals = segment.indexOf('=');
             if (equals < 0) {
                 continue;
             }
-            if (segment.substring(0, equals).trim().equalsIgnoreCase("DB_LOCALE")) {
+            String key = segment.substring(0, equals).trim();
+            int urlPrefix = key.lastIndexOf(':');
+            if (urlPrefix >= 0) {
+                key = key.substring(urlPrefix + 1).trim();
+            }
+            if (key.equalsIgnoreCase(parameterName)) {
                 return segment.substring(equals + 1).trim();
             }
         }
@@ -498,7 +507,8 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
             Connection conn = requireConnection();
             String owner = trim(schema);
             Set<Integer> primaryKeyColumns = getPrimaryKeyColumnNumbers(conn, owner, table);
-            Map<String, String> columnDefaults = loadColumnDefaults(conn, owner, table);
+            boolean mysqlCompatMode = isMysqlCompatMode(databaseListParams);
+            Map<String, String> columnDefaults = loadColumnDefaults(conn, owner, table, mysqlCompatMode);
             List<Object> args = new ArrayList<>();
             args.add(table);
             StringBuilder sql = new StringBuilder("""
@@ -544,16 +554,21 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
         }
     }
 
-    private static Map<String, String> loadColumnDefaults(Connection conn, String owner, String table) {
+    private static Map<String, String> loadColumnDefaults(
+        Connection conn,
+        String owner,
+        String table,
+        boolean mysqlCompatMode
+    ) {
         List<Object> args = new ArrayList<>();
         args.add(table);
         StringBuilder sql = new StringBuilder("""
-            SELECT c.colname, e.default AS column_default
+            SELECT c.colname, %s AS column_default
             FROM systables t
             JOIN syscolumns c ON t.tabid = c.tabid
             JOIN sysdefaultsexpr e ON c.tabid = e.tabid AND c.colno = e.colno
             WHERE t.tabname = ? AND e.type = 'T'
-            """.stripIndent().trim());
+            """.formatted(mysqlCompatMode ? "e.`default`" : "e.default").stripIndent().trim());
         if (!owner.isEmpty()) {
             sql.append(" AND t.owner = ?");
             args.add(owner);
@@ -574,6 +589,17 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
             return Collections.emptyMap();
         }
         return defaults;
+    }
+
+    private static boolean isMysqlCompatMode(ConnectParams params) {
+        if (params == null) {
+            return false;
+        }
+        if (params.isMysql_compat_mode()) {
+            return true;
+        }
+        String sqlMode = connectionParameterValue(buildUrl(params), "SQLMODE");
+        return sqlMode.equalsIgnoreCase("mysql");
     }
 
     @Override
@@ -955,6 +981,8 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
             case 41 -> "BOOLEAN";
             case 43, 52 -> "BIGINT";
             case 44, 53 -> "BIGSERIAL";
+            case 63 -> "VARCHAR2";
+            case 64 -> "NVARCHAR2";
             // MySQL-compat extended types (SQLMODE=mysql); codes match the
             // 3.6.5+ driver's IfxBigIntUnsigned/IfxTinyInt/IfxMediumInt/IfxBit.
             case 66 -> "BIGINT UNSIGNED";
@@ -1081,7 +1109,7 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
 
     private static Integer characterMaximumLength(int baseType, int length) {
         return switch (baseType) {
-            case 0, 13, 15, 16, 40 -> length;
+            case 0, 13, 15, 16, 40, 63, 64 -> length;
             default -> null;
         };
     }

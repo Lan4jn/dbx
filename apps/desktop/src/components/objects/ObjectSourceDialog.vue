@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Clipboard, Loader2, PencilLine, RefreshCw } from "@lucide/vue";
 import { useToast } from "@/composables/useToast";
@@ -9,7 +9,8 @@ import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatSqlForDisplay, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { buildEditableObjectSource, buildExecutableObjectSourceStatements, executeObjectSourceSave, formatObjectSourceSaveError, resolveObjectSourceEditDraft } from "@/lib/table/objectSourceEditor";
 import { loadObjectSourceWithRoutineFallback } from "@/lib/table/objectSourceLoad";
-import { xuguRoutineMetadataFromDefinition, type XuguRoutineMetadata } from "@/lib/table/routineParameters";
+import { assertSourceIdentity, beginSourceSave, captureSourceIdentity, renewSourceIdentity, type SourceIdentitySnapshot } from "@/lib/table/objectSourceIdentity";
+import { jdbcRoutineMetadata, xuguRoutineMetadataFromDefinition, type RoutineMetadata } from "@/lib/table/routineParameters";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import * as api from "@/lib/backend/api";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
@@ -57,25 +58,34 @@ const editing = ref(false);
 const sourceEditable = ref(true);
 const error = ref("");
 const saveError = ref("");
-const routineMetadata = ref<XuguRoutineMetadata | null>(null);
+const routineMetadata = ref<RoutineMetadata | null>(null);
 /** May differ from props.objectType after PROCEDURE/FUNCTION/PACKAGE fallback resolution. */
 const resolvedObjectType = ref<ObjectSourceKind>(props.objectType);
 let loadSerial = 0;
+let sourceIdentity: SourceIdentitySnapshot | undefined;
+onBeforeUnmount(() => {
+  ++loadSerial;
+});
 
-const canEdit = computed(() => sourceEditable.value && props.objectType !== "SEQUENCE");
+const canEdit = computed(() => sourceEditable.value && (props.objectType !== "SEQUENCE" || props.databaseType === "oceanbase-oracle"));
 const title = computed(() => `${editing.value ? t("contextMenu.editView") : t("contextMenu.viewSource")} - ${props.name}`);
 const hasRoutineMetadata = computed(() => !!routineMetadata.value && (routineMetadata.value.parameters.length > 0 || !!routineMetadata.value.returnType));
 
 watch(
-  () => [props.open, props.connectionId, props.database, props.schema, props.name, props.relationName, props.signature, props.objectType, props.initialEditing] as const,
+  () => [props.open, props.connectionId, props.database, props.schema, props.name, props.relationName, props.signature, props.objectType, props.databaseType, props.initialEditing] as const,
   () => {
     if (props.open) void loadSource();
+    else ++loadSerial;
   },
-  { immediate: true },
+  { immediate: true, flush: "sync" },
 );
 
 async function loadSource(nextEditing = props.initialEditing && canEdit.value) {
   const serial = ++loadSerial;
+  const target = { ...props };
+  const identity = captureSourceIdentity({ ...target, schema: target.schema || target.database });
+  sourceIdentity = undefined;
+  saving.value = false;
   content.value = "";
   editableText.value = "";
   draft.value = "";
@@ -86,26 +96,34 @@ async function loadSource(nextEditing = props.initialEditing && canEdit.value) {
   editing.value = false;
   loading.value = true;
   try {
-    if (!props.databaseType) throw new Error("Connection type is unavailable.");
+    if (!target.databaseType) throw new Error("Connection type is unavailable.");
     // issue #9035：连接建立也纳入弹窗的加载态。调用方不再先 await ensureConnected
     // 才打开弹窗，否则弹窗挂载前会有一段没有任何反馈的等待。
-    await connectionStore.ensureConnected(props.connectionId);
-    connectionStore.activeConnectionId = props.connectionId;
-    const schema = props.schema || props.database;
-    const { source: result, objectType: resolvedType } = await loadObjectSourceWithRoutineFallback(api.getObjectSource, props.connectionId, props.database, schema, props.name, props.objectType, props.signature, props.relationName);
+    await connectionStore.ensureConnected(target.connectionId);
+    if (serial !== loadSerial) return;
+    connectionStore.activeConnectionId = target.connectionId;
+    const schema = target.schema || target.database;
+    const { source: result, objectType: resolvedType } = await loadObjectSourceWithRoutineFallback(api.getObjectSource, target.connectionId, target.database, schema, target.name, target.objectType, target.signature, target.relationName);
+    if (serial !== loadSerial) return;
     const editableAllowed = result.editable !== false;
     const editable = await buildEditableObjectSource({
-      databaseType: props.databaseType,
+      databaseType: target.databaseType,
       objectType: resolvedType,
       schema,
-      name: props.name,
+      name: target.name,
       source: result.source,
     });
     if (serial !== loadSerial) return;
     resolvedObjectType.value = resolvedType;
-    routineMetadata.value = props.databaseType === "xugu" && (resolvedType === "PROCEDURE" || resolvedType === "FUNCTION") ? xuguRoutineMetadataFromDefinition(result.source) : null;
+    const isRoutine = resolvedType === "PROCEDURE" || resolvedType === "FUNCTION";
+    routineMetadata.value = !isRoutine ? null : result.routine_parameters !== undefined ? jdbcRoutineMetadata(result.routine_parameters) : target.databaseType === "xugu" ? xuguRoutineMetadataFromDefinition(result.source) : null;
     sourceEditable.value = editableAllowed;
-    const formatted = await formatSqlForDisplay(editable, props.formatDialect ?? props.dialect, settingsStore.editorSettings.sqlFormatter);
+    const displaySource = resolvedType === "SEQUENCE" ? result.source : editable;
+    const formatted = await formatSqlForDisplay(displaySource, target.formatDialect ?? target.dialect, settingsStore.editorSettings.sqlFormatter);
+    if (serial !== loadSerial) return;
+    const renewed = renewSourceIdentity(identity);
+    sourceIdentity = resolvedType === target.objectType ? renewed : captureSourceIdentity({ ...identity, objectType: resolvedType });
+    assertSourceIdentity(sourceIdentity);
     editableText.value = editable;
     content.value = formatted;
     draft.value = nextEditing && canEdit.value ? resolveObjectSourceEditDraft(props.databaseType, resolvedType, formatted, editable) : "";
@@ -146,47 +164,71 @@ function cancelEditSource() {
   saveError.value = "";
 }
 
+async function refreshSource() {
+  if (loading.value || saving.value) return;
+  if (editing.value && !window.confirm(t("objects.refreshDiscardConfirm"))) return;
+  await loadSource(editing.value && canEdit.value);
+}
+
 async function saveSource() {
+  if (saving.value || loading.value || !props.open) return;
   if (!canEdit.value) {
     toast(t("objects.sourceReadOnly"), 3000);
     return;
   }
   if (!draft.value.trim() || !props.databaseType) return;
   const databaseType = props.databaseType;
+  const connectionId = props.connectionId,
+    database = props.database,
+    name = props.name;
+  const objectType = resolvedObjectType.value,
+    serial = loadSerial;
   const schema = props.schema || props.database;
   saving.value = true;
   saveError.value = "";
   try {
+    if (!sourceIdentity) return;
+    const identity = sourceIdentity;
+    assertSourceIdentity(identity);
     const statements = await buildExecutableObjectSourceStatements({
       databaseType,
-      objectType: resolvedObjectType.value,
+      objectType,
       schema,
-      name: props.name,
+      name,
       source: draft.value,
     });
+    if (serial !== loadSerial) return;
     const executableSql = statements.filter((sql) => sql.trim()).join(";\n");
+    const execute = async () => {
+      if (serial !== loadSerial || !props.open) return false;
+      const release = beginSourceSave(identity);
+      try {
+        await executeObjectSourceSave(connectionId, database, databaseType, statements, schema);
+        return true;
+      } finally {
+        release();
+      }
+    };
     if (executableSql.trim()) {
       const saved = await executeWithProductionSqlGuard({
-        connection: connectionStore.getConfig(props.connectionId),
-        database: props.database,
+        connection: connectionStore.getConfig(connectionId),
+        database,
         sql: executableSql,
         source: t("production.sourceObjectSource"),
-        execute: async () => {
-          await executeObjectSourceSave(props.connectionId, props.database, databaseType, statements, schema);
-          return true;
-        },
+        execute,
       });
       if (!saved) return;
     } else {
-      await executeObjectSourceSave(props.connectionId, props.database, databaseType, statements, schema);
+      if (!(await execute())) return;
     }
+    if (serial !== loadSerial) return;
     toast(t("objects.sourceSaved"));
     emit("saved");
     await loadSource(false);
   } catch (e: unknown) {
-    saveError.value = formatObjectSourceSaveError(e, databaseType, props.objectType, t("objects.postgresViewColumnChangeHint"));
+    if (serial === loadSerial) saveError.value = formatObjectSourceSaveError(e, databaseType, objectType, t("objects.postgresViewColumnChangeHint"));
   } finally {
-    saving.value = false;
+    if (serial === loadSerial) saving.value = false;
   }
 }
 
@@ -234,6 +276,7 @@ function closeDialog() {
       <div v-else class="flex min-h-0 flex-col gap-3 overflow-hidden">
         <RoutineMetadataPanel v-if="hasRoutineMetadata && routineMetadata" :parameters="routineMetadata.parameters" :return-type="routineMetadata.returnType" />
         <QueryEditor
+          v-if="content || !hasRoutineMetadata"
           :key="`${props.connectionId}:${props.database}:${props.schema || ''}:${props.name}:${props.objectType}`"
           :model-value="content"
           class="object-source-dialog-editor min-h-0 flex-1 overflow-hidden rounded border"
@@ -252,6 +295,10 @@ function closeDialog() {
 
       <DialogFooter>
         <Button variant="outline" @click="closeDialog">{{ t("common.close") }}</Button>
+        <Button variant="outline" :disabled="loading || saving" :title="t('structureEditor.refresh')" @click="refreshSource">
+          <RefreshCw class="h-4 w-4" />
+          {{ t("structureEditor.refresh") }}
+        </Button>
         <Button v-if="!editing" variant="outline" :disabled="!content" @click="copySource">
           <Clipboard class="h-4 w-4" />
           {{ t("grid.copy") }}

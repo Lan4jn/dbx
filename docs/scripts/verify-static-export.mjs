@@ -46,7 +46,7 @@ const requiredContent = [
     file: `${language}.html`,
     includes: [`<html lang="${HTML_LANG[language] ?? language}"`, '"@type":"SoftwareApplication"'],
   })),
-  { file: "llms.txt", includes: ["90+ database", "25 MB", "Apache-2.0"] },
+  { file: "llms.txt", includes: ["100+ data systems", "25 MB", "Apache-2.0"] },
 ];
 
 for (const requirement of requiredContent) {
@@ -64,13 +64,7 @@ for (const requirement of requiredContent) {
 
 console.log("Static export metadata verified for language, software schema, and llms.txt accuracy.");
 
-const localizedHtmlFiles = files.filter(
-  (file) =>
-    extname(file) === ".html" &&
-    LANGUAGES.some(
-      (lang) => file === join(outputDirectory, `${lang}.html`) || file.startsWith(`${join(outputDirectory, lang)}${sep}`),
-    ),
-);
+const localizedHtmlFiles = files.filter((file) => extname(file) === ".html" && LANGUAGES.some((lang) => file === join(outputDirectory, `${lang}.html`) || file.startsWith(`${join(outputDirectory, lang)}${sep}`)));
 
 for (const file of localizedHtmlFiles) {
   const content = await readFile(file, "utf8");

@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 use super::connection::AppState;
 
@@ -32,6 +34,115 @@ struct ExecuteQueryRequest {
     database: Option<String>,
     sql: String,
     schema: Option<String>,
+    approval_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SqlApprovalRequest {
+    connection_id: String,
+    database: String,
+    sql: String,
+}
+
+#[derive(Deserialize)]
+struct ConsumeSqlApprovalRequest {
+    token: String,
+    connection_id: String,
+    database: String,
+    sql: String,
+}
+
+#[derive(Clone, Serialize)]
+struct SqlApprovalEvent {
+    id: String,
+    connection_name: String,
+    database: String,
+    sql: String,
+}
+
+#[derive(Clone, Copy)]
+enum SqlApprovalDecision {
+    Once,
+    Hour,
+    Day,
+    Deny,
+}
+
+struct SqlApprovalGrant {
+    connection: crate::models::connection::ConnectionConfig,
+    database: String,
+    sql: String,
+    expires_at: Instant,
+}
+
+struct TimedSqlApproval {
+    connection: crate::models::connection::ConnectionConfig,
+    expires_at: Instant,
+}
+
+impl TimedSqlApproval {
+    fn valid_for(&self, connection: &crate::models::connection::ConnectionConfig, now: Instant) -> bool {
+        self.expires_at > now && self.connection == *connection
+    }
+}
+
+#[derive(Default)]
+struct SqlApprovals {
+    generation: u64,
+    pending: HashMap<String, oneshot::Sender<SqlApprovalDecision>>,
+    tokens: HashMap<String, SqlApprovalGrant>,
+    timed: HashMap<(String, String), TimedSqlApproval>,
+}
+
+static SQL_APPROVALS: OnceLock<Mutex<SqlApprovals>> = OnceLock::new();
+
+fn sql_approvals() -> &'static Mutex<SqlApprovals> {
+    SQL_APPROVALS.get_or_init(|| Mutex::new(SqlApprovals::default()))
+}
+
+pub(crate) fn clear_mcp_sql_approvals() {
+    if let Ok(mut approvals) = sql_approvals().lock() {
+        approvals.generation = approvals.generation.wrapping_add(1);
+        approvals.timed.clear();
+        approvals.tokens.clear();
+        approvals.pending.clear();
+    }
+}
+
+#[tauri::command]
+pub fn respond_mcp_sql_approval(window: tauri::Window, id: String, decision: String) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Only the main DBX window can approve MCP SQL.".to_string());
+    }
+    let decision = match decision.as_str() {
+        "once" => SqlApprovalDecision::Once,
+        "hour" => SqlApprovalDecision::Hour,
+        "day" => SqlApprovalDecision::Day,
+        "deny" => SqlApprovalDecision::Deny,
+        _ => return Err("Invalid MCP SQL approval decision.".to_string()),
+    };
+    let sender = sql_approvals()
+        .lock()
+        .map_err(|_| "MCP approval state unavailable")?
+        .pending
+        .remove(&id)
+        .ok_or_else(|| "MCP approval request expired.".to_string())?;
+    sender.send(decision).map_err(|_| "MCP approval request expired.".to_string())
+}
+
+fn take_sql_approval(
+    token: Option<&str>,
+    connection: &crate::models::connection::ConnectionConfig,
+    database: &str,
+    sql: &str,
+) -> bool {
+    let Some(token) = token else { return false };
+    let Ok(mut state) = sql_approvals().lock() else { return false };
+    let Some(grant) = state.tokens.remove(token) else { return false };
+    grant.expires_at > Instant::now()
+        && grant.connection == *connection
+        && grant.database == database
+        && grant.sql == sql
 }
 
 #[derive(Deserialize)]
@@ -221,14 +332,20 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
             let app = app_handle.clone();
             let st = state.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                let n = match stream.read(&mut buf).await {
-                    Ok(n) if n > 0 => n,
-                    _ => return,
+                let request = match read_bridge_request(&mut stream).await {
+                    Some(request) => request,
+                    None => return,
                 };
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                let first_line = request.lines().next().unwrap_or("");
+                let mut parts = request.splitn(2, "\r\n\r\n");
+                let head = parts.next().unwrap_or("");
+                let body = parts.next().unwrap_or("");
+                let first_line = head.lines().next().unwrap_or("");
+                if !bridge_request_is_local_client(first_line, head) {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
 
                 if first_line.starts_with("POST /open-table") {
                     handle_open_table(&app, &st, body, &mut stream).await;
@@ -270,6 +387,10 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
                     handle_redis_execute_command_data(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /data/execute-query") {
                     handle_execute_query_data(&st, body, &mut stream).await;
+                } else if first_line.starts_with("POST /approve-high-risk-sql") {
+                    handle_sql_approval(&app, &st, body, &mut stream).await;
+                } else if first_line.starts_with("POST /consume-high-risk-sql-approval") {
+                    handle_consume_sql_approval(&st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /execute-query") {
                     handle_execute_query(&app, &st, body, &mut stream).await;
                 } else if first_line.starts_with("POST /reload-connections") {
@@ -286,8 +407,117 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
 fn write_port_file(data_dir: &Path, actual_port: u16) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join(MCP_BRIDGE_PORT_FILE);
-    std::fs::write(&path, actual_port.to_string())?;
+    // 0600: the published port is the discovery half of a local control
+    // plane; other local users must not be able to read (and talk to) it.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::io::Write::write_all(&mut file, actual_port.to_string().as_bytes())?;
     Ok(path)
+}
+
+/// Upper bound for one bridge request (headers + body). Generous for large
+/// SQL batches; the previous fixed 64 KiB single read silently truncated
+/// bigger requests — and a truncation that landed on a JSON boundary could
+/// execute cut-down SQL.
+const MAX_BRIDGE_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+const BRIDGE_HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+
+/// Reads one HTTP/1.1 request off the bridge connection: the header block
+/// first, then exactly `Content-Length` body bytes. TCP delivers large
+/// bodies across multiple segments, so a single read truncates them; a
+/// closed or short read still returns whatever arrived so routing can
+/// answer with a precise 400 instead of dropping the connection.
+async fn read_bridge_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 16384];
+    let mut header_end: Option<usize> = None;
+    let mut content_length: usize = 0;
+    let mut scanned = 0usize;
+    loop {
+        if let Some(end) = header_end {
+            if buf.len() >= end + content_length {
+                return Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+        } else if let Some(pos) =
+            buf[scanned..].windows(BRIDGE_HEADER_TERMINATOR.len()).position(|window| window == BRIDGE_HEADER_TERMINATOR)
+        {
+            let end = scanned + pos + BRIDGE_HEADER_TERMINATOR.len();
+            header_end = Some(end);
+            content_length = parse_content_length(&String::from_utf8_lossy(&buf[..end]));
+            // The same read may already contain the complete body (or no body).
+            continue;
+        } else {
+            scanned = buf.len().saturating_sub(BRIDGE_HEADER_TERMINATOR.len() - 1);
+        }
+        let n = match stream.read(&mut chunk).await {
+            Ok(n) if n > 0 => n,
+            _ => {
+                return if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).into_owned()) };
+            }
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_BRIDGE_REQUEST_BYTES {
+            log::warn!("MCP bridge dropped an oversized request ({} bytes)", buf.len());
+            return None;
+        }
+    }
+}
+
+fn parse_content_length(header_block: &str) -> usize {
+    header_block
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0)
+}
+
+/// The bridge is a loopback-only control plane for local, non-browser
+/// clients. Browsers attach an `Origin` header to every cross-origin
+/// request, and their non-preflighted cross-site POSTs cannot carry
+/// `Content-Type: application/json` — either one marks a fire-and-forget
+/// CSRF attempt. A `Host` outside the loopback forms marks DNS rebinding.
+/// All are refused before routing; ordinary local clients (the plugin
+/// sidecars, dbx-mcp, dbx-cli) send Host + application/json and no Origin.
+fn bridge_request_is_local_client(first_line: &str, head: &str) -> bool {
+    let header_value = |name: &str| -> Option<String> {
+        head.lines().skip(1).find_map(|line| {
+            let (line_name, value) = line.split_once(':')?;
+            line_name.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+        })
+    };
+    if first_line.starts_with("POST") {
+        let is_json = header_value("content-type")
+            .map(|value| value.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"))
+            .unwrap_or(false);
+        if !is_json {
+            return false;
+        }
+    }
+    if header_value("origin").is_some() {
+        return false;
+    }
+    match header_value("host") {
+        Some(host) => {
+            host.starts_with("127.0.0.1:")
+                || host.starts_with("localhost:")
+                || host == "127.0.0.1"
+                || host == "localhost"
+        }
+        None => false,
+    }
 }
 
 fn find_config_by_name<'a>(
@@ -300,15 +530,65 @@ fn find_config_by_name<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_database_execution_policy, ensure_connection_in_mcp_scope, ensure_mcp_connection_sql_write_allowed,
-        ensure_mcp_execute_and_show_supported, ensure_mcp_mongo_pipeline_target_allowed_by_id,
-        ensure_mcp_sql_database_switch_allowed, is_terminal_routed_exec, mongo_filter_is_effectively_unbounded,
-        mongo_pipeline_has_write_stage, plugin_connection_summaries, plugin_connection_summary, resolve_connection,
-        resolve_mongo_database, resolve_mongo_target_values, write_port_file, AppState,
+        bridge_request_is_local_client, clear_mcp_sql_approvals, effective_database_execution_policy,
+        ensure_connection_in_mcp_scope, ensure_mcp_connection_sql_write_allowed, ensure_mcp_execute_and_show_supported,
+        ensure_mcp_mongo_pipeline_target_allowed_by_id, ensure_mcp_sql_database_switch_allowed,
+        is_terminal_routed_exec, mongo_filter_is_effectively_unbounded, mongo_pipeline_has_write_stage,
+        parse_content_length, plugin_connection_summaries, plugin_connection_summary, read_bridge_request,
+        resolve_call_plugin_target, resolve_connection, resolve_mongo_database, resolve_mongo_target_values,
+        sql_approvals, take_sql_approval, write_port_file, AppState, SqlApprovalGrant, TimedSqlApproval,
     };
     use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
-    use dbx_core::storage::{McpConnectionPolicy, McpDatabasePolicy, McpDatabaseScope, McpGlobalPolicy, Storage};
+    use dbx_core::storage::{McpConnectionPolicy, McpDatabasePolicy, McpDatabaseScope, McpGlobalPolicy};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn sql_approval_token_is_single_use_and_bound_to_target_and_text() {
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut config = mysql_config(false);
+        config.id = "mysql".to_string();
+        let insert = |expires_at| {
+            sql_approvals().lock().unwrap().tokens.insert(
+                token.clone(),
+                SqlApprovalGrant {
+                    connection: config.clone(),
+                    database: "app".to_string(),
+                    sql: "DROP TABLE t".to_string(),
+                    expires_at,
+                },
+            );
+        };
+        insert(Instant::now() + Duration::from_secs(60));
+        assert!(!take_sql_approval(Some(&token), &config, "other", "DROP TABLE t"));
+        assert!(!take_sql_approval(Some(&token), &config, "app", "DROP TABLE t"));
+        insert(Instant::now() - Duration::from_secs(1));
+        assert!(!take_sql_approval(Some(&token), &config, "app", "DROP TABLE t"));
+        insert(Instant::now() + Duration::from_secs(60));
+        let mut changed = config.clone();
+        changed.host = "other-host".to_string();
+        assert!(!take_sql_approval(Some(&token), &changed, "app", "DROP TABLE t"));
+        insert(Instant::now() + Duration::from_secs(60));
+        assert!(take_sql_approval(Some(&token), &config, "app", "DROP TABLE t"));
+        assert!(!take_sql_approval(Some(&token), &config, "app", "DROP TABLE t"));
+        insert(Instant::now() + Duration::from_secs(60));
+        let generation = sql_approvals().lock().unwrap().generation;
+        clear_mcp_sql_approvals();
+        assert_ne!(sql_approvals().lock().unwrap().generation, generation);
+        assert!(!take_sql_approval(Some(&token), &config, "app", "DROP TABLE t"));
+    }
+
+    #[test]
+    fn timed_sql_approval_does_not_follow_a_connection_edit() {
+        let config = mysql_config(false);
+        let grant =
+            TimedSqlApproval { connection: config.clone(), expires_at: Instant::now() + Duration::from_secs(60) };
+        assert!(grant.valid_for(&config, Instant::now()));
+        let mut changed = config.clone();
+        changed.host = "other-host".to_string();
+        assert!(!grant.valid_for(&changed, Instant::now()));
+        assert!(!grant.valid_for(&config, grant.expires_at));
+    }
 
     fn mysql_config(read_only: bool) -> ConnectionConfig {
         serde_json::from_value(serde_json::json!({
@@ -339,10 +619,168 @@ mod tests {
         let port_file = write_port_file(&resolved_data_dir, 49152).unwrap();
 
         assert_eq!(port_file, resolved_data_dir.join("mcp-bridge-port"));
-        assert_eq!(std::fs::read_to_string(port_file).unwrap(), "49152");
+        assert_eq!(std::fs::read_to_string(&port_file).unwrap(), "49152");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&port_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the port file must not be world-readable");
+        }
         assert!(!default_data_dir.join("mcp-bridge-port").exists());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn call_plugin_target_accepts_the_bound_plugin_with_or_without_an_echo() {
+        assert_eq!(resolve_call_plugin_target(Some("io.dbx.ssh"), None).unwrap(), "io.dbx.ssh");
+        assert_eq!(resolve_call_plugin_target(Some("io.dbx.ssh"), Some("io.dbx.ssh")).unwrap(), "io.dbx.ssh");
+    }
+
+    #[test]
+    fn call_plugin_target_rejects_override_and_unbound_connections() {
+        assert!(resolve_call_plugin_target(Some("io.dbx.ssh"), Some("io.dbx.files")).is_err());
+        assert!(resolve_call_plugin_target(None, Some("io.dbx.ssh")).is_err());
+        assert!(resolve_call_plugin_target(Some(""), Some("io.dbx.ssh")).is_err());
+        assert_eq!(resolve_call_plugin_target(None, None).unwrap_err(), "connection is not bound to a plugin");
+    }
+
+    #[test]
+    fn content_length_parsing_tolerates_case_and_whitespace() {
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\nContent-Length: 12\r\n\r\n"), 12);
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\ncontent-length:  7\r\n\r\n"), 7);
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\nContent-Length: bogus\r\n\r\n"), 0);
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\n\r\n"), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_reads_bodies_arriving_in_multiple_segments() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_bridge_request(&mut stream).await.unwrap()
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        let body = "x".repeat(100_000);
+        let request = format!(
+            "POST /execute-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let bytes = request.into_bytes();
+        // Split the request well past the header so the body cannot arrive
+        // in the same TCP segment the header rides in.
+        client.write_all(&bytes[..4096]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(&bytes[4096..]).await.unwrap();
+        let parsed = reader.await.unwrap();
+        assert!(parsed.ends_with(&body), "body must arrive complete, not truncated");
+    }
+
+    async fn wait_for_queued_request(stream: &tokio::net::TcpStream, expected_len: usize) {
+        let mut queued = vec![0u8; expected_len];
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if stream.peek(&mut queued).await.unwrap() >= expected_len {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request bytes must be queued before the reader starts");
+    }
+
+    async fn read_complete_request_while_writer_stays_open(request: &[u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        client.write_all(request).await.unwrap();
+        wait_for_queued_request(&server, request.len()).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), read_bridge_request(&mut server))
+            .await
+            .expect("complete request must not wait for another read")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bridge_reads_complete_small_request_while_writer_stays_open() {
+        let request = b"POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}";
+
+        assert_eq!(read_complete_request_while_writer_stays_open(request).await.as_bytes(), request);
+    }
+
+    #[tokio::test]
+    async fn bridge_reads_zero_length_body_while_writer_stays_open() {
+        let request = b"POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(read_complete_request_while_writer_stays_open(request).await.as_bytes(), request);
+    }
+
+    #[tokio::test]
+    async fn bridge_reads_complete_body_in_fragment_that_finishes_header_delimiter() {
+        let first = b"POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r";
+        let last = b"\n{}";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        client.write_all(first).await.unwrap();
+        wait_for_queued_request(&server, first.len()).await;
+        let mut reader = Box::pin(read_bridge_request(&mut server));
+        // Consume the queued prefix before providing the delimiter's final bytes.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reader.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        client.write_all(last).await.unwrap();
+
+        let parsed = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+            .await
+            .expect("complete final fragment must not wait for another read")
+            .unwrap();
+        let expected = [first.as_slice(), last.as_slice()].concat();
+        assert_eq!(parsed.as_bytes(), expected);
+    }
+
+    #[test]
+    fn bridge_rejects_browser_shaped_requests_and_keeps_local_clients() {
+        assert!(bridge_request_is_local_client(
+            "POST /call-plugin-tool HTTP/1.1",
+            "POST /call-plugin-tool HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nContent-Type: application/json"
+        ));
+        assert!(bridge_request_is_local_client("GET / HTTP/1.1", "GET / HTTP/1.1\r\nHost: localhost"));
+        assert!(bridge_request_is_local_client(
+            "POST /execute-query HTTP/1.1",
+            "POST /execute-query HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nContent-Type: application/json; charset=utf-8"
+        ));
+        // Browsers always attach Origin to cross-origin requests.
+        assert!(!bridge_request_is_local_client(
+            "POST /call-plugin-tool HTTP/1.1",
+            "POST /call-plugin-tool HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nContent-Type: application/json\r\nOrigin: http://evil.example"
+        ));
+        // Non-preflightable content types are the classic fire-and-forget form POST.
+        assert!(!bridge_request_is_local_client(
+            "POST /call-plugin-tool HTTP/1.1",
+            "POST /call-plugin-tool HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nContent-Type: text/plain"
+        ));
+        assert!(!bridge_request_is_local_client(
+            "POST /call-plugin-tool HTTP/1.1",
+            "POST /call-plugin-tool HTTP/1.1\r\nHost: 127.0.0.1:7777"
+        ));
+        // DNS rebinding presents a foreign Host.
+        assert!(!bridge_request_is_local_client(
+            "POST /call-plugin-tool HTTP/1.1",
+            "POST /call-plugin-tool HTTP/1.1\r\nHost: evil.example\r\nContent-Type: application/json"
+        ));
     }
 
     #[test]
@@ -413,7 +851,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let storage = Storage::open(&root.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&root.join("storage.db")).await.unwrap();
         let mut config = mysql_config(false);
         storage.save_connections(&[config.clone()]).await.unwrap();
         let state = Arc::new(AppState::new_with_plugin_dir(storage, root.join("plugins")));
@@ -484,6 +922,7 @@ mod tests {
                     McpDatabasePolicy { database_name: "aa".to_string(), read_only: false, allow_dangerous_sql: true },
                     McpDatabasePolicy { database_name: "aaa".to_string(), read_only: true, allow_dangerous_sql: false },
                 ],
+                allow_salesforce_dml: false,
             }],
             ..Default::default()
         };
@@ -501,7 +940,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let storage = Storage::open(&root.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&root.join("storage.db")).await.unwrap();
         let mut config = mysql_config(false);
         config.id = "conn-1".to_string();
         storage.save_connections(&[config]).await.unwrap();
@@ -520,6 +959,7 @@ mod tests {
                         read_only: false,
                         allow_dangerous_sql: true,
                     }],
+                    allow_salesforce_dml: false,
                 }],
                 ..Default::default()
             })
@@ -1183,6 +1623,16 @@ async fn ensure_mcp_sql_allowed(
     database: &str,
     sql: &str,
 ) -> Result<(), String> {
+    ensure_mcp_sql_allowed_with_approval(state, config, database, sql, false).await
+}
+
+async fn ensure_mcp_sql_allowed_with_approval(
+    state: &Arc<AppState>,
+    config: &crate::models::connection::ConnectionConfig,
+    database: &str,
+    sql: &str,
+    approved: bool,
+) -> Result<(), String> {
     let (policy, group_paths) = load_mcp_policy_context(state).await?;
     let group_path = group_paths.get(&config.id);
     ensure_connection_in_mcp_scope_with_groups(&policy, group_path, &config.id)?;
@@ -1203,7 +1653,10 @@ async fn ensure_mcp_sql_allowed(
         }
     }
     ensure_mcp_sql_database_switch_allowed(config.db_type, sql)?;
-    let is_write = dbx_core::query_execution_sql::is_write_sql_for_database(sql, config.db_type);
+    let risk = dbx_core::sql_risk::classify_sql_risk_for_database(sql, config.db_type)
+        .map_err(|error| format!("SQL_BLOCKED: {error}"))?;
+    let is_write = risk != dbx_core::sql_risk::SqlRisk::ReadOnly
+        || dbx_core::query_execution_sql::is_write_sql_for_database(sql, config.db_type);
     dbx_core::mcp_policy::ensure_sql_database_execution_scope(&policy, config, database, sql)?;
     let group_ids = group_path.map(|path| path.ids.as_slice()).unwrap_or_default();
     let (read_only, allow_dangerous_sql) =
@@ -1213,7 +1666,11 @@ async fn ensure_mcp_sql_allowed(
             "MCP_READ_ONLY: MCP execution permission for database '{database}' is read-only. SQL write blocked."
         ));
     }
-    if !allow_dangerous_sql && dbx_core::sql_risk::is_dangerous_sql_for_database(sql, config.db_type) {
+    if !allow_dangerous_sql
+        && (risk == dbx_core::sql_risk::SqlRisk::Ddl
+            || dbx_core::sql_risk::is_dangerous_sql_for_database(sql, config.db_type))
+        && !(approved && policy.prompt_high_risk_sql && !read_only)
+    {
         return Err("SQL_BLOCKED: High-risk SQL is disabled in DBX MCP settings.".to_string());
     }
     ensure_mcp_connection_sql_write_allowed(config, is_write)?;
@@ -1221,6 +1678,184 @@ async fn ensure_mcp_sql_allowed(
         return Err("PRODUCTION_DATABASE_READ_ONLY: SQL write targeting production scope is blocked.".to_string());
     }
     Ok(())
+}
+
+async fn handle_sql_approval(app: &AppHandle, state: &Arc<AppState>, body: &str, stream: &mut tokio::net::TcpStream) {
+    let req: SqlApprovalRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(_) => {
+            respond_error(stream, "400 Bad Request", "Invalid approval request").await;
+            return;
+        }
+    };
+    let config = match resolve_connection(state, Some(&req.connection_id), "").await {
+        Ok(config) => config,
+        Err(error) => {
+            respond_error(stream, "403 Forbidden", &error).await;
+            return;
+        }
+    };
+    // A prompt must not be offered for an operation that cannot be executed
+    // even with high-risk permission (scope, read-only, or production).
+    let (policy, group_paths) = match load_mcp_policy_context(state).await {
+        Ok(context) => context,
+        Err(error) => {
+            respond_error(stream, "403 Forbidden", &error).await;
+            return;
+        }
+    };
+    let group_ids = group_paths.get(&config.id).map(|path| path.ids.as_slice()).unwrap_or_default();
+    let (read_only, allow_dangerous) =
+        effective_database_execution_policy_with_groups(&policy, group_ids, &config.id, &req.database);
+    if !policy.prompt_high_risk_sql
+        || read_only
+        || allow_dangerous
+        || !(dbx_core::sql_risk::classify_sql_risk_for_database(&req.sql, config.db_type)
+            .is_ok_and(|risk| risk == dbx_core::sql_risk::SqlRisk::Ddl)
+            || dbx_core::sql_risk::is_dangerous_sql_for_database(&req.sql, config.db_type))
+    {
+        respond_error(stream, "403 Forbidden", "SQL_BLOCKED: High-risk SQL approval is unavailable.").await;
+        return;
+    }
+    if let Err(error) = ensure_mcp_sql_allowed_with_approval(state, &config, &req.database, &req.sql, true).await {
+        respond_error(stream, "403 Forbidden", &error).await;
+        return;
+    }
+    let key = (config.id.clone(), req.database.clone());
+    let now = Instant::now();
+    let existing = (|| {
+        let mut approvals = sql_approvals().lock().map_err(|_| ())?;
+        approvals
+            .timed
+            .retain(|grant_key, grant| grant.expires_at > now && (grant_key != &key || grant.valid_for(&config, now)));
+        Ok::<_, ()>((approvals.timed.contains_key(&key).then_some(SqlApprovalDecision::Hour), approvals.generation))
+    })();
+    let (decision, generation) = match existing {
+        Ok(existing) => existing,
+        Err(()) => {
+            respond_error(stream, "500 Internal Server Error", "MCP approval state unavailable").await;
+            return;
+        }
+    };
+    let decision = if let Some(decision) = decision {
+        decision
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (sender, receiver) = oneshot::channel();
+        let queued = (|| {
+            let mut approvals =
+                sql_approvals().lock().map_err(|_| ("500 Internal Server Error", "MCP approval state unavailable"))?;
+            if approvals.pending.len() >= 16 {
+                return Err(("429 Too Many Requests", "Too many pending MCP approvals"));
+            }
+            approvals.pending.insert(id.clone(), sender);
+            Ok::<_, (&str, &str)>(())
+        })();
+        if let Err((status, message)) = queued {
+            respond_error(stream, status, message).await;
+            return;
+        }
+        let event = SqlApprovalEvent {
+            id: id.clone(),
+            connection_name: config.name.clone(),
+            database: req.database.clone(),
+            sql: req.sql.clone(),
+        };
+        if app.emit_to("main", "mcp-sql-approval", event).is_err() {
+            sql_approvals().lock().ok().map(|mut approvals| approvals.pending.remove(&id));
+            respond_error(stream, "503 Service Unavailable", "DBX approval window unavailable").await;
+            return;
+        }
+        let answer = tokio::time::timeout(Duration::from_secs(90), receiver).await;
+        sql_approvals().lock().ok().map(|mut approvals| approvals.pending.remove(&id));
+        match answer {
+            Ok(Ok(decision)) => decision,
+            _ => {
+                respond_error(stream, "403 Forbidden", "SQL_BLOCKED: MCP approval timed out.").await;
+                return;
+            }
+        }
+    };
+    if matches!(decision, SqlApprovalDecision::Deny) {
+        respond_error(stream, "403 Forbidden", "SQL_BLOCKED: MCP approval denied.").await;
+        return;
+    }
+    // Re-read mutable policy after the person responds. Revocation wins.
+    let current = match resolve_connection(state, Some(&config.id), "").await {
+        Ok(current) => current,
+        Err(error) => {
+            respond_error(stream, "403 Forbidden", &error).await;
+            return;
+        }
+    };
+    if current != config {
+        respond_error(stream, "403 Forbidden", "SQL_BLOCKED: Connection changed while awaiting approval.").await;
+        return;
+    }
+    if let Err(error) = ensure_mcp_sql_allowed_with_approval(state, &current, &req.database, &req.sql, true).await {
+        respond_error(stream, "403 Forbidden", &error).await;
+        return;
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let grant_result = (|| -> Result<(), &'static str> {
+        let mut approvals = sql_approvals().lock().map_err(|_| "MCP approval state unavailable")?;
+        if approvals.generation != generation {
+            return Err("SQL_BLOCKED: Approval revoked by policy change.");
+        }
+        if let Some(duration) = match decision {
+            SqlApprovalDecision::Hour => Some(Duration::from_secs(3600)),
+            SqlApprovalDecision::Day => Some(Duration::from_secs(86400)),
+            _ => None,
+        } {
+            // Do not renew an existing grant on use.
+            approvals.timed.entry(key).or_insert_with(|| TimedSqlApproval {
+                connection: config.clone(),
+                expires_at: Instant::now() + duration,
+            });
+        }
+        approvals.tokens.retain(|_, grant| grant.expires_at > Instant::now());
+        approvals.tokens.insert(
+            token.clone(),
+            SqlApprovalGrant {
+                connection: config,
+                database: req.database,
+                sql: req.sql,
+                expires_at: Instant::now() + Duration::from_secs(90),
+            },
+        );
+        Ok(())
+    })();
+    if let Err(error) = grant_result {
+        respond_error(stream, "403 Forbidden", error).await;
+        return;
+    }
+    respond_json(stream, &serde_json::json!({ "token": token })).await;
+}
+
+async fn handle_consume_sql_approval(state: &Arc<AppState>, body: &str, stream: &mut tokio::net::TcpStream) {
+    let req: ConsumeSqlApprovalRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(_) => {
+            respond_error(stream, "400 Bad Request", "Invalid approval request").await;
+            return;
+        }
+    };
+    let config = match resolve_connection(state, Some(&req.connection_id), "").await {
+        Ok(config) => config,
+        Err(error) => {
+            respond_error(stream, "403 Forbidden", &error).await;
+            return;
+        }
+    };
+    if !take_sql_approval(Some(&req.token), &config, &req.database, &req.sql) {
+        respond_error(stream, "403 Forbidden", "SQL_BLOCKED: Approval expired or does not match this request.").await;
+        return;
+    }
+    if let Err(error) = ensure_mcp_sql_allowed_with_approval(state, &config, &req.database, &req.sql, true).await {
+        respond_error(stream, "403 Forbidden", &error).await;
+        return;
+    }
+    respond_json(stream, &serde_json::json!({ "ok": true })).await;
 }
 
 fn ensure_mcp_sql_database_switch_allowed(
@@ -1352,6 +1987,26 @@ async fn plugin_agent_mode_on(state: &Arc<AppState>, plugin_id: &str, connection
         .is_some_and(|mode| mode == "auto" || mode == "strict")
 }
 
+/// `/call-plugin-tool` may only talk to the saved connection's own plugin:
+/// the lifecycle payload (which carries the connection's credentials) is
+/// built from the config, so honoring a request-named `plugin_id` would hand
+/// connection A's secrets to plugin B's sidecar. Callers may repeat the
+/// binding, never override it.
+fn resolve_call_plugin_target(
+    config_plugin_id: Option<&str>,
+    request_plugin_id: Option<&str>,
+) -> Result<String, String> {
+    let bound = config_plugin_id
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "connection is not bound to a plugin".to_string())?;
+    if let Some(requested) = request_plugin_id {
+        if requested != bound {
+            return Err(format!("plugin_id {requested:?} does not match the connection's plugin {bound:?}"));
+        }
+    }
+    Ok(bound.to_string())
+}
+
 /// POST /call-plugin-tool: runs a plugin MCP tool on the desktop app's own
 /// plugin session — the same sidecar process the workbench talks to. The
 /// connection's workbench tab is opened only when the call will route into
@@ -1379,11 +2034,13 @@ async fn handle_call_plugin_tool(
             return;
         }
     };
-    let plugin_id = req.plugin_id.or_else(|| config.plugin_id.clone()).unwrap_or_default();
-    if plugin_id.is_empty() {
-        respond_error(stream, "400 Bad Request", "connection is not bound to a plugin").await;
-        return;
-    }
+    let plugin_id = match resolve_call_plugin_target(config.plugin_id.as_deref(), req.plugin_id.as_deref()) {
+        Ok(plugin_id) => plugin_id,
+        Err(message) => {
+            respond_error(stream, "400 Bad Request", &message).await;
+            return;
+        }
+    };
     // The workbench tab only needs to exist when the forwarded call will
     // actually route into the visible terminal: an explicit runInTerminal,
     // or no flag plus the connection's terminal MCP mode being on (asked
@@ -1532,7 +2189,8 @@ async fn handle_execute_query(app: &AppHandle, state: &Arc<AppState>, body: &str
     // Check the complete batch first so a session-changing statement cannot
     // hide a later production write, then recheck every statement immediately
     // before it reaches the database.
-    if let Err(e) = ensure_mcp_sql_allowed(state, &config, &database, &req.sql).await {
+    let approved = take_sql_approval(req.approval_token.as_deref(), &config, &database, &req.sql);
+    if let Err(e) = ensure_mcp_sql_allowed_with_approval(state, &config, &database, &req.sql, approved).await {
         respond(stream, "403 Forbidden", &e).await;
         return;
     }
@@ -1551,7 +2209,7 @@ async fn handle_execute_query(app: &AppHandle, state: &Arc<AppState>, body: &str
                 return;
             }
         };
-        if let Err(e) = ensure_mcp_sql_allowed(state, &current, &database, &statement).await {
+        if let Err(e) = ensure_mcp_sql_allowed_with_approval(state, &current, &database, &statement, approved).await {
             respond(stream, "403 Forbidden", &e).await;
             return;
         }

@@ -27,6 +27,7 @@ import {
 } from "@/lib/app/appTheme";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { persistAppAppearancePatch } from "@/lib/app/appAppearance";
 
 function isLinuxTauriRuntime() {
   return isTauriRuntime() && typeof navigator !== "undefined" && /linux/i.test(navigator.userAgent);
@@ -62,6 +63,39 @@ const isDark = computed(() => resolveAppThemeAppearance(themeMode.value, systemP
 // miss palette switches and custom-color edits. Consumers that mirror the
 // resolved token set (plugin iframe bridge) watch this revision instead.
 const themeRevision = ref(0);
+
+// Token mutations on the root that happen outside applyTheme() — e.g. the UI
+// and editor font settings write --font-sans / --font-mono inline — bump this
+// so open plugin workbench bridges re-read and re-push the resolved tokens.
+function bumpThemeRevision() {
+  themeRevision.value += 1;
+}
+
+let pendingBumpTimer: ReturnType<typeof setTimeout> | undefined;
+
+// The one sanctioned way to write a design token onto the root outside
+// applyTheme(): writes the inline override AND bumps the theme revision.
+// Writing root tokens directly (documentElement.style.setProperty) skips the
+// bump and open plugin bridges keep stale tokens — always go through here.
+// `debounceMs` coalesces rapid writes (font-family preview keystrokes) into
+// one bump; an immediate write afterwards supersedes the pending one.
+function writeRootToken(cssVar: string, value: string, options?: { debounceMs?: number }) {
+  if (typeof document === "undefined") return;
+  document.documentElement.style.setProperty(cssVar, value);
+  if (options?.debounceMs) {
+    if (pendingBumpTimer) clearTimeout(pendingBumpTimer);
+    pendingBumpTimer = setTimeout(() => {
+      pendingBumpTimer = undefined;
+      bumpThemeRevision();
+    }, options.debounceMs);
+    return;
+  }
+  if (pendingBumpTimer) {
+    clearTimeout(pendingBumpTimer);
+    pendingBumpTimer = undefined;
+  }
+  bumpThemeRevision();
+}
 
 let mediaQuery: MediaQueryList | null = null;
 let isListeningForSystemTheme = false;
@@ -136,6 +170,7 @@ function applyTheme() {
 function setThemeMode(mode: AppThemeMode) {
   themeMode.value = mode;
   safeLocalStorageSet(APP_THEME_STORAGE_KEY, mode);
+  persistAppAppearancePatch({ themeMode: mode });
   applyTheme();
 }
 
@@ -143,6 +178,7 @@ function setThemePalette(palette: AppThemePalette) {
   savedThemePaletteValue.value = palette;
   previewedThemePalette.value = null;
   safeLocalStorageSet(APP_THEME_PALETTE_STORAGE_KEY, palette);
+  persistAppAppearancePatch({ themePalette: palette });
   applyTheme();
 }
 
@@ -192,6 +228,7 @@ function setCustomUiColors(colors: AppCustomUiColors) {
     customUiColors.value = next;
     safeLocalStorageSet(APP_CUSTOM_UI_STORAGE_KEY, JSON.stringify(next));
   }
+  persistAppAppearancePatch({ [isDark.value ? "customUiColorsDark" : "customUiColors"]: next });
   applyCustomUiColors();
 }
 
@@ -202,6 +239,7 @@ function resetCustomUiColors() {
 function setCornerStyle(style: AppCornerStyle) {
   cornerStyle.value = normalizeAppCornerStyle(style);
   safeLocalStorageSet(APP_CORNER_STYLE_STORAGE_KEY, cornerStyle.value);
+  persistAppAppearancePatch({ cornerStyle: cornerStyle.value });
   applyTheme();
 }
 
@@ -212,5 +250,25 @@ export function useTheme() {
     setThemeMode(isDark.value ? "light" : "dark");
   }
 
-  return { isDark, themeMode, themePalette, customUiColors, customUiColorsDark, activeCustomUiColors, themeRevision, cornerStyle, applyTheme, setThemeMode, setThemePalette, previewThemePalette, clearThemePalettePreview, setCustomUiColors, resetCustomUiColors, setCornerStyle, toggleTheme };
+  return {
+    isDark,
+    themeMode,
+    themePalette,
+    customUiColors,
+    customUiColorsDark,
+    activeCustomUiColors,
+    themeRevision,
+    bumpThemeRevision,
+    writeRootToken,
+    cornerStyle,
+    applyTheme,
+    setThemeMode,
+    setThemePalette,
+    previewThemePalette,
+    clearThemePalettePreview,
+    setCustomUiColors,
+    resetCustomUiColors,
+    setCornerStyle,
+    toggleTheme,
+  };
 }

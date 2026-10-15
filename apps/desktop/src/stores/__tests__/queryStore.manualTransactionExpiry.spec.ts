@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   analyzeEditableQueryEditability: vi.fn(),
   beginManualTransaction: vi.fn(),
+  commitManualTransaction: vi.fn(),
+  rollbackManualTransaction: vi.fn(),
+  cancelQueryAndWait: vi.fn(),
   closeClientConnectionSession: vi.fn(),
   closeQuerySession: vi.fn(),
   executeInManualTransaction: vi.fn(),
@@ -16,6 +19,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/backend/api", () => ({
   analyzeEditableQueryEditability: mocks.analyzeEditableQueryEditability,
   beginManualTransaction: mocks.beginManualTransaction,
+  commitManualTransaction: mocks.commitManualTransaction,
+  rollbackManualTransaction: mocks.rollbackManualTransaction,
+  cancelQueryAndWait: mocks.cancelQueryAndWait,
   closeClientConnectionSession: mocks.closeClientConnectionSession,
   closeQuerySession: mocks.closeQuerySession,
   executeInManualTransaction: mocks.executeInManualTransaction,
@@ -76,6 +82,10 @@ function successfulSelect() {
   return [{ columns: ["VALUE"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }];
 }
 
+function successfulReadOnlySelect() {
+  return [{ columns: ["VALUE"], rows: [[1]], affected_rows: 0, execution_time_ms: 1, manual_transaction_proven_read_only: true }];
+}
+
 describe("queryStore manual transaction expiry recovery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -123,6 +133,51 @@ describe("queryStore manual transaction expiry recovery", () => {
     expect(tab.txnAutoRolledBack).toBe(true);
     expect(tab.result?.execution_error).not.toBe(true);
     expect(tab.result?.affected_rows).toBe(1);
+  });
+
+  it("restarts an expired read-only transaction without the rollback notice", async () => {
+    mocks.beginManualTransaction.mockResolvedValueOnce("txn-old").mockResolvedValueOnce("txn-new");
+    mocks.executeInManualTransaction.mockResolvedValueOnce(successfulReadOnlySelect()).mockRejectedValueOnce(expiredTransactionError()).mockResolvedValueOnce(successfulReadOnlySelect());
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("oracle-1", "ORCL", "Query", "query", "APP");
+    store.setAutoCommit(tabId, false);
+
+    await store.executeTabSql(tabId, "SELECT VALUE FROM DUAL");
+    await store.executeTabSql(tabId, "SELECT VALUE FROM DUAL");
+
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    expect(tab.txnSessionId).toBe("txn-new");
+    expect(tab.result?.rows).toEqual([[1]]);
+    // 只读会话没有任何未提交改动，空闲回收后静默重建即可，不应提示「事务已自动回滚」(#9831)
+    expect(tab.txnAutoRolledBack).not.toBe(true);
+  });
+
+  it("keeps the rollback notice for a manual dialect without sticky read-only tracking", async () => {
+    mocks.getConnectionConfig.mockReturnValue({
+      id: "dameng-1",
+      name: "DM",
+      db_type: "dameng",
+      database: "DMHR",
+      query_timeout_secs: 30,
+    });
+    mocks.beginManualTransaction.mockResolvedValueOnce("txn-old").mockResolvedValueOnce("txn-new");
+    mocks.executeInManualTransaction.mockResolvedValueOnce(successfulSelect()).mockRejectedValueOnce(expiredTransactionError()).mockResolvedValueOnce(successfulSelect());
+
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("dameng-1", "DMHR", "Query", "query", "SYSDBA");
+    store.setAutoCommit(tabId, false);
+
+    await store.executeTabSql(tabId, "SELECT 1 FROM DUAL");
+    await store.executeTabSql(tabId, "SELECT 1 FROM DUAL");
+
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    expect(tab.txnSessionId).toBe("txn-new");
+    expect(tab.result?.rows).toEqual([[1]]);
+    // 不跟踪只读状态的方言无法判断会话是否干净，保留原有提示。
+    expect(tab.txnAutoRolledBack).toBe(true);
   });
 
   it("normalizes a stale manual tab for a non-transactional database before query dispatch", async () => {
@@ -269,5 +324,143 @@ describe("queryStore manual transaction expiry recovery", () => {
     expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
     expect(mocks.executeMulti).toHaveBeenCalledOnce();
     expect(tab.result?.execution_error).toBe(true);
+  });
+
+  async function sqlServerTab() {
+    mocks.getConnectionConfig.mockReturnValue({ id: "sqlserver-1", name: "SQL Server", db_type: "sqlserver", database: "db", query_timeout_secs: 30 });
+    mocks.rollbackManualTransaction.mockResolvedValue({ columns: [], rows: [] });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const id = store.createTab("sqlserver-1", "db", "SQL", "query", "dbo");
+    store.setAutoCommit(id, false);
+    return { store, id, tab: store.tabs.find((tab) => tab.id === id)! };
+  }
+
+  function transactionError(code: string, outcome: "unknown" | "rolled_back" | "committed" = "unknown") {
+    return { ...expiredTransactionError(), code, messageKey: code === "DBX-TXN-1007" ? "backendErrors.transaction.commitUnknown" : "backendErrors.transaction.connectionLost", transactionOutcome: outcome };
+  }
+
+  it("SQL Server retains one session across executions and forwards cancellation identity and timeout", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    mocks.beginManualTransaction.mockResolvedValue("sqlserver-txn-fixed");
+    mocks.executeInManualTransaction.mockResolvedValue(successfulUpdate());
+    await store.executeTabSql(id, "UPDATE users SET active = 1");
+    await store.executeTabSql(id, "UPDATE users SET active = 2");
+    expect(mocks.beginManualTransaction).toHaveBeenCalledOnce();
+    expect(mocks.executeInManualTransaction).toHaveBeenCalledTimes(2);
+    for (const call of mocks.executeInManualTransaction.mock.calls) {
+      expect(call[0]).toBe("sqlserver-txn-fixed");
+      expect(call[9]).toEqual(expect.any(String));
+      expect(call[10]).toBe(30);
+    }
+    expect(tab.txnStatus).toBe("active");
+    expect(tab.autoCommit).toBe(false);
+  });
+
+  it.each([expiredTransactionError(), transactionError("DBX-TXN-1005"), transactionError("DBX-TXN-1009", "rolled_back")])("SQL Server never silently replays a failed execution (%s)", async (error) => {
+    const { store, id, tab } = await sqlServerTab();
+    mocks.beginManualTransaction.mockResolvedValueOnce("sqlserver-txn-old").mockResolvedValueOnce("sqlserver-txn-new");
+    mocks.executeInManualTransaction.mockRejectedValueOnce(error).mockResolvedValueOnce(successfulUpdate());
+    await store.executeTabSql(id, "UPDATE users SET active = 1");
+    expect(mocks.executeInManualTransaction).toHaveBeenCalledOnce();
+    expect(mocks.beginManualTransaction).toHaveBeenCalledOnce();
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
+    expect(tab.txnSessionId).toBeUndefined();
+    expect(tab.autoCommit).toBe(false);
+    expect(tab.txnAutoRolledBack).toBe(false);
+    expect(tab.result?.execution_error).toBe(true);
+    await store.executeTabSql(id, "UPDATE users SET active = 2");
+    expect(mocks.beginManualTransaction).toHaveBeenCalledTimes(2);
+    expect(mocks.executeInManualTransaction).toHaveBeenCalledTimes(2);
+    expect(tab.txnSessionId).toBe("sqlserver-txn-new");
+  });
+
+  it("SQL Server refuses unsupported BEGIN even for a read without automatic execution", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    mocks.beginManualTransaction.mockRejectedValueOnce(new Error("Unknown method: begin_manual_transaction"));
+    await store.executeTabSql(id, "SELECT 1");
+    expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
+    expect(tab.autoCommit).toBe(false);
+    expect(tab.result?.execution_error).toBe(true);
+  });
+
+  it("SQL Server clears a lost commit session, reports unknown and never retries commit", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    tab.txnSessionId = "sqlserver-txn-commit";
+    mocks.commitManualTransaction.mockRejectedValueOnce(transactionError("DBX-TXN-1007"));
+    await store.commitTransaction(id);
+    expect(mocks.commitManualTransaction).toHaveBeenCalledOnce();
+    expect(mocks.rollbackManualTransaction).not.toHaveBeenCalled();
+    expect(tab.txnStatus).toBe("unknown");
+    expect(tab.txnSessionId).toBeUndefined();
+    expect(tab.autoCommit).toBe(false);
+  });
+
+  it("SQL Server refuses switching to auto commit when rollback is unconfirmed", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    tab.txnSessionId = "sqlserver-txn-rollback";
+    mocks.rollbackManualTransaction.mockRejectedValueOnce(transactionError("DBX-TXN-1006"));
+    store.setAutoCommit(id, true);
+    await vi.waitFor(() => expect(tab.txnStatus).toBe("lost"));
+    expect(tab.autoCommit).toBe(false);
+    expect(tab.txnSessionId).toBeUndefined();
+    expect(tab.txnAutoRolledBack).toBe(false);
+  });
+
+  it("SQL Server preserves the transaction handle on a busy rollback rejection", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    tab.txnSessionId = "sqlserver-txn-busy";
+    mocks.rollbackManualTransaction.mockRejectedValueOnce(transactionError("DBX-TXN-1003"));
+    await store.rollbackTransaction(id);
+    expect(tab.txnSessionId).toBe("sqlserver-txn-busy");
+    expect(tab.txnStatus).toBe("active");
+  });
+
+  it("SQL Server keeps manual mode while cancellation is not terminal", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    tab.txnSessionId = "sqlserver-txn-running";
+    tab.isExecuting = true;
+    tab.executionId = "running-id";
+    mocks.cancelQueryAndWait.mockResolvedValueOnce({ requested: true, terminal: false });
+    store.setAutoCommit(id, true);
+    await vi.waitFor(() => expect(mocks.cancelQueryAndWait).toHaveBeenCalledWith("running-id"));
+    await Promise.resolve();
+    expect(tab.autoCommit).toBe(false);
+    expect(tab.txnSessionId).toBe("sqlserver-txn-running");
+    expect(mocks.rollbackManualTransaction).not.toHaveBeenCalled();
+  });
+
+  it("SQL Server treats a lost desktop commit response as unknown even without a backend envelope", async () => {
+    const { store, id, tab } = await sqlServerTab();
+    tab.txnSessionId = "sqlserver-txn-transport";
+    mocks.commitManualTransaction.mockRejectedValueOnce(new Error("IPC response lost"));
+    await store.commitTransaction(id);
+    expect(tab.txnStatus).toBe("unknown");
+    expect(tab.txnSessionId).toBeUndefined();
+    expect(tab.txnNotice).toContain("COMMIT");
+    expect(mocks.commitManualTransaction).toHaveBeenCalledOnce();
+    expect(mocks.rollbackManualTransaction).not.toHaveBeenCalled();
+  });
+
+  it.each(["database", "close"])("SQL Server cleans a late BEGIN after a %s change without dispatching SQL", async (action) => {
+    const { store, id, tab } = await sqlServerTab();
+    let finishBegin!: (session: string) => void;
+    mocks.beginManualTransaction.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        finishBegin = resolve;
+      }),
+    );
+    const execution = store.executeTabSql(id, "UPDATE users SET active = 1");
+    await vi.waitFor(() => expect(mocks.beginManualTransaction).toHaveBeenCalledOnce());
+    if (action === "database") store.updateDatabase(id, "other_database");
+    else store.closeTab(id, { force: true });
+    finishBegin("sqlserver-txn-late");
+    await execution;
+    expect(mocks.rollbackManualTransaction).toHaveBeenCalledOnce();
+    expect(mocks.rollbackManualTransaction).toHaveBeenCalledWith("sqlserver-txn-late");
+    expect(mocks.executeInManualTransaction).not.toHaveBeenCalled();
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
+    expect(tab.txnSessionId).toBeUndefined();
   });
 });

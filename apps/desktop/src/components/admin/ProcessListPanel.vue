@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Activity, AlertTriangle, ArrowDown, ArrowUp, Ban, Copy, Loader2, RefreshCcw, Search } from "@lucide/vue";
+import { Activity, AlertTriangle, ArrowDown, ArrowUp, Ban, Copy, Loader2, PlugZap, RefreshCcw, Search } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -13,6 +13,8 @@ import * as api from "@/lib/backend/api";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { clampInterval, createProcessListLoadCoordinator, DEFAULT_REFRESH_SECONDS, processListExecutionError, processListSessionCount } from "@/lib/database/mysqlProcessList";
 import { resolveProcessListDriverForConnection, type ProcessRow } from "@/lib/database/processListDrivers";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { processListSelectionAfterClick } from "@/lib/database/processListSelection";
 import { useTabUiState } from "@/lib/tabs/tabUiState";
 
 const props = defineProps<{
@@ -33,12 +35,16 @@ const { initialState: restoredUiState, track: trackUiState } = useTabUiState<{
 // The panel is only opened for supported engines; guard the driver defensively so
 // a missing one degrades to an empty table rather than crashing the render.
 const driver = computed(() => resolveProcessListDriverForConnection(props.connection));
+const xuguAdminRequired = computed(() => effectiveDatabaseTypeForConnection(props.connection) === "xugu" && driver.value === null);
 const columns = computed(() => driver.value?.columns ?? []);
 const numericKeys = computed(() => new Set(columns.value.filter((column) => column.numeric).map((column) => column.key)));
 
 const rows = ref<ProcessRow[]>([]);
 const truncated = ref(false);
 const ownSessionId = ref<number | null>(null);
+const ownNodeId = ref<number | null>(null);
+const transactionMode = computed(() => driver.value?.mode === "transaction");
+const transactionIdentityUnavailable = computed(() => transactionMode.value && (ownSessionId.value === null || ownNodeId.value === null));
 const loading = ref(false);
 const loadCoordinator = createProcessListLoadCoordinator();
 const loadError = ref("");
@@ -53,12 +59,21 @@ let timer: ReturnType<typeof setInterval> | undefined;
 
 const cancelTarget = ref<ProcessRow | null>(null);
 const canceling = ref(false);
+const terminateTarget = ref<ProcessRow | null>(null);
+const terminating = ref(false);
 const batchSupported = computed(() => driver.value?.supportsBatchCancel === true);
+// Engines without a terminate statement only expose query cancellation.
+const terminateSupported = computed(() => typeof driver.value?.buildTerminateSessionSql === "function");
+// Multi-selection serves batch cancel and/or batch terminate; either enables the checkboxes.
+const selectionSupported = computed(() => batchSupported.value || terminateSupported.value);
 const selectedIds = ref(new Set<number>());
+// Anchor row for Shift+click range selection, in the current display order.
+const selectionAnchorId = ref<number | null>(null);
 const batchTargets = ref<ProcessRow[] | null>(null);
-const batchResult = ref<{ succeeded: number; failures: { id: number; message: string }[] } | null>(null);
+const batchTerminateTargets = ref<ProcessRow[] | null>(null);
+const batchResult = ref<{ kind: "cancel" | "terminate"; succeeded: number; failures: { id: number; message: string }[] } | null>(null);
 const refreshing = ref(false);
-const actionsLocked = computed(() => canceling.value || cancelTarget.value !== null || batchTargets.value !== null);
+const actionsLocked = computed(() => canceling.value || cancelTarget.value !== null || terminating.value || terminateTarget.value !== null || batchTargets.value !== null || batchTerminateTargets.value !== null);
 let connectionGeneration = 0;
 let disposed = false;
 const fallbackListSql = ref<string | null>(null);
@@ -108,21 +123,31 @@ watch(
   (visible) => {
     const available = new Set(visible.map((row) => row.id));
     selectedIds.value = new Set([...selectedIds.value].filter((id) => available.has(id)));
+    if (selectionAnchorId.value !== null && !available.has(selectionAnchorId.value)) selectionAnchorId.value = null;
   },
   { flush: "sync" },
 );
 
-function toggleSelection(id: number, checked: boolean) {
+function clearSelection() {
+  selectedIds.value = new Set();
+  selectionAnchorId.value = null;
+}
+
+/** Row checkbox click: a plain click toggles one row, Shift+click extends from the anchor. */
+function toggleSelection(id: number, event: MouseEvent) {
   if (actionsLocked.value || refreshing.value) return;
-  const next = new Set(selectedIds.value);
-  if (checked && selectableRows.value.some((row) => row.id === id)) next.add(id);
-  else next.delete(id);
-  selectedIds.value = next;
+  // The browser toggles the clicked checkbox before this handler runs, so the
+  // next state comes from the selection; both agree because the click is never
+  // cancelled (cancelling it would leave the DOM checkbox out of sync).
+  const next = processListSelectionAfterClick(selectableRows.value, { selected: selectedIds.value, anchorId: selectionAnchorId.value }, id, event);
+  selectedIds.value = next.selected;
+  selectionAnchorId.value = next.anchorId;
 }
 
 function toggleAll(checked: boolean) {
   if (actionsLocked.value || refreshing.value) return;
   selectedIds.value = new Set(checked ? selectableRows.value.map((row) => row.id) : []);
+  selectionAnchorId.value = null;
 }
 
 function requestBatchCancel() {
@@ -134,21 +159,21 @@ function requestBatchCancel() {
 async function confirmBatchCancel() {
   const targets = batchTargets.value;
   const activeDriver = driver.value;
-  if (!targets?.length || !activeDriver?.supportsBatchCancel || ownSessionId.value === null || canceling.value) return;
+  if (!targets?.length || !activeDriver?.supportsBatchCancel || !activeDriver.buildCancelQuerySql || ownSessionId.value === null || canceling.value) return;
   const connection = { ...props.connection };
   const generation = connectionGeneration;
   const isCurrent = () => !disposed && generation === connectionGeneration;
   canceling.value = true;
   let executed = false;
   try {
-    const statements = targets.map((row) => ({ id: row.id, sql: activeDriver.buildCancelQuerySql(row.id) }));
+    const statements = targets.map((row) => ({ id: row.id, sql: activeDriver.buildCancelQuerySql!(row.id) }));
     const result = await executeWithProductionSqlGuard({
       connection,
       database: "",
       sql: statements.map((statement) => statement.sql).join(";\n"),
       source: t("production.sourceAdmin"),
       execute: async () => {
-        const summary = { succeeded: 0, failures: [] as { id: number; message: string }[] };
+        const summary = { kind: "cancel" as const, succeeded: 0, failures: [] as { id: number; message: string }[] };
         for (const statement of statements) {
           // A closed tab or changed connection must not dispatch remaining work.
           if (!isCurrent()) break;
@@ -168,11 +193,84 @@ async function confirmBatchCancel() {
     if (result === undefined || !isCurrent()) return;
     batchResult.value = result;
     batchTargets.value = null;
-    selectedIds.value = new Set();
+    clearSelection();
   } catch (error: unknown) {
     if (isCurrent()) toast(t("processList.killFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
   } finally {
     canceling.value = false;
+    if (!disposed && (executed || !isCurrent())) void load({ silent: true });
+  }
+}
+
+function requestBatchTerminate() {
+  if (!terminateSupported.value || actionsLocked.value || refreshing.value || ownSessionId.value === null) return;
+  const targets = selectableRows.value.filter((row) => selectedIds.value.has(row.id));
+  if (targets.length) batchTerminateTargets.value = targets.map((row) => ({ ...row }));
+}
+
+/**
+ * Close the selected sessions one by one. Each statement runs on its own so a
+ * failure on one session (permissions, an id that already exited) is reported in
+ * the summary instead of aborting the remaining terminations, mirroring batch
+ * cancel. The `terminating` mutex is shared with the single-row terminate action.
+ */
+async function confirmBatchTerminate() {
+  const targets = batchTerminateTargets.value;
+  const activeDriver = driver.value;
+  const buildTerminateSql = activeDriver?.buildTerminateSessionSql;
+  if (!targets?.length || !activeDriver || !buildTerminateSql || terminating.value) return;
+  const connection = { ...props.connection };
+  const generation = connectionGeneration;
+  const isCurrent = () => !disposed && generation === connectionGeneration;
+  terminating.value = true;
+  let executed = false;
+  try {
+    const statements = targets.map((row) => ({ id: row.id, sql: buildTerminateSql.call(activeDriver, row.id) }));
+    const executeTerminateSql = async (sql: string) => {
+      const results = await api.executeMulti(connection.id, "", sql, undefined, undefined, { maxRows: 1 });
+      const executionError = processListExecutionError(results);
+      if (executionError) throw new Error(executionError);
+      return results;
+    };
+    const result = await executeWithProductionSqlGuard({
+      connection,
+      database: "",
+      sql: statements.map((statement) => statement.sql).join(";\n"),
+      source: t("production.sourceAdmin"),
+      execute: async () => {
+        const summary = { kind: "terminate" as const, succeeded: 0, failures: [] as { id: number; message: string }[] };
+        for (const statement of statements) {
+          // A closed tab or changed connection must not dispatch remaining work.
+          if (!isCurrent()) break;
+          executed = true;
+          try {
+            let usedFallbackTerminateSql = false;
+            let results;
+            try {
+              results = await executeTerminateSql(statement.sql);
+            } catch (error) {
+              if (!activeDriver.buildFallbackTerminateSessionSql || !activeDriver.shouldUseFallbackTerminateSessionSql?.(error)) throw error;
+              usedFallbackTerminateSql = true;
+              results = await executeTerminateSql(activeDriver.buildFallbackTerminateSessionSql(statement.id));
+            }
+            const terminateResultError = usedFallbackTerminateSql ? activeDriver.fallbackTerminateSessionResultError?.(results) : activeDriver.terminateSessionResultError?.(results);
+            if (terminateResultError) throw new Error(terminateResultError);
+            summary.succeeded++;
+          } catch (error: unknown) {
+            summary.failures.push({ id: statement.id, message: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        return summary;
+      },
+    });
+    if (result === undefined || !isCurrent()) return;
+    batchResult.value = result;
+    batchTerminateTargets.value = null;
+    clearSelection();
+  } catch (error: unknown) {
+    if (isCurrent()) toast(t("processList.terminateFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
+  } finally {
+    terminating.value = false;
     if (!disposed && (executed || !isCurrent())) void load({ silent: true });
   }
 }
@@ -197,20 +295,29 @@ async function load(options: { silent?: boolean } = {}) {
   if (!options.silent) loading.value = true;
   loadError.value = "";
   try {
-    await connectionStore.ensureConnected(connectionId);
+    await connectionStore.ensureConnected(connectionId, { skipIfClosedByUser: true });
     if (!isCurrent()) return;
     if (ownSessionId.value === null) {
       try {
         let idResult;
         try {
-          idResult = await api.executeQuery(connectionId, "", activeDriver.ownSessionSql, undefined, undefined, { maxRows: 1 });
+          idResult = await api.executeQuery(connectionId, activeDriver.database ?? "", activeDriver.ownSessionSql, undefined, undefined, { maxRows: 1 });
         } catch (error) {
           if (!activeDriver.fallbackOwnSessionSql || !activeDriver.shouldUseFallbackOwnSessionSql?.(error)) throw error;
-          idResult = await api.executeQuery(connectionId, "", activeDriver.fallbackOwnSessionSql, undefined, undefined, { maxRows: 1 });
+          idResult = await api.executeQuery(connectionId, activeDriver.database ?? "", activeDriver.fallbackOwnSessionSql, undefined, undefined, { maxRows: 1 });
         }
-        const raw = idResult?.rows?.[0]?.[0];
-        const parsed = Number(raw);
-        if (isCurrent() && Number.isInteger(parsed) && parsed > 0) ownSessionId.value = parsed;
+        const ownRow = idResult?.rows?.[0];
+        if (activeDriver.mode === "transaction") {
+          const nodeId = Number(ownRow?.[0]);
+          const sessionId = Number(ownRow?.[1]);
+          if (isCurrent() && Number.isSafeInteger(nodeId) && nodeId > 0 && Number.isSafeInteger(sessionId) && sessionId >= 0) {
+            ownNodeId.value = nodeId;
+            ownSessionId.value = sessionId;
+          }
+        } else {
+          const parsed = Number(ownRow?.[0]);
+          if (isCurrent() && Number.isInteger(parsed) && parsed > 0) ownSessionId.value = parsed;
+        }
       } catch {
         // Non-fatal: without our own id we simply cannot dim the self row.
       }
@@ -219,10 +326,10 @@ async function load(options: { silent?: boolean } = {}) {
     const listSql = fallbackListSql.value ?? activeDriver.listSql;
     let result;
     try {
-      result = await api.executeQuery(connectionId, "", listSql, undefined, undefined, { maxRows: activeDriver.maxRows });
+      result = await api.executeQuery(connectionId, activeDriver.database ?? "", listSql, undefined, undefined, { maxRows: activeDriver.maxRows });
     } catch (error) {
       if (fallbackListSql.value || !activeDriver.fallbackListSql || !activeDriver.shouldUseFallbackListSql?.(error)) throw error;
-      result = await api.executeQuery(connectionId, "", activeDriver.fallbackListSql, undefined, undefined, { maxRows: activeDriver.maxRows });
+      result = await api.executeQuery(connectionId, activeDriver.database ?? "", activeDriver.fallbackListSql, undefined, undefined, { maxRows: activeDriver.maxRows });
       // Cache the compatible query so old servers do not fail once per refresh.
       if (isCurrent()) fallbackListSql.value = activeDriver.fallbackListSql;
     }
@@ -230,7 +337,17 @@ async function load(options: { silent?: boolean } = {}) {
     rows.value = activeDriver.mapRows(result);
     truncated.value = result.truncated === true;
   } catch (error: any) {
-    if (isCurrent()) loadError.value = error?.message || String(error);
+    if (isCurrent()) {
+      if (activeDriver.mode === "transaction") {
+        // A failed refresh must not leave stale kill targets on screen. A
+        // connection failure is not evidence that there are no transactions.
+        rows.value = [];
+        truncated.value = false;
+        ownSessionId.value = null;
+        ownNodeId.value = null;
+      }
+      loadError.value = activeDriver.mode === "transaction" ? t("processList.transactionLoadFailed", { message: error?.message || String(error) }) : error?.message || String(error);
+    }
   } finally {
     loading.value = false;
     refreshing.value = false;
@@ -240,38 +357,48 @@ async function load(options: { silent?: boolean } = {}) {
 }
 
 function isOwnSession(row: ProcessRow): boolean {
+  if (transactionMode.value) return ownNodeId.value !== null && ownSessionId.value !== null && row.nodeId === ownNodeId.value && row.id === ownSessionId.value;
   return ownSessionId.value !== null && row.id === ownSessionId.value;
 }
 
 function requestCancel(row: ProcessRow) {
-  if (isOwnSession(row) || actionsLocked.value || refreshing.value) return;
+  if (isOwnSession(row) || transactionIdentityUnavailable.value || actionsLocked.value || refreshing.value) return;
   cancelTarget.value = row;
 }
 
 async function confirmCancel() {
   const target = cancelTarget.value;
   const activeDriver = driver.value;
-  if (!target || !activeDriver || canceling.value) return;
+  if (!target || !activeDriver || canceling.value || isOwnSession(target) || transactionIdentityUnavailable.value || (transactionMode.value ? !activeDriver.buildKillTransactionSql : !activeDriver.buildCancelQuerySql)) return;
   const connection = { ...props.connection };
   const generation = connectionGeneration;
   const isCurrent = () => !disposed && generation === connectionGeneration;
   canceling.value = true;
   try {
-    const cancelSql = activeDriver.buildCancelQuerySql(target.id);
+    const cancelSql = transactionMode.value ? activeDriver.buildKillTransactionSql!(target) : activeDriver.buildCancelQuerySql!(target.id);
     let usedFallbackCancelSql = false;
     const executeCancelSql = async (sql: string) => {
       if (!isCurrent()) return undefined;
-      const results = await api.executeMulti(connection.id, "", sql, undefined, undefined, { maxRows: 1 });
+      const results = await api.executeMulti(connection.id, activeDriver.database ?? "", sql, undefined, undefined, { maxRows: 1 });
       const executionError = processListExecutionError(results);
       if (executionError) throw new Error(executionError);
       return results;
     };
     const result = await executeWithProductionSqlGuard({
       connection,
-      database: "",
+      database: activeDriver.database ?? "",
       sql: cancelSql,
       source: t("production.sourceAdmin"),
       execute: async () => {
+        if (activeDriver.mode === "transaction") {
+          // A confirmation dialog may stay open while the Agent reconnects.
+          // Refuse to kill until the executing session has been identified again.
+          const identity = await api.executeQuery(connection.id, activeDriver.database ?? "", activeDriver.ownSessionSql, undefined, undefined, { maxRows: 1 });
+          const currentNode = Number(identity.rows?.[0]?.[0]);
+          const currentSession = Number(identity.rows?.[0]?.[1]);
+          if (!Number.isSafeInteger(currentNode) || currentNode <= 0 || !Number.isSafeInteger(currentSession) || currentSession < 0) throw new Error(t("processList.transactionNeedsSession"));
+          if (currentNode === target.nodeId && currentSession === target.id) throw new Error(t("processList.transactionCannotKillSelf"));
+        }
         try {
           return await executeCancelSql(cancelSql);
         } catch (error) {
@@ -284,13 +411,69 @@ async function confirmCancel() {
     if (result === undefined || !isCurrent()) return;
     const cancelResultError = usedFallbackCancelSql ? activeDriver.fallbackCancelQueryResultError?.(result) : activeDriver.cancelQueryResultError?.(result);
     if (cancelResultError) throw new Error(cancelResultError);
-    toast(t("processList.killSuccess", { id: target.id }), 2500);
+    toast(t(activeDriver.mode === "transaction" ? "processList.transactionKillSuccess" : "processList.killSuccess", { id: target.transactionId ?? target.id }), 2500);
     cancelTarget.value = null;
   } catch (error: any) {
-    if (isCurrent()) toast(t("processList.killFailed", { message: error?.message || String(error) }), 5000);
+    if (isCurrent()) toast(t(activeDriver.mode === "transaction" ? "processList.transactionKillFailed" : "processList.killFailed", { message: error?.message || String(error) }), 5000);
   } finally {
     canceling.value = false;
     if (cancelTarget.value === null) void load({ silent: true });
+  }
+}
+
+function requestTerminate(row: ProcessRow) {
+  if (isOwnSession(row) || actionsLocked.value || refreshing.value || !terminateSupported.value) return;
+  terminateTarget.value = row;
+}
+
+/**
+ * Close the session itself. `KILL QUERY` / `pg_cancel_backend` leave an idle session
+ * connected, so an idle row could never be removed from the list before this action.
+ */
+async function confirmTerminate() {
+  const target = terminateTarget.value;
+  const activeDriver = driver.value;
+  const buildTerminateSql = activeDriver?.buildTerminateSessionSql;
+  if (!target || !activeDriver || !buildTerminateSql || terminating.value) return;
+  const connection = { ...props.connection };
+  const generation = connectionGeneration;
+  const isCurrent = () => !disposed && generation === connectionGeneration;
+  terminating.value = true;
+  try {
+    const terminateSql = buildTerminateSql.call(activeDriver, target.id);
+    let usedFallbackTerminateSql = false;
+    const executeTerminateSql = async (sql: string) => {
+      if (!isCurrent()) return undefined;
+      const results = await api.executeMulti(connection.id, "", sql, undefined, undefined, { maxRows: 1 });
+      const executionError = processListExecutionError(results);
+      if (executionError) throw new Error(executionError);
+      return results;
+    };
+    const result = await executeWithProductionSqlGuard({
+      connection,
+      database: "",
+      sql: terminateSql,
+      source: t("production.sourceAdmin"),
+      execute: async () => {
+        try {
+          return await executeTerminateSql(terminateSql);
+        } catch (error) {
+          if (!activeDriver.buildFallbackTerminateSessionSql || !activeDriver.shouldUseFallbackTerminateSessionSql?.(error)) throw error;
+          usedFallbackTerminateSql = true;
+          return executeTerminateSql(activeDriver.buildFallbackTerminateSessionSql(target.id));
+        }
+      },
+    });
+    if (result === undefined || !isCurrent()) return;
+    const terminateResultError = usedFallbackTerminateSql ? activeDriver.fallbackTerminateSessionResultError?.(result) : activeDriver.terminateSessionResultError?.(result);
+    if (terminateResultError) throw new Error(terminateResultError);
+    toast(t("processList.terminateSuccess", { id: target.id }), 2500);
+    terminateTarget.value = null;
+  } catch (error: any) {
+    if (isCurrent()) toast(t("processList.terminateFailed", { message: error?.message || String(error) }), 5000);
+  } finally {
+    terminating.value = false;
+    if (terminateTarget.value === null) void load({ silent: true });
   }
 }
 
@@ -327,14 +510,16 @@ watch(
   () => props.connection.id,
   () => {
     connectionGeneration++;
-    selectedIds.value = new Set();
+    clearSelection();
     batchTargets.value = null;
+    batchTerminateTargets.value = null;
     batchResult.value = null;
     cancelTarget.value = null;
     fallbackListSql.value = null;
     rows.value = [];
     truncated.value = false;
     ownSessionId.value = null;
+    ownNodeId.value = null;
     search.value = "";
     sortKey.value = driver.value?.defaultSortKey ?? "time";
     sortDir.value = "desc";
@@ -351,13 +536,21 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col bg-background">
+  <div v-if="xuguAdminRequired" class="flex h-full items-center justify-center bg-background p-6">
+    <div class="flex max-w-md items-start gap-3 rounded-lg border bg-muted/20 p-4 text-sm text-muted-foreground">
+      <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+      <span>{{ t("processList.transactionRequiresSysdba") }}</span>
+    </div>
+  </div>
+  <div v-else class="flex h-full min-h-0 flex-col bg-background">
     <div class="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b bg-muted/20 px-3 py-1">
       <div class="flex min-w-0 items-center gap-2">
         <Activity class="h-4 w-4 text-primary" />
-        <div class="truncate text-sm font-semibold">{{ t("processList.title") }}</div>
+        <div class="truncate text-sm font-semibold">{{ t(transactionMode ? "processList.transactionTitle" : "processList.title") }}</div>
         <Badge variant="outline" class="h-5 rounded-md px-1.5 text-[11px]">{{ connection.name }}</Badge>
-        <Badge variant="secondary" class="h-5 rounded-md px-1.5 text-[11px]">{{ t("processList.sessionCount", { count: processListSessionCount(truncated ? rows.length : filteredRows.length, truncated) }) }}</Badge>
+        <Badge v-if="!transactionMode || !loadError" variant="secondary" class="h-5 rounded-md px-1.5 text-[11px]">{{
+          t(transactionMode ? "processList.transactionCount" : "processList.sessionCount", { count: processListSessionCount(truncated ? rows.length : filteredRows.length, truncated) })
+        }}</Badge>
       </div>
       <div class="ml-auto flex flex-wrap items-center gap-2">
         <Button
@@ -373,9 +566,22 @@ onBeforeUnmount(() => {
           <Ban v-else class="h-3.5 w-3.5" />
           {{ t("processList.batchCancel", { count: selectedIds.size }) }}
         </Button>
+        <Button
+          v-if="terminateSupported"
+          variant="destructive"
+          size="sm"
+          class="h-7 gap-1.5 px-2 text-xs"
+          :disabled="actionsLocked || refreshing || selectedIds.size === 0 || ownSessionId === null"
+          :title="ownSessionId === null ? t('processList.batchNeedsSession') : undefined"
+          @click="requestBatchTerminate"
+        >
+          <Loader2 v-if="terminating && batchTerminateTargets" class="h-3.5 w-3.5 animate-spin" />
+          <PlugZap v-else class="h-3.5 w-3.5" />
+          {{ t("processList.batchTerminate", { count: selectedIds.size }) }}
+        </Button>
         <div class="flex h-7 items-center gap-1.5 rounded-md border bg-background px-2">
           <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          <input v-model="search" :disabled="actionsLocked" class="h-full w-40 min-w-0 bg-transparent text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('processList.filter')" />
+          <input v-model="search" :disabled="actionsLocked" class="h-full w-40 min-w-0 bg-transparent text-xs outline-none placeholder:text-muted-foreground" :placeholder="t(transactionMode ? 'processList.transactionFilter' : 'processList.filter')" />
         </div>
         <label class="flex items-center gap-1.5 text-xs text-muted-foreground">
           <input v-model="autoRefresh" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
@@ -393,7 +599,10 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div v-if="batchSupported && ownSessionId === null && !refreshing" class="border-b px-3 py-2 text-xs text-muted-foreground">{{ t("processList.batchNeedsSession") }}</div>
+    <div v-if="transactionMode" class="border-b bg-muted/10 px-3 py-2 text-xs text-muted-foreground">{{ t("processList.transactionScope") }}</div>
+
+    <div v-if="selectionSupported && ownSessionId === null && !refreshing" class="border-b px-3 py-2 text-xs text-muted-foreground">{{ t("processList.batchNeedsSession") }}</div>
+    <div v-if="transactionIdentityUnavailable && !refreshing && !loadError" class="border-b px-3 py-2 text-xs text-muted-foreground">{{ t("processList.transactionNeedsSession") }}</div>
 
     <div v-if="loadError" class="border-b bg-destructive/10 px-3 py-2 text-xs text-destructive">{{ loadError }}</div>
 
@@ -401,7 +610,7 @@ onBeforeUnmount(() => {
       <table class="w-full border-collapse text-xs">
         <thead class="sticky top-0 z-10 bg-muted/40 backdrop-blur">
           <tr>
-            <th v-if="batchSupported" class="w-8 border-b px-3 py-2">
+            <th v-if="selectionSupported" class="w-8 border-b px-3 py-2">
               <input
                 type="checkbox"
                 class="h-3.5 w-3.5 accent-primary"
@@ -420,19 +629,19 @@ onBeforeUnmount(() => {
                 <ArrowDown v-else-if="sortKey === column.key && sortDir === 'desc'" class="h-3 w-3" />
               </span>
             </th>
-            <th class="w-16 whitespace-nowrap border-b px-3 py-2 text-right font-medium">{{ t("processList.colActions") }}</th>
+            <th class="w-40 whitespace-nowrap border-b px-3 py-2 text-right font-medium">{{ t("processList.colActions") }}</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="row in filteredRows" :key="row.id" class="border-b hover:bg-accent/40" :class="{ 'bg-primary/5': isOwnSession(row) }">
-            <td v-if="batchSupported" class="px-3 py-1.5">
+          <tr v-for="row in filteredRows" :key="driver?.rowKey?.(row) ?? row.id" class="border-b hover:bg-accent/40" :class="{ 'bg-primary/5': isOwnSession(row) }">
+            <td v-if="selectionSupported" class="px-3 py-1.5">
               <input
                 type="checkbox"
                 class="h-3.5 w-3.5 accent-primary"
                 :checked="selectedIds.has(row.id)"
                 :disabled="actionsLocked || refreshing || ownSessionId === null || isOwnSession(row) || !Number.isInteger(row.id) || row.id <= 0"
                 :aria-label="t('processList.selectSession', { id: row.id })"
-                @change="toggleSelection(row.id, ($event.target as HTMLInputElement).checked)"
+                @click="toggleSelection(row.id, $event as MouseEvent)"
               />
             </td>
             <td
@@ -450,22 +659,36 @@ onBeforeUnmount(() => {
               <template v-else>{{ row[column.key] === null || row[column.key] === undefined ? "—" : row[column.key] }}</template>
             </td>
             <td class="px-3 py-1.5 text-right">
-              <Button
-                variant="ghost"
-                size="sm"
-                class="h-6 gap-1 px-1.5 text-[11px] text-destructive hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
-                :disabled="isOwnSession(row) || actionsLocked || refreshing"
-                :title="isOwnSession(row) ? t('processList.cannotKillSelf') : t('processList.kill')"
-                @click="requestCancel(row)"
-              >
-                <Ban class="h-3.5 w-3.5" />
-                {{ t("processList.kill") }}
-              </Button>
+              <span class="inline-flex items-center justify-end gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="h-6 gap-1 px-1.5 text-[11px] text-destructive hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+                  :disabled="isOwnSession(row) || transactionIdentityUnavailable || actionsLocked || refreshing"
+                  :title="isOwnSession(row) ? t(transactionMode ? 'processList.transactionCannotKillSelf' : 'processList.cannotKillSelf') : t(transactionMode ? 'processList.transactionKill' : 'processList.kill')"
+                  @click="requestCancel(row)"
+                >
+                  <Ban class="h-3.5 w-3.5" />
+                  {{ t(transactionMode ? "processList.transactionKill" : "processList.kill") }}
+                </Button>
+                <Button
+                  v-if="terminateSupported"
+                  variant="ghost"
+                  size="sm"
+                  class="h-6 gap-1 px-1.5 text-[11px] text-destructive hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+                  :disabled="isOwnSession(row) || actionsLocked || refreshing"
+                  :title="isOwnSession(row) ? t('processList.cannotTerminateSelf') : t('processList.terminate')"
+                  @click="requestTerminate(row)"
+                >
+                  <PlugZap class="h-3.5 w-3.5" />
+                  {{ t("processList.terminate") }}
+                </Button>
+              </span>
             </td>
           </tr>
-          <tr v-if="!loading && filteredRows.length === 0">
-            <td :colspan="columns.length + 1 + (batchSupported ? 1 : 0)" class="px-3 py-10 text-center text-muted-foreground">
-              {{ search ? t("grid.noSearchResults") : t("processList.empty") }}
+          <tr v-if="!loading && filteredRows.length === 0 && (!transactionMode || !loadError)">
+            <td :colspan="columns.length + 1 + (selectionSupported ? 1 : 0)" class="px-3 py-10 text-center text-muted-foreground">
+              {{ search ? t("grid.noSearchResults") : t(transactionMode ? "processList.transactionEmpty" : "processList.empty") }}
             </td>
           </tr>
         </tbody>
@@ -484,17 +707,45 @@ onBeforeUnmount(() => {
         <DialogHeader>
           <DialogTitle class="flex items-center gap-2">
             <AlertTriangle class="h-4 w-4 text-destructive" />
-            {{ t("processList.killTitle") }}
+            {{ t(transactionMode ? "processList.transactionKillTitle" : "processList.killTitle") }}
           </DialogTitle>
         </DialogHeader>
         <p v-if="cancelTarget" class="text-sm text-muted-foreground">
-          {{ t("processList.killConfirm", { id: cancelTarget.id, user: cancelTarget.user }) }}
+          {{ t(transactionMode ? "processList.transactionKillConfirm" : "processList.killConfirm", { id: cancelTarget.transactionId ?? cancelTarget.id, node: cancelTarget.nodeId, user: cancelTarget.user, db: cancelTarget.db }) }}
         </p>
         <DialogFooter>
           <Button variant="outline" :disabled="canceling" @click="cancelTarget = null">{{ t("dangerDialog.cancel") }}</Button>
           <Button variant="destructive" :disabled="canceling" @click="confirmCancel">
             <Loader2 v-if="canceling" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            {{ t("processList.kill") }}
+            {{ t(transactionMode ? "processList.transactionKill" : "processList.kill") }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog
+      :open="terminateTarget !== null"
+      @update:open="
+        (open) => {
+          if (!open && !terminating) terminateTarget = null;
+        }
+      "
+    >
+      <DialogContent class="max-w-sm" :show-close-button="!terminating">
+        <DialogHeader>
+          <DialogTitle class="flex items-center gap-2">
+            <AlertTriangle class="h-4 w-4 text-destructive" />
+            {{ t("processList.terminateTitle") }}
+          </DialogTitle>
+        </DialogHeader>
+        <p v-if="terminateTarget" class="text-sm text-muted-foreground">
+          {{ t("processList.terminateConfirm", { id: terminateTarget.id, user: terminateTarget.user }) }}
+        </p>
+        <DialogFooter>
+          <Button variant="outline" :disabled="terminating" @click="terminateTarget = null">{{ t("dangerDialog.cancel") }}</Button>
+          <Button variant="destructive" :disabled="terminating" @click="confirmTerminate">
+            <Loader2 v-if="terminating" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            {{ t("processList.terminate") }}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -538,6 +789,43 @@ onBeforeUnmount(() => {
     </Dialog>
 
     <Dialog
+      :open="batchTerminateTargets !== null"
+      @update:open="
+        (open) => {
+          if (!open && !terminating) batchTerminateTargets = null;
+        }
+      "
+    >
+      <DialogContent
+        class="max-w-md"
+        :show-close-button="!terminating"
+        @interact-outside="
+          (event) => {
+            if (terminating) event.preventDefault();
+          }
+        "
+        @escape-key-down="
+          (event) => {
+            if (terminating) event.preventDefault();
+          }
+        "
+      >
+        <DialogHeader>
+          <DialogTitle>{{ t("processList.batchTerminateTitle") }}</DialogTitle>
+        </DialogHeader>
+        <p class="text-sm text-muted-foreground">{{ t("processList.batchTerminateConfirm", { count: batchTerminateTargets?.length ?? 0 }) }}</p>
+        <p class="max-h-40 overflow-auto break-words font-mono text-xs">{{ batchTerminateTargets?.map((row) => row.id).join(", ") }}</p>
+        <DialogFooter>
+          <Button variant="outline" :disabled="terminating" @click="batchTerminateTargets = null">{{ t("dangerDialog.cancel") }}</Button>
+          <Button variant="destructive" :disabled="terminating" @click="confirmBatchTerminate">
+            <Loader2 v-if="terminating" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            {{ t(terminating ? "processList.batchTerminateRunning" : "processList.terminate") }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog
       :open="batchResult !== null"
       @update:open="
         (open) => {
@@ -547,9 +835,9 @@ onBeforeUnmount(() => {
     >
       <DialogContent class="max-w-lg">
         <DialogHeader>
-          <DialogTitle>{{ t("processList.batchTitle") }}</DialogTitle>
+          <DialogTitle>{{ t(batchResult?.kind === "terminate" ? "processList.batchTerminateTitle" : "processList.batchTitle") }}</DialogTitle>
         </DialogHeader>
-        <p v-if="batchResult" class="text-sm">{{ t("processList.batchSummary", { succeeded: batchResult.succeeded, failed: batchResult.failures.length }) }}</p>
+        <p v-if="batchResult" class="text-sm">{{ t(batchResult.kind === "terminate" ? "processList.batchTerminateSummary" : "processList.batchSummary", { succeeded: batchResult.succeeded, failed: batchResult.failures.length }) }}</p>
         <ul v-if="batchResult?.failures.length" class="max-h-60 space-y-2 overflow-auto text-xs text-destructive">
           <li v-for="failure in batchResult.failures" :key="failure.id" class="break-words">{{ failure.id }}: {{ failure.message }}</li>
         </ul>

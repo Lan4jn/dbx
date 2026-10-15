@@ -10,12 +10,15 @@ import { getCachedTableMetadata, loadTableMetadata, TABLE_METADATA_CACHE_TTL_MS,
 import { canApplyDataTabMetadata, dataTabMetadataNeedsRefresh, findExistingDataTabCandidate, isDataTabMetadataLifecycleStale, type DataTabOpenMode, type DataTabReuseMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
-import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
-import { shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
+import { buildTableSelectSql, requiresEagerTableMetadataForDataOpen } from "@/lib/table/tableSelectSql";
+import { resolveTableDefaultSort, applyTableDefaultSortResult } from "@/lib/table/tableDefaultSort";
+import { physicalTablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
 import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
+import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
+import type { NavigationOpenOptions } from "@/composables/useNavigationTargets";
 
 const DATA_TAB_METADATA_TTL_MS = TABLE_METADATA_CACHE_TTL_MS;
 
@@ -28,17 +31,20 @@ export function useSidebarDataOpenRuntime() {
   const queryStore = useQueryStore();
   const settingsStore = useSettingsStore();
 
-  async function openData(node: TreeNode, request?: SidebarDataOpenRequest, openMode: DataTabOpenMode = "default", options: { reuseMode?: DataTabReuseMode } = {}) {
+  async function openData(node: TreeNode, request?: SidebarDataOpenRequest, openMode: DataTabOpenMode = "default", options: NavigationOpenOptions & { reuseMode?: DataTabReuseMode; revealColumn?: string } = {}) {
+    if (options.isCurrent?.() === false) return;
     if (!(node.type === "table" || node.type === "view" || node.type === "materialized_view") || !hasNodeDatabaseContext(node)) return;
     const config = connectionStore.getConfig(node.connectionId);
     const reuseMode = options.reuseMode ?? settingsStore.editorSettings.dataTabReuseMode;
     if (config?.db_type === "hbase") {
       await connectionStore.ensureConnected(node.connectionId);
+      if (options.isCurrent?.() === false) return;
       const tabId = queryStore.createTab(node.connectionId, node.database, node.label, "hbase", undefined, node.label, undefined, {
         forceNew: openMode === "new-tab" || reuseMode === "always-new",
         insertAfterActive: settingsStore.editorSettings.openDataTabsNextToActive,
       });
       queryStore.updateSql(tabId, node.label);
+      options.onOpened?.(tabId);
       return;
     }
     const traceId = uuid().slice(0, 8);
@@ -58,6 +64,21 @@ export function useSidebarDataOpenRuntime() {
         ...extra,
       });
       lastPhaseAt = now;
+    };
+    // Each data tab executes on its own session-scoped pool
+    // (`<connection>:<database>[:catalog:..]:session:<tabId>`), so its first Run
+    // pays a fresh database connection. On a remote link that setup costs
+    // hundreds of milliseconds of round trips and lands on the critical path of
+    // the page fetch the user is waiting for. Start it in the background as soon
+    // as the tab exists (and again once the connection is up) so it overlaps the
+    // table-metadata load instead of the visible loading spinner.
+    const warmTabSessionPool = (targetTabId: string) => {
+      if (!config) return;
+      connectionStore.warmConnection(node.connectionId, {
+        database: dataTabExecutionDatabase(config, node.database, node.catalog),
+        catalog: node.catalog,
+        clientSessionId: targetTabId,
+      });
     };
     openDataLog("info", "start", {
       traceId,
@@ -152,6 +173,7 @@ export function useSidebarDataOpenRuntime() {
       tab.schema = tableSchema;
       tab.whereInput = undefined;
       tab.orderByInput = undefined;
+      tab.structuredOrderByInput = undefined;
       tab.previewSql = undefined;
       tab.resultSortColumn = undefined;
       tab.resultSortColumnIndex = undefined;
@@ -182,7 +204,11 @@ export function useSidebarDataOpenRuntime() {
           tableType,
         });
       }
+      if (options.revealColumn) {
+        queryStore.requestGridRevealColumn(existingSameTableTab.id, options.revealColumn);
+      }
       queryStore.switchTab(existingSameTableTab.id);
+      options.onOpened?.(existingSameTableTab.id);
       logPhase("existing-tab-activated", { table: node.label });
       // 代次失配视同冷缓存（即使位于 30s TTL 窗口内也要重建）：disconnect /
       // 关库 / 死池重连都可能不改变 timestamp 判定而改变连接生命周期
@@ -202,6 +228,9 @@ export function useSidebarDataOpenRuntime() {
         queryStore.switchTab(existingDataTabCandidate.tab.id);
         resetReusedDataTabState(existingDataTabCandidate.tab);
         existingDataTabCandidate.tab.tableComment = node.comment;
+        if (options.revealColumn) {
+          queryStore.requestGridRevealColumn(existingDataTabCandidate.tab.id, options.revealColumn);
+        }
         return existingDataTabCandidate.tab.id;
       }
       const createdTabId = queryStore.createTab(node.connectionId, node.database, node.label, "data", tableSchema, undefined, node.catalog, {
@@ -209,11 +238,17 @@ export function useSidebarDataOpenRuntime() {
         insertAfterActive: settingsStore.editorSettings.openDataTabsNextToActive,
       });
       const createdTab = queryStore.tabs.find((tab) => tab.id === createdTabId);
-      if (createdTab) createdTab.tableComment = node.comment;
+      if (createdTab) {
+        createdTab.tableComment = node.comment;
+        if (options.revealColumn) {
+          queryStore.requestGridRevealColumn(createdTab.id, options.revealColumn);
+        }
+      }
       return createdTabId;
     })();
     openDataLog("info", "tab-created", { traceId, tabId, elapsed: elapsed() });
     logPhase("tab-created", { tabId });
+    warmTabSessionPool(tabId);
     // 接管该 tab：登记本次导航代次，作废在途的 openTableTarget/openData 旧代次
     // ——旧导航即使目标身份相同（同表不同 whereInput）也不得再落地
     const navigationToken = beginDataTabNavigation(tabId);
@@ -225,7 +260,7 @@ export function useSidebarDataOpenRuntime() {
       logPhase("previous-execution-cancelled", { tabId });
       // 取消等待期间可能有更晚的导航（openTableTarget/openData）接管本 tab：
       // 本代次已作废，不得再写占位元数据/executionId 覆盖新导航
-      if (!isCurrentDataTabNavigation(tabId, navigationToken)) {
+      if (!isCurrentDataTabNavigation(tabId, navigationToken) || options.isCurrent?.() === false) {
         logPhase("superseded-during-cancel", { tabId });
         return;
       }
@@ -292,6 +327,7 @@ export function useSidebarDataOpenRuntime() {
       }
     });
     logPhase("state-prepared", { tabId });
+    options.onOpened?.(tabId);
 
     // Yield to Vue's scheduler so the new tab becomes visible in the UI (tab
     // bar activates, content area switches) before the first blocking network
@@ -311,9 +347,11 @@ export function useSidebarDataOpenRuntime() {
       }
       openDataLog("info", "ensure-connected:done", { traceId, elapsed: elapsed() });
       logPhase("ensure-connected", { tabId });
+      warmTabSessionPool(tabId);
       if (!config) throw new Error("Connection config not found");
 
       const limit = tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
+      const defaultSortMode = settingsStore.editorSettings.tableOpenSortMode ?? "none";
       const shouldRefreshTableMeta = !cachedTableMeta;
       // Dameng metadata calls must remain serialized behind the table query.
       const deferTableMetaRefresh = effectiveDbType === "dameng";
@@ -334,7 +372,9 @@ export function useSidebarDataOpenRuntime() {
       }
 
       const metadataRefresh = shouldRefreshTableMeta && !deferTableMetaRefresh ? refreshTableMetaInBackground(tabId) : undefined;
-      if (!cachedTableMeta && (effectiveDbType === "mysql" || effectiveDbType === "postgres")) {
+      if (!cachedTableMeta && (requiresEagerTableMetadataForDataOpen(effectiveDbType) || defaultSortMode !== "none")) {
+        // No query is in flight yet, so deferred drivers can safely load metadata serially.
+        if (deferTableMetaRefresh) await refreshTableMetaInBackground(tabId);
         await metadataRefresh;
       }
 
@@ -347,10 +387,13 @@ export function useSidebarDataOpenRuntime() {
       const loadedTableMeta = cachedTableMeta ?? queryStore.tabs.find((item) => item.id === tabId)?.tableMeta;
       const columns = loadedTableMeta?.columns ?? [];
       const primaryKeys = loadedTableMeta?.primaryKeys ?? [];
+      const defaultSort = resolveTableDefaultSort(settingsStore.editorSettings, effectiveDbType, loadedTableMeta?.physicalPrimaryKeys ?? physicalTablePrimaryKeys(columns), connectionStore.connectionIdentifierQuote?.(node.connectionId));
+      const defaultOrderBy = defaultSort.orderBy;
       const includeRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableType);
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
         driverProfile: config?.driver_profile,
+        serverVersion: connectionStore.getConfig(node.connectionId)?.database_info?.productVersion,
         identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
         schema: tableSchema,
         database: node.database,
@@ -364,6 +407,7 @@ export function useSidebarDataOpenRuntime() {
         limit,
         includeRowId,
         injectDefaultTimeSeriesWhere: true,
+        orderBy: defaultOrderBy,
       });
       // SQL 构建是异步后端调用：期间更晚的导航（openData/openTableTarget）
       // 接管会替换 executionId，旧流程不得再覆盖 SQL/启动查询
@@ -380,6 +424,8 @@ export function useSidebarDataOpenRuntime() {
       });
       logPhase("sql-built", { tabId, columnCount: columns.length, primaryKeyCount: primaryKeys.length });
       queryStore.updateSql(tabId, sql);
+      const openedTab = queryStore.tabs.find((item) => item.id === tabId);
+      if (openedTab && defaultOrderBy) openedTab.orderByInput = defaultOrderBy;
       logPhase("sql-updated", { tabId });
 
       openDataLog("info", "execute:start", { traceId, tabId, elapsed: elapsed() });
@@ -389,6 +435,10 @@ export function useSidebarDataOpenRuntime() {
         pagination: { limit, offset: 0 },
       });
       openDataLog("info", "execute:done", { traceId, tabId, elapsed: elapsed() });
+      const sortedTab = queryStore.tabs.find((item) => item.id === tabId);
+      if ((request?.isCurrent() ?? true) && sortedTab && sortedTab === openedTab && sortedTab.sql === sql) {
+        applyTableDefaultSortResult(sortedTab, defaultSort, queryStore.sortTabResultLocally);
+      }
       logPhase("execute-tab-sql", { tabId });
       if (shouldRefreshTableMeta && deferTableMetaRefresh && canApplyTableMetadata(tabId)) {
         void refreshTableMetaInBackground(tabId);

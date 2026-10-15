@@ -145,6 +145,8 @@ mod tests {
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             id: "test".to_string(),
             name: "test".to_string(),
             db_type,
@@ -162,6 +164,8 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -200,6 +204,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -298,6 +303,7 @@ mod tests {
             db::TableInfo {
                 name: "USERS".to_string(),
                 table_type: "TABLE".to_string(),
+                valid: None,
                 comment: None,
                 parent_schema: None,
                 parent_name: None,
@@ -305,6 +311,7 @@ mod tests {
             db::TableInfo {
                 name: "BIN$abc123==$0".to_string(),
                 table_type: "TABLE".to_string(),
+                valid: None,
                 comment: None,
                 parent_schema: None,
                 parent_name: None,

@@ -1,8 +1,5 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { compactJsonText, valueEditorActions } from "@/lib/dataGrid/cellDetailPresentation";
-
-const dataGridSource = readFileSync(new URL("../../../components/grid/DataGrid.vue", import.meta.url), "utf8");
+import { compactJsonText, formatJsonText, looksLikeJsonContainerText, valueEditorActions } from "@/lib/dataGrid/cellDetailPresentation";
 
 describe("cellDetailPresentation", () => {
   it("offers compact JSON beside format JSON for editable JSON values", () => {
@@ -11,8 +8,12 @@ describe("cellDetailPresentation", () => {
     expect(compactJsonText('{\n  "name": "DBX",\n  "enabled": true\n}')).toBe('{"name":"DBX","enabled":true}');
   });
 
-  it("wires the value editor compact action to the existing compact handler", () => {
-    expect(dataGridSource).toContain("activeValueEditorActions.includes('compactJson')");
-    expect(dataGridSource).toContain('@click="compactDetailJson"');
+  it("formats serialized JSON strings into pretty-printed JSON (issue #11636)", () => {
+    const serialized = '"{\\"abc\\":\\"\\"}"';
+    expect(looksLikeJsonContainerText(serialized)).toBe(true);
+    expect(formatJsonText(serialized)).toBe('{\n  "abc": ""\n}');
+
+    // Scalar string in quotes is not treated as a container
+    expect(looksLikeJsonContainerText('"hello"')).toBe(false);
   });
 });

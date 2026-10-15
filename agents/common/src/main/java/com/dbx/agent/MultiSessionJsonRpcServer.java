@@ -8,6 +8,7 @@ import com.google.gson.JsonParser;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,11 +40,12 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
     private final ExecutorService cleanup;
     private final JdbcConnectionPoolRegistry poolRegistry;
     private final Gson gson = new Gson();
-    private final PrintStream protocolOutput = System.out;
+    private final PrintStream protocolOutput = new PrintStream(System.out, true, StandardCharsets.UTF_8);
     private final Object outputLock = new Object();
     private final Object maintenanceLock = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
     private ScheduledExecutorService maintenance;
+    private boolean blobBindStatements;
 
     public MultiSessionJsonRpcServer(Supplier<? extends DatabaseAgent> agentFactory) {
         this(agentFactory, new JdbcConnectionPoolRegistry(), RuntimeLimits.defaults());
@@ -90,12 +92,18 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
         return new MultiSessionJsonRpcServer(sessionHandlerFactory, true);
     }
 
+    public static MultiSessionJsonRpcServer withBlobBindings(Supplier<? extends DatabaseAgent> agentFactory) {
+        MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(agentFactory);
+        server.blobBindStatements = true;
+        return server;
+    }
+
     public void run() {
         synchronized (outputLock) {
             protocolOutput.println("{\"ready\":true}");
             protocolOutput.flush();
         }
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 JsonObject request = JsonParser.parseString(line).getAsJsonObject();
@@ -137,7 +145,9 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
         try {
             Object result;
             if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
-                result = sessionHandlerFactory == null ? AgentProtocol.multiSessionJdbcHandshakeResult() : customHandshake();
+                result = sessionHandlerFactory == null
+                    ? AgentProtocol.multiSessionJdbcHandshakeResult(blobBindStatements)
+                    : customHandshake();
             } else if (AgentProtocol.METHOD_OPEN_SESSION.equals(method)) {
                 result = openSession(requiredSessionId(params), params);
             } else if (AgentProtocol.METHOD_CLOSE_SESSION.equals(method)) {
@@ -424,6 +434,8 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
 
         private boolean quarantineAndClose(ExecutorService cleanup) {
             state.compareAndSet(State.ACTIVE, State.QUARANTINED);
+            // Release native requests before cleanup waits for their session lock.
+            cancel();
             boolean replaceRuntime = server != null && server.quarantine();
             if (!cleanupScheduled.compareAndSet(false, true)) {
                 return replaceRuntime;

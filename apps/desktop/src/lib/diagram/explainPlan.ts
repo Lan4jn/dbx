@@ -2,21 +2,29 @@ import type { DatabaseType, QueryResult } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import { supportsDatabaseFeature } from "@/lib/database/databaseDriverManifest";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
+import { parseDb2ExplainText } from "./db2ExplainPlan";
+export { parseDb2ExplainText } from "./db2ExplainPlan";
+import { parseXuguExplainResult } from "./xuguExplainPlan";
 
 export interface ExplainPlanNode {
   id: string;
   title: string;
   nodeType: string;
+  /** Optional dialect hint for engine-specific operator presentation. */
+  dialect?: ExplainPlanDatabaseType;
   relation?: string;
   index?: string;
   cost?: string;
+  /** Suppress derived cost shares when costs cannot be safely attributed to nodes. */
+  costModel?: "unknown";
   rows?: string;
   width?: string;
+  estimatedTimeUs?: string;
   details: string[];
   children: ExplainPlanNode[];
 }
 
-export type ExplainPlanDatabaseType = "mysql" | "postgres" | "dameng" | "questdb" | "doris" | "oracle" | "sqlserver";
+export type ExplainPlanDatabaseType = "mysql" | "postgres" | "dameng" | "questdb" | "doris" | "oracle" | "oceanbase-oracle" | "sqlserver" | "xugu" | "db2";
 
 export interface ParsedExplainPlan {
   databaseType: ExplainPlanDatabaseType;
@@ -26,7 +34,12 @@ export interface ParsedExplainPlan {
 
 export type BuildExplainSqlResult = { ok: true; sql: string } | { ok: false; reason: "unsupported" | "empty" | "unsafe" };
 
-const SUPPORTED_EXPLAIN_TYPES = new Set<DatabaseType>(["mysql", "postgres", "dameng", "questdb", "doris", "oracle", "sqlserver"]);
+export function formatExplainPlanDetails(node: ExplainPlanNode | undefined, estimatedTimeLabel: string): string[] {
+  if (!node) return [];
+  return node.estimatedTimeUs === undefined ? node.details : [`${estimatedTimeLabel}: ${node.estimatedTimeUs} µs`, ...node.details];
+}
+
+const SUPPORTED_EXPLAIN_TYPES = new Set<DatabaseType>(["mysql", "postgres", "dameng", "questdb", "doris", "oracle", "oceanbase-oracle", "sqlserver", "xugu", "db2"]);
 export function supportsExplainPlan(databaseType?: DatabaseType): databaseType is ExplainPlanDatabaseType {
   return !!databaseType && supportsDatabaseFeature(databaseType, "sqlExplain") && SUPPORTED_EXPLAIN_TYPES.has(databaseType);
 }
@@ -37,7 +50,12 @@ export function buildExplainSql(databaseType: DatabaseType | undefined, sql: str
 }
 
 export function parseExplainResult(databaseType: ExplainPlanDatabaseType, result: QueryResult): ParsedExplainPlan {
-  if (databaseType === "dameng") {
+  if (databaseType === "db2") {
+    if (isQueryExecutionErrorResult(result)) throw new Error(String(result.rows[0]?.[0] ?? "DB2 EXPLAIN failed"));
+    return parseDb2ExplainText(String(result.rows[0]?.[0] ?? ""));
+  } else if (databaseType === "xugu") {
+    return parseXuguExplainResult(result);
+  } else if (databaseType === "dameng") {
     return parseDamengExplain(result);
   } else if (databaseType === "questdb") {
     return parseQuestdbExplain(result);
@@ -45,6 +63,8 @@ export function parseExplainResult(databaseType: ExplainPlanDatabaseType, result
     return parseDorisExplain(result);
   } else if (databaseType === "sqlserver") {
     return parseSqlServerExplain(result);
+  } else if (databaseType === "oceanbase-oracle") {
+    return parseOceanbaseOracleExplain(result);
   }
   const raw = parseExplainCell(result.rows[0]?.[0]);
   const nodes = databaseType === "postgres" ? parsePostgresExplain(raw) : parseMysqlExplain(raw);
@@ -394,23 +414,21 @@ function parseSqlServerExplain(result: QueryResult): ParsedExplainPlan {
   if (!raw) throw new Error("SQL Server did not return ShowPlan XML");
   if (typeof DOMParser === "undefined") throw new Error("XML parser is unavailable");
 
+  if (!hasBalancedXmlTags(raw)) throw new Error("Invalid SQL Server ShowPlan XML");
   const parserIssues: string[] = [];
-  type XmlParserConstructor = new (options?: {
-    errorHandler?: {
-      warning: (message: string) => void;
-      error: (message: string) => void;
-      fatalError: (message: string) => void;
-    };
-  }) => DOMParser;
+  type XmlParserConstructor = new (options?: { onError?: (level: string, message: string) => void }) => DOMParser;
   const Parser = DOMParser as unknown as XmlParserConstructor;
-  const recordParserIssue = (message: string) => parserIssues.push(message);
-  const document = new Parser({
-    errorHandler: {
-      warning: recordParserIssue,
-      error: recordParserIssue,
-      fatalError: recordParserIssue,
-    },
-  }).parseFromString(raw, "application/xml");
+  const recordParserIssue = (_level: string, message: string) => parserIssues.push(message);
+  let document: Document;
+  try {
+    document = new Parser({
+      onError: recordParserIssue,
+    }).parseFromString(raw, "application/xml");
+  } catch {
+    // xmldom 0.9 throws ParseError on fatal issues even with onError set; the
+    // recorded issues are non-fatal warnings at this point.
+    throw new Error("Invalid SQL Server ShowPlan XML");
+  }
   if (parserIssues.length > 0 || xmlElements(document, "parsererror").length > 0 || !document.documentElement) {
     throw new Error("Invalid SQL Server ShowPlan XML");
   }
@@ -427,6 +445,23 @@ function parseSqlServerExplain(result: QueryResult): ParsedExplainPlan {
     raw,
     nodes: roots.map(parseSqlServerRelOp),
   };
+}
+
+function hasBalancedXmlTags(xml: string): boolean {
+  const stack: string[] = [];
+  const tokens = xml.match(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[^>]*\?>|<!DOCTYPE[^>]*>|<\/?[A-Za-z_][\w:.-]*(?:\s[^<>]*?)?\/?>/gi);
+  if (!tokens || xml.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[^>]*\?>|<!DOCTYPE[^>]*>|<\/?[A-Za-z_][\w:.-]*(?:\s[^<>]*?)?\/?>/gi, "").includes("<")) return false;
+  for (const token of tokens) {
+    if (token.startsWith("<!--") || token.startsWith("<![CDATA[") || token.startsWith("<?") || /^<!DOCTYPE/i.test(token)) continue;
+    const closing = /^<\//.test(token);
+    const selfClosing = /\/\s*>$/.test(token);
+    const name = token.match(/^<\/?([A-Za-z_][\w:.-]*)/)?.[1];
+    if (!name) return false;
+    if (closing) {
+      if (stack.pop() !== name) return false;
+    } else if (!selfClosing) stack.push(name);
+  }
+  return stack.length === 0;
 }
 
 function firstSqlServerShowplanXml(result: QueryResult): string | undefined {
@@ -586,6 +621,42 @@ function parseExplainCell(value: unknown): unknown {
   } catch {
     return value;
   }
+}
+
+function parseOceanbaseOracleExplain(result: QueryResult): ParsedExplainPlan {
+  // OceanBase JDBC returns one line of the JSON document per Query Plan row.
+  const text = result.rows.map((row) => String(row[0] ?? "")).join("\n");
+  const raw = parseExplainCell(text);
+  const root = objectValue(raw);
+  return { databaseType: "oceanbase-oracle", raw, nodes: root ? [parseOceanbaseOracleNode(root, "0")] : [] };
+}
+
+const OCEANBASE_PLAN_KEYS = { id: "ID", operator: "OPERATOR", name: "NAME", rows: "EST.ROWS", time: "EST.TIME(us)", cost: "COST" } as const;
+const OCEANBASE_PLAN_FIELDS = new Set<string>(Object.values(OCEANBASE_PLAN_KEYS));
+const OCEANBASE_CHILD_KEY = /^CHILD_\d+$/;
+
+function parseOceanbaseOracleNode(plan: Record<string, unknown>, fallbackId: string): ExplainPlanNode {
+  const nodeType = stringValue(plan[OCEANBASE_PLAN_KEYS.operator])?.trim() || "Plan";
+  const relation = stringValue(plan[OCEANBASE_PLAN_KEYS.name])?.trim() || undefined;
+  const children = Object.entries(plan)
+    .filter(([key, value]) => OCEANBASE_CHILD_KEY.test(key) && objectValue(value))
+    .sort(([left], [right]) => Number(left.slice(6)) - Number(right.slice(6)))
+    .map(([key, value]) => parseOceanbaseOracleNode(objectValue(value)!, `${fallbackId}.${key.slice(6)}`));
+  const estimatedTimeUs = numberLike(plan[OCEANBASE_PLAN_KEYS.time]);
+  const details = Object.entries(plan)
+    .filter(([key, value]) => !OCEANBASE_PLAN_FIELDS.has(key) && !OCEANBASE_CHILD_KEY.test(key) && value !== null)
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+  return {
+    id: numberLike(plan[OCEANBASE_PLAN_KEYS.id]) || fallbackId,
+    title: relation && relation !== nodeType ? `${nodeType} on ${relation}` : nodeType,
+    nodeType,
+    relation,
+    cost: numberLike(plan[OCEANBASE_PLAN_KEYS.cost]),
+    rows: numberLike(plan[OCEANBASE_PLAN_KEYS.rows]),
+    estimatedTimeUs,
+    details,
+    children,
+  };
 }
 
 // ── DM (达梦) tabular explain parser ──────────────────────────────────

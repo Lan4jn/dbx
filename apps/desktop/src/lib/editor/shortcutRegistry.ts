@@ -1,4 +1,5 @@
 import { isMacShortcutPlatform, parseShortcutParts, parseShortcutStrokes, shortcutDisplayParts } from "@/lib/editor/shortcutDisplay";
+import { isModifierDoubleTapShortcut, matchesModifierDoubleTapShortcut } from "@/lib/editor/modifierDoubleTapShortcut";
 
 export type ShortcutActionId =
   | "executeSql"
@@ -19,22 +20,31 @@ export type ShortcutActionId =
   | "deleteLine"
   | "moveLineUp"
   | "moveLineDown"
+  | "scrollLineUp"
+  | "scrollLineDown"
   | "copyLineUp"
   | "copyLineDown"
   | "undo"
   | "redo"
   | "selectAll"
+  | "selectCurrentStatement"
   | "extendSelection"
   | "addNextSelectionOccurrence"
   | "selectAllSelectionOccurrences"
+  | "selectLineEnds"
   | "uppercaseSelection"
   | "lowercaseSelection"
+  | "toggleCaseSelection"
   | "convertNamingStyle"
   | "exPasteSqlInCondition"
   | "toggleFold"
+  | "foldAll"
+  | "unfoldAll"
+  | "editCell"
   | "editTableStructure"
   | "copyCurrentRow"
   | "deleteCurrentRow"
+  | "focusWhere"
   | "goToColumn"
   | "goToFirstPage"
   | "goToPreviousPage"
@@ -43,9 +53,13 @@ export type ShortcutActionId =
   | "newQuery"
   | "openSettings"
   | "closeTab"
+  | "reopenClosedTab"
   | "closeOtherTabs"
+  | "closeAllTabs"
+  | "closeWindow"
   | "focusSearch"
   | "quickOpen"
+  | "globalSearch"
   | "toggleAiPanel"
   | "navigateTabHistoryBack"
   | "navigateTabHistoryForward"
@@ -65,6 +79,7 @@ export type ShortcutActionId =
   | "zoomOutUi"
   | "resetUiZoom"
   | "find"
+  | "gotoLine"
   | "replace"
   | "refreshData"
   | "toggleResultsPane"
@@ -75,8 +90,11 @@ export type ShortcutActionId =
   | "copySidebarSelection"
   | "pasteSidebarSelection"
   | "editSidebarConnection"
+  | "disconnectSidebarConnection"
+  | "disconnectAllActiveConnections"
   | "openDataInNewTab"
   | "viewTableDdl"
+  | "editSidebarTableStructure"
   | "sendSelectionToAi"
   | "sqlIntentionActions";
 
@@ -88,6 +106,7 @@ export interface ShortcutDefinition {
   scope: ShortcutScope;
   defaultShortcut: string;
   inputKind?: "keyboard" | "modifier-only";
+  supportsModifierDoubleTap?: boolean;
 }
 
 export type ShortcutSettings = Record<ShortcutActionId, string>;
@@ -114,6 +133,12 @@ export function selectionOccurrenceDefaultShortcut(actionId: "addNextSelectionOc
   return actionId === "addNextSelectionOccurrence" ? "Alt+J" : "Ctrl+Alt+Shift+J";
 }
 
+export function selectLineEndsDefaultShortcut(_platform = globalThis.navigator?.platform || ""): string {
+  // VS Code uses Option+Shift+I on macOS; CodeMirror's physical shortcut
+  // representation is Alt+Shift+I on every platform.
+  return "Alt+Shift+I";
+}
+
 export function tabNavigationHistoryDefaultShortcut(direction: "back" | "forward", platform = globalThis.navigator?.platform || ""): string {
   const modifier = isMacShortcutPlatform(platform) ? "Ctrl" : "Mod";
   const key = direction === "back" ? "ArrowLeft" : "ArrowRight";
@@ -126,13 +151,30 @@ export function toggleAiPanelDefaultShortcut(platform = globalThis.navigator?.pl
   return isMacShortcutPlatform(platform) ? "Ctrl+Mod+I" : "Ctrl+Alt+I";
 }
 
+// 「跳转到行」的平台默认键。Windows/Linux 上用 Ctrl+G，与 VS Code / SSMS /
+// DataGrip 的惯例一致（编辑器内查找下一个仍有 F3 与搜索面板回车）；
+// macOS 的 Ctrl+G 已分配给「选中下一个相同词」（JetBrains 风格），因此沿用
+// CodeMirror 搜索键位里原本就指向 gotoLine 的 ⌘⌥G。
+export function gotoLineDefaultShortcut(platform = globalThis.navigator?.platform || ""): string {
+  return isMacShortcutPlatform(platform) ? "Mod+Alt+G" : "Mod+G";
+}
+
+export function foldAllDefaultShortcut(actionId: "foldAll" | "unfoldAll", platform = globalThis.navigator?.platform || ""): string {
+  const key = actionId === "foldAll" ? "[" : "]";
+  return `${isMacShortcutPlatform(platform) ? "Ctrl+Alt" : "Shift+Alt"}+${key}`;
+}
+
 const PLATFORM_DEFAULT_SHORTCUTS: Partial<Record<ShortcutActionId, ReadonlySet<string>>> = {
   closeOtherTabs: new Set(["Alt+Mod+W", "Shift+Alt+W"]),
   navigateTabHistoryBack: new Set(["Ctrl+Alt+ArrowLeft", "Mod+Alt+ArrowLeft"]),
   navigateTabHistoryForward: new Set(["Ctrl+Alt+ArrowRight", "Mod+Alt+ArrowRight"]),
   addNextSelectionOccurrence: new Set(["Ctrl+G", "Alt+J"]),
   selectAllSelectionOccurrences: new Set(["Ctrl+Mod+G", "Ctrl+Alt+Shift+J"]),
+  selectLineEnds: new Set(["Alt+Shift+I"]),
   toggleAiPanel: new Set(["Ctrl+Mod+I", "Ctrl+Alt+I"]),
+  gotoLine: new Set(["Mod+G", "Mod+Alt+G"]),
+  foldAll: new Set(["Mod+Alt+[", "Ctrl+Alt+[", "Shift+Alt+["]),
+  unfoldAll: new Set(["Mod+Alt+]", "Ctrl+Alt+]", "Shift+Alt+]"]),
 };
 const LEGACY_CLOSE_TAB_DEFAULT = "Meta+W";
 const LEGACY_COPY_CURRENT_ROW_DEFAULT = "Mod+D";
@@ -140,6 +182,18 @@ const EDIT_TABLE_STRUCTURE_DEFAULT = "Mod+Shift+D";
 const TAB_NAVIGATION_HISTORY_ACTIONS: ShortcutActionId[] = ["navigateTabHistoryBack", "navigateTabHistoryForward"];
 
 export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
+  {
+    id: "scrollLineUp",
+    labelKey: "settings.shortcutScrollLineUp",
+    scope: "editor",
+    defaultShortcut: "Ctrl+ArrowUp",
+  },
+  {
+    id: "scrollLineDown",
+    labelKey: "settings.shortcutScrollLineDown",
+    scope: "editor",
+    defaultShortcut: "Ctrl+ArrowDown",
+  },
   {
     id: "executeSql",
     labelKey: "settings.shortcutExecuteSql",
@@ -279,6 +333,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+A",
   },
   {
+    id: "selectCurrentStatement",
+    labelKey: "settings.shortcutSelectCurrentStatement",
+    scope: "editor",
+    defaultShortcut: "Mod+Shift+E",
+  },
+  {
     id: "extendSelection",
     labelKey: "settings.shortcutExtendSelection",
     scope: "editor",
@@ -297,6 +357,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Ctrl+Mod+G",
   },
   {
+    id: "selectLineEnds",
+    labelKey: "settings.shortcutSelectLineEnds",
+    scope: "editor",
+    defaultShortcut: "Alt+Shift+I",
+  },
+  {
     id: "uppercaseSelection",
     labelKey: "settings.shortcutUppercaseSelection",
     scope: "editor",
@@ -307,6 +373,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutLowercaseSelection",
     scope: "editor",
     defaultShortcut: "Shift+Alt+L",
+  },
+  {
+    id: "toggleCaseSelection",
+    labelKey: "settings.shortcutToggleCaseSelection",
+    scope: "editor",
+    defaultShortcut: "Mod+Shift+U",
   },
   {
     id: "convertNamingStyle",
@@ -327,6 +399,24 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+.",
   },
   {
+    id: "foldAll",
+    labelKey: "settings.shortcutFoldAll",
+    scope: "editor",
+    defaultShortcut: foldAllDefaultShortcut("foldAll"),
+  },
+  {
+    id: "unfoldAll",
+    labelKey: "settings.shortcutUnfoldAll",
+    scope: "editor",
+    defaultShortcut: foldAllDefaultShortcut("unfoldAll"),
+  },
+  {
+    id: "editCell",
+    labelKey: "settings.shortcutEditCell",
+    scope: "grid",
+    defaultShortcut: "F2",
+  },
+  {
     id: "editTableStructure",
     labelKey: "settings.shortcutEditTableStructure",
     scope: "grid",
@@ -343,6 +433,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutDeleteCurrentRow",
     scope: "grid",
     defaultShortcut: "Delete",
+  },
+  {
+    id: "focusWhere",
+    labelKey: "settings.shortcutFocusWhere",
+    scope: "grid",
+    defaultShortcut: "",
   },
   {
     id: "goToColumn",
@@ -393,10 +489,30 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+W",
   },
   {
+    id: "reopenClosedTab",
+    labelKey: "settings.shortcutReopenClosedTab",
+    scope: "global",
+    defaultShortcut: "Shift+Mod+T",
+  },
+  {
     id: "closeOtherTabs",
     labelKey: "contextMenu.closeOtherTabs",
     scope: "global",
     defaultShortcut: closeOtherTabsDefaultShortcut(),
+  },
+  {
+    // VS Code's close-all-tabs chord (Cmd/Ctrl+K W) needs chord support the
+    // registry doesn't have, so this action ships unbound and stays optional.
+    id: "closeAllTabs",
+    labelKey: "contextMenu.closeAllTabs",
+    scope: "global",
+    defaultShortcut: "",
+  },
+  {
+    id: "closeWindow",
+    labelKey: "settings.shortcutCloseWindow",
+    scope: "global",
+    defaultShortcut: "Shift+Mod+W",
   },
   {
     id: "focusSearch",
@@ -406,9 +522,17 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
   {
     id: "quickOpen",
+    supportsModifierDoubleTap: true,
     labelKey: "settings.shortcutQuickOpen",
     scope: "global",
     defaultShortcut: "Mod+P",
+  },
+  {
+    id: "globalSearch",
+    supportsModifierDoubleTap: true,
+    labelKey: "settings.shortcutGlobalSearch",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+F",
   },
   {
     id: "toggleAiPanel",
@@ -525,6 +649,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+F",
   },
   {
+    id: "gotoLine",
+    labelKey: "settings.shortcutGotoLine",
+    scope: "editor",
+    defaultShortcut: gotoLineDefaultShortcut(),
+  },
+  {
     id: "replace",
     labelKey: "settings.shortcutReplace",
     scope: "editor",
@@ -567,6 +697,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Shift+Mod+F12",
   },
   {
+    id: "disconnectAllActiveConnections",
+    labelKey: "sidebar.disconnectAllActiveConnections",
+    scope: "global",
+    defaultShortcut: "",
+  },
+  {
     id: "copySidebarSelection",
     labelKey: "settings.shortcutCopySidebarSelection",
     scope: "sidebar",
@@ -585,6 +721,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+E",
   },
   {
+    id: "disconnectSidebarConnection",
+    labelKey: "settings.shortcutDisconnectSidebarConnection",
+    scope: "sidebar",
+    defaultShortcut: "Shift+Mod+E",
+  },
+  {
     id: "openDataInNewTab",
     labelKey: "settings.shortcutOpenDataInNewTab",
     scope: "sidebar",
@@ -596,6 +738,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutViewTableDdl",
     scope: "sidebar",
     defaultShortcut: "Shift+Mod+D",
+  },
+  {
+    id: "editSidebarTableStructure",
+    labelKey: "settings.shortcutEditSidebarTableStructure",
+    scope: "sidebar",
+    defaultShortcut: "F4",
   },
   {
     id: "sendSelectionToAi",
@@ -626,16 +774,33 @@ function hasExplicitShortcut(settings: Partial<ShortcutSettings> | undefined, ac
 }
 
 function shortcutsUseSameKeys(first: string, second: string, platform = globalThis.navigator?.platform || ""): boolean {
-  return !!first && !!second && formatShortcut(first, platform).toLowerCase() === formatShortcut(second, platform).toLowerCase();
+  if (isModifierDoubleTapShortcut(first) || isModifierDoubleTapShortcut(second)) return matchesModifierDoubleTapShortcut(first, second, platform);
+  const comparisonKey = (shortcut: string) =>
+    formatShortcut(shortcut, platform)
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((stroke) => {
+        const parts = stroke.split("+").filter(Boolean);
+        if (parts.length <= 1) return stroke.toLowerCase();
+        const key = parts.pop()!;
+        return [...parts.sort(), key].join("+").toLowerCase();
+      })
+      .join(" ");
+  return !!first && !!second && comparisonKey(first) === comparisonKey(second);
 }
 
 function shortcutDefaultForPlatform(definition: ShortcutDefinition, platform: string): string {
+  if ((definition.id === "scrollLineUp" || definition.id === "scrollLineDown") && isMacShortcutPlatform(platform)) return definition.defaultShortcut.replace("Ctrl+", "Ctrl+Alt+");
   if (definition.id === "addNextSelectionOccurrence") return selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence", platform);
   if (definition.id === "selectAllSelectionOccurrences") return selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences", platform);
+  if (definition.id === "selectLineEnds") return selectLineEndsDefaultShortcut(platform);
   if (definition.id === "closeOtherTabs") return closeOtherTabsDefaultShortcut(platform);
+  if (definition.id === "gotoLine") return gotoLineDefaultShortcut(platform);
   if (definition.id === "navigateTabHistoryBack") return tabNavigationHistoryDefaultShortcut("back", platform);
   if (definition.id === "navigateTabHistoryForward") return tabNavigationHistoryDefaultShortcut("forward", platform);
   if (definition.id === "toggleAiPanel") return toggleAiPanelDefaultShortcut(platform);
+  if (definition.id === "foldAll" || definition.id === "unfoldAll") return foldAllDefaultShortcut(definition.id, platform);
   return definition.defaultShortcut;
 }
 
@@ -679,7 +844,10 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>, 
     normalized.copyCurrentRow = LEGACY_COPY_CURRENT_ROW_DEFAULT;
   }
 
-  for (const actionId of TAB_NAVIGATION_HISTORY_ACTIONS) {
+  // gotoLine 的平台默认键（Win/Linux 为 Ctrl+G）在该动作引入前是其他动作可合法
+  // 显式绑定的自由键位；无显式配置的默认值与同作用域显式绑定同键时同样让位，
+  // 否则运行时 keymap 先注册的 gotoLine 会遮蔽用户的显式配置。
+  for (const actionId of [...TAB_NAVIGATION_HISTORY_ACTIONS, "gotoLine"] as ShortcutActionId[]) {
     if (hasExplicitShortcut(settings, actionId)) continue;
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
     if (!definition) continue;
@@ -704,6 +872,39 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>, 
   }
 
   return normalized;
+}
+
+export interface CapturedShortcutEdit {
+  /** 归一化后的完整键位表：与 store 落盘口径一致，草稿直接采用它就不会与落盘值分叉。 */
+  shortcuts: ShortcutSettings;
+  /**
+   * 用户按下的组合命中了“另一平台的默认键”规则：落盘时该字面量会被换成本机平台
+   * 的默认键，所以这个组合在本平台不可能被保存（见上方 PLATFORM_DEFAULT_SHORTCUTS）。
+   */
+  rejectedByPlatformDefault: boolean;
+  /** 归一化是否改动了任意一行（跨平台默认键、旧默认键、遗留迁移都会改动）。 */
+  changed: boolean;
+}
+
+/**
+ * 捕获阶段的归一化：把用户在设置面板按下的组合先过一遍落盘时会走的
+ * `normalizeShortcutSettings`，让草稿始终是持久化值的**不动点**。
+ *
+ * 设置面板的“有无未保存改动”是拿草稿和 store 里的值做 JSON 比较
+ * （`editorSettingsDraftChanged`）得来的：草稿里只要存在一个会被落盘口径改写的
+ * 值，这个比较就永远为真——「应用」看起来毫无反应，「应用并关闭」每次都弹
+ * “未保存的更改”，改了多少次都存不进去（#9881：把「关闭其他标签页」改成 ⇧⌥W，
+ * 落盘时被跨平台默认键规则换回 ⌥⌘W）。调用方拿到结果后必须采用 `shortcuts`，
+ * 并在 `rejectedByPlatformDefault` 为真时提示用户换一个组合。
+ */
+export function resolveCapturedShortcutEdit(actionId: ShortcutActionId, shortcut: string, shortcuts: ShortcutSettings, platform = globalThis.navigator?.platform || ""): CapturedShortcutEdit {
+  const next = normalizeShortcutSettings({ ...shortcuts, [actionId]: shortcut }, platform);
+  const rejectedByPlatformDefault = next[actionId] !== shortcut && (PLATFORM_DEFAULT_SHORTCUTS[actionId]?.has(shortcut) === true || (actionId === "closeTab" && shortcut === LEGACY_CLOSE_TAB_DEFAULT));
+  return {
+    shortcuts: next,
+    rejectedByPlatformDefault,
+    changed: SHORTCUT_DEFINITIONS.some((definition) => next[definition.id] !== shortcuts[definition.id]),
+  };
 }
 
 export function shortcutToCodeMirrorKey(shortcut: string): string {
@@ -823,4 +1024,29 @@ export function countShortcutConflictPairs(conflicts: Partial<Record<ShortcutAct
     }
   }
   return pairs.size;
+}
+
+/**
+ * 按当前搜索的可见行过滤冲突**展示**（不改变判定）。
+ *
+ * 冲突判定始终基于全局绑定（见上方两个 find*），但顶部徽章、组头摘要要与
+ * 列表同口径：只统计“可见行或其冲突对方”参与的冲突。取“或”是因为对方被
+ * 搜索过滤掉时，冲突本身仍然真实存在，不能从统计里消失——与 Eclipse/
+ * DBeaver Keys 偏好页一致：过滤器只作用于视图，冲突模型始终全局。
+ *
+ * 同时接受 L1（每行单个对方）与 L2（每行多个对方）两种形状，与
+ * `countShortcutConflictPairs` 的口径约定一致。空可见集返回空映射，
+ * 让徽章在“无搜索结果”时自然隐藏。
+ */
+export function filterShortcutConflictsByVisibleIds<T extends ShortcutActionId | ShortcutActionId[]>(conflicts: Partial<Record<ShortcutActionId, T>>, visibleIds: ReadonlySet<ShortcutActionId>): Partial<Record<ShortcutActionId, T>> {
+  if (visibleIds.size === 0) return {};
+  const filtered: Partial<Record<ShortcutActionId, T>> = {};
+  for (const [actionId, value] of Object.entries(conflicts)) {
+    if (!value) continue;
+    const others = (Array.isArray(value) ? value : [value]) as ShortcutActionId[];
+    if (visibleIds.has(actionId as ShortcutActionId) || others.some((other) => visibleIds.has(other))) {
+      filtered[actionId as ShortcutActionId] = value;
+    }
+  }
+  return filtered;
 }

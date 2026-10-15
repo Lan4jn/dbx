@@ -27,7 +27,7 @@ const TAB_DRAG_HORIZONTAL_THRESHOLD = 24;
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onUnmounted, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import {
@@ -42,6 +42,7 @@ import {
   Clock3,
   Copy,
   Database,
+  FoldHorizontal,
   ListFilter,
   ListOrdered,
   Maximize2,
@@ -54,11 +55,13 @@ import {
   Pencil,
   Pin,
   PlugZap,
+  Plus,
   RotateCcw,
   RotateCw,
   Search,
   Server,
   Settings,
+  Tag,
   Ungroup,
   X,
 } from "@lucide/vue";
@@ -67,12 +70,15 @@ import LightDropdown from "@/components/ui/LightDropdown.vue";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Input } from "@/components/ui/input";
+import { appTabActiveBackground, appTabActiveIndicator } from "@/lib/tabs/tabPresentation";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import ConnectionIcon from "@/components/icons/ConnectionIcon.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import TabExecutionStatus from "@/components/layout/TabExecutionStatus.vue";
 import TabModeIcon from "@/components/layout/TabModeIcon.vue";
 import ReadOnlySessionControl from "@/components/connection/ReadOnlySessionControl.vue";
+import { EDITOR_TOOLBAR_ACTIONS } from "./editorToolbarActions";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -81,12 +87,16 @@ import { useTabScroll } from "@/composables/useTabScroll";
 import { useToast } from "@/composables/useToast";
 import { hexToRgba } from "@/lib/common/color";
 import { copyToClipboard } from "@/lib/common/clipboard";
+import { redisDatabaseLabel } from "@/lib/redis/redisDatabaseAlias";
 import { parseTabDragPayload, serializeTabDragPayload } from "@/lib/tabs/tabDrag";
-import { createCloseAllTabMenuItem, createCloseLeftTabMenuItem, createCloseOtherTabMenuItem, createCloseRightTabMenuItem, createCloseTabMenuItem, createLocateTabMenuItem, createPinTabMenuItem, createRenameDuplicateTabItems } from "@/lib/tabs/tabMenu";
-import { connectionColor, dirtyTabTitleStyle, tabColorStyle as sharedTabColorStyle, tabDatabaseIconType, tabDisplayTitle, tabIconClass, tabTooltipLines } from "@/lib/tabs/tabPresentation";
+import { createCloseAllTabMenuItem, createCloseLeftTabMenuItem, createCloseOtherTabMenuItem, createCloseRightTabMenuItem, createCloseTabMenuItem, createLocateTabMenuItem, createPinTabMenuItem, createRenameDuplicateTabItems, createReopenClosedTabMenuItem } from "@/lib/tabs/tabMenu";
+import { formatShortcut } from "@/lib/editor/shortcutRegistry";
+import { findTabWithSameTitleSuffix, joinTabTitleParts, TAB_TITLE_SUFFIX_MAX_LENGTH, tabConnectionColor, dirtyTabTitleStyle, tabColorStyle as sharedTabColorStyle, tabDatabaseIconType, tabDisplayTitle, tabDisplayTitleParts, tabIconClass, tabTooltipLines } from "@/lib/tabs/tabPresentation";
 import { activeTabSidebarTarget } from "@/lib/sidebar/sidebarActiveTabTarget";
 import "./appTabBar.css";
 import type { QueryTab } from "@/types/database";
+import { buildConnectionDatabaseTabGroupStripEntries, type TabGroupTreeGuide } from "@/lib/tabs/tabGroupTree";
+import TabGroupTreeGuides from "./TabGroupTreeGuides.vue";
 
 const props = defineProps<{
   groupId: string;
@@ -122,6 +132,8 @@ const { t } = useI18n();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
+const toolbar = inject(EDITOR_TOOLBAR_ACTIONS, null);
+const canNewQuery = computed(() => toolbar?.canNewQuery.value ?? false);
 const { toast } = useToast();
 const tabsContainerRef = ref<HTMLElement | null>(null);
 const { hasTabOverflow, scrollThumbLeftPercent, scrollThumbWidthPercent, isScrollbarDragging, updateScrollButtons, onTabsWheel, startScrollbarDrag } = useTabScroll(tabsContainerRef);
@@ -131,6 +143,7 @@ const fixedTabsScroll = useTabScroll(fixedTabsRowRef);
 const regularTabsScroll = useTabScroll(regularTabsRowRef);
 const editingTabId = ref<string | null>(null);
 const editingTitle = ref("");
+const openTabTooltipId = ref<string | null>(null);
 // Drag suppression must survive pointerup: the browser fires click *after*
 // pointerup, so the flag is consumed by the click instead of being cleared
 // with the drag state. A fresh pointerdown always resets it.
@@ -165,23 +178,31 @@ function specialPageTabClass(active: boolean): string[] {
 
 function specialPageTabStyle(active: boolean) {
   if (!active) return undefined;
-  const activeBackground = "color-mix(in srgb, var(--foreground) 18%, var(--background))";
-  if (isVerticalLayout.value) return { "--app-tab-background": "var(--accent)" };
-  if (!isClassicLayout.value) return { "--app-tab-background": activeBackground, borderColor: "var(--ring)" };
-  return { "--app-tab-background": activeBackground, boxShadow: "inset 0 -2px 0 color-mix(in srgb, var(--foreground) 72%, transparent)" };
+  // Vertical active pills take the neutral wash from appTabBar.css; an inline
+  // --app-tab-background here would repaint the special pages in solid accent.
+  if (isVerticalLayout.value) return undefined;
+  if (!isClassicLayout.value) return { "--app-tab-background": appTabActiveBackground(), borderColor: "var(--ring)" };
+  return { "--app-tab-background": appTabActiveBackground(), boxShadow: appTabActiveIndicator() };
 }
 const isVerticalLayout = computed(() => settingsStore.editorSettings.tabPlacement === "left" || settingsStore.editorSettings.tabPlacement === "right");
 const isWrapLayout = computed(() => !isVerticalLayout.value && settingsStore.editorSettings.tabLayout === "wrap");
 // The icon-only collapse only exists in the vertical toolbar; horizontal
 // placements must ignore the persisted collapse state entirely.
 const isTabBarCollapsed = computed(() => isVerticalLayout.value && !!props.tabBarCollapsed);
+const showTabTreeGuides = computed(() => isVerticalLayout.value && !isTabBarCollapsed.value && settingsStore.editorSettings.tabGroupMode === "sidebar");
+// Outer [data-workspace-tab-navigation] / [data-special-page-navigation] owns
+// the shared vertical rail width; fill that rail so nested pane bars stay in
+// sync while the resize handle updates the outer panel (issue #9977).
 const tabBarStyle = computed<CSSProperties | undefined>(() => {
-  if (!isVerticalLayout.value) return undefined;
-  if (props.tabBarCollapsed) {
-    return { width: "100%", flex: "0 0 100%" };
+  const styles: CSSProperties = {};
+  if (isVerticalLayout.value) {
+    styles.width = "100%";
+    styles.flex = "0 0 100%";
   }
-  const width = props.tabBarWidth ?? 240;
-  return { width: `${width}px`, flex: `0 0 ${width}px` };
+  if (!isVerticalLayout.value && settingsStore.editorSettings.tabMaxWidth > 0) {
+    styles["--tab-max-width"] = `${settingsStore.editorSettings.tabMaxWidth}px`;
+  }
+  return Object.keys(styles).length > 0 ? styles : undefined;
 });
 const tabBarCollapseIcon = computed(() => {
   const isLeft = settingsStore.editorSettings.tabPlacement === "left";
@@ -266,7 +287,7 @@ const filteredGroupTabs = computed(() => {
   if (!query) {
     return props.tabs;
   }
-  return props.tabs.filter((tab) => tabDisplayTitle(tab, t).toLocaleLowerCase().includes(query) || tab.title.toLocaleLowerCase().includes(query));
+  return props.tabs.filter((tab) => tabTitleText(tab).toLocaleLowerCase().includes(query) || tab.title.toLocaleLowerCase().includes(query));
 });
 
 watch(tabOverflowOpen, (open) => {
@@ -353,6 +374,7 @@ const tabGroupItems = computed(() => [
   { value: "database-type", label: t("settings.tabGroupDatabaseType") },
   { value: "database", label: t("settings.tabGroupDatabase") },
   { value: "connection", label: t("settings.tabGroupConnection") },
+  { value: "sidebar", label: t("settings.tabGroupSidebar") },
 ]);
 const tabSortItems = computed(() => [
   { value: "manual", label: t("settings.tabSortManual") },
@@ -365,8 +387,15 @@ const tabPlacementItems = computed(() => [
   { value: "left", label: t("settings.tabPlacementLeft") },
   { value: "right", label: t("settings.tabPlacementRight") },
 ]);
+const tabMaxWidthItems = computed(() => [
+  { value: 0, label: t("settings.tabMaxWidthUnlimited") },
+  { value: 160, label: t("settings.tabMaxWidthCompact") },
+  { value: 200, label: t("settings.tabMaxWidthMedium") },
+  { value: 240, label: t("settings.tabMaxWidthStandard") },
+  { value: 320, label: t("settings.tabMaxWidthWide") },
+]);
 
-type TabPreferencePatch = Partial<Pick<EditorSettings, "tabPlacement" | "tabGroupMode" | "tabSortMode" | "tabGroupCustomizations">>;
+type TabPreferencePatch = Partial<Pick<EditorSettings, "tabPlacement" | "tabGroupMode" | "tabSortMode" | "tabGroupCustomizations" | "tabMaxWidth">>;
 
 async function persistTabPreferences(partial: TabPreferencePatch) {
   try {
@@ -377,7 +406,7 @@ async function persistTabPreferences(partial: TabPreferencePatch) {
 }
 
 function updateTabGroupMode(value: string) {
-  if (value === "none" || value === "database-type" || value === "database" || value === "connection") void persistTabPreferences({ tabGroupMode: value });
+  if (value === "none" || value === "database-type" || value === "database" || value === "connection" || value === "sidebar") void persistTabPreferences({ tabGroupMode: value });
 }
 
 function updateTabSortMode(value: string) {
@@ -386,6 +415,10 @@ function updateTabSortMode(value: string) {
 
 function updateTabPlacement(value: string) {
   if (value === "top" || value === "bottom" || value === "left" || value === "right") void persistTabPreferences({ tabPlacement: value });
+}
+
+function updateTabMaxWidth(value: number) {
+  if (Number.isFinite(value) && value >= 0) void persistTabPreferences({ tabMaxWidth: value });
 }
 
 function databaseTabGroupKey(tab: QueryTab) {
@@ -399,6 +432,7 @@ function databaseTabGroupKey(tab: QueryTab) {
 
 function tabGroupKey(tab: QueryTab) {
   const connection = connectionStore.getConfig(tab.connectionId);
+  if (settingsStore.editorSettings.tabGroupMode === "sidebar") return tab.connectionId;
   if (settingsStore.editorSettings.tabGroupMode === "connection") return tab.connectionId;
   if (settingsStore.editorSettings.tabGroupMode === "database") return databaseTabGroupKey(tab);
   return connection?.driver_profile || connection?.db_type || tab.connectionId || "unknown";
@@ -411,24 +445,46 @@ function compareTabGroupKeys(left: string, right: string) {
   return localized || (left < right ? -1 : 1);
 }
 
+// Numbered across every open tab (not just this group's) so a tab keeps the
+// same label when the same query tab is moved between panes.
+const tabTitleParts = computed(() => tabDisplayTitleParts(queryStore.tabs, t));
+
+function tabTitleBase(tab: QueryTab) {
+  return (tabTitleParts.value.get(tab.id) ?? { base: tabDisplayTitle(tab, t), suffix: "" }).base;
+}
+
+// The suffix is rendered outside the truncating title element so a narrow tab
+// (tabMaxWidth) shortens the title instead of hiding the part that tells
+// duplicate tabs apart.
+function tabTitleSuffixText(tab: QueryTab) {
+  return tabTitleParts.value.get(tab.id)?.suffix ?? "";
+}
+
 function tabTitleText(tab: QueryTab) {
-  return tabDisplayTitle(tab, t);
+  return joinTabTitleParts({ base: tabTitleBase(tab), suffix: tabTitleSuffixText(tab) });
 }
 
 function tabConnectionLabel(tab: QueryTab) {
-  return connectionStore.getConfig(tab.connectionId)?.name || tab.connectionId;
+  // 连接已删除但页签被保留时，回退到原连接名，避免显示成裸 uuid。
+  return connectionStore.getConfig(tab.connectionId)?.name || tab.detachedConnectionName || tab.connectionId;
 }
 
 function tabConnectionTargetLabel(tab: QueryTab) {
   const connection = connectionStore.getConfig(tab.connectionId);
   const host = connection?.host.trim();
-  return connection && host ? `${host}:${connection.port}` : tab.connectionId;
+  return connection && host ? `${host}:${connection.port}` : tab.detachedConnectionName || tab.connectionId;
 }
 
 function databaseTabGroupBaseLabel(tab: QueryTab) {
   if (connectionStore.getConfig(tab.connectionId)?.db_type === "redis") return tabConnectionLabel(tab);
   if (!tab.database) return tabConnectionLabel(tab);
   return [tab.database, ...(tab.catalog ? [tab.catalog] : [])].join(" · ");
+}
+
+function hierarchyDatabaseLabel(tab: QueryTab) {
+  const connection = connectionStore.getConfig(tab.connectionId);
+  if (connection?.db_type === "redis" && tab.database !== "") return redisDatabaseLabel(tab.database, connection.redis_database_aliases);
+  return tab.database ? databaseTabGroupBaseLabel(tab) : tab.catalog || tabConnectionLabel(tab);
 }
 
 const databaseTabGroupIdentityDisplaysByLabel = computed(() => {
@@ -492,6 +548,7 @@ const editingTabGroupFallbackColor = ref(tabGroupPalette[0]!);
 
 function tabGroupDefaultLabel(tab: QueryTab) {
   const connection = connectionStore.getConfig(tab.connectionId);
+  if (settingsStore.editorSettings.tabGroupMode === "sidebar") return tabConnectionLabel(tab);
   if (settingsStore.editorSettings.tabGroupMode === "connection") return connection?.name || tab.connectionId;
   if (settingsStore.editorSettings.tabGroupMode === "database") {
     const baseLabel = databaseTabGroupBaseLabel(tab);
@@ -508,7 +565,8 @@ function tabGroupDefaultLabel(tab: QueryTab) {
 }
 
 function tabGroupCustomizationKey(tab: QueryTab) {
-  return `${settingsStore.editorSettings.tabGroupMode}:${tabGroupKey(tab)}`;
+  const mode = settingsStore.editorSettings.tabGroupMode === "sidebar" ? "connection" : settingsStore.editorSettings.tabGroupMode;
+  return `${mode}:${tabGroupKey(tab)}`;
 }
 
 function tabGroupCustomization(tab: QueryTab) {
@@ -524,18 +582,27 @@ function tabGroupId(tab: QueryTab) {
   return `${tab.pinned ? "fixed" : "regular"}:${settingsStore.editorSettings.tabGroupMode}:${tabGroupKey(tab)}`;
 }
 
-function isTabGroupCollapsed(tab: QueryTab) {
-  if (settingsStore.editorSettings.tabGroupMode === "none") return false;
-  return collapsedTabGroups.value.has(tabGroupId(tab));
+function isGroupCollapsed(groupId: string) {
+  return settingsStore.editorSettings.tabGroupMode !== "none" && collapsedTabGroups.value.has(groupId);
 }
 
-const activeTabGroupId = computed(() => {
+const activeTabGroupIds = computed(() => {
   const activeTab = props.tabs.find((item) => isTabActive(item));
-  return activeTab ? tabGroupId(activeTab) : null;
+  if (!activeTab) return new Set<string>();
+  if (settingsStore.editorSettings.tabGroupMode !== "sidebar") return new Set([tabGroupId(activeTab)]);
+  const ids = new Set<string>();
+  for (const section of stripSections.value) {
+    const entry = section.entries.find((item) => item.kind === "tab" && item.tab.id === activeTab.id);
+    if (entry?.kind === "tab") {
+      entry.ancestorIds.forEach((id) => ids.add(id));
+      ids.add(entry.groupId);
+    }
+  }
+  return ids;
 });
 
-function isTabGroupActive(tab: QueryTab) {
-  return activeTabGroupId.value === tabGroupId(tab);
+function isGroupActive(groupId: string) {
+  return activeTabGroupIds.value.has(groupId);
 }
 
 function preserveTabScrollPosition() {
@@ -638,9 +705,8 @@ function handleTabGroupTransitionEnd(event: TransitionEvent) {
   refreshHorizontalTabOverflow();
 }
 
-function toggleTabGroup(tab: QueryTab) {
+function toggleTabGroupById(groupId: string) {
   preserveTabScrollPosition();
-  const groupId = tabGroupId(tab);
   if (collapsingTabGroups.value.has(groupId)) {
     cancelTabGroupCollapse(groupId);
   }
@@ -658,6 +724,9 @@ function toggleTabGroup(tab: QueryTab) {
 
 function tabGroupIdsInPane() {
   if (settingsStore.editorSettings.tabGroupMode === "none") return [];
+  if (settingsStore.editorSettings.tabGroupMode === "sidebar") {
+    return [...new Set(stripSections.value.flatMap((section) => section.entries.filter((entry) => entry.kind === "header").map((entry) => entry.groupId)))];
+  }
   return [...new Set(props.tabs.map((tab) => tabGroupId(tab)))];
 }
 
@@ -677,16 +746,17 @@ function expandTabGroupForTab(tabId: string | null) {
   if (!tabId || settingsStore.editorSettings.tabGroupMode === "none") return;
   const tab = queryStore.tabs.find((item) => item.id === tabId);
   if (!tab) return;
-  const groupId = tabGroupId(tab);
-  cancelTabGroupCollapse(groupId);
-  if (!collapsedTabGroups.value.has(groupId)) return;
+  const groupIds = settingsStore.editorSettings.tabGroupMode === "sidebar" ? stripSections.value.flatMap((section) => section.entries.filter((entry) => entry.kind === "tab" && entry.tab.id === tabId).flatMap((entry) => [entry.groupId, ...entry.ancestorIds])) : [tabGroupId(tab)];
+  groupIds.forEach((groupId) => cancelTabGroupCollapse(groupId));
+  const hidden = groupIds.filter((groupId) => collapsedTabGroups.value.has(groupId));
+  if (!hidden.length) return;
   const next = new Set(collapsedTabGroups.value);
-  next.delete(groupId);
+  hidden.forEach((groupId) => next.delete(groupId));
   collapsedTabGroups.value = next;
 }
 
 function defaultTabGroupColor(tab: QueryTab) {
-  const connectionGroupColor = settingsStore.editorSettings.tabGroupMode === "connection" ? connectionColor(tab.connectionId) : undefined;
+  const connectionGroupColor = settingsStore.editorSettings.tabGroupMode === "connection" && settingsStore.editorSettings.colorizeConnectionTabs ? tabConnectionColor(tab.connectionId) : undefined;
   let hash = 0;
   for (const character of tabGroupKey(tab)) hash = (hash * 31 + character.codePointAt(0)!) | 0;
   return connectionGroupColor || tabGroupPalette[Math.abs(hash) % tabGroupPalette.length]!;
@@ -705,6 +775,56 @@ function groupColorStyle(color: string): CSSProperties {
 
 function tabGroupStyle(tab: QueryTab): CSSProperties {
   return groupColorStyle(resolvedTabGroupColor(tab));
+}
+
+function tabGroupStyleForEntry(entry: Extract<StripEntry, { kind: "header" }>): CSSProperties {
+  if (entry.level === "connection") return tabGroupStyle(entry.tab);
+  return tabGroupStyleForGroupId(entry.groupId);
+}
+
+function tabGroupStyleForGroupId(groupId: string): CSSProperties {
+  let hash = 0;
+  for (const character of groupId) hash = (hash * 31 + character.codePointAt(0)!) | 0;
+  return groupColorStyle(tabGroupPalette[Math.abs(hash) % tabGroupPalette.length]!);
+}
+
+function tabGroupStyleForTabEntry(entry: Extract<StripEntry, { kind: "tab" }>): CSSProperties {
+  return settingsStore.editorSettings.tabGroupMode === "sidebar" ? tabGroupStyleForGroupId(entry.groupId) : tabGroupStyle(entry.tab);
+}
+
+function tabGroupHeaderDepthStyle(entry: Extract<StripEntry, { kind: "header" }>): CSSProperties | undefined {
+  if (!isVerticalLayout.value || isTabBarCollapsed.value || settingsStore.editorSettings.tabGroupMode !== "sidebar") return undefined;
+  return {
+    "--tab-group-depth-offset": `${entry.depth * 0.75}rem`,
+    ...tabGroupTreeRowStyle(entry),
+  } as CSSProperties;
+}
+
+function tabGroupTreeRowStyle(entry: StripEntry): CSSProperties | undefined {
+  if (!showTabTreeGuides.value) return undefined;
+  const parentColor = resolvedTabGroupColor(entry.tab);
+  const childColor = entry.kind === "header" && entry.level === "connection" ? parentColor : tabGroupPalette[Math.abs([...entry.groupId].reduce((hash, character) => (hash * 31 + character.codePointAt(0)!) | 0, 0)) % tabGroupPalette.length]!;
+  return {
+    "--tab-tree-guide-base-x": entry.kind === "header" ? "calc(var(--tab-group-root-rail-x) - var(--tab-group-header-inset))" : "var(--tab-group-root-rail-x)",
+    "--tab-tree-guide-child-x": entry.kind === "header" ? `calc(var(--tab-group-root-rail-x) - var(--tab-group-header-inset) + ${entry.depth * 0.75}rem)` : `calc(var(--tab-group-tab-inset) + ${entry.depth * 0.5}rem)`,
+    "--tab-tree-parent-color": parentColor,
+    "--tab-tree-child-color": childColor,
+    ...(entry.kind === "header" ? tabGroupStyleForEntry(entry) : tabGroupStyleForTabEntry(entry)),
+  } as CSSProperties;
+}
+
+function tabGroupTabDepthStyle(entry: Extract<StripEntry, { kind: "tab" }>): CSSProperties | undefined {
+  if (!isVerticalLayout.value || isTabBarCollapsed.value || settingsStore.editorSettings.tabGroupMode !== "sidebar") return undefined;
+  return {
+    "--tab-group-depth-offset": `${entry.depth * 0.75}rem`,
+    "--tab-group-vertical-depth-offset": `${entry.depth * 0.5}rem`,
+  } as CSSProperties;
+}
+
+function isEntryHidden(entry: StripEntry) {
+  if (tabSearchQuery.value.trim() || settingsStore.editorSettings.tabGroupMode === "none") return false;
+  const ids = entry.kind === "header" ? entry.ancestorIds : [...entry.ancestorIds, entry.groupId];
+  return ids.some((id) => collapsedTabGroups.value.has(id));
 }
 
 const tabGroupEditorPreviewStyle = computed(() => groupColorStyle(editingTabGroupColor.value || editingTabGroupFallbackColor.value));
@@ -776,12 +896,26 @@ function closeTabGroup(tab: QueryTab) {
   queryStore.closeTabsByIds(tabsToClose, finalActiveTabId);
 }
 
+function closeTabsByIds(tabIds: string[]) {
+  const uniqueIds = [...new Set(tabIds)];
+  if (!uniqueIds.length) return;
+  const finalActiveTabId = queryStore.activeTabId && !uniqueIds.includes(queryStore.activeTabId) ? queryStore.activeTabId : (queryStore.tabs.find((item) => !uniqueIds.includes(item.id))?.id ?? null);
+  queryStore.closeTabsByIds(uniqueIds, finalActiveTabId);
+}
+
 const tabOrganizationItems = computed(() => [
   ...tabPlacementItems.value.map((item, index) => ({ ...item, value: `placement:${item.value}`, icon: { top: PanelTop, bottom: PanelBottom, left: PanelLeft, right: PanelRight }[item.value], groupLabel: index === 0 ? t("settings.tabPlacement") : undefined })),
-  ...tabGroupItems.value.map((item, index) => ({ ...item, value: `group:${item.value}`, icon: { none: Ungroup, "database-type": Database, database: Database, connection: Server }[item.value], separatorBefore: index === 0, groupLabel: index === 0 ? t("settings.tabGroup") : undefined })),
+  ...tabGroupItems.value.map((item, index) => ({
+    ...item,
+    value: `group:${item.value}`,
+    icon: { none: Ungroup, "database-type": Database, database: Database, connection: Server, sidebar: Server }[item.value],
+    separatorBefore: index === 0,
+    groupLabel: index === 0 ? t("settings.tabGroup") : undefined,
+  })),
   ...tabSortItems.value.map((item, index) => ({ ...item, value: `sort:${item.value}`, icon: { manual: ListOrdered, "created-asc": Clock3, "title-asc": ArrowDownAZ }[item.value], separatorBefore: index === 0, groupLabel: index === 0 ? t("settings.tabSort") : undefined })),
+  ...tabMaxWidthItems.value.map((item, index) => ({ ...item, value: `maxwidth:${item.value}`, icon: item.value === 0 ? Maximize2 : FoldHorizontal, separatorBefore: index === 0, groupLabel: index === 0 ? t("settings.tabMaxWidth") : undefined })),
 ]);
-const selectedTabOrganizationItems = computed(() => [`placement:${settingsStore.editorSettings.tabPlacement}`, `group:${settingsStore.editorSettings.tabGroupMode}`, `sort:${settingsStore.editorSettings.tabSortMode}`]);
+const selectedTabOrganizationItems = computed(() => [`placement:${settingsStore.editorSettings.tabPlacement}`, `group:${settingsStore.editorSettings.tabGroupMode}`, `sort:${settingsStore.editorSettings.tabSortMode}`, `maxwidth:${settingsStore.editorSettings.tabMaxWidth}`]);
 
 function selectTabOrganizationItem(value: string) {
   const [section, option] = value.split(":");
@@ -789,6 +923,7 @@ function selectTabOrganizationItem(value: string) {
   if (section === "placement") updateTabPlacement(option);
   else if (section === "group") updateTabGroupMode(option);
   else if (section === "sort") updateTabSortMode(option);
+  else if (section === "maxwidth") updateTabMaxWidth(Number(option));
 }
 
 function getTabGroupMenuItems(tab: QueryTab): ContextMenuItem[] {
@@ -828,13 +963,59 @@ function getTabGroupMenuItems(tab: QueryTab): ContextMenuItem[] {
   ];
 }
 
+function getTabGroupHeaderMenuItems(entry: Extract<StripEntry, { kind: "header" }>): ContextMenuItem[] {
+  if (settingsStore.editorSettings.tabGroupMode !== "sidebar") return getTabGroupMenuItems(entry.tab);
+  const customization = tabGroupCustomization(entry.tab);
+  const customizationItems: ContextMenuItem[] =
+    entry.level === "connection"
+      ? [
+          { label: t("contextMenu.editTabGroup"), action: () => openTabGroupEditor(entry.tab), icon: Pencil },
+          { label: t("contextMenu.resetTabGroup"), action: () => resetTabGroupCustomization(entry.tab), icon: RotateCcw, visible: !!(customization?.name || customization?.color) },
+          { label: "", separator: true },
+        ]
+      : [];
+  return [
+    ...customizationItems,
+    { label: t("contextMenu.collapseAll"), action: collapseAllTabGroups, icon: ChevronsDownUp },
+    { label: t("contextMenu.expandAll"), action: () => expandAllTabGroups(), icon: ChevronsUpDown },
+    { label: "", separator: true },
+    { label: t("contextMenu.closeTabGroup"), action: () => closeTabsByIds(entry.tabIds), icon: X, variant: "destructive" },
+  ];
+}
+
 function openTabGroupContextMenu(event: MouseEvent, open: (event: MouseEvent) => void) {
   event.preventDefault();
   document.getSelection()?.removeAllRanges();
   open(event);
 }
 
-type StripEntry = { kind: "header"; key: string; tab: QueryTab; pinned: boolean; count: number } | { kind: "tab"; key: string; tab: QueryTab; groupFirst: boolean; groupLast: boolean; grouping: boolean };
+type StripEntry =
+  | {
+      kind: "header";
+      key: string;
+      tab: QueryTab;
+      groupId: string;
+      pinned: boolean;
+      count: number;
+      label: string;
+      level: "connection" | "database";
+      depth: number;
+      tabIds: string[];
+      ancestorIds: string[];
+      treeGuides?: TabGroupTreeGuide[];
+    }
+  | {
+      kind: "tab";
+      key: string;
+      tab: QueryTab;
+      groupId: string;
+      depth: number;
+      ancestorIds: string[];
+      groupFirst: boolean;
+      groupLast: boolean;
+      grouping: boolean;
+      treeGuides?: TabGroupTreeGuide[];
+    };
 
 /**
  * Flattens the strip's two sections (pinned, then regular) into render
@@ -842,7 +1023,7 @@ type StripEntry = { kind: "header"; key: string; tab: QueryTab; pinned: boolean;
  * pills. Collapsed pills remain mounted so their visibility can animate.
  */
 function tabMatchesSearch(tab: QueryTab, query: string) {
-  const title = tabDisplayTitle(tab, t).toLocaleLowerCase();
+  const title = tabTitleText(tab).toLocaleLowerCase();
   return title.includes(query) || tab.title.toLocaleLowerCase().includes(query);
 }
 
@@ -861,6 +1042,18 @@ const filteredRegularTabs = computed(() => {
 });
 
 function buildStripEntries(section: QueryTab[], pinned: boolean): StripEntry[] {
+  if (settingsStore.editorSettings.tabGroupMode === "sidebar") {
+    const connectionlessEntries: StripEntry[] = section.filter((tab) => !tab.connectionId).map((tab) => ({ kind: "tab", key: tab.id, tab, groupId: "", depth: 0, ancestorIds: [], groupFirst: false, groupLast: false, grouping: false }));
+    const hierarchyEntries = buildConnectionDatabaseTabGroupStripEntries(
+      section.filter((tab) => tab.connectionId),
+      pinned,
+    ).map((entry): StripEntry => {
+      if (entry.kind === "tab") return entry;
+      const label = entry.level === "connection" ? tabGroupLabel(entry.tab) : hierarchyDatabaseLabel(entry.tab);
+      return { ...entry, label };
+    });
+    return [...connectionlessEntries, ...hierarchyEntries];
+  }
   const entries: StripEntry[] = [];
   const grouping = settingsStore.editorSettings.tabGroupMode !== "none";
   const groupKeys = grouping ? section.map(tabGroupKey) : [];
@@ -873,9 +1066,10 @@ function buildStripEntries(section: QueryTab[], pinned: boolean): StripEntry[] {
     const first = grouping && (index === 0 || groupKeys[index - 1] !== groupKey);
     const last = grouping && (index === section.length - 1 || groupKeys[index + 1] !== groupKey);
     if (first) {
-      entries.push({ kind: "header", key: `header:${tab.id}`, tab, pinned, count: groupCounts.get(groupKey!) ?? 0 });
+      const groupId = tabGroupId(tab);
+      entries.push({ kind: "header", key: `header:${groupId}`, tab, groupId, pinned, count: groupCounts.get(groupKey!) ?? 0, label: tabGroupLabel(tab), level: "connection", depth: 0, tabIds: section.filter((item) => tabGroupKey(item) === groupKey).map((item) => item.id), ancestorIds: [] });
     }
-    entries.push({ kind: "tab", key: tab.id, tab, groupFirst: first, groupLast: last, grouping });
+    entries.push({ kind: "tab", key: tab.id, tab, groupId: grouping ? tabGroupId(tab) : "", depth: 0, ancestorIds: grouping ? [tabGroupId(tab)] : [], groupFirst: first, groupLast: last, grouping });
   });
   return entries;
 }
@@ -892,14 +1086,28 @@ const stripSections = computed(() => {
 });
 
 function tabColorStyle(tab: QueryTab): CSSProperties | undefined {
-  // Sidebar tabs carry their group/connection color as a soft active wash;
-  // the active indicator itself comes from the vertical CSS rules.
+  // Keep ungrouped sidebar tabs aligned with the horizontal tab strip: every
+  // tab gets a connection-colored wash, while the active tab gets the stronger
+  // border and leading accent.
   if (isVerticalLayout.value) {
-    if (!isTabActive(tab)) {
-      return undefined;
-    }
-    const color = connectionColor(tab.connectionId);
-    return { "--app-tab-background": color ? hexToRgba(color, 0.12) : "var(--accent)" } as CSSProperties;
+    if (settingsStore.editorSettings.tabGroupMode !== "none" || !settingsStore.editorSettings.colorizeConnectionTabs) return undefined;
+    const active = isTabActive(tab);
+    const color = tabConnectionColor(tab.connectionId);
+    return {
+      "--app-tab-background": hexToRgba(color, active ? 0.24 : 0.09),
+      "--app-tab-hover-background": hexToRgba(color, 0.16),
+      ...(active
+        ? {
+            "--app-tab-active-border": hexToRgba(color, 0.72),
+            "--app-tab-active-accent": color,
+          }
+        : { borderColor: hexToRgba(color, 0.18) }),
+    } as CSSProperties;
+  }
+  // Keep horizontal tabs quiet by default; group headers and rails already
+  // provide the connection identity, while the selected tab gets the wash.
+  if (!isTabActive(tab)) {
+    return undefined;
   }
   return sharedTabColorStyle(tab, isTabActive(tab), isClassicLayout.value);
 }
@@ -908,6 +1116,23 @@ const tabTooltipSide = computed(() => {
   if (!isVerticalLayout.value) return "bottom" as const;
   return settingsStore.editorSettings.tabPlacement === "left" ? ("right" as const) : ("left" as const);
 });
+function updateTabTooltipOpen(tabId: string, open: boolean) {
+  if (open) {
+    openTabTooltipId.value = tabId;
+  } else if (openTabTooltipId.value === tabId) {
+    openTabTooltipId.value = null;
+  }
+}
+
+function closeTabTooltip(tabId: string) {
+  if (openTabTooltipId.value === tabId) {
+    openTabTooltipId.value = null;
+  }
+}
+
+function isConnectionlessPluginTab(tab: QueryTab): boolean {
+  return (tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem") && !tab.connectionId;
+}
 
 /**
  * Drag visuals for a pill, ported from the legacy tab bar's tabDropStyle: the
@@ -924,6 +1149,9 @@ function tabDropStyle(tab: QueryTab): CSSProperties | undefined {
   if (groupTabDrag.targetTabId !== tab.id) {
     return undefined;
   }
+  if (isVerticalLayout.value) {
+    return groupTabDrag.position === "before" ? { borderTop: "2px solid var(--ring)" } : { borderBottom: "2px solid var(--ring)" };
+  }
   if (groupTabDrag.position === "before") {
     return { boxShadow: "inset 3px 0 0 0 var(--ring)" };
   }
@@ -933,7 +1161,8 @@ function tabDropStyle(tab: QueryTab): CSSProperties | undefined {
 function createTabDragGhost(sourceEl: HTMLElement, x: number, y: number) {
   const ghost = document.createElement("div");
   const textNode = sourceEl.querySelector(".truncate");
-  ghost.textContent = textNode?.textContent || "";
+  const suffixNode = sourceEl.querySelector("[data-tab-title-suffix]");
+  ghost.textContent = [textNode?.textContent, suffixNode?.textContent].filter(Boolean).join(" ");
   ghost.style.cssText = `position: fixed; pointer-events: none; z-index: 9999; opacity: 0.9; box-shadow: 0 2px 8px rgba(0,0,0,0.15); border-radius: var(--dbx-radius-fixed-6); background: var(--background, #fff); border: 1px solid var(--border, #e5e7eb); max-width: 200px; height: 28px; padding: 0 12px; font-size: 12px; line-height: 28px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; left: ${x + 12}px; top: ${y - 14}px;`;
   document.body.appendChild(ghost);
   return ghost;
@@ -959,19 +1188,28 @@ function tabTitleStyle(tab: QueryTab): CSSProperties | undefined {
   return dirtyTabTitleStyle(isDirtyTab(tab));
 }
 
+let lastDispatchedSwitchTabId: string | null = null;
 function dispatchBeforeTabSwitch(tabId: string) {
-  if (tabId === props.activeTabId) {
+  if (tabId === props.activeTabId || tabId === lastDispatchedSwitchTabId) {
     return;
   }
+  lastDispatchedSwitchTabId = tabId;
   window.dispatchEvent(new CustomEvent("dbx:before-tab-switch", { detail: { tabId, fromTabId: props.activeTabId } }));
 }
 
 function activateTab(tabId: string) {
+  dispatchBeforeTabSwitch(tabId);
   emit("activate-tab", tabId);
 }
 
 function handleTabPointerDown(event: PointerEvent, tab: QueryTab) {
   if (event.button !== 0) {
+    return;
+  }
+  // Reordering only has a stable meaning when the strip follows the manual
+  // order. Derived sort modes would immediately move a dragged tab back to
+  // their computed position, so keep those strips click-only.
+  if (settingsStore.editorSettings.tabSortMode !== "manual") {
     return;
   }
   // A drag session is already in progress (second pointer device): ignore.
@@ -1012,6 +1250,84 @@ function handleTabPointerDown(event: PointerEvent, tab: QueryTab) {
 
 function canRenameTab(tab: QueryTab) {
   return tab.mode === "query";
+}
+
+// Every tab except a query tab derives its label from its connection, database
+// and object (table, collection, key, plugin page...), so it cannot be renamed;
+// the suffix is how users tell several tabs of the same target apart. Query tabs
+// already have a full rename, which lets them choose the whole title.
+function canSetTabSuffix(tab: QueryTab) {
+  return tab.mode !== "query";
+}
+
+const tabSuffixEditorOpen = ref(false);
+const tabSuffixEditingTabId = ref<string | null>(null);
+const tabSuffixInput = ref("");
+const tabSuffixDuplicateOpen = ref(false);
+const tabSuffixDuplicateTitle = ref("");
+const tabSuffixEditingTab = computed(() => queryStore.tabs.find((tab) => tab.id === tabSuffixEditingTabId.value));
+const tabSuffixEditorPreview = computed(() => {
+  const tab = tabSuffixEditingTab.value;
+  if (!tab) return "";
+  return joinTabTitleParts({ base: tabTitleBase(tab), suffix: tabSuffixInput.value.trim() });
+});
+
+function openTabSuffixEditor(tab: QueryTab) {
+  tabSuffixEditingTabId.value = tab.id;
+  tabSuffixInput.value = tab.titleSuffix ?? "";
+  tabSuffixEditorOpen.value = true;
+  nextTick(() => {
+    const input = document.querySelector<HTMLInputElement>("[data-tab-suffix-input]");
+    input?.focus();
+    input?.select();
+  });
+}
+
+function applyTabSuffix(tab: QueryTab, suffix: string) {
+  queryStore.setTabTitleSuffix(tab.id, suffix);
+  tabSuffixDuplicateOpen.value = false;
+  tabSuffixEditorOpen.value = false;
+  tabSuffixEditingTabId.value = null;
+}
+
+function saveTabSuffix() {
+  const tab = tabSuffixEditingTab.value;
+  if (!tab) {
+    tabSuffixEditorOpen.value = false;
+    return;
+  }
+  const suffix = tabSuffixInput.value.trim();
+  const duplicate = findTabWithSameTitleSuffix(queryStore.tabs, tab, suffix, t);
+  if (duplicate) {
+    tabSuffixDuplicateTitle.value = tabTitleText(duplicate);
+    tabSuffixDuplicateOpen.value = true;
+    return;
+  }
+  applyTabSuffix(tab, suffix);
+}
+
+function clearTabSuffix() {
+  const tab = tabSuffixEditingTab.value;
+  if (tab) applyTabSuffix(tab, "");
+  else tabSuffixEditorOpen.value = false;
+}
+
+function backToTabSuffixEditor() {
+  tabSuffixDuplicateOpen.value = false;
+  nextTick(() => document.querySelector<HTMLInputElement>("[data-tab-suffix-input]")?.focus());
+}
+
+function confirmDuplicateTabSuffix() {
+  const tab = tabSuffixEditingTab.value;
+  if (tab) applyTabSuffix(tab, tabSuffixInput.value);
+  else tabSuffixDuplicateOpen.value = false;
+}
+
+function handleTabSuffixKeydown(event: KeyboardEvent) {
+  // Enter that confirms an IME composition (e.g. Chinese pinyin) must not save.
+  if (event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  saveTabSuffix();
 }
 
 function isDetachableTab(tab: QueryTab) {
@@ -1094,10 +1410,16 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       onDuplicate: () => queryStore.duplicateTab(tab.id),
     }),
     {
+      label: t("contextMenu.setTabSuffix"),
+      action: () => openTabSuffixEditor(tab),
+      icon: Tag,
+      visible: canSetTabSuffix(tab),
+    },
+    {
       label: t("contextMenu.copyName"),
       action: async () => {
         try {
-          await copyToClipboard(tabDisplayTitle(tab, t));
+          await copyToClipboard(tabTitleText(tab));
           toast(t("connection.copied"), 2000);
         } catch (e: any) {
           toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
@@ -1192,6 +1514,12 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       label: t("contextMenu.closeTab"),
       onClose: () => closeTab(tab),
     }),
+    createReopenClosedTabMenuItem({
+      label: t("contextMenu.reopenClosedTab"),
+      disabled: !queryStore.canReopenClosedTab,
+      shortcut: formatShortcut(settingsStore.editorSettings.shortcuts?.reopenClosedTab ?? "Shift+Mod+T"),
+      onReopen: () => queryStore.reopenClosedTab(),
+    }),
   ];
   return items;
 }
@@ -1261,9 +1589,10 @@ function handleTabPointerMove(event: PointerEvent) {
     return;
   }
   if (!drag.active) {
-    // Horizontal-only threshold, matching the legacy tab bar: absorbs click
-    // jitter and touch tap drift (touch never arms the drag at all).
-    if (Math.abs(event.clientX - drag.startX) < TAB_DRAG_HORIZONTAL_THRESHOLD) {
+    // Use the strip's primary axis for the drag threshold: horizontal strips
+    // react to horizontal movement, while left/right strips react vertically.
+    const distance = isVerticalLayout.value ? Math.abs(event.clientY - drag.startY) : Math.abs(event.clientX - drag.startX);
+    if (distance < TAB_DRAG_HORIZONTAL_THRESHOLD) {
       return;
     }
     drag.active = true;
@@ -1286,7 +1615,9 @@ function handleTabPointerMove(event: PointerEvent) {
   if (tabElement && groupElement) {
     drag.targetTabId = tabElement.dataset.tabId ?? null;
     const rect = tabElement.getBoundingClientRect();
-    drag.position = event.clientX < rect.left + rect.width / 2 ? "before" : "after";
+    const pointerPosition = isVerticalLayout.value ? event.clientY : event.clientX;
+    const targetMiddle = isVerticalLayout.value ? rect.top + rect.height / 2 : rect.left + rect.width / 2;
+    drag.position = pointerPosition < targetMiddle ? "before" : "after";
   }
 }
 
@@ -1350,6 +1681,7 @@ const tabScrollBehavior = ref<ScrollBehavior>("smooth");
 watch(
   () => props.activeTabId,
   (tabId) => {
+    lastDispatchedSwitchTabId = null;
     // A tab that just became active must be visible: reveal its group if collapsed.
     expandTabGroupForTab(tabId);
     nextTick(() => {
@@ -1379,6 +1711,7 @@ watch(
     props.specialPageTabs?.driverStoreOpen,
     settingsStore.editorSettings.tabLayout,
     settingsStore.editorSettings.tabGroupMode,
+    settingsStore.editorSettings.tabMaxWidth,
     compactTabTitle.value,
     Array.from(collapsedTabGroups.value).sort().join("|"),
   ],
@@ -1431,9 +1764,18 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
     :data-group-id="groupId"
     :data-group-mode="settingsStore.editorSettings.tabGroupMode"
     :data-placement="settingsStore.editorSettings.tabPlacement"
+    :data-has-max-tab-width="!isVerticalLayout && settingsStore.editorSettings.tabMaxWidth > 0"
   >
     <!-- Compact vertical toolbar: search, tab organization, collapse. -->
     <div v-if="isVerticalLayout" class="flex h-9 shrink-0 items-center gap-0.5 border-b p-1" :class="isTabBarCollapsed ? 'justify-center' : ''">
+      <Tooltip v-if="canNewQuery">
+        <TooltipTrigger as-child>
+          <button type="button" data-new-query-tab :class="verticalTabToolbarButtonClass" :aria-label="t('toolbar.newQuery')" @click="toolbar?.newQuery(groupId)">
+            <Plus class="h-4 w-4" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.newQuery") }}</TooltipContent>
+      </Tooltip>
       <div v-if="!isTabBarCollapsed" class="relative min-w-0 flex-1">
         <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         <Input v-model="tabSearchQuery" type="search" :placeholder="t('tabs.searchOpenTabs')" class="h-7 w-full pl-7 text-sm" />
@@ -1456,6 +1798,7 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
         :show-chevron="false"
         :close-on-select="false"
         :match-trigger-width="false"
+        max-height="min(600px, calc(100vh - 16px))"
         align="end"
         @update:model-value="selectTabOrganizationItem"
       />
@@ -1482,6 +1825,7 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
         :show-chevron="false"
         :close-on-select="false"
         :match-trigger-width="false"
+        max-height="min(600px, calc(100vh - 16px))"
         @update:model-value="selectTabOrganizationItem"
       />
       <div class="app-tab-strip relative h-full min-w-0 flex-1 overflow-hidden">
@@ -1525,24 +1869,28 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                 @wheel="hasHorizontalFixedRows && onHorizontalTabWheel($event)"
               >
                 <template v-for="entry in section.entries" :key="entry.key">
-                  <CustomContextMenu v-if="entry.kind === 'header'" :items="() => getTabGroupMenuItems(entry.tab)" v-slot="{ onContextMenu }">
+                  <CustomContextMenu v-if="entry.kind === 'header'" :items="() => getTabGroupHeaderMenuItems(entry)" v-slot="{ onContextMenu }">
                     <button
                       type="button"
                       class="tab-group-header"
-                      :class="{ 'tab-group-header--collapsed': isTabGroupCollapsed(entry.tab), 'tab-group-header--active': isTabGroupActive(entry.tab) }"
-                      :style="tabGroupStyle(entry.tab)"
-                      :aria-expanded="!isTabGroupCollapsed(entry.tab)"
-                      :title="tabGroupLabel(entry.tab)"
-                      @click="toggleTabGroup(entry.tab)"
+                      :class="{ 'tab-group-header--collapsed': isGroupCollapsed(entry.groupId), 'tab-group-header--active': isGroupActive(entry.groupId), 'tab-group-header--hidden': isEntryHidden(entry) }"
+                      :style="[tabGroupStyleForEntry(entry), tabGroupHeaderDepthStyle(entry)]"
+                      :data-tree-level="settingsStore.editorSettings.tabGroupMode === 'sidebar' ? entry.level : undefined"
+                      :aria-expanded="!isGroupCollapsed(entry.groupId)"
+                      :title="entry.label"
+                      @click="toggleTabGroupById(entry.groupId)"
                       @contextmenu="openTabGroupContextMenu($event, onContextMenu)"
                     >
+                      <TabGroupTreeGuides v-if="showTabTreeGuides" :guides="entry.treeGuides ?? []" :expanded="!isGroupCollapsed(entry.groupId) || !!tabSearchQuery.trim()" />
                       <span class="tab-group-header-content">
                         <span class="tab-group-marker" aria-hidden="true" />
                         <Pin v-if="entry.pinned" class="tab-group-pin" aria-hidden="true" />
-                        <ChevronDown class="tab-group-chevron" :class="{ 'tab-group-chevron--collapsed': isTabGroupCollapsed(entry.tab) }" aria-hidden="true" />
-                        <DatabaseIcon :db-type="tabDatabaseIconType(entry.tab)" class="tab-group-database-icon" aria-hidden="true" />
-                        <span class="tab-group-label">{{ tabGroupLabel(entry.tab) }}</span>
-                        <span v-if="isTabGroupCollapsed(entry.tab)" class="tab-group-count">{{ entry.count }}</span>
+                        <ChevronDown class="tab-group-chevron" :class="{ 'tab-group-chevron--collapsed': isGroupCollapsed(entry.groupId) }" aria-hidden="true" />
+                        <ConnectionIcon v-if="entry.level === 'connection' && settingsStore.editorSettings.tabGroupMode === 'sidebar'" :connection="connectionStore.getConfig(entry.tab.connectionId)" class="tab-group-database-icon tab-group-connection-icon" aria-hidden="true" />
+                        <DatabaseIcon v-else-if="entry.level === 'connection'" :db-type="tabDatabaseIconType(entry.tab)" class="tab-group-database-icon tab-group-connection-icon" aria-hidden="true" />
+                        <Database v-else class="tab-group-database-icon tab-group-library-icon text-yellow-500" aria-hidden="true" />
+                        <span class="tab-group-label">{{ entry.label }}</span>
+                        <span v-if="isGroupCollapsed(entry.groupId)" class="tab-group-count">{{ entry.count }}</span>
                       </span>
                     </button>
                   </CustomContextMenu>
@@ -1552,17 +1900,19 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                         'tab-group-entry',
                         isClassicLayout && !isVerticalLayout ? 'h-full' : '',
                         {
-                          'tab-group-entry--collapsing': entry.grouping && !tabSearchQuery.trim() && collapsingTabGroups.has(tabGroupId(entry.tab)),
-                          'tab-group-entry--collapsed': entry.grouping && !tabSearchQuery.trim() && isTabGroupCollapsed(entry.tab),
+                          'tab-group-entry--collapsing': entry.grouping && !tabSearchQuery.trim() && collapsingTabGroups.has(entry.groupId),
+                          'tab-group-entry--collapsed': entry.grouping && !tabSearchQuery.trim() && isEntryHidden(entry),
                         },
                       ]"
-                      :data-tab-group-id="entry.grouping ? tabGroupId(entry.tab) : undefined"
-                      :aria-hidden="entry.grouping && !tabSearchQuery.trim() && isTabGroupCollapsed(entry.tab)"
-                      :inert="entry.grouping && !tabSearchQuery.trim() && isTabGroupCollapsed(entry.tab)"
+                      :data-tab-group-id="entry.grouping ? entry.groupId : undefined"
+                      :style="tabGroupTreeRowStyle(entry)"
+                      :aria-hidden="entry.grouping && !tabSearchQuery.trim() && isEntryHidden(entry)"
+                      :inert="entry.grouping && !tabSearchQuery.trim() && isEntryHidden(entry)"
                       @contextmenu="onContextMenu"
                       @transitionend.self="handleTabGroupTransitionEnd"
                     >
-                      <Tooltip>
+                      <TabGroupTreeGuides v-if="showTabTreeGuides" :guides="entry.treeGuides ?? []" />
+                      <Tooltip :open="openTabTooltipId === entry.tab.id" @update:open="updateTabTooltipOpen(entry.tab.id, $event)">
                         <TooltipTrigger as-child>
                           <div
                             class="app-tab-pill group flex cursor-default items-center gap-1 px-2 text-xs transition-colors whitespace-nowrap select-none"
@@ -1576,10 +1926,11 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                                 'tab-group-tab--last': entry.grouping && entry.groupLast,
                               },
                             ]"
-                            :style="[tabColorStyle(entry.tab), entry.grouping ? tabGroupStyle(entry.tab) : undefined, tabDropStyle(entry.tab)]"
+                            :style="[tabColorStyle(entry.tab), entry.grouping ? tabGroupStyleForTabEntry(entry) : undefined, tabDropStyle(entry.tab), entry.grouping ? tabGroupTabDepthStyle(entry) : undefined]"
                             :data-active-tab="isTabActive(entry.tab)"
                             :data-tab-id="entry.tab.id"
                             @pointerdown="handleTabPointerDown($event, entry.tab)"
+                            @mouseleave="closeTabTooltip(entry.tab.id)"
                             @click="handleTabClick(entry.tab)"
                             @dblclick="handleTabDoubleClick(entry.tab, $event)"
                             @mousedown.middle.prevent="closeTab(entry.tab)"
@@ -1604,7 +1955,10 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                             />
                             <span v-else-if="!isTabBarCollapsed" class="inline-flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden text-foreground">
                               <span v-if="isDirtyTab(entry.tab)" aria-hidden="true" class="dirty-tab-marker">*</span>
-                              <span class="min-w-0 flex-1 truncate" :style="tabTitleStyle(entry.tab)">{{ tabDisplayTitle(entry.tab, t) }}</span>
+                              <span class="flex min-w-0 flex-1 items-center overflow-hidden">
+                                <span class="min-w-0 truncate" :style="tabTitleStyle(entry.tab)">{{ tabTitleBase(entry.tab) }}</span>
+                                <span v-if="tabTitleSuffixText(entry.tab)" class="tab-title-suffix max-w-full shrink-0 overflow-hidden pl-1 text-ellipsis whitespace-nowrap" :style="tabTitleStyle(entry.tab)" data-tab-title-suffix>{{ tabTitleSuffixText(entry.tab) }}</span>
+                              </span>
                             </span>
                             <ReadOnlySessionControl v-if="!isTabBarCollapsed" :connection-id="entry.tab.connectionId" compact />
                             <button
@@ -1622,7 +1976,10 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                             </button>
                           </div>
                         </TooltipTrigger>
-                        <TooltipContent :side="tabTooltipSide" class="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 text-xs">
+                        <TooltipContent v-if="isConnectionlessPluginTab(entry.tab)" :side="tabTooltipSide" data-plugin-title-tooltip>
+                          {{ tabTitleText(entry.tab) }}
+                        </TooltipContent>
+                        <TooltipContent v-else :side="tabTooltipSide" class="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 text-xs">
                           <template v-for="line in tabTooltipLines(entry.tab, t)" :key="line.label">
                             <span class="whitespace-nowrap font-medium opacity-70">{{ line.label }}</span>
                             <span class="min-w-0 break-all">{{ line.value }}</span>
@@ -1634,29 +1991,34 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                 </template>
                 <template v-if="!section.pinned && showSpecialPageTabs">
                   <CustomContextMenu v-if="specialPageTabs?.pluginCenterOpen" :items="getSpecialPageTabMenuItems('pluginCenter')" v-slot="{ onContextMenu }">
-                    <div
-                      data-plugin-center-tab
-                      class="app-tab-pill group flex shrink-0 cursor-default items-center gap-1 px-2 text-xs transition-colors whitespace-nowrap select-none"
-                      :class="specialPageTabClass(!!specialPageTabs?.pluginCenterActive)"
-                      :style="specialPageTabStyle(!!specialPageTabs?.pluginCenterActive)"
-                      :data-active-tab="specialPageTabs?.pluginCenterActive"
-                      :title="t('toolbar.pluginCenter')"
-                      :aria-label="t('toolbar.pluginCenter')"
-                      :aria-pressed="!!specialPageTabs?.pluginCenterActive"
-                      role="button"
-                      tabindex="0"
-                      @click="emit('activate-plugin-center')"
-                      @keydown.enter.self.prevent="emit('activate-plugin-center')"
-                      @keydown.space.self.prevent="emit('activate-plugin-center')"
-                      @contextmenu="onContextMenu"
-                      @mousedown.middle.prevent="emit('close-plugin-center')"
-                    >
-                      <PlugZap class="h-3.5 w-3.5 shrink-0 text-violet-600 dark:text-violet-400" />
-                      <span v-if="!isTabBarCollapsed" class="min-w-0 flex-1 truncate">{{ t("toolbar.pluginCenter") }}</span>
-                      <button v-if="!isTabBarCollapsed" class="shrink-0 rounded p-0.5 hover:bg-muted-foreground/20" :aria-label="t('common.close')" :title="t('common.close')" @click.stop="emit('close-plugin-center')">
-                        <X class="h-3 w-3" />
-                      </button>
-                    </div>
+                    <Tooltip :open="openTabTooltipId === 'special:plugin-center'" @update:open="updateTabTooltipOpen('special:plugin-center', $event)">
+                      <TooltipTrigger as-child>
+                        <div
+                          data-plugin-center-tab
+                          class="app-tab-pill group flex shrink-0 cursor-default items-center gap-1 px-2 text-xs transition-colors whitespace-nowrap select-none"
+                          :class="specialPageTabClass(!!specialPageTabs?.pluginCenterActive)"
+                          :style="specialPageTabStyle(!!specialPageTabs?.pluginCenterActive)"
+                          :data-active-tab="specialPageTabs?.pluginCenterActive"
+                          :aria-label="t('toolbar.pluginCenter')"
+                          :aria-pressed="!!specialPageTabs?.pluginCenterActive"
+                          role="button"
+                          tabindex="0"
+                          @mouseleave="closeTabTooltip('special:plugin-center')"
+                          @click="emit('activate-plugin-center')"
+                          @keydown.enter.self.prevent="emit('activate-plugin-center')"
+                          @keydown.space.self.prevent="emit('activate-plugin-center')"
+                          @contextmenu="onContextMenu"
+                          @mousedown.middle.prevent="emit('close-plugin-center')"
+                        >
+                          <PlugZap class="h-3.5 w-3.5 shrink-0 text-violet-600 dark:text-violet-400" />
+                          <span v-if="!isTabBarCollapsed" class="min-w-0 flex-1 truncate">{{ t("toolbar.pluginCenter") }}</span>
+                          <button v-if="!isTabBarCollapsed" class="shrink-0 rounded p-0.5 hover:bg-muted-foreground/20" :aria-label="t('common.close')" :title="t('common.close')" @click.stop="emit('close-plugin-center')">
+                            <X class="h-3 w-3" />
+                          </button>
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent :side="tabTooltipSide">{{ t("toolbar.pluginCenter") }}</TooltipContent>
+                    </Tooltip>
                   </CustomContextMenu>
                   <CustomContextMenu v-if="specialPageTabs?.settingsOpen" :items="getSpecialPageTabMenuItems('settings')" v-slot="{ onContextMenu }">
                     <div
@@ -1712,13 +2074,27 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                     </div>
                   </CustomContextMenu>
                 </template>
-                <div v-if="!section.pinned" :class="tabTailDragRegionClass" data-tauri-drag-region />
+                <div v-if="!section.pinned" :class="tabTailDragRegionClass" data-tauri-drag-region="false" />
               </div>
             </div>
           </template>
         </div>
       </div>
-      <div v-if="showOverflowControl" class="tab-overflow-control absolute right-0 top-0 z-30 flex h-full items-center">
+      <Tooltip v-if="!isVerticalLayout && canNewQuery">
+        <TooltipTrigger as-child>
+          <button
+            type="button"
+            data-new-query-tab
+            class="mx-0.5 inline-flex h-7 w-7 shrink-0 self-center items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            :aria-label="t('toolbar.newQuery')"
+            @click="toolbar?.newQuery(groupId)"
+          >
+            <Plus class="h-4 w-4" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.newQuery") }}</TooltipContent>
+      </Tooltip>
+      <div v-if="showOverflowControl" class="tab-overflow-control absolute top-0 z-30 flex h-full items-center" :class="canNewQuery ? (isClassicLayout ? 'right-[2.125rem]' : 'right-[2.625rem]') : 'right-0'">
         <Popover v-model:open="tabOverflowOpen">
           <PopoverTrigger as-child>
             <button type="button" class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-background text-foreground/70 hover:border-border hover:text-foreground" :aria-label="t('tabs.openTabs')" :title="t('tabs.openTabs')">
@@ -1735,7 +2111,7 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                 <div
                   class="group flex w-full items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-sm outline-hidden hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground"
                   :class="isTabActive(tab) ? 'bg-accent/70 text-accent-foreground' : ''"
-                  :title="tabDisplayTitle(tab, t)"
+                  :title="tabTitleText(tab)"
                   role="menuitem"
                   tabindex="0"
                   @click="
@@ -1753,7 +2129,10 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                   </TabExecutionStatus>
                   <span class="inline-flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
                     <span v-if="isDirtyTab(tab)" aria-hidden="true" class="dirty-tab-marker">*</span>
-                    <span class="min-w-0 flex-1 truncate" :style="tabTitleStyle(tab)">{{ tabDisplayTitle(tab, t) }}</span>
+                    <span class="flex min-w-0 flex-1 items-center overflow-hidden">
+                      <span class="min-w-0 truncate" :style="tabTitleStyle(tab)">{{ tabTitleBase(tab) }}</span>
+                      <span v-if="tabTitleSuffixText(tab)" class="tab-title-suffix max-w-full shrink-0 overflow-hidden pl-1 text-ellipsis whitespace-nowrap" :style="tabTitleStyle(tab)">{{ tabTitleSuffixText(tab) }}</span>
+                    </span>
                   </span>
                   <ReadOnlySessionControl :connection-id="tab.connectionId" compact />
                   <Pin v-if="tab.pinned" class="h-3 w-3 shrink-0 fill-current text-primary" />
@@ -1826,6 +2205,39 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
             <Button variant="outline" @click="tabGroupEditorOpen = false">{{ t("common.cancel") }}</Button>
             <Button @click="saveTabGroupCustomization">{{ t("common.save") }}</Button>
           </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog v-model:open="tabSuffixEditorOpen">
+      <DialogContent class="sm:max-w-[400px]">
+        <DialogHeader>
+          <DialogTitle>{{ t("tabs.suffixDialogTitle") }}</DialogTitle>
+        </DialogHeader>
+        <div class="space-y-3">
+          <label class="grid gap-1.5 text-sm">
+            <span class="font-medium">{{ t("tabs.suffixLabel") }}</span>
+            <Input v-model="tabSuffixInput" data-tab-suffix-input :maxlength="TAB_TITLE_SUFFIX_MAX_LENGTH" :placeholder="t('tabs.suffixPlaceholder')" class="h-9" @keydown.enter="handleTabSuffixKeydown" />
+          </label>
+          <p class="text-xs text-muted-foreground">{{ t("tabs.suffixHint") }}</p>
+          <p class="text-xs text-muted-foreground" data-tab-suffix-limit>{{ t("tabs.suffixMaxLength", { max: TAB_TITLE_SUFFIX_MAX_LENGTH }) }}</p>
+          <p class="break-all rounded-md bg-muted px-2 py-1.5 text-xs" data-tab-suffix-preview>{{ tabSuffixEditorPreview }}</p>
+        </div>
+        <DialogFooter>
+          <Button v-if="tabSuffixEditingTab?.titleSuffix" variant="outline" data-tab-suffix-clear @click="clearTabSuffix">{{ t("common.clear") }}</Button>
+          <Button variant="outline" @click="tabSuffixEditorOpen = false">{{ t("common.cancel") }}</Button>
+          <Button data-tab-suffix-save @click="saveTabSuffix">{{ t("common.save") }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog v-model:open="tabSuffixDuplicateOpen">
+      <DialogContent class="sm:max-w-[400px]" data-tab-suffix-duplicate>
+        <DialogHeader>
+          <DialogTitle>{{ t("tabs.suffixDuplicateTitle") }}</DialogTitle>
+        </DialogHeader>
+        <p class="break-all text-sm text-muted-foreground">{{ t("tabs.suffixDuplicateMessage", { title: tabSuffixDuplicateTitle }) }}</p>
+        <DialogFooter>
+          <Button variant="outline" data-tab-suffix-duplicate-back @click="backToTabSuffixEditor">{{ t("tabs.suffixDuplicateBack") }}</Button>
+          <Button data-tab-suffix-duplicate-confirm @click="confirmDuplicateTabSuffix">{{ t("tabs.suffixDuplicateUseAnyway") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -1,5 +1,6 @@
 import type { DatabaseType } from "@/types/database";
 import { qualifiedTableName, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
+import { generateRegexValue } from "@/lib/dataGrid/regexGenerate";
 
 export interface GeneratorNode {
   key: string;
@@ -944,8 +945,39 @@ function transformText(text: string, mode: string): string {
 function generateEmail(): string {
   return `${pick(firstNames).toLowerCase()}.${pick(lastNames).toLowerCase()}@${pick(domains)}`;
 }
-function generatePhone(): string {
-  return `+1${randInt(200, 999)}${randInt(100, 999)}${randInt(1000, 9999)}`;
+function generatePhone(params?: GeneratorParams): string {
+  const regions = params?.phoneRegions?.length ? params.phoneRegions : ["us"];
+  const region = pick(regions);
+  const separator = params?.phoneSeparator === true;
+  const format = params?.phoneFormat ?? "domestic";
+  let phone: string;
+
+  if (region === "uk") {
+    const first = randInt(1000, 9999);
+    const second = randInt(100000, 999999);
+    phone = separator ? `${first} ${second}` : `+44${first}${second}`;
+  } else if (region === "jp") {
+    const first = randInt(10, 99);
+    const second = randInt(1000, 9999);
+    const third = randInt(1000, 9999);
+    phone = separator ? `0${first}-${second}-${third}` : `+810${first}${second}${third}`;
+  } else if (region === "cn" || region === "other") {
+    const first = randInt(130, 199);
+    const second = randInt(1000, 9999);
+    const third = randInt(1000, 9999);
+    const domestic = separator ? `${first}-${second}-${third}` : `${first}${second}${third}`;
+    phone = format === "international" ? `+86${domestic.replace(/[^0-9]/g, "")}` : domestic;
+  } else {
+    const first = randInt(200, 999);
+    const second = randInt(100, 999);
+    const third = randInt(1000, 9999);
+    phone = separator ? `(${first}) ${second}-${third}` : `+1${first}${second}${third}`;
+  }
+
+  const maxLength = params?.maxLength;
+  if (maxLength === undefined || !Number.isFinite(maxLength) || maxLength < 1 || phone.length <= maxLength) return phone;
+  const digits = phone.replace(/\D/g, "");
+  return digits.length <= maxLength ? digits : digits.slice(-Math.floor(maxLength));
 }
 function generateIP(): string {
   return `${randInt(1, 255)}.${randInt(0, 255)}.${randInt(0, 255)}.${randInt(1, 255)}`;
@@ -1195,9 +1227,35 @@ export interface ColumnAttrs {
   numericPrecision?: number | null;
   numericScale?: number | null;
   characterMaximumLength?: number | null;
+  /// True when a single-column unique constraint (primary key or unique index)
+  /// covers this column on the target table.
+  uniqueConstraint?: boolean;
 }
 
+/// Generators that already produce a distinct value per row, so an extra
+/// uniqueness check would only burn attempts without changing the result.
+const INHERENTLY_UNIQUE_GENERATORS = new Set(["sequence", "uuid"]);
+
+/**
+ * Resolve the default parameters for one column.
+ *
+ * Columns covered by a single-column unique constraint (PRIMARY KEY or UNIQUE
+ * index) must not receive duplicated values: a multi-row INSERT that repeats a
+ * value is rejected by the server, so the whole batch is lost behind an opaque
+ * "Statement N failed" error (#5958). Turn the per-column uniqueness
+ * bookkeeping on by default for those columns; users can still clear the
+ * "唯一" checkbox when they want raw random values.
+ *
+ * `sequence` / `uuid` already emit a distinct value per row, so the extra
+ * bookkeeping stays off for them.
+ */
 export function defaultGeneratorParams(_columnName: string, attrs: ColumnAttrs, generatorKey: string): GeneratorParams {
+  const params = buildDefaultGeneratorParams(_columnName, attrs, generatorKey);
+  if (attrs.uniqueConstraint && !INHERENTLY_UNIQUE_GENERATORS.has(generatorKey)) params.unique = true;
+  return params;
+}
+
+function buildDefaultGeneratorParams(_columnName: string, attrs: ColumnAttrs, generatorKey: string): GeneratorParams {
   const params: GeneratorParams = {};
   const type = attrs.dataType.toLowerCase();
   const precision = attrs.numericPrecision ?? null;
@@ -1429,6 +1487,7 @@ export function defaultGeneratorParams(_columnName: string, attrs: ColumnAttrs, 
     params.phoneFormat = "domestic";
     params.phoneSeparator = true;
     params.phoneRegions = ["us"];
+    if (charLen !== null && charLen > 0) params.maxLength = Math.min(charLen, 2000);
     return params;
   }
   if (generatorKey === "email") {
@@ -1707,6 +1766,10 @@ export function generateValue(columnName: string, dataType: string, generatorKey
     return randInt(params?.min ?? 1, params?.max ?? 500);
   }
   if (key === "image") return `0x${Array.from({ length: 16 }, () => randInt(0, 255).toString(16).padStart(2, "0")).join("")}`;
+  if (key === "regex") {
+    const generated = generateRegexValue(params?.pattern, params?.rawPattern);
+    if (generated.status === "ok") return generated.value;
+  }
 
   const fn = GeneratorFunctions[key];
   if (fn) return fn(params);
@@ -1958,7 +2021,7 @@ export function formatGeneratedRowValues(config: TableGenerateConfig, databaseTy
  * on backends that report failures inside the result array instead of throwing.
  */
 export function generateInsertBatches(databaseType: DatabaseType | undefined, state: TableGenerateChunkState, valueRows: string[], forceSingleRow = false): { statements: string[]; rowsPerStatement: number[] } {
-  if (databaseType === "oracle") {
+  if (databaseType === "oracle" || databaseType === "oceanbase-oracle") {
     const statements = buildOracleInsertStatements(state.targetTable, state.columnList, valueRows);
     return { statements, rowsPerStatement: oracleRowsPerStatement(valueRows, statements) };
   }

@@ -1,17 +1,61 @@
 <script setup lang="ts">
+import { Compartment } from "@codemirror/state";
+import { keymap as codeMirrorKeymap } from "@codemirror/view";
+import { getStarRocksCapabilities } from "@/lib/table/starrocksCapabilities";
+import { starRocksAlterOptionsFromDdl, starRocksColumnDefinitionLocked, type StarRocksAlterOptions } from "@/lib/table/starrocksAlterOptions";
+import { getColumnDefaultValuePresets } from "@/lib/table/columnDefaultPresets";
+import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
+import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
+import StructureIndexColumnPicker from "./StructureIndexColumnPicker.vue";
+
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, shallowRef, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
+import { RecycleScroller } from "vue-virtual-scroller";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Pencil, Plus, RefreshCw, RotateCcw, Save, Search, Settings, SlidersHorizontal, Trash2, UserRound, X } from "@lucide/vue";
-import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  ClipboardList,
+  Copy,
+  Database,
+  Info,
+  KeyRound,
+  ListChevronsUpDown,
+  Loader2,
+  Maximize2,
+  Pencil,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Rows3,
+  Save,
+  Search,
+  Settings,
+  SlidersHorizontal,
+  SquareFunction,
+  Trash2,
+  UserRound,
+  X,
+} from "@lucide/vue";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { SearchableSelect } from "@/components/ui/searchable-select";
+import StarRocksAlterStatus from "@/components/structure/StarRocksAlterStatus.vue";
+import StarRocksSortKeyEditor from "@/components/structure/StarRocksSortKeyEditor.vue";
+import StarRocksLayoutCopyDialog from "@/components/structure/StarRocksLayoutCopyDialog.vue";
+import StarRocksPhysicalOptionsEditor from "@/components/structure/StarRocksPhysicalOptionsEditor.vue";
+import { buildStarRocksDialectOptions, emptyStarRocksPhysicalOptions, hasStarRocksPhysicalOptions, restoreStarRocksPhysicalOptions } from "@/lib/table/starrocksPhysicalOptions";
+import TablePhysicalOptionsEditor from "@/components/structure/TablePhysicalOptionsEditor.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -20,40 +64,64 @@ import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { useQueryStore } from "@/stores/queryStore";
 import { useHistoryStore } from "@/stores/historyStore";
+import { matchesShortcut } from "@/lib/editor/keyboardShortcuts";
+import { selectLineEndsDefaultShortcut, shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
+import { selectLineEnds } from "@/lib/editor/selectLineEnds";
 import { useSettingsStore, type StructureEditorDensity } from "@/stores/settingsStore";
 import { useTheme } from "@/composables/useTheme";
 import { editorFontTheme, loadEditorTheme } from "@/lib/editor/editorThemes";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { useToast } from "@/composables/useToast";
+import { fetchNamespaceOptionsForConnection, fetchCatalogNamespaceOptions, namespaceOptionsAreSchemas, normalizedQueryTabCatalog, selectedQueryCatalogName } from "@/composables/useDatabaseOptions";
+import { schemaOptionsForConnection } from "@/composables/useSchemaOptions";
+import { connectionIsDorisFamilyCatalogCapable, isSchemaAware } from "@/lib/database/databaseFeatureSupport";
+import { useVerticalOverlayScrollbar } from "@/composables/useVerticalOverlayScrollbar";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sql/sqlHighlighter";
 import { joinSqlStatementsForScript } from "@/lib/sql/sqlBatchScript";
-import { formatGeneratedDdlIdentifierQuotes, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
+import { applyDdlDatabaseQualifier, formatDdlForDisplay, formatGeneratedDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
-import { copyToClipboard } from "@/lib/common/clipboard";
-import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import { copyToClipboard, eventTargetUsesNativeClipboard, isPlainClipboardShortcut } from "@/lib/common/clipboard";
+import { formatTsv } from "@/lib/export/exportFormats";
+import DataGridCopyColumnNamesDialog from "@/components/grid/DataGridCopyColumnNamesDialog.vue";
+import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { queryTimeoutSecsForConcurrentIndex, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
+import { isMacOS } from "@/lib/backend/platform";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { invalidateObjectDdl, loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { invalidateObjectMetadataCache, loadObjectMetadataFacet, type ObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
-import { type BuildTableStructureChangeSqlOptions, type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql";
-import { buildMysqlAutoIncrementCounterStatement, canEditMysqlAutoIncrementCounter, refreshMysqlAutoIncrementCounterDraft } from "@/lib/table/mysqlAutoIncrementCounter";
+import {
+  type BuildTableStructureChangeSqlOptions,
+  type EditableStructureColumn,
+  type EditableStructureForeignKey,
+  type EditableStructureIndex,
+  type EditableStructureTrigger,
+  type TablePartitionBoundDraft,
+  type TablePartitionOperation,
+  type TablePartitionOperationKind,
+  type TablePartitionSqlOptions,
+} from "@/lib/table/tableStructureEditorSql";
+import { buildMysqlAutoIncrementCounterStatement, canEditMysqlAutoIncrementCounter, refreshMysqlAutoIncrementCounterDraft, translateMysqlAutoIncrementWarning } from "@/lib/table/mysqlAutoIncrementCounter";
 import { mysqlTableCollationSql, parseMysqlTableCollation } from "@/lib/table/mysqlTableCollation";
 import { MYSQL_STORAGE_ENGINES_SQL, mysqlTableEngineSql, mysqlTableEngineSqlOption, parseMysqlTableEngineMetadata, refreshMysqlTableEngineDraft, supportsMysqlTableEngine } from "@/lib/table/mysqlTableEngine";
+import { INCEPTOR_PHYSICAL_OPTIONS, buildInceptorCreateOptions, emptyTablePhysicalOptions, hasTablePhysicalOptions, pruneTablePhysicalOptions, restoreTablePhysicalOptions } from "@/lib/table/tablePhysicalOptions";
 import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/lib/table/tableColumnTemplates";
 import { getMysqlDataTypeHelp } from "@/lib/table/mysqlDataTypeHelp";
 import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/postgresDataTypeHelp";
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
+import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows, type PgPartitionTreeRow } from "@/lib/table/pgPartitionPresentation";
+import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
 import { getConcurrentIndexAvailability, concurrentIndexNamesInStatements, normalizeUnsupportedConcurrentIndexes, type ConcurrentIndexAvailability } from "@/lib/table/concurrentIndexAvailability";
 import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
 import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
-import { codeMirrorSqlDialectForConnection, connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { codeMirrorSqlDialectForConnection, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { postgresListRolesSql, usersFromPostgresRolesResult } from "@/lib/database/databaseUserAdmin";
-import type { ColumnInfo, ConstraintInfo, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
+import type { CatalogInfo, ColumnInfo, ConnectionConfig, ConstraintInfo, PgPartitionKind, PgPartitionNode, PgTablePartitioning, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
 import {
   applyManticoreDdlColumnExtras,
   buildStructureTargetLabel,
@@ -72,8 +140,12 @@ import {
   dataTypeLengthUnitValue,
   defaultNewColumnDataType,
   filterStructureIndexColumnOptions,
-  generateIndexName,
   generateUniqueIndexName,
+  generateUniqueShortIndexName,
+  structureIndexKind,
+  canIndexTypeHaveSpecialIssue,
+  specialIndexColumnIssue,
+  type StructureIndexKind,
   getColumnEditorControls,
   getDataTypeOptions,
   POSTGRES_GEOMETRY_TYPES,
@@ -92,6 +164,7 @@ import {
   isSqlServerIdentityCompatibleDataType,
   mysqlEnumDataType,
   parseExtraToColumnExtra,
+  parseMysqlGeneratedColumnExtra,
   rehydrateColumnDraftsFromMetadata,
   resolveInsertColumnIndex,
   restoreCharacterLengthUnitsAfterSave,
@@ -100,13 +173,19 @@ import {
   structureColumnSelectionRange,
   isSyntheticContextMenuClick,
   resolveColumnSelectionActiveId,
+  structureColumnCommentsForCopy,
+  structureColumnNamesForCopy,
   tableStructureIdentifierComparisonKey,
   toColumnNames,
+  copySourceColumnDetails,
+  matchesCopySourceColumnSearch,
+  foldCreatedTableName,
+  draftColumnNameForSql,
 } from "@/lib/table/tableStructureEditorState";
 import { CREATE_DATABASE_CHARSET_OPTIONS, createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, normalizeCreateDatabaseCharsetKey, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import type { CreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import * as api from "@/lib/backend/api";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 
 const { t } = useI18n();
 const { isDark, themePalette } = useTheme();
@@ -117,15 +196,27 @@ const historyStore = useHistoryStore();
 const settingsStore = useSettingsStore();
 const { toast } = useToast();
 const rootRef = ref<HTMLElement>();
-type StructureScrollerRef = HTMLElement | { $el?: HTMLElement };
+const useColumnVirtualFlowMode = isTauriRuntime() && isMacOS();
+type StructureScrollerRef =
+  | HTMLElement
+  | {
+      $el?: HTMLElement;
+      scrollToItem?: (index: number, options?: { align?: ScrollLogicalPosition }) => void;
+      updateVisibleItems?: (itemsChanged: boolean, checkPositionDiff?: boolean) => void;
+    };
 const columnsScrollerRef = ref<StructureScrollerRef>();
 const indexesScrollerRef = ref<StructureScrollerRef>();
 const foreignKeysScrollerRef = ref<StructureScrollerRef>();
 const constraintsScrollerRef = ref<StructureScrollerRef>();
 const triggersScrollerRef = ref<StructureScrollerRef>();
+const partitionsScrollerRef = ref<StructureScrollerRef>();
 const ddlScrollerRef = ref<StructureScrollerRef>();
 const structureHorizontalScrollbarTrackRef = ref<HTMLDivElement>();
+const indexesTableRef = ref<HTMLElement | null>(null);
+const structureVerticalScrollbarTrackRef = ref<HTMLElement | null>(null);
+const structureVerticalScrollbarThumbRef = ref<HTMLElement | null>(null);
 const structureHorizontalScrollbarThumbRef = ref<HTMLDivElement>();
+const columnContextMenuTarget = shallowRef<EditableStructureColumn | null>(null);
 const hasStructureHorizontalOverflow = ref(false);
 const dynamicDataTypeOptionsCache = new Map<string, string[]>();
 
@@ -150,6 +241,8 @@ const props = defineProps<{
   catalog?: string;
   schema?: string;
   tableName: string;
+  /** `view` loads `CREATE OR REPLACE VIEW` instead of table DDL. */
+  tableType?: "table" | "view";
   initialTab?: TableInfoTab;
   initialTabRequestId?: number;
   initialTarget?: TableStructureEditorTarget;
@@ -158,12 +251,32 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "update:draft": [draft: TableStructureEditorDraft | undefined];
-  saved: [commentChanged: boolean];
+  saved: [commentChanged: boolean, createdTableName?: string];
   close: [];
   openSettings: [initialTab?: string, initialSection?: string];
+  /** Jump from the DDL view to the table's data tab (issue #6724). */
+  viewData: [];
 }>();
 
 const activeTab = ref<TableInfoTab>("columns");
+
+// DBX hides native scrollbars, so the columns/indexes tables only had the custom
+// horizontal bar. Render the same overlay affordance vertically for whichever
+// table tab is active; the bar occupies the tab panel's second grid column.
+const activeStructureTableScrollerRef = computed<HTMLElement | null>(() => structureScrollerElement(activeTab.value === "indexes" ? indexesScrollerRef.value : columnsScrollerRef.value) ?? null);
+const activeStructureTableContentRef = computed<HTMLElement | null>(() => {
+  if (activeTab.value === "indexes") return indexesTableRef.value ?? null;
+  const scroller = structureScrollerElement(columnsScrollerRef.value);
+  return scroller?.querySelector<HTMLElement>(".vue-recycle-scroller__item-wrapper") ?? scroller ?? null;
+});
+const {
+  hasOverflow: hasStructureVerticalOverflow,
+  isScrolling: isStructureVerticalScrollbarScrolling,
+  isDragging: isStructureVerticalScrollbarDragging,
+  onScroll: onStructureVerticalScrollerScroll,
+  onTrackPointerDown: onStructureVerticalScrollbarTrackPointerDown,
+  onThumbPointerDown: onStructureVerticalScrollbarThumbPointerDown,
+} = useVerticalOverlayScrollbar(activeStructureTableScrollerRef, activeStructureTableContentRef, structureVerticalScrollbarTrackRef, structureVerticalScrollbarThumbRef);
 const loading = ref(false);
 const saving = ref(false);
 const postSaveRefreshing = ref(false);
@@ -173,12 +286,16 @@ const indexesLoading = ref(false);
 const foreignKeysLoading = ref(false);
 const constraintsLoading = ref(false);
 const triggersLoading = ref(false);
-const ddlContent = ref("");
+const rawDdlContent = ref("");
+const ddlStorageExcluded = ref(settingsStore.editorSettings.excludeDdlStorage);
+const ddlContent = computed(() => applyDdlStoragePreference(rawDdlContent.value, databaseType.value, ddlStorageExcluded.value));
 const ddlLoading = ref(false);
 const ddlEditorContainer = ref<HTMLDivElement>();
 const ddlSearchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
 const ddlSearchOpen = ref(false);
 const ddlEditorView = shallowRef<EditorView | null>(null);
+const ddlEditorShortcut = new Compartment();
+const selectLineEndsShortcut = () => settingsStore.editorSettings?.shortcuts?.selectLineEnds ?? selectLineEndsDefaultShortcut();
 let ddlEditorInitRequestId = 0;
 let ddlEditorScrollCleanup: (() => void) | null = null;
 const loadedMetadataFacets = new Set<ObjectMetadataFacet>();
@@ -194,9 +311,36 @@ const ddlDraft = ref<string | null>(null);
  */
 const ddlEditingEnabled = computed(() => !isCreateMode.value && !!ddlContent.value.trim());
 const ddlDirty = computed(() => ddlDraft.value !== null && ddlDraft.value.trim() !== ddlContent.value.trim());
+watch([() => settingsStore.editorSettings.excludeDdlStorage, ddlDirty], ([exclude, dirty]) => {
+  if (!dirty && ddlStorageExcluded.value !== exclude) {
+    ddlDraft.value = null;
+    ddlStorageExcluded.value = exclude;
+  }
+});
 
 function ddlEditorDocument(): string {
   return ddlDraft.value ?? (ddlContent.value || t("structureEditor.emptyReadonly"));
+}
+
+/**
+ * Formats fetched DDL through the shared read-only display pipeline for the
+ * structure editor's DDL tab. The storage preference is not baked in: the
+ * `ddlContent` computed re-filters on read so toggling it updates without a
+ * reload.
+ */
+function formatStructureDdl(ddl: string): Promise<string> {
+  return formatDdlForDisplay(
+    ddl,
+    {
+      dialect: sqlFormatDialectForDbType(databaseType.value),
+      databaseType: databaseType.value,
+      database: props.database,
+      catalog: props.catalog,
+      includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+      quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
+    },
+    settingsStore.editorSettings.sqlFormatter,
+  );
 }
 
 function resetDdlDraft() {
@@ -248,6 +392,10 @@ function observeDdlEditorScroll(view: EditorView) {
   ddlEditorScrollCleanup = () => scrollDOM.removeEventListener("scroll", onScroll);
 }
 
+watch(selectLineEndsShortcut, (shortcut) => {
+  ddlEditorView.value?.dispatch({ effects: ddlEditorShortcut.reconfigure(codeMirrorKeymap.of([{ key: shortcutToCodeMirrorKey(shortcut), preventDefault: true, run: selectLineEnds }])) });
+});
+
 async function initDdlEditor(content: string) {
   const container = ddlEditorContainer.value;
   if (!container) return;
@@ -291,6 +439,14 @@ async function initDdlEditor(content: string) {
       langSql.sql({ dialect }),
       themeExt,
       fontExt,
+      ddlEditorShortcut.of(keymap.of([{ key: shortcutToCodeMirrorKey(selectLineEndsShortcut()), preventDefault: true, run: selectLineEnds }])),
+      EditorView.domEventHandlers({
+        keydown(event, eventView) {
+          if (!matchesShortcut(event, selectLineEndsShortcut())) return false;
+          event.preventDefault();
+          return selectLineEnds(eventView);
+        },
+      }),
       Prec.highest(keymap.of([{ key: "Mod-f", run: () => ddlSearchPanelRef.value?.openSearch() ?? false, preventDefault: true }])),
       EditorView.theme({
         "&.cm-focused": { outline: "none" },
@@ -330,13 +486,37 @@ function scheduleDdlEditorInit() {
   });
 }
 
-function ddlRequest() {
+/**
+ * Applies the SQL generation preferences (database qualifier + identifier
+ * quoting) to a DDL statement generated from the pending structure changes
+ * before it is executed. Oracle folds bare identifiers to uppercase, so safe
+ * quoted names are uppercased before their quotes are removed.
+ */
+function applyDdlGenerationPreferences(sql: string, dialect: SqlFormatDialect): string {
+  const unqualified = applyDdlDatabaseQualifier(sql, dialect, databaseType.value, settingsStore.editorSettings.generateSqlIncludeDatabaseName, props.database, props.catalog);
+  if (settingsStore.editorSettings.generateSqlQuoteIdentifiers) return unqualified;
+  return formatGeneratedDdlIdentifierQuotes(unqualified, dialect, false, { preserveCaseSensitiveIdentifiers: tableStoresCaseSensitiveIdentifiers.value });
+}
+
+type StructureDdlRequest = {
+  connectionId: string;
+  queryTimeoutSecs?: number;
+  database: string;
+  schema: string;
+  tableName: string;
+  catalog?: string;
+  objectType?: "VIEW";
+};
+
+function ddlRequest(): StructureDdlRequest {
   return {
     connectionId: props.connectionId,
+    queryTimeoutSecs: store.getConfig(props.connectionId)?.query_timeout_secs,
     database: props.database,
     schema: metadataSchema.value,
     tableName: props.tableName,
     catalog: props.catalog,
+    objectType: props.tableType === "view" ? "VIEW" : undefined,
   };
 }
 
@@ -346,12 +526,10 @@ async function fetchDdl(force = false) {
   ddlLoading.value = true;
   try {
     const { ddl } = await loadObjectDdl(ddlRequest(), { force });
-    const dialect = sqlFormatDialectForDbType(databaseType.value);
-    const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
-    ddlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
+    rawDdlContent.value = await formatStructureDdl(ddl);
     ddlFetched.value = true;
   } catch (e: any) {
-    ddlContent.value = `-- Error: ${e?.message || e}`;
+    rawDdlContent.value = `-- Error: ${e?.message || e}`;
     ddlFetched.value = true;
   } finally {
     ddlLoading.value = false;
@@ -360,7 +538,31 @@ async function fetchDdl(force = false) {
 const errorMessage = ref("");
 const secondaryMetadataErrors = ref<Partial<Record<ObjectMetadataFacet, string>>>({});
 const columns = ref<EditableStructureColumn[]>([]);
+const starrocksStatusBusy = ref(false);
+const starrocksStatusRevision = ref(0);
+const starrocksSubmittedSql = ref<{ target: string; sql: string }>();
+const starrocksStatusTarget = computed(() => JSON.stringify([props.connectionId, props.database, props.tableName, props.schema, props.catalog]));
+const starrocksDraftDirty = computed(() => hasPendingStructureChanges() || ddlDirty.value);
+const starrocksAlterContext = ref<StarRocksAlterOptions>();
+const starrocksLayoutCopyOpen = ref(false);
+const starrocksSortColumns = ref<string[]>();
+const pendingStarRocksSort = computed(() => (starrocksSortColumns.value && starrocksAlterContext.value?.sortColumns && JSON.stringify(starrocksSortColumns.value) !== JSON.stringify(starrocksAlterContext.value.sortColumns) ? starrocksSortColumns.value : undefined));
+async function authorizeStarRocksLayoutCopy(sql: string): Promise<boolean> {
+  const config = store.getConfig(props.connectionId);
+  const productionContext = productionContextForDatabase(config, props.database);
+  return !productionContext.active || (await productionSafetyStore.requestConfirmation({ sql, connectionName: config?.name, database: props.database, productionDatabases: productionContext.databases, source: t("starrocksLayout.copyTitle") }));
+}
 const copyColumnsDialogOpen = ref(false);
+const copySourceConnectionId = ref("");
+const copySourceDatabase = ref("");
+const copySourceSchema = ref("");
+const copySourceCatalog = ref("");
+const copySourceDatabases = ref<string[]>([]);
+const copySourceSchemas = ref<string[]>([]);
+const copySourceCatalogs = ref<CatalogInfo[]>([]);
+const copySourceScopeLoading = ref(false);
+const copySourceScopeReady = ref(false);
+let copySourceScopeRequestId = 0;
 const copySourceTables = ref<TableInfo[]>([]);
 const copySourceTableName = ref("");
 const copySourceTableSearch = ref("");
@@ -383,6 +585,58 @@ const indexes = ref<EditableStructureIndex[]>([]);
  * is rejected by the server on such tables, so the option is disabled here and
  * the SQL builder refuses any concurrent request on it (fail closed). */
 const isPartitionedParent = ref(false);
+// True when the edited table is itself a member partition of another table.
+const isTablePartition = ref(false);
+// True when the edited table is a PostgreSQL foreign table (relkind = 'f').
+// PostgreSQL requires `COMMENT ON FOREIGN TABLE` for these, so the SQL
+// preview must know which form to generate.
+const isForeignTable = ref(false);
+// The partition-status probe has settled (success or failure), so the tab can
+// be hidden without hiding it merely because the probe is still in flight.
+const partitionStatusResolved = ref(false);
+
+/**
+ * Standalone partition-status probe for entry points that intentionally skip
+ * `loadStructure` (opening directly on the DDL tab). It only decides whether the
+ * Partitions tab is offered; the Concurrent-index normalization still runs from
+ * `loadStructure` when an editable tab loads.
+ */
+let partitionTabProbeRequestId = 0;
+async function probePartitionsTabVisibility() {
+  if (!tableMetadataCapabilities.value.partitions || isCreateMode.value) {
+    isPartitionedParent.value = false;
+    isTablePartition.value = false;
+    isForeignTable.value = false;
+    partitionStatusResolved.value = true;
+    return;
+  }
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const tableName = props.tableName;
+  if (!connectionId || !database || !tableName) {
+    partitionStatusResolved.value = true;
+    return;
+  }
+  const requestId = ++partitionTabProbeRequestId;
+  try {
+    const status = await api.getTablePartitionStatus(connectionId, database, metadataSchema.value, tableName);
+    if (requestId !== partitionTabProbeRequestId) return;
+    isPartitionedParent.value = status.isPartitionedParent;
+    isTablePartition.value = status.isPartition;
+    isForeignTable.value = status.isForeign;
+    partitionStatusResolved.value = true;
+  } catch {
+    if (requestId !== partitionTabProbeRequestId) return;
+    isPartitionedParent.value = false;
+    isTablePartition.value = false;
+    isForeignTable.value = false;
+    // A failed probe leaves the concurrent-index availability unknown, so keep
+    // the documented fail-closed behavior (disable Concurrent) instead of
+    // assuming the table is a plain, non-partitioned one.
+    partitionStatusKnown.value = false;
+    partitionStatusResolved.value = true;
+  }
+}
 /** Whether the last partition-status probe succeeded. When it cannot be
  * verified (probe failed), Concurrent is disabled — we must not assume a
  * non-partitioned table we could not check. */
@@ -400,6 +654,269 @@ const sqliteSchemaRevision = ref<string>();
 const foreignKeys = ref<EditableStructureForeignKey[]>([]);
 const constraints = ref<ConstraintInfo[]>([]);
 const constraintsLoaded = ref(false);
+// Structured PostgreSQL partitioning view (partitioned parent, its descendant
+// partitions, or a member partition's parent/bound). Read-only for now.
+const partitioning = ref<PgTablePartitioning | null>(null);
+const partitionsLoading = ref(false);
+const partitionsError = ref("");
+// Pending partition operations (not yet saved). Unlike columns/indexes these
+// are explicit actions on the live catalog, so they are never diffed — they
+// accumulate here until Save, then are cleared and the tree reloaded.
+const partitionOperations = ref<TablePartitionOperation[]>([]);
+// Create-mode partitioning declaration (`CREATE TABLE ... PARTITION BY ...`).
+const createPartitioningEnabled = ref(false);
+const createPartitioningKind = ref<PgPartitionKind>("range");
+const createPartitioningColumns = ref<string[]>([]);
+const createPartitioningExpression = ref("");
+
+const partitionTreeRows = computed(() =>
+  flattenPgPartitionNodes(partitioning.value?.partitions ?? [], {
+    schema: metadataSchema.value,
+    name: props.tableName || "",
+  }),
+);
+// Folded parents, so a large partition hierarchy can be navigated by level.
+const collapsedPartitionKeys = ref<Set<string>>(new Set());
+
+function togglePartitionRow(key: string) {
+  const next = new Set(collapsedPartitionKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  collapsedPartitionKeys.value = next;
+}
+
+watch(
+  () => partitioning.value,
+  () => {
+    collapsedPartitionKeys.value = new Set();
+  },
+);
+
+const partitionVisibleRows = computed(() => visiblePgPartitionRows(partitionTreeRows.value, collapsedPartitionKeys.value));
+const partitionCreatableColumns = computed(() => columns.value.filter((column) => !column.markedForDrop && !!column.name.trim()).map((column) => column.name.trim()));
+
+function partitionStrategyLabel(kind?: PgPartitionKind): string {
+  const key = pgPartitionKindLabelKey(kind);
+  return key ? t(key) : "";
+}
+
+// --- Partition maintenance -------------------------------------------------
+const partitionDialogOpen = ref(false);
+const partitionDialogMode = ref<TablePartitionOperationKind>("create");
+const partitionDialogName = ref("");
+const partitionDialogSchema = ref("");
+const partitionDialogParentSchema = ref("");
+const partitionDialogParentTable = ref("");
+const partitionDialogBoundKind = ref<PgPartitionKind | "default">("range");
+const partitionDialogRangeFrom = ref("");
+const partitionDialogRangeTo = ref("");
+const partitionDialogListValues = ref("");
+const partitionDialogModulus = ref("2");
+const partitionDialogRemainder = ref("0");
+const partitionDialogConcurrently = ref(false);
+const partitionDialogError = ref("");
+
+const canManagePartitions = computed(() => {
+  if (!tableMetadataCapabilities.value.partitions) return false;
+  if (isCreateMode.value) return createPartitioningEnabled.value;
+  return !!partitioning.value && (partitioning.value.isPartitioned || partitioning.value.isPartition);
+});
+const partitionSupportsConcurrentDetach = computed(() => databaseType.value === "postgres" && (partitioning.value?.serverVersionNum ?? 0) >= 140000 && !partitioning.value?.defaultPartition);
+const partitionDialogNeedsBound = computed(() => partitionDialogMode.value === "create" || partitionDialogMode.value === "attach");
+
+function resetPartitionDialog() {
+  partitionDialogName.value = "";
+  partitionDialogSchema.value = "";
+  partitionDialogParentSchema.value = "";
+  partitionDialogParentTable.value = "";
+  partitionDialogBoundKind.value = isCreateMode.value ? createPartitioningKind.value : "range";
+  partitionDialogRangeFrom.value = "";
+  partitionDialogRangeTo.value = "";
+  partitionDialogListValues.value = "";
+  partitionDialogModulus.value = "2";
+  partitionDialogRemainder.value = "0";
+  partitionDialogConcurrently.value = false;
+  partitionDialogError.value = "";
+}
+
+function openPartitionDialog(mode: TablePartitionOperationKind, boundKind?: PgPartitionKind) {
+  resetPartitionDialog();
+  partitionDialogMode.value = mode;
+  partitionDialogBoundKind.value = boundKind ?? (isCreateMode.value ? createPartitioningKind.value : partitioning.value?.strategy) ?? "range";
+  partitionDialogOpen.value = true;
+}
+
+function openPartitionRowOperation(mode: TablePartitionOperationKind, row: PgPartitionTreeRow) {
+  openPartitionDialog(mode);
+  partitionDialogName.value = row.node.name;
+  partitionDialogSchema.value = row.node.schema;
+  partitionDialogParentSchema.value = row.parentSchema ?? "";
+  partitionDialogParentTable.value = row.parentName ?? "";
+}
+
+/** Detaching the partition currently being edited: the parent is not the
+ * edited table, so it must be named explicitly. */
+function openDetachSelfPartitionDialog() {
+  openPartitionDialog("detach");
+  partitionDialogName.value = props.tableName || "";
+  partitionDialogSchema.value = metadataSchema.value;
+  partitionDialogParentSchema.value = partitioning.value?.parentSchema ?? "";
+  partitionDialogParentTable.value = partitioning.value?.parentTable ?? "";
+}
+
+/** `reportError` separates the confirm path (which surfaces validation
+ * messages) from the live SQL preview (which stays quiet while the user is
+ * still typing). */
+function partitionDialogBound(reportError: boolean): TablePartitionBoundDraft | undefined {
+  const kind = partitionDialogBoundKind.value;
+  if (kind === "default") return { kind: "default" };
+  if (kind === "range") {
+    const from = splitPgPartitionBoundValues(partitionDialogRangeFrom.value);
+    const to = splitPgPartitionBoundValues(partitionDialogRangeTo.value);
+    if (!from.length || from.length !== to.length) {
+      if (reportError) partitionDialogError.value = t("structureEditor.partitionRangeBoundInvalid");
+      return undefined;
+    }
+    return { kind: "range", from, to };
+  }
+  if (kind === "list") {
+    const values = splitPgPartitionBoundValues(partitionDialogListValues.value);
+    if (!values.length) {
+      if (reportError) partitionDialogError.value = t("structureEditor.partitionListBoundInvalid");
+      return undefined;
+    }
+    return { kind: "list", values };
+  }
+  const modulus = Number.parseInt(partitionDialogModulus.value, 10);
+  const remainder = Number.parseInt(partitionDialogRemainder.value, 10);
+  if (!Number.isInteger(modulus) || modulus <= 0 || !Number.isInteger(remainder) || remainder < 0 || remainder >= modulus) {
+    if (reportError) partitionDialogError.value = t("structureEditor.partitionHashBoundInvalid");
+    return undefined;
+  }
+  return { kind: "hash", modulus, remainder };
+}
+
+function partitionDialogOperation(reportError: boolean, id: string): TablePartitionOperation | undefined {
+  const mode = partitionDialogMode.value;
+  const name = partitionDialogName.value.trim();
+  if (!name) {
+    if (reportError) partitionDialogError.value = t("structureEditor.partitionNameRequired");
+    return undefined;
+  }
+  let bound: TablePartitionBoundDraft | undefined;
+  if (partitionDialogNeedsBound.value) {
+    bound = partitionDialogBound(reportError);
+    if (!bound) return undefined;
+  }
+  return {
+    id,
+    kind: mode,
+    parentSchema: partitionDialogParentSchema.value.trim(),
+    parentTable: partitionDialogParentTable.value.trim(),
+    schema: partitionDialogSchema.value.trim(),
+    name,
+    bound,
+    concurrently: mode === "detach" && partitionDialogConcurrently.value && partitionSupportsConcurrentDetach.value,
+  };
+}
+
+function confirmPartitionDialog() {
+  partitionDialogError.value = "";
+  const operation = partitionDialogOperation(true, `partition-op:${uuid()}`);
+  if (!operation) return;
+  partitionOperations.value = [...partitionOperations.value, operation];
+  partitionDialogOpen.value = false;
+  scheduleSqlPreviewRefresh();
+  syncDraftToParent();
+}
+
+const partitionDialogSql = ref("");
+const partitionDialogSqlWarnings = ref<string[]>([]);
+let partitionDialogSqlTimer: ReturnType<typeof setTimeout> | undefined;
+let partitionDialogSqlRequestId = 0;
+
+/** Rebuilds the statement the dialog would queue, using the same backend
+ * builder the save path uses, so the preview can never drift from execution. */
+async function refreshPartitionDialogSql() {
+  if (!partitionDialogOpen.value) {
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [];
+    return;
+  }
+  const operation = partitionDialogOperation(false, "partition-preview");
+  if (!operation) {
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [];
+    return;
+  }
+  const requestId = ++partitionDialogSqlRequestId;
+  try {
+    const result = await api.buildTablePartitionOperationSql({ ...partitionSqlOptions(), operations: [operation] });
+    if (requestId !== partitionDialogSqlRequestId) return;
+    partitionDialogSql.value = result.statements.join("\n");
+    partitionDialogSqlWarnings.value = result.warnings;
+  } catch (error: any) {
+    if (requestId !== partitionDialogSqlRequestId) return;
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [error?.message || String(error)];
+  }
+}
+
+function schedulePartitionDialogSqlRefresh() {
+  if (partitionDialogSqlTimer) clearTimeout(partitionDialogSqlTimer);
+  partitionDialogSqlTimer = setTimeout(() => {
+    partitionDialogSqlTimer = undefined;
+    void refreshPartitionDialogSql();
+  }, 150);
+}
+
+function removePartitionOperation(id: string) {
+  partitionOperations.value = partitionOperations.value.filter((operation) => operation.id !== id);
+  scheduleSqlPreviewRefresh();
+  syncDraftToParent();
+}
+
+watch(
+  [
+    partitionDialogOpen,
+    partitionDialogMode,
+    partitionDialogName,
+    partitionDialogSchema,
+    partitionDialogParentSchema,
+    partitionDialogParentTable,
+    partitionDialogBoundKind,
+    partitionDialogRangeFrom,
+    partitionDialogRangeTo,
+    partitionDialogListValues,
+    partitionDialogModulus,
+    partitionDialogRemainder,
+    partitionDialogConcurrently,
+  ],
+  () => schedulePartitionDialogSqlRefresh(),
+  { flush: "post" },
+);
+
+function partitionOperationLabel(kind: TablePartitionOperationKind): string {
+  switch (kind) {
+    case "create":
+      return t("structureEditor.partitionAdd");
+    case "attach":
+      return t("structureEditor.partitionAttach");
+    case "detach":
+      return t("structureEditor.partitionDetach");
+    case "drop":
+      return t("structureEditor.partitionDrop");
+  }
+}
+
+function partitionOperationSummary(operation: TablePartitionOperation): string {
+  return `${partitionOperationLabel(operation.kind)}: ${operation.name}`;
+}
+
+/** Size/count estimates live in the row's hover hint so the row stays two lines. */
+function partitionRowHint(node: PgPartitionNode): string | undefined {
+  return pgPartitionRowHint(node, t, formatBytes);
+}
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/ObjectBrowser.
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -434,7 +951,7 @@ watch(
 function selectTrigger(trigger: EditableStructureTrigger) {
   selectedTriggerId.value = trigger.id;
 }
-const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value);
+const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value || partitionsLoading.value);
 
 function sameList(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
   const a = left ?? [];
@@ -450,7 +967,7 @@ function columnChanged(column: EditableStructureColumn, index: number): boolean 
   if (!column.original || column.markedForDrop) return true;
   const original = column.original;
   return (
-    isPhysicalTableColumnOrderChange(databaseType.value, connection.value?.db_type, column.originalPosition, index) ||
+    isPhysicalTableColumnOrderChange(databaseType.value, connection.value?.db_type, column.originalPosition, index, structureCapabilities.value.reorderColumn ? starrocksAlterContext.value?.model : undefined) ||
     column.name !== original.name ||
     column.dataType !== original.data_type ||
     column.isNullable !== original.is_nullable ||
@@ -495,12 +1012,12 @@ function foreignKeyChanged(foreignKey: EditableStructureForeignKey): boolean {
 function triggerChanged(trigger: EditableStructureTrigger): boolean {
   if (!trigger.original || trigger.markedForDrop) return true;
   const original = trigger.original;
-  return trigger.name !== original.name || trigger.timing !== original.timing || trigger.event !== original.event || !sameText(trigger.statement, original.statement);
+  return trigger.name !== original.name || trigger.timing !== original.timing || trigger.event !== original.event || !sameText(trigger.statement, original.statement) || (trigger.enabled !== undefined && trigger.enabled !== original.enabled);
 }
 
 function captureStructureRefreshScope(): TableStructureRefreshScope {
   return {
-    columns: columns.value.some(columnChanged),
+    columns: columns.value.some(columnChanged) || !!pendingStarRocksSort.value,
     indexes: indexes.value.some(indexChanged),
     foreignKeys: foreignKeys.value.some(foreignKeyChanged),
     // Constraints have no editable draft of their own, but column/index/FK
@@ -508,6 +1025,9 @@ function captureStructureRefreshScope(): TableStructureRefreshScope {
     // so refresh the tab if it was ever loaded rather than leaving it stale.
     constraints: constraintsLoaded.value,
     triggers: triggers.value.some(triggerChanged),
+    // Read-only tab with no editable draft; refresh it whenever it was loaded
+    // so a save that rebuilds partitions can't leave stale rows behind.
+    partitions: loadedMetadataFacets.has("partitions"),
     tableComment: tableComment.value !== originalTableComment.value,
   };
 }
@@ -523,6 +1043,10 @@ const STRUCTURE_COLUMNS_WIDTHS_STORAGE_KEY = "dbx-structure-editor-column-widths
 const STRUCTURE_INDEX_COLUMNS_WIDTHS_STORAGE_KEY = "dbx-structure-editor-index-column-widths";
 const STRUCTURE_SQL_PREVIEW_COLLAPSED_STORAGE_KEY = "dbx-structure-editor-sql-preview-collapsed";
 const FIELD_SHORTCUT_TOOLTIP_DELAY_MS = 500;
+const STRUCTURE_COLUMN_VIRTUAL_BUFFER_PX = 320;
+const STRUCTURE_COLUMN_VIRTUAL_PRERENDER_ROWS = 24;
+const STRUCTURE_COLUMN_SCROLL_INTERACTION_DELAY_MS = 120;
+const STRUCTURE_SCROLL_DRAFT_SYNC_DELAY_MS = 180;
 const STRUCTURE_COLUMN_WIDTH_COUNT = 12;
 const STRUCTURE_INDEX_COLUMN_WIDTH_COUNT = 9;
 const PERSISTED_STRUCTURE_INDEX_COLUMN_WIDTHS = new Set([0, 1, 6]);
@@ -549,7 +1073,7 @@ const structureDensityMetrics: Record<
 > = {
   compact: {
     columns: [28, 168, 136, 82, 60, 52, 108, 220, 80, 120, 144, 108],
-    indexes: [120, 180, 60, 88, 124, 144, 120, 84, 70],
+    indexes: [280, 180, 60, 88, 124, 144, 120, 84, 70],
     minColumnWidth: 24,
     minLengthColumnWidth: 140,
     minIndexColumnWidth: 48,
@@ -567,7 +1091,7 @@ const structureDensityMetrics: Record<
   },
   standard: {
     columns: [32, 200, 160, 104, 72, 64, 128, 260, 90, 140, 160, 136],
-    indexes: [148, 224, 72, 108, 148, 180, 148, 100, 84],
+    indexes: [320, 224, 72, 108, 148, 180, 148, 100, 84],
     minColumnWidth: 28,
     minLengthColumnWidth: 156,
     minIndexColumnWidth: 60,
@@ -585,7 +1109,7 @@ const structureDensityMetrics: Record<
   },
   comfortable: {
     columns: [36, 232, 188, 116, 84, 76, 152, 300, 100, 160, 188, 148],
-    indexes: [176, 260, 84, 124, 176, 216, 176, 116, 104],
+    indexes: [360, 260, 84, 124, 176, 216, 176, 116, 104],
     minColumnWidth: 32,
     minLengthColumnWidth: 176,
     minIndexColumnWidth: 64,
@@ -723,7 +1247,7 @@ const structureCheckboxClass = "h-[var(--structure-checkbox-size)] w-[var(--stru
 const structureHeaderCellClass = "relative min-w-0 overflow-hidden border-b border-r px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-left last:border-r-0";
 const structureCellClass = "min-w-0 overflow-hidden border-b border-r px-[var(--structure-cell-px)] py-[var(--structure-cell-py)] last:border-r-0";
 const structureLastCellClass = "min-w-0 overflow-hidden border-b px-[var(--structure-cell-px)] py-[var(--structure-cell-py)]";
-const structurePropertyListClass = "flex min-w-0 items-center gap-0 overflow-hidden";
+const structurePropertyListClass = "flex w-max min-w-0 items-center gap-0 overflow-hidden";
 const structurePropertyLabelClass = "flex min-w-0 items-center gap-1 whitespace-nowrap";
 const structureActionButtonClass = `${structureIconButtonClass} shrink-0`;
 const structureDensityMenuOpen = ref(false);
@@ -808,6 +1332,11 @@ const selectedColumnId = ref<string | null>(null);
 // new rows are inserted and which row copy/add operations anchor to.
 const selectedColumnIds = ref<Set<string>>(new Set());
 const columnSelectionAnchorId = ref<string | null>(null);
+// The editable field rows have their own selection state for batch structure
+// operations. Header selection is a separate mode so clipboard actions do not
+// accidentally apply row copy/drop operations to the field rows.
+const selectedStructureColumnKeys = ref<Set<string>>(new Set());
+const structureColumnSelectionAnchorKey = ref<string | null>(null);
 const highlightedColumnId = ref<string | null>(null);
 const indexSearchInputRef = ref<InstanceType<typeof Input>>();
 const indexSearchText = ref("");
@@ -873,14 +1402,23 @@ function onIndexColResize(e: MouseEvent, col: number) {
 
 const connection = computed(() => (props.connectionId ? store.getConfig(props.connectionId) : undefined));
 const databaseType = computed(() => tableStructureDatabaseTypeForConnection(connection.value));
-const supportsCharacterLengthUnits = computed(() => databaseType.value === "dameng" || databaseType.value === "oracle");
+const usesNativeMysqlIndexNames = computed(() => {
+  const profile = connection.value?.driver_profile?.trim().toLowerCase();
+  return databaseType.value === "mysql" && connection.value?.db_type === "mysql" && (!profile || profile === "mysql");
+});
+const supportsCharacterLengthUnits = computed(() => databaseType.value === "dameng" || databaseType.value === "oracle" || databaseType.value === "oceanbase-oracle");
 const usesMysql8SafeDefaults = computed(() => databaseType.value === "mysql" && connection.value?.db_type === "mysql" && connection.value.driver_profile === "mysql");
-const structureCapabilities = computed(() => getTableStructureCapabilities(databaseType.value, connection.value?.db_type, connection.value?.database_info?.productVersion));
+const structureCapabilities = computed(() => getTableStructureCapabilities(databaseType.value, connection.value?.db_type, connection.value?.database_info?.productVersion, starrocksAlterContext.value?.model));
 const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(databaseType.value));
 const structureDialect = computed(() => structureCapabilities.value.dialect);
-const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment);
+const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment || (!isCreateMode.value && databaseType.value === "starrocks" && !getStarRocksCapabilities(connection.value?.database_info?.productVersion).tableComment));
 const dynamicDataTypeOptions = ref<string[]>([]);
-const dataTypeOptions = computed(() => mergeDataTypeOptions(dynamicDataTypeOptions.value, getDataTypeOptions(databaseType.value)));
+const dataTypeOptions = computed(() => {
+  const options = getDataTypeOptions(databaseType.value, dynamicDataTypeOptions.value, connection.value?.database_info?.productVersion);
+  if (databaseType.value !== "oceanbase-oracle") return options;
+  // JDBC may advertise Oracle types that OceanBase rejects.
+  return options.filter((type) => !/^(?:nclob|long(?:\s+raw)?|bfile|boolean|vector)\s*(?:\(|$)/i.test(type.trim()));
+});
 const columnEditorControls = computed(() => getColumnEditorControls(databaseType.value));
 
 const indexTypesByDb: Record<string, string[]> = {
@@ -902,67 +1440,78 @@ const indexTypeOptions = computed(() => {
 interface DefaultValuePreset {
   label: string;
   value: string;
+  dataType: string | null;
 }
 
 const defaultValuePresets = computed((): DefaultValuePreset[] => {
   const universal: DefaultValuePreset[] = [
-    { label: "''", value: "''" },
-    { label: "NULL", value: "NULL" },
-    { label: "0", value: "0" },
-    { label: "1", value: "1" },
+    { label: "''", value: "''", dataType: "text" },
+    { label: "NULL", value: "NULL", dataType: null },
+    { label: "0", value: "0", dataType: "int" },
+    { label: "1", value: "1", dataType: "int" },
   ];
 
   const dialectPresets: Record<string, DefaultValuePreset[]> = {
     mysql: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-      { label: "CURRENT_TIME", value: "CURRENT_TIME" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
+      { label: "CURRENT_DATE", value: "CURRENT_DATE", dataType: "date" },
+      { label: "CURRENT_TIME", value: "CURRENT_TIME", dataType: "time" },
     ],
     postgres: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-      { label: "now()", value: "now()" },
-      { label: "gen_random_uuid()", value: "gen_random_uuid()" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
+      { label: "CURRENT_DATE", value: "CURRENT_DATE", dataType: "date" },
+      { label: "now()", value: "now()", dataType: "timestamp" },
+      { label: "gen_random_uuid()", value: "gen_random_uuid()", dataType: "uuid" },
     ],
     sqlite: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-      { label: "CURRENT_TIME", value: "CURRENT_TIME" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
+      { label: "CURRENT_DATE", value: "CURRENT_DATE", dataType: "date" },
+      { label: "CURRENT_TIME", value: "CURRENT_TIME", dataType: "time" },
     ],
     duckdb: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
+      { label: "CURRENT_DATE", value: "CURRENT_DATE", dataType: "date" },
     ],
     sqlserver: [
-      { label: "GETDATE()", value: "GETDATE()" },
-      { label: "GETUTCDATE()", value: "GETUTCDATE()" },
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "NEWID()", value: "NEWID()" },
+      { label: "GETDATE()", value: "GETDATE()", dataType: "datetime" },
+      { label: "GETUTCDATE()", value: "GETUTCDATE()", dataType: "datetime" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
+      { label: "NEWID()", value: "NEWID()", dataType: "uuid" },
     ],
     oracle: [
-      { label: "SYSDATE", value: "SYSDATE" },
-      { label: "SYSTIMESTAMP", value: "SYSTIMESTAMP" },
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
+      { label: "SYSDATE", value: "SYSDATE", dataType: "date" },
+      { label: "SYSTIMESTAMP", value: "SYSTIMESTAMP", dataType: "timestamp" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
     ],
     h2: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
+      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP", dataType: "timestamp" },
+      { label: "CURRENT_DATE", value: "CURRENT_DATE", dataType: "date" },
     ],
     clickhouse: [
-      { label: "now()", value: "now()" },
-      { label: "today()", value: "today()" },
+      { label: "now()", value: "now()", dataType: "timestamp" },
+      { label: "today()", value: "today()", dataType: "date" },
     ],
     informix: [
-      { label: "CURRENT", value: "CURRENT" },
-      { label: "TODAY", value: "TODAY" },
+      { label: "CURRENT", value: "CURRENT", dataType: "timestamp" },
+      { label: "TODAY", value: "TODAY", dataType: "date" },
     ],
   };
 
   return [...universal, ...(dialectPresets[structureDialect.value] ?? [])];
 });
+function columnDefaultValuePresets(column: EditableStructureColumn): DefaultValuePreset[] {
+  if (databaseType.value !== "starrocks") return defaultValuePresets.value;
+  return getColumnDefaultValuePresets(column, {
+    databaseType: databaseType.value,
+    dialect: structureDialect.value,
+    serverVersion: connection.value?.database_info?.productVersion,
+    unsetLabel: t("structureEditor.unsetDefault"),
+    isCreateMode: isCreateMode.value,
+  }).map((preset) => ({ ...preset, dataType: column.dataType }));
+}
 
 const showExtendedProperties = computed(() => supportsTableStructureExtendedProperties(databaseType.value));
-const showCharacterSet = computed(() => structureDialect.value === "mysql");
+const showCharacterSet = computed(() => structureDialect.value === "mysql" && databaseType.value !== "starrocks");
 
 const serverCharsetMetadata = ref<CreateDatabaseCharsetMetadata>();
 const charsetMetadataLoading = ref(false);
@@ -1031,6 +1580,9 @@ function columnCollation(column: EditableStructureColumn): string {
 }
 
 const extendedPropertiesColumnIndex = 10;
+// Widest extended-properties content seen so far. The column is last (no resize
+// handle) and its controls differ per dialect/locale, so a fixed width clips them.
+const extendedPropertiesContentWidth = ref(0);
 const actionButtonGap = 2;
 const columnOrdinalIndicatorGap = 4;
 const columnOrdinalIndicatorTrailingChrome = 3;
@@ -1041,7 +1593,8 @@ const columnOrdinalIndicatorWidth = computed(() => {
   // Reserve a full em per digit plus the primary-key icon, its gap, padding,
   // and divider. The indicator is shared by every row, so it must fit the
   // largest ordinal even when that row is a primary-key column.
-  const requiredWidth = metric.fontSize * digitCount + metric.iconSize + columnOrdinalIndicatorGap + columnOrdinalIndicatorTrailingChrome;
+  const iconCount = Math.max(1, ...columns.value.map((column) => columnIndexIndicators(column).length));
+  const requiredWidth = metric.fontSize * digitCount + (metric.iconSize + columnOrdinalIndicatorGap) * iconCount + columnOrdinalIndicatorTrailingChrome;
   return Math.max(metric.columns[0], requiredWidth);
 });
 const columnActionsWidth = computed(() => {
@@ -1054,6 +1607,7 @@ const visibleColWidths = computed(() =>
   colLabels.value.map((column) => {
     if (column.key === "actions") return columnActionsWidth.value;
     const width = colWidths.value[column.widthIndex] ?? structureDensityMetric.value.minColumnWidth;
+    if (column.key === "extendedProperties") return Math.max(width, extendedPropertiesContentWidth.value);
     return column.key === "length" && supportsCharacterLengthUnits.value ? Math.max(width, structureDensityMetric.value.minLengthColumnWidth) : width;
   }),
 );
@@ -1079,6 +1633,273 @@ const colLabels = computed(() => {
     labels.push({ key: "extendedProperties", label: t("structureEditor.extendedProperties"), widthIndex: extendedPropertiesColumnIndex });
   }
   return labels;
+});
+
+const copyableStructureColumnLabels = computed(() => colLabels.value.filter((label) => label.key !== "actions"));
+
+function structureColumnSelectionClass(key: string): string {
+  return key !== "actions" && selectedStructureColumnKeys.value.has(key) ? "structure-grid-column-selected" : "";
+}
+
+function normalizedStructureDataType(dataType: string): string {
+  return dataTypeBaseInputValue(databaseType.value, dataType)
+    .replace(/["'`\[\]]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function structureDataTypeToneClass(dataType: string): string {
+  const type = normalizedStructureDataType(dataType);
+  if (!type) return "structure-data-type-other";
+
+  if (/^(?:bool|boolean)$/.test(type)) return "structure-data-type-boolean";
+  if (/^(?:enum|set)(?:\b|$)/.test(type)) return "structure-data-type-enum";
+  if (/^(?:json|jsonb|xml)\b/.test(type)) return "structure-data-type-json";
+  if (/^(?:date|time|timestamp|timestamptz|datetime|smalldatetime|interval|year)\b/.test(type)) return "structure-data-type-temporal";
+  if (/^(?:tinyblob|mediumblob|longblob|blob|binary|varbinary|bytea|image|raw|long raw)\b/.test(type)) return "structure-data-type-binary";
+  if (/^(?:geometry|geometrycollection|geography|point|line|linestring|lseg|box|path|polygon|circle|multipoint|multilinestring|multipolygon)\b/.test(type)) return "structure-data-type-spatial";
+  if (/^(?:number|numeric|decimal|dec|float|double|real|money|smallmoney)\b/.test(type)) return "structure-data-type-real";
+  if (/^(?:tinyint|smallint|mediumint|int|integer|bigint|serial|bigserial|bit)\b/.test(type)) return "structure-data-type-numeric";
+  if (/^(?:char|varchar|varchar2|nvarchar|nchar|text|tinytext|mediumtext|longtext|clob|nclob|string|uuid|uniqueidentifier)\b/.test(type)) return "structure-data-type-text";
+
+  return "structure-data-type-other";
+}
+
+function structureDefaultValueToneClass(value: string | null | undefined, dataType: string | null): string {
+  const text = value?.trim() ?? "";
+  if (dataType === null || !text || /^null$/i.test(text)) return "structure-data-type-null";
+  return structureDataTypeToneClass(dataType);
+}
+
+function structureColumnComparisonKey(name: string): string {
+  return tableStructureIdentifierComparisonKey(name, databaseType.value, connection.value?.database_info);
+}
+
+const activeColumnByName = computed(() => {
+  const map = new Map<string, EditableStructureColumn>();
+  for (const item of columns.value) {
+    if (!item.markedForDrop) map.set(item.name, item);
+  }
+  return map;
+});
+
+const activeColumnByComparisonKey = computed(() => {
+  const map = new Map<string, EditableStructureColumn>();
+  for (const item of columns.value) {
+    if (item.markedForDrop) continue;
+    if (item.name) map.set(structureColumnComparisonKey(item.name), item);
+    if (item.original?.name) map.set(structureColumnComparisonKey(item.original.name), item);
+  }
+  return map;
+});
+
+const indexesByColumnComparisonKey = computed(() => {
+  const map = new Map<string, EditableStructureIndex[]>();
+  for (const index of indexes.value) {
+    if (index.markedForDrop || index.isPrimary) continue;
+    for (const name of index.columns) {
+      const key = structureColumnComparisonKey(name);
+      const list = map.get(key);
+      if (list) list.push(index);
+      else map.set(key, [index]);
+    }
+  }
+  return map;
+});
+
+function indexContainsColumn(index: EditableStructureIndex, column: EditableStructureColumn): boolean {
+  const names = [column.name, column.original?.name].filter((name): name is string => !!name).map(structureColumnComparisonKey);
+  return index.columns.some((name) => names.includes(structureColumnComparisonKey(name)));
+}
+
+function columnIndexes(column: EditableStructureColumn): EditableStructureIndex[] {
+  if (!column.name.trim() || column.markedForDrop) return [];
+  const key1 = structureColumnComparisonKey(column.name);
+  const key2 = column.original?.name ? structureColumnComparisonKey(column.original.name) : null;
+  const list1 = indexesByColumnComparisonKey.value.get(key1) ?? [];
+  if (!key2 || key1 === key2) return list1;
+  const list2 = indexesByColumnComparisonKey.value.get(key2) ?? [];
+  if (!list2.length) return list1;
+  const set = new Set(list1);
+  const result = [...list1];
+  for (const idx of list2) {
+    if (!set.has(idx)) {
+      set.add(idx);
+      result.push(idx);
+    }
+  }
+  return result;
+}
+
+const indexKindOrder: StructureIndexKind[] = ["primary", "unique", "index", "fulltext", "spatial"];
+
+function indexIconClass(kind: StructureIndexKind): string {
+  return {
+    primary: "text-amber-600 dark:text-amber-400",
+    unique: "text-red-600 dark:text-red-400",
+    index: "text-green-700 dark:text-green-300",
+    fulltext: "text-purple-600 dark:text-purple-300",
+    spatial: "text-cyan-700 dark:text-cyan-300",
+  }[kind];
+}
+
+function columnIndexKind(column: EditableStructureColumn): StructureIndexKind | "none" {
+  if (column.markedForDrop) return "none";
+  if (column.isPrimaryKey) return "primary";
+  const memberships = columnIndexes(column);
+  return indexKindOrder.find((kind) => memberships.some((index) => structureIndexKind(index) === kind)) ?? "none";
+}
+
+function columnIndexIndicators(column: EditableStructureColumn): { kind: StructureIndexKind; title: string }[] {
+  if (column.markedForDrop) return [];
+  const memberships = columnIndexes(column);
+  return indexKindOrder.flatMap((kind) => {
+    const titles = memberships.filter((index) => structureIndexKind(index) === kind).map(indexTitle);
+    if (kind === "primary" && column.isPrimaryKey)
+      titles.unshift(
+        `PRIMARY (${columns.value
+          .filter((item) => item.isPrimaryKey && !item.markedForDrop)
+          .map((item) => item.name)
+          .join(", ")})`,
+      );
+    return titles.length ? [{ kind, title: titles.join("\n") }] : [];
+  });
+}
+
+function indexTitle(index: EditableStructureIndex): string {
+  return `${index.isPrimary ? "PRIMARY" : index.isUnique ? "UNIQUE" : index.indexType || "INDEX"} ${index.name} (${index.columns.join(", ")})`;
+}
+
+function columnIndexTitle(column: EditableStructureColumn): string {
+  return columnIndexIndicators(column)
+    .map((indicator) => indicator.title)
+    .join("\n");
+}
+
+function structureColumnClipboardValue(column: EditableStructureColumn, key: string): string {
+  switch (key) {
+    case "name":
+      return column.name;
+    case "type":
+      return gaussdbMDataTypeDisplayName(dataTypeBaseInputValue(databaseType.value, column.dataType));
+    case "length": {
+      if (isMysqlEnumDataType(databaseType.value, column.dataType)) return (column.enumValues ?? []).join(", ");
+      if (isPostgresGeometryDataType(databaseType.value, column.dataType)) {
+        return [postgresGeometryTypeValue(column.dataType), postgresGeometrySridValue(column.dataType)].filter(Boolean).join(", ");
+      }
+      return [dataTypeLengthInputValue(databaseType.value, column.dataType), dataTypeLengthUnitValue(databaseType.value, column.dataType)].filter(Boolean).join(" ");
+    }
+    case "nullable":
+      return column.isNullable ? t("structureEditor.yes") : t("structureEditor.no");
+    case "primaryKey":
+      return column.isPrimaryKey ? t("structureEditor.yes") : t("structureEditor.no");
+    case "defaultValue":
+      return column.defaultValue;
+    case "comment":
+      return column.comment;
+    case "characterSet":
+      return columnCharset(column);
+    case "collation":
+      return columnCollation(column);
+    case "extendedProperties":
+      return Object.entries(column.extra)
+        .filter(([, value]) => value !== undefined && value !== false && value !== "")
+        .map(([name, value]) => `${name}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`)
+        .join("; ");
+    default:
+      return "";
+  }
+}
+
+function structureColumnClipboardText(): string {
+  const labels = copyableStructureColumnLabels.value.filter((label) => selectedStructureColumnKeys.value.has(label.key));
+  if (labels.length === 0) return "";
+  const rows = columns.value.filter((column) => !column.markedForDrop).map((column) => labels.map((label) => structureColumnClipboardValue(column, label.key)));
+  return formatTsv(
+    labels.map((label) => label.label),
+    rows,
+    "",
+  );
+}
+
+function setStructureColumnSelection(keys: Iterable<string>, anchorKey: string | null) {
+  // Clears first: setColumnSelection also resets the header-column keys.
+  clearColumnSelection();
+  selectedStructureColumnKeys.value = new Set(keys);
+  structureColumnSelectionAnchorKey.value = anchorKey;
+}
+
+function selectStructureColumnKey(key: string, event: MouseEvent) {
+  if (key === "actions") return;
+  const labels = copyableStructureColumnLabels.value;
+  const index = labels.findIndex((label) => label.key === key);
+  if (index < 0) return;
+
+  if (event.shiftKey && structureColumnSelectionAnchorKey.value) {
+    const anchorIndex = labels.findIndex((label) => label.key === structureColumnSelectionAnchorKey.value);
+    if (anchorIndex >= 0) {
+      const start = Math.min(anchorIndex, index);
+      const end = Math.max(anchorIndex, index);
+      setStructureColumnSelection(
+        labels.slice(start, end + 1).map((label) => label.key),
+        structureColumnSelectionAnchorKey.value,
+      );
+      return;
+    }
+  }
+
+  if (event.metaKey || event.ctrlKey) {
+    const next = new Set(selectedStructureColumnKeys.value);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setStructureColumnSelection(next, key);
+    return;
+  }
+
+  setStructureColumnSelection([key], key);
+}
+
+function selectAllStructureColumns() {
+  const keys = copyableStructureColumnLabels.value.map((label) => label.key);
+  if (keys.length > 0) setStructureColumnSelection(keys, keys[0] ?? null);
+}
+
+async function copySelectedStructureColumns() {
+  const text = structureColumnClipboardText();
+  if (!text) return;
+  try {
+    await copyToClipboard(text);
+    toast(t("grid.copied"));
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+watch(
+  copyableStructureColumnLabels,
+  (labels) => {
+    const allowed = new Set(labels.map((label) => label.key));
+    const next = [...selectedStructureColumnKeys.value].filter((key) => allowed.has(key));
+    if (next.length !== selectedStructureColumnKeys.value.size) selectedStructureColumnKeys.value = new Set(next);
+    if (structureColumnSelectionAnchorKey.value && !allowed.has(structureColumnSelectionAnchorKey.value)) structureColumnSelectionAnchorKey.value = next[0] ?? null;
+  },
+  { flush: "sync" },
+);
+
+const structureColumnRowHeight = computed(() => structureDensityMetric.value.controlHeight + structureDensityMetric.value.cellPaddingY * 2 + 1);
+const columnTableWidth = computed(() => visibleColWidths.value.reduce((total, width) => total + width, 0));
+function columnNeedsVariableGeometryHeight(column: EditableStructureColumn): boolean {
+  return isPostgresGeometryDataType(databaseType.value, column.dataType) && !postgresGeometryTypeValue(column.dataType) && !!postgresGeometrySridValue(column.dataType);
+}
+const columnVirtualItemSize = computed(() => (columns.value.some(columnNeedsVariableGeometryHeight) ? null : structureColumnRowHeight.value));
+const columnVirtualRows = computed(() => {
+  const geometryHintHeight = Math.ceil(structureDensityMetric.value.fontSize * structureDensityMetric.value.lineHeight) + 2;
+  return columns.value.map((column, index) => ({
+    id: column.id,
+    column,
+    index,
+    size: structureColumnRowHeight.value + (columnNeedsVariableGeometryHeight(column) ? geometryHintHeight : 0),
+  }));
 });
 const indexColLabels = computed(() => [
   t("structureEditor.indexName"),
@@ -1119,9 +1940,33 @@ const triggerEventOptions = ["INSERT", "UPDATE", "DELETE"];
 const metadataSchema = computed(() => connectionObjectTreeQuerySchema(connection.value, props.database, props.schema));
 const refreshVersion = computed(() => (props.connectionId && props.tableName ? queryStore.tableStructureRefreshVersion(props.connectionId, props.database, props.schema, props.tableName) : 0));
 const isCreateMode = computed(() => !props.tableName);
+// Hidden for an existing table that is not partitioned: the tab could only ever
+// render an empty state. Create mode keeps it so partitioning can be declared.
+const showPartitionsTab = computed(() => tableMetadataCapabilities.value.partitions && (isCreateMode.value || isPartitionedParent.value || isTablePartition.value));
+
+/**
+ * Whether the edited table already stores a lowercase or mixed-case identifier.
+ * Oracle folds bare identifiers to uppercase, so dequoting such a name points at
+ * a column that does not exist (`CNAME` instead of `"cName"`, ORA-00904) or
+ * silently creates a differently-cased column for a newly added field (#9649).
+ * Tables whose names are all in the dialect's default case keep the
+ * PL/SQL-Developer-style folding requested in #8997.
+ */
+const tableStoresCaseSensitiveIdentifiers = computed(() => {
+  if (isCreateMode.value) return false;
+  const databaseInfo = connection.value?.database_info;
+  const requiresQuotesForIdentity = (name: string | null | undefined) => !!name && tableStructureIdentifierComparisonKey(name, databaseType.value, databaseInfo).startsWith("quoted:");
+  // 外键的引用侧（被引用 schema/表/列）与约束名一样进入生成的 REFERENCES
+  // 子句，同样需要纳入大小写敏感扫描，否则会被折叠改写身份。
+  const foreignKeyIdentifiers = foreignKeys.value.flatMap((foreignKey) => {
+    const original = foreignKey.original;
+    return original ? [original.name, original.ref_schema, original.ref_table, original.ref_column] : [];
+  });
+  return [props.tableName, ...columns.value.map((column) => column.original?.name), ...indexes.value.map((index) => index.original?.name), ...foreignKeyIdentifiers, ...triggers.value.map((trigger) => trigger.original?.name)].some(requiresQuotesForIdentity);
+});
 const usesSqliteRebuildStrategy = computed(() => !isCreateMode.value && structureCapabilities.value.alterStrategy === "sqlite-rebuild");
 const hasSqliteTypeChange = computed(() => usesSqliteRebuildStrategy.value && hasExistingColumnTypeChange(columns.value));
-const canAddColumn = computed(() => canAddTableStructureColumn(databaseType.value, isCreateMode.value));
+const canAddColumn = computed(() => canAddTableStructureColumn(databaseType.value, isCreateMode.value) && (isCreateMode.value || databaseType.value !== "starrocks" || ["primary", "duplicate"].includes(starrocksAlterContext.value?.model ?? "")));
 const newTableName = ref("");
 const tableComment = ref("");
 const originalTableComment = ref("");
@@ -1131,6 +1976,15 @@ const mysqlAutoIncrementLoading = ref(false);
 const mysqlAutoIncrementLoadError = ref("");
 const mysqlTableEngine = ref("");
 const originalMysqlTableEngine = ref("");
+const physicalOptions = ref(emptyTablePhysicalOptions());
+const starrocksPhysicalOptions = ref(emptyStarRocksPhysicalOptions());
+watch(
+  () => columns.value.filter((column) => !column.markedForDrop).map((column) => column.id),
+  (ids) => {
+    if (!isCreateMode.value) return;
+    physicalOptions.value = pruneTablePhysicalOptions(physicalOptions.value, new Set(ids));
+  },
+);
 const mysqlTableEngineOptions = ref<string[]>([]);
 const mysqlTableEngineLoading = ref(false);
 const mysqlTableEngineLoadError = ref("");
@@ -1142,8 +1996,23 @@ const tableOwnerRoles = ref<string[]>([]);
 const tableOwnerRolesLoading = ref(false);
 const tableOwnerRolesLoadError = ref("");
 const supportsTableOwner = computed(() => !isCreateMode.value && databaseType.value === "postgres");
+const primaryKeyName = ref("");
+// Mirrors Rust `supports_named_primary_key`: engines that persist a user-supplied
+// PK constraint name. Other dialects ignore the symbol, so the field is hidden.
+const canNamePrimaryKey = computed(() => {
+  if (connection.value?.driver_profile?.toLowerCase() === "gaussdb-m") return true;
+  const dialect = structureCapabilities.value.dialect;
+  return dialect === "mysql" || dialect === "postgres" || dialect === "sqlserver" || dialect === "oracle";
+});
+/** Whether the draft will create a primary key that did not exist before
+ * (matching the Rust builder's pure-add path; replacements never rename). */
+const willCreateNewPrimaryKey = computed(() => {
+  const active = columns.value.filter((column) => !column.markedForDrop);
+  return active.some((column) => column.isPrimaryKey) && !active.some((column) => column.original?.is_primary_key);
+});
+const canEditPrimaryKeyName = computed(() => canNamePrimaryKey.value && willCreateNewPrimaryKey.value && (isCreateMode.value || structureCapabilities.value.addPrimaryKey));
 const canEditMysqlAutoIncrement = computed(() => canEditMysqlAutoIncrementCounter(connection.value, isCreateMode.value, columns.value));
-const canBuildMysqlAutoIncrement = computed(() => canEditMysqlAutoIncrement.value && !mysqlAutoIncrementLoading.value && !mysqlAutoIncrementLoadError.value && originalMysqlAutoIncrementValue.value !== undefined);
+const canBuildMysqlAutoIncrement = computed(() => !isCreateMode.value && canEditMysqlAutoIncrement.value && !mysqlAutoIncrementLoading.value && !mysqlAutoIncrementLoadError.value && originalMysqlAutoIncrementValue.value !== undefined);
 const supportsMysqlEngine = computed(() => supportsMysqlTableEngine(connection.value));
 const hasPersistedMysqlAutoIncrementColumn = computed(() => columns.value.some((column) => !column.markedForDrop && (column.original?.extra ?? "").toLowerCase().includes("auto_increment")));
 function isMysqlAutoIncrementCounterColumn(column: EditableStructureColumn): boolean {
@@ -1151,8 +2020,52 @@ function isMysqlAutoIncrementCounterColumn(column: EditableStructureColumn): boo
 }
 function setMysqlAutoIncrement(column: EditableStructureColumn, checked: boolean) {
   column.extra.autoIncrement = checked;
-  if (checked && originalMysqlAutoIncrementValue.value === undefined && !mysqlAutoIncrementLoading.value) {
+  if (!isCreateMode.value && checked && originalMysqlAutoIncrementValue.value === undefined && !mysqlAutoIncrementLoading.value) {
     void loadMysqlAutoIncrementCounter(true);
+  }
+}
+
+// MySQL generated columns (issue #11208). Tri-state mirrors the backend contract:
+// `undefined` inherits the original definition, an empty expression removes the
+// attribute, otherwise the clause renders from the edited values.
+function hasOriginalMysqlGeneratedColumn(column: EditableStructureColumn): boolean {
+  return structureDialect.value === "mysql" && !!column.original?.extra && !!parseMysqlGeneratedColumnExtra(column.original.extra);
+}
+
+function isMysqlGeneratedChecked(column: EditableStructureColumn): boolean {
+  return structureDialect.value === "mysql" && column.extra.generated !== undefined;
+}
+
+function isMysqlGeneratedActive(column: EditableStructureColumn): boolean {
+  return isMysqlGeneratedChecked(column) && (column.extra.generated?.expression.trim() ?? "") !== "";
+}
+
+function setMysqlGenerated(column: EditableStructureColumn, checked: boolean) {
+  // Only manage the generated flag here. Conflicting attributes (DEFAULT,
+  // AUTO_INCREMENT, ON UPDATE) stay in the draft: they are disabled in the UI
+  // while generated, and stripped from the SQL payload only while the
+  // generated attribute is active, so unchecking restores them untouched.
+  if (checked) {
+    // Re-checking after an accidental uncheck restores the original expression
+    // and storage instead of starting from a blank VIRTUAL draft.
+    const original = column.original?.extra ? parseMysqlGeneratedColumnExtra(column.original.extra) : undefined;
+    column.extra.generated = original ? { ...original } : { expression: "", storage: "STORED" };
+    return;
+  }
+  // Dropping the attribute must be explicit for a column that was generated,
+  // otherwise `undefined` would inherit the original definition back.
+  column.extra.generated = hasOriginalMysqlGeneratedColumn(column) ? { expression: "" } : undefined;
+}
+
+function updateMysqlGeneratedExpression(column: EditableStructureColumn, expression: string) {
+  if (column.extra.generated) {
+    column.extra.generated.expression = expression;
+  }
+}
+
+function updateMysqlGeneratedStorage(column: EditableStructureColumn, storage: string) {
+  if (column.extra.generated) {
+    column.extra.generated.storage = storage === "STORED" ? "STORED" : "VIRTUAL";
   }
 }
 function isSqliteAutoIncrement(column: EditableStructureColumn): boolean {
@@ -1212,7 +2125,10 @@ let syncingDraft = false;
 let draftHydrated = false;
 let lastAppliedInitialTabRequestId: number | undefined;
 let hydratingRestoredDraft = false;
-let structureScrollFrame = 0;
+let structureScrollDraftSyncTimer: ReturnType<typeof setTimeout> | undefined;
+let structureColumnScrollingTimer: ReturnType<typeof setTimeout> | undefined;
+let lastColumnVirtualRenderScrollTop = 0;
+let lastSyncedDraft: TableStructureEditorDraft | undefined;
 let structureHorizontalScrollbarThumbLeftPercent = 0;
 let structureHorizontalScrollbarThumbWidthPercent = 100;
 let structureHorizontalScrollbarResizeObserver: ResizeObserver | null = null;
@@ -1233,7 +2149,7 @@ function cloneDraftValue<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-const structureScrollPositions = ref<Partial<Record<TableInfoTab, TableStructureEditorViewport>>>({});
+let structureScrollPositions: Partial<Record<TableInfoTab, TableStructureEditorViewport>> = {};
 
 function structureScrollerElement(scroller: StructureScrollerRef | undefined): HTMLElement | undefined {
   if (!scroller) return undefined;
@@ -1247,6 +2163,7 @@ function structureScrollerForTab(tab: TableInfoTab): HTMLElement | undefined {
   if (tab === "foreignKeys") return structureScrollerElement(foreignKeysScrollerRef.value);
   if (tab === "constraints") return structureScrollerElement(constraintsScrollerRef.value);
   if (tab === "triggers") return structureScrollerElement(triggersScrollerRef.value);
+  if (tab === "partitions") return structureScrollerElement(partitionsScrollerRef.value);
   if (tab === "ddl") return structureScrollerElement(ddlScrollerRef.value);
   return undefined;
 }
@@ -1283,15 +2200,21 @@ function observeStructureHorizontalScroller() {
   structureHorizontalScrollbarResizeObserver?.disconnect();
   structureHorizontalScrollbarResizeObserver = null;
   const tab = activeTab.value;
-  void nextTick(() => {
+  const refresh = () => {
     if (generation !== structureHorizontalScrollbarObserverGeneration || tab !== activeTab.value) return;
     const scroller = activeStructureHorizontalScroller();
     updateStructureHorizontalScrollbar(scroller);
     if (!scroller || typeof ResizeObserver === "undefined") return;
-    structureHorizontalScrollbarResizeObserver = new ResizeObserver(() => updateStructureHorizontalScrollbar(scroller));
+    structureHorizontalScrollbarResizeObserver = new ResizeObserver(() => {
+      updateStructureHorizontalScrollbar(scroller);
+    });
     structureHorizontalScrollbarResizeObserver.observe(scroller);
     for (const child of Array.from(scroller.children)) structureHorizontalScrollbarResizeObserver.observe(child);
-  });
+  };
+  // TabsContent mounts the newly active pane on the tick after the tab change.
+  // Defer the measurement one additional tick so returning from a card tab
+  // (for example, Triggers) can find the freshly mounted columns scroller.
+  void nextTick(() => void nextTick(refresh));
 }
 
 function applyStructureHorizontalScrollbarDrag(clientX: number) {
@@ -1349,7 +2272,7 @@ function startStructureHorizontalScrollbarDrag(event: PointerEvent) {
 }
 
 function restoreStructureScrollPosition(tab = activeTab.value) {
-  const position = structureScrollPositions.value[tab];
+  const position = structureScrollPositions[tab];
   if (!position) return;
   nextTick(() => {
     if (tab === "ddl" && ddlEditorView.value) {
@@ -1365,25 +2288,78 @@ function restoreStructureScrollPosition(tab = activeTab.value) {
   });
 }
 
+function scheduleStructureScrollDraftSync() {
+  if (structureScrollDraftSyncTimer) clearTimeout(structureScrollDraftSyncTimer);
+  structureScrollDraftSyncTimer = setTimeout(() => {
+    structureScrollDraftSyncTimer = undefined;
+    syncStructureScrollDraftToParent();
+  }, STRUCTURE_SCROLL_DRAFT_SYNC_DELAY_MS);
+}
+
+function flushStructureScrollDraftSync() {
+  if (!structureScrollDraftSyncTimer) return;
+  clearTimeout(structureScrollDraftSyncTimer);
+  structureScrollDraftSyncTimer = undefined;
+  syncStructureScrollDraftToParent();
+}
+
+function updateColumnVirtualRowsDuringScroll(scroller: HTMLElement) {
+  const virtualScroller = columnsScrollerRef.value;
+  if (!virtualScroller || virtualScroller instanceof HTMLElement || structureScrollerElement(virtualScroller) !== scroller) return;
+  lastColumnVirtualRenderScrollTop = scroller.scrollTop;
+  virtualScroller.updateVisibleItems?.(false, true);
+}
+
+function updateExtendedPropertiesContentWidth() {
+  const scroller = structureScrollerElement(columnsScrollerRef.value);
+  if (!scroller) return;
+  const chromeWidth = structureDensityMetric.value.cellPaddingX * 2 + 1;
+  let width = extendedPropertiesContentWidth.value;
+  for (const content of scroller.querySelectorAll<HTMLElement>("[data-structure-extended-properties]")) {
+    width = Math.max(width, content.offsetWidth + chromeWidth);
+  }
+  extendedPropertiesContentWidth.value = width;
+}
+
+function onColumnVirtualRowsUpdated() {
+  const scroller = structureScrollerElement(columnsScrollerRef.value);
+  if (scroller) lastColumnVirtualRenderScrollTop = scroller.scrollTop;
+  void nextTick(updateExtendedPropertiesContentWidth);
+}
+
+function columnVirtualRowsNeedSynchronousUpdate(scroller: HTMLElement): boolean {
+  return Math.abs(scroller.scrollTop - lastColumnVirtualRenderScrollTop) >= STRUCTURE_COLUMN_VIRTUAL_BUFFER_PX;
+}
+
+function markColumnVirtualScrollerScrolling(scroller: HTMLElement) {
+  scroller.classList.add("is-scrolling");
+  if (structureColumnScrollingTimer) clearTimeout(structureColumnScrollingTimer);
+  structureColumnScrollingTimer = window.setTimeout(() => {
+    structureColumnScrollingTimer = undefined;
+    scroller.classList.remove("is-scrolling");
+    updateColumnVirtualRowsDuringScroll(scroller);
+  }, STRUCTURE_COLUMN_SCROLL_INTERACTION_DELAY_MS);
+}
+
 function onStructureContentScroll(tab: TableInfoTab, event: Event) {
   const target = event.currentTarget;
   if (!(target instanceof HTMLElement)) return;
-  if (tab === "columns" || tab === "indexes") updateStructureHorizontalScrollbar(target);
+  if (tab === "columns") {
+    markColumnVirtualScrollerScrolling(target);
+    if (columnVirtualRowsNeedSynchronousUpdate(target)) updateColumnVirtualRowsDuringScroll(target);
+  }
+  if (tab === "columns" || tab === "indexes") {
+    updateStructureHorizontalScrollbar(target);
+    if (activeTab.value === tab) onStructureVerticalScrollerScroll();
+  }
   const position: TableStructureEditorViewport = {
     scrollTop: Math.max(0, Math.round(target.scrollTop)),
     scrollLeft: Math.max(0, Math.round(target.scrollLeft)),
   };
-  const previous = structureScrollPositions.value[tab];
+  const previous = structureScrollPositions[tab];
   if (previous?.scrollTop === position.scrollTop && previous.scrollLeft === position.scrollLeft) return;
-  structureScrollPositions.value = {
-    ...structureScrollPositions.value,
-    [tab]: position,
-  };
-  if (structureScrollFrame) return;
-  structureScrollFrame = window.requestAnimationFrame(() => {
-    structureScrollFrame = 0;
-    syncDraftToParent();
-  });
+  structureScrollPositions[tab] = position;
+  scheduleStructureScrollDraftSync();
 }
 
 function createCurrentDraft(initialized = true): TableStructureEditorDraft {
@@ -1394,6 +2370,8 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     // Only carried alongside an actual edit: without a draft the baseline is
     // refetched, and copying every table's DDL into every draft is pure weight.
     ddlContent: ddlDraft.value === null ? undefined : ddlContent.value,
+    rawDdlContent: ddlDraft.value === null ? undefined : rawDdlContent.value,
+    excludeDdlStorage: ddlStorageExcluded.value,
     newTableName: newTableName.value,
     tableComment: tableComment.value,
     originalTableComment: originalTableComment.value,
@@ -1401,6 +2379,9 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     originalMysqlAutoIncrementValue: originalMysqlAutoIncrementValue.value,
     mysqlTableEngine: mysqlTableEngine.value,
     originalMysqlTableEngine: originalMysqlTableEngine.value,
+    physicalOptions: cloneDraftValue(physicalOptions.value),
+    starrocksPhysicalOptions: cloneDraftValue(starrocksPhysicalOptions.value),
+    starrocksSortColumns: starrocksSortColumns.value ? [...starrocksSortColumns.value] : undefined,
     tableOwner: tableOwner.value,
     originalTableOwner: originalTableOwner.value,
     columns: cloneDraftValue(columns.value),
@@ -1410,22 +2391,52 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     constraintsLoaded: constraintsLoaded.value,
     triggers: cloneDraftValue(triggers.value),
     triggersLoaded: triggersLoaded.value,
+    partitionOperations: cloneDraftValue(partitionOperations.value),
+    createPartitioningEnabled: createPartitioningEnabled.value,
+    createPartitioningKind: createPartitioningKind.value,
+    createPartitioningColumns: cloneDraftValue(createPartitioningColumns.value),
+    createPartitioningExpression: createPartitioningExpression.value,
     loadedMetadataFacets: [...loadedMetadataFacets],
-    scrollPositions: cloneDraftValue(structureScrollPositions.value),
+    scrollPositions: cloneDraftValue(structureScrollPositions),
     appliedInitialTabRequestId: lastAppliedInitialTabRequestId,
     initialized,
   };
 }
 
+function emitDraftToParent(draft: TableStructureEditorDraft | undefined) {
+  lastSyncedDraft = draft;
+  emit("update:draft", draft);
+}
+
+function syncStructureScrollDraftToParent() {
+  if (!draftHydrated || restoringDraft || syncingDraft) return;
+  const draft = lastSyncedDraft ?? props.draft;
+  if (!draft) {
+    syncDraftToParent();
+    return;
+  }
+  emitDraftToParent({
+    ...draft,
+    activeTab: activeTab.value as TableStructureEditorDraft["activeTab"],
+    scrollPositions: cloneDraftValue(structureScrollPositions),
+    appliedInitialTabRequestId: lastAppliedInitialTabRequestId,
+  });
+}
+
 function syncDraftToParent() {
+  if (structureScrollDraftSyncTimer) {
+    clearTimeout(structureScrollDraftSyncTimer);
+    structureScrollDraftSyncTimer = undefined;
+  }
   if (!draftHydrated) return;
   if (restoringDraft || syncingDraft) return;
   syncingDraft = true;
-  emit("update:draft", createCurrentDraft());
+  emitDraftToParent(createCurrentDraft());
   syncingDraft = false;
 }
 
 function restoreDraft(draft: TableStructureEditorDraft) {
+  lastSyncedDraft = draft;
   restoringDraft = true;
   draftHydrated = false;
   lastAppliedInitialTabRequestId = draft.appliedInitialTabRequestId;
@@ -1433,7 +2444,8 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   // Restore the DDL baseline alongside the edit, otherwise the restored script
   // would read as dirty (or clean) against the wrong reference text.
   if (draft.ddlContent) {
-    ddlContent.value = draft.ddlContent;
+    rawDdlContent.value = draft.rawDdlContent ?? draft.ddlContent;
+    ddlStorageExcluded.value = draft.excludeDdlStorage ?? false;
     ddlFetched.value = true;
   }
   ddlDraft.value = draft.ddlDraft ?? null;
@@ -1447,10 +2459,21 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   tableOwner.value = draft.tableOwner || "";
   originalTableOwner.value = draft.originalTableOwner || "";
   columns.value = cloneDraftValue(draft.columns || []);
+  physicalOptions.value = restoreTablePhysicalOptions(draft);
+  starrocksPhysicalOptions.value = restoreStarRocksPhysicalOptions(draft.starrocksPhysicalOptions);
+  starrocksSortColumns.value = draft.starrocksSortColumns ? [...draft.starrocksSortColumns] : undefined;
   // Existing-index edits never support Concurrent (the checkbox is disabled and
   // the core builder rejects the request), so a stale `concurrently: true`
   // saved in a restored draft must not be submitted or deadlock the save.
-  indexes.value = cloneDraftValue(draft.indexes || []).map((index) => (index.original ? { ...index, concurrently: false } : index));
+  indexes.value = cloneDraftValue(draft.indexes || []).map((index) => {
+    if (index.original) index.concurrently = false;
+    // Older drafts have no naming seed. Preserve their saved names until regeneration.
+    if (index.autoNameColumn === undefined) {
+      if (index.name) index.nameEdited = true;
+      else index.nameEdited ??= false;
+    }
+    return index;
+  });
   // Re-run the availability normalization against the current inputs (e.g. a
   // re-activated editor may already carry an unknown/unsupported partition
   // status): restored new-index Concurrent choices that became illegal are
@@ -1463,19 +2486,27 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   triggers.value = cloneDraftValue(draft.triggers || []);
   // Drafts created before lazy trigger loading always contained live trigger metadata.
   triggersLoaded.value = draft.triggersLoaded ?? true;
+  partitionOperations.value = cloneDraftValue(draft.partitionOperations || []);
+  createPartitioningEnabled.value = draft.createPartitioningEnabled ?? false;
+  createPartitioningKind.value = draft.createPartitioningKind ?? "range";
+  createPartitioningColumns.value = cloneDraftValue(draft.createPartitioningColumns || []);
+  createPartitioningExpression.value = draft.createPartitioningExpression ?? "";
   loadedMetadataFacets.clear();
   if (draft.loadedMetadataFacets) {
     for (const facet of draft.loadedMetadataFacets) loadedMetadataFacets.add(facet);
   } else {
     const activeScope = visibleTableStructureRefreshScope(draft.activeTab || "columns");
     if (activeScope.columns) loadedMetadataFacets.add("columns");
-    if (activeScope.indexes || draft.indexes?.length) loadedMetadataFacets.add("indexes");
+    // Older field-tab drafts did not load indexes alongside columns.
+    if (draft.activeTab === "indexes" || draft.indexes?.length) loadedMetadataFacets.add("indexes");
     if (activeScope.foreignKeys || draft.foreignKeys?.length) loadedMetadataFacets.add("foreign-keys");
     if (activeScope.constraints || constraintsLoaded.value) loadedMetadataFacets.add("constraints");
     if (activeScope.triggers || triggersLoaded.value) loadedMetadataFacets.add("triggers");
     if (activeScope.tableComment) loadedMetadataFacets.add("comment");
   }
-  structureScrollPositions.value = cloneDraftValue(draft.scrollPositions || {});
+  // Some older snapshots have incomplete facet flags but already contain index edits.
+  if (indexes.value.length) loadedMetadataFacets.add("indexes");
+  structureScrollPositions = cloneDraftValue(draft.scrollPositions || {});
   restoringDraft = false;
   draftHydrated = !needsColumnDraftMetadataHydration();
   restoreStructureScrollPosition();
@@ -1498,13 +2529,11 @@ async function hydrateRestoredDraftFromDatabase() {
   let shouldRefreshPreview = false;
   try {
     await store.ensureConnected(connectionId);
-    let { value: nextColumns } = await loadObjectMetadataFacet({ connectionId, database, schema, tableName, catalog }, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog));
+    let { value: nextColumns } = await loadObjectMetadataFacet({ connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs }, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog));
     if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
       try {
-        const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog });
-        const dialect = sqlFormatDialectForDbType(databaseType.value);
-        const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
-        ddlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
+        const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs });
+        rawDdlContent.value = await formatStructureDdl(ddl);
         ddlFetched.value = true;
         nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
       } catch {
@@ -1529,7 +2558,19 @@ function markDraftHydratedAndSync() {
 
 function hasPendingStructureChanges(): boolean {
   if (isCreateMode.value) {
-    return !!newTableName.value.trim() || !!tableComment.value.trim() || mysqlTableEngine.value !== originalMysqlTableEngine.value || columns.value.length > 0 || indexes.value.length > 0 || foreignKeys.value.length > 0 || triggers.value.length > 0;
+    return (
+      !!newTableName.value.trim() ||
+      !!tableComment.value.trim() ||
+      mysqlTableEngine.value !== originalMysqlTableEngine.value ||
+      hasTablePhysicalOptions(physicalOptions.value) ||
+      (databaseType.value === "starrocks" && hasStarRocksPhysicalOptions(starrocksPhysicalOptions.value)) ||
+      columns.value.length > 0 ||
+      indexes.value.length > 0 ||
+      foreignKeys.value.length > 0 ||
+      triggers.value.length > 0 ||
+      createPartitioningEnabled.value ||
+      partitionOperations.value.length > 0
+    );
   }
   const scope = captureStructureRefreshScope();
   return (
@@ -1538,6 +2579,7 @@ function hasPendingStructureChanges(): boolean {
     scope.foreignKeys ||
     scope.triggers ||
     scope.tableComment ||
+    partitionOperations.value.length > 0 ||
     mysqlTableEngine.value.toLowerCase() !== originalMysqlTableEngine.value.toLowerCase() ||
     (canBuildMysqlAutoIncrement.value && mysqlAutoIncrementValue.value !== originalMysqlAutoIncrementValue.value) ||
     (supportsTableOwner.value && tableOwner.value.trim() !== originalTableOwner.value.trim())
@@ -1652,7 +2694,10 @@ function scheduleSqlPreviewRefresh() {
   }
   sqlPreviewRequestId++;
   deferredSqlPreviewRefresh = false;
-  if (!hasPendingStructureChanges() && !ddlDirty.value) {
+  // Existing StarRocks tables need their model metadata before definition
+  // controls can be enabled, even when no column has been edited yet.
+  const needsStarRocksAlterContext = !isCreateMode.value && databaseType.value === "starrocks" && !starrocksAlterContext.value;
+  if (!hasPendingStructureChanges() && !ddlDirty.value && !needsStarRocksAlterContext) {
     pendingStatements.value = [];
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
@@ -1683,18 +2728,55 @@ function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
     driverProfile: connection.value?.driver_profile,
     schema: props.schema,
     tableName: isCreateMode.value ? newTableName.value.trim() : props.tableName || "",
-    // Do not let a draft created by an older build submit properties that the
-    // current database cannot represent (notably PostgreSQL-style identity on openGauss).
-    columns: showExtendedProperties.value ? columns.value : columns.value.map((column) => ({ ...column, extra: {} })),
+    // User-entered names are normalized here so the preview and the executed
+    // batch agree: MySQL rejects identifiers that end with a space (ERROR 1166),
+    // while a metadata name the user never touched keeps its exact spelling.
+    columns: columns.value.map((column) => {
+      const normalized = {
+        ...column,
+        name: draftColumnNameForSql(column.name, column.original?.name),
+        // Do not let a draft created by an older build submit properties that the
+        // current database cannot represent (notably PostgreSQL-style identity on openGauss).
+        ...(showExtendedProperties.value ? {} : { extra: {} }),
+      };
+      // MySQL generated columns cannot carry DEFAULT / AUTO_INCREMENT /
+      // ON UPDATE CURRENT_TIMESTAMP; drop them from the payload only while the
+      // generated attribute is active, so unchecking "virtual" leaves the
+      // draft (and the diff) exactly as the user last saw it.
+      if (isMysqlGeneratedActive(column) && normalized.extra) {
+        const { autoIncrement: _autoIncrement, onUpdateCurrentTimestamp: _onUpdate, ...restExtra } = normalized.extra;
+        normalized.extra = restExtra;
+        normalized.defaultValue = "";
+      }
+      return normalized;
+    }),
     indexes: sanitizeStructureIndexesForCapabilities(indexes.value, structureCapabilities.value),
     foreignKeys: foreignKeys.value,
     triggers: triggers.value,
     tableComment: tableComment.value,
     originalTableComment: isCreateMode.value ? undefined : originalTableComment.value,
+    mysqlAutoIncrementValue: isCreateMode.value && canEditMysqlAutoIncrement.value ? mysqlAutoIncrementValue.value || undefined : undefined,
     mysqlEngine: mysqlTableEngineSqlOption({ value: mysqlTableEngine.value, originalValue: originalMysqlTableEngine.value }, isCreateMode.value, supportsMysqlEngine.value && !mysqlTableEngineLoading.value && !mysqlTableEngineLoadError.value),
+    transwarpCreate: isCreateMode.value && databaseType.value === "transwarp" ? buildInceptorCreateOptions(physicalOptions.value, columns.value) : undefined,
     tableCollation: mysqlTableDefaultCollation.value || undefined,
     partitioned: isPartitionedParent.value,
+    foreignTable: isForeignTable.value,
     isGaussdbMMode: connection.value?.driver_profile?.toLowerCase() === "gaussdb-m",
+    primaryKeyName: willCreateNewPrimaryKey.value ? primaryKeyName.value.trim() || undefined : undefined,
+  };
+}
+
+function partitionSqlOptions(): TablePartitionSqlOptions {
+  return {
+    databaseType: databaseType.value,
+    driverProfile: connection.value?.driver_profile,
+    // `metadataSchema` normalizes the fallback (database as schema, empty → public
+    // on the backend), so DDL stays schema-qualified like every other statement.
+    schema: metadataSchema.value,
+    // Create mode has no table yet: the pending partition operations target the
+    // new table's name.
+    tableName: isCreateMode.value ? newTableName.value.trim() : props.tableName || "",
+    operations: partitionOperations.value,
   };
 }
 
@@ -1723,10 +2805,41 @@ async function refreshSqlPreview() {
     sqlPreviewPending.value = false;
     return;
   }
+  if (!isCreateMode.value && databaseType.value === "starrocks") {
+    try {
+      const { ddl } = await loadObjectDdl(ddlRequest());
+      starrocksAlterContext.value = starRocksAlterOptionsFromDdl(ddl, connection.value?.database_info?.productVersion);
+      if (!starrocksSortColumns.value) starrocksSortColumns.value = [...(starrocksAlterContext.value.sortColumns ?? [])];
+    } catch {
+      starrocksAlterContext.value = starRocksAlterOptionsFromDdl("", connection.value?.database_info?.productVersion);
+    }
+  }
+  if (requestId !== sqlPreviewRequestId) return;
   if (!hasPendingStructureChanges()) {
     pendingStatements.value = [];
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
+    sqlPreviewLoading.value = false;
+    sqlPreviewPending.value = false;
+    return;
+  }
+  const indexWarnings = indexes.value
+    .filter((index) => !index.markedForDrop && needsIndexColumnValidation(index))
+    .flatMap((index) => {
+      const issue = indexColumnsIssue(index);
+      return issue ? [`${index.name || t("structureEditor.addIndex")}: ${t(`structureEditor.${issue}`)}`] : [];
+    });
+  if (indexWarnings.length) {
+    pendingStatements.value = [];
+    warnings.value = indexWarnings;
+    sqliteSchemaRevision.value = undefined;
+    sqlPreviewLoading.value = false;
+    sqlPreviewPending.value = false;
+    return;
+  }
+  if (pendingStarRocksSort.value && (columns.value.some(columnChanged) || tableComment.value !== originalTableComment.value || indexes.value.some(indexChanged) || foreignKeys.value.some(foreignKeyChanged) || triggers.value.some(triggerChanged))) {
+    pendingStatements.value = [];
+    warnings.value = [t("starrocksLayout.sortSaveSeparately")];
     sqlPreviewLoading.value = false;
     sqlPreviewPending.value = false;
     return;
@@ -1745,9 +2858,18 @@ async function refreshSqlPreview() {
   }
   sqlPreviewLoading.value = true;
   const options = structureChangeOptions();
+  const partitionResultPromise = partitionOperations.value.length > 0 ? api.buildTablePartitionOperationSql(partitionSqlOptions()) : Promise.resolve({ statements: [], warnings: [] });
   try {
-    const [result, ownerResult, mysqlAutoIncrementStatement] = await Promise.all([
-      isCreateMode.value ? api.buildCreateTableSql(options) : hasSqliteTypeChange.value ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options) : api.buildTableStructureChangeSql(options),
+    const [result, ownerResult, mysqlAutoIncrementStatement, partitionResult] = await Promise.all([
+      isCreateMode.value
+        ? createPartitioningEnabled.value
+          ? api.buildCreatePartitionedTableSql({ options, partitioning: { kind: createPartitioningKind.value, columns: createPartitioningColumns.value, expression: createPartitioningExpression.value } })
+          : api.buildCreateTableSql(options, connection.value?.database_info?.productVersion, databaseType.value === "starrocks" ? buildStarRocksDialectOptions(starrocksPhysicalOptions.value) : undefined)
+        : hasSqliteTypeChange.value
+          ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options)
+          : databaseType.value === "starrocks"
+            ? api.buildTableStructureChangeSql(options, { ...starrocksAlterContext.value!, reorderColumns: false, positionColumnOrder: structureCapabilities.value.reorderColumn, sortColumnNames: pendingStarRocksSort.value })
+            : api.buildTableStructureChangeSql(options),
       supportsTableOwner.value
         ? api.buildTableOwnerChangeSql({
             databaseType: databaseType.value,
@@ -1767,12 +2889,13 @@ async function refreshSqlPreview() {
         tableName: props.tableName || "",
         buildSql: api.buildMysqlAutoIncrementSql,
       }),
+      partitionResultPromise,
     ]);
     if (requestId !== sqlPreviewRequestId) return;
-    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : []), ...partitionResult.statements];
     // SQLite type-change apply regenerates this revision-checked plan, so its preview must stay byte-for-byte aligned.
-    pendingStatements.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers !== false || hasSqliteTypeChange.value ? statements : statements.map((statement) => formatGeneratedDdlIdentifierQuotes(statement, sqlFormatDialectForDbType(databaseType.value), false));
-    warnings.value = [...result.warnings, ...ownerResult.warnings];
+    pendingStatements.value = hasSqliteTypeChange.value ? statements : statements.map((statement) => applyDdlGenerationPreferences(statement, sqlFormatDialectForDbType(databaseType.value)));
+    warnings.value = [...result.warnings, ...ownerResult.warnings, ...partitionResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
     if (requestId !== sqlPreviewRequestId) return;
@@ -1791,6 +2914,7 @@ const canApply = computed(
   () =>
     !loading.value &&
     !saving.value &&
+    (databaseType.value !== "starrocks" || !starrocksStatusBusy.value) &&
     !postSaveRefreshing.value &&
     !secondaryMetadataLoading.value &&
     !mysqlTableEngineLoading.value &&
@@ -1806,7 +2930,7 @@ const canApply = computed(
 
 function clearDraft() {
   draftHydrated = false;
-  emit("update:draft", undefined);
+  emitDraftToParent(undefined);
 }
 
 function resetState() {
@@ -1819,9 +2943,14 @@ function resetState() {
   foreignKeysLoading.value = false;
   constraintsLoading.value = false;
   triggersLoading.value = false;
+  partitionsLoading.value = false;
+  partitionsError.value = "";
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
   isPartitionedParent.value = false;
+  isTablePartition.value = false;
+  isForeignTable.value = false;
+  partitionStatusResolved.value = false;
   partitionStatusKnown.value = true;
   concurrentAvailabilityInvalidated.value = false;
   columns.value = [];
@@ -1832,10 +2961,16 @@ function resetState() {
   foreignKeys.value = [];
   constraints.value = [];
   constraintsLoaded.value = false;
+  partitioning.value = null;
   triggers.value = [];
   triggersLoaded.value = false;
+  partitionOperations.value = [];
+  createPartitioningEnabled.value = false;
+  createPartitioningKind.value = "range";
+  createPartitioningColumns.value = [];
+  createPartitioningExpression.value = "";
   clearColumnSelection();
-  ddlContent.value = "";
+  rawDdlContent.value = "";
   ddlDraft.value = null;
   ddlFetched.value = false;
   loadedMetadataFacets.clear();
@@ -1849,6 +2984,10 @@ function resetState() {
   mysqlAutoIncrementLoadError.value = "";
   mysqlTableEngine.value = "";
   originalMysqlTableEngine.value = "";
+  physicalOptions.value = emptyTablePhysicalOptions();
+  starrocksPhysicalOptions.value = emptyStarRocksPhysicalOptions();
+  starrocksAlterContext.value = undefined;
+  starrocksSortColumns.value = undefined;
   mysqlTableEngineOptions.value = [];
   mysqlTableEngineLoadRequestId += 1;
   mysqlTableEngineLoading.value = false;
@@ -1883,6 +3022,14 @@ async function reloadStructureFromDatabase() {
     constraints.value = [];
     constraintsLoaded.value = false;
   }
+  if (activeTab.value !== "partitions") {
+    partitioning.value = null;
+  }
+  // Refreshing from the database discards every other draft; pending partition
+  // operations must not survive it and still be applied on save.
+  partitionOperations.value = [];
+  starrocksAlterContext.value = undefined;
+  starrocksSortColumns.value = undefined;
   const refreshDdl = activeTab.value === "ddl";
   const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
   invalidateTableMetadataCache(metadataMatch);
@@ -1905,6 +3052,7 @@ function setSecondaryMetadataLoading(scope: TableStructureRefreshScope, value: b
   if (scope.foreignKeys && tableMetadataCapabilities.value.foreignKeys) foreignKeysLoading.value = value;
   if (scope.constraints && tableMetadataCapabilities.value.constraints) constraintsLoading.value = value;
   if (scope.triggers && tableMetadataCapabilities.value.triggers) triggersLoading.value = value;
+  if (scope.partitions && tableMetadataCapabilities.value.partitions) partitionsLoading.value = value;
 }
 
 function withRequiredPostgresPrimaryKeyMetadata(scope: TableStructureRefreshScope): TableStructureRefreshScope {
@@ -1927,7 +3075,7 @@ async function fetchTableCommentValue(connectionId: string, database: string, sc
   }
 }
 
-function loadCachedTableComment(request: ReturnType<typeof ddlRequest>, force = false): Promise<{ value: string | undefined; cacheStatus: "memory" | "disk" | "remote" }> {
+function loadCachedTableComment(request: StructureDdlRequest, force = false): Promise<{ value: string | undefined; cacheStatus: "memory" | "disk" | "remote" }> {
   return loadObjectMetadataFacet(request, "comment", () => fetchTableCommentValue(request.connectionId, request.database, request.schema, request.tableName, request.catalog), { force });
 }
 
@@ -1945,7 +3093,7 @@ async function loadVisibleTableComment(force = false, preserveDraft = false) {
   const loadPromise = (async () => {
     try {
       await store.ensureConnected(connectionId);
-      const { value } = await loadCachedTableComment({ connectionId, database, schema, tableName, catalog }, force);
+      const { value } = await loadCachedTableComment({ connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs }, force);
       if (requestId !== tableCommentLoadRequestId) return;
       if (connectionId !== props.connectionId || database !== props.database || schema !== metadataSchema.value || tableName !== props.tableName || (catalog || "") !== (props.catalog || "")) return;
       if (value === undefined) return;
@@ -1966,6 +3114,8 @@ async function loadVisibleTableComment(force = false, preserveDraft = false) {
 }
 
 async function loadMysqlAutoIncrementCounter(preserveDraft = false) {
+  // Creation drafts own their counter; there is no server table to refresh.
+  if (isCreateMode.value) return;
   const requestId = ++mysqlAutoIncrementLoadRequestId;
   if (!canEditMysqlAutoIncrement.value || !props.connectionId || !props.database || !props.tableName) {
     mysqlAutoIncrementValue.value = undefined;
@@ -2041,7 +3191,7 @@ async function loadTableOwner(force = false, preserveDraft = false) {
   tableOwnerLoadError.value = "";
   try {
     await store.ensureConnected(connectionId);
-    const result = await loadObjectMetadataFacet({ connectionId, database, schema, tableName, catalog }, "owner", () => api.getTableOwner(connectionId, database, schema, tableName), { force });
+    const result = await loadObjectMetadataFacet({ connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs }, "owner", () => api.getTableOwner(connectionId, database, schema, tableName), { force });
     if (requestId !== tableOwnerLoadRequestId) return;
     const owner = result.value || "";
     originalTableOwner.value = owner;
@@ -2100,6 +3250,7 @@ async function loadStructure(
   setSecondaryMetadataLoading(effectiveScope, true);
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
+  partitionsError.value = "";
   let secondaryMetadataScheduled = false;
   let loadedSuccessfully = false;
   let columnsServedFromCache = false;
@@ -2111,7 +3262,7 @@ async function loadStructure(
     const metadataRequest = ddlRequest();
     const forceMetadata = options.forceMetadata === true;
     const partitionStatusPromise =
-      databaseType.value === "postgres" && !isCreateMode.value
+      tableMetadataCapabilities.value.partitions && !isCreateMode.value
         ? api
             .getTablePartitionStatus(connectionId, database, schema, tableName)
             // No reactive mutation inside the catch: a stale request must not
@@ -2120,8 +3271,8 @@ async function loadStructure(
             // status we cannot rule out a partitioned parent, so Concurrent is
             // treated as unavailable until a later reload re-runs the probe.
             .then((status) => ({ known: true, status }))
-            .catch(() => ({ known: false, status: { isPartitionedParent: false, isPartition: false } }))
-        : Promise.resolve({ known: true, status: { isPartitionedParent: false, isPartition: false } });
+            .catch(() => ({ known: false, status: { isPartitionedParent: false, isPartition: false, isForeign: false } }))
+        : Promise.resolve({ known: true, status: { isPartitionedParent: false, isPartition: false, isForeign: false } });
     const columnsLoad = effectiveScope.columns ? loadObjectMetadataFacet(metadataRequest, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog), { force: forceMetadata }) : undefined;
     const columnsPromise = columnsLoad
       ? columnsLoad.then((result) => {
@@ -2149,6 +3300,11 @@ async function loadStructure(
         ? loadObjectMetadataFacet(metadataRequest, "triggers", () => api.listTriggers(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
+    // Partition metadata is a live catalog read (not persisted), so it is
+    // fetched directly rather than through the object metadata cache.
+    // Create mode has no catalog entry to read; the Partitions tab edits a
+    // local `PARTITION BY` declaration instead.
+    const partitioningPromise = effectiveScope.partitions && !isCreateMode.value ? (tableMetadataCapabilities.value.partitions ? api.getTablePartitioning(connectionId, database, schema, tableName) : Promise.resolve(undefined)) : Promise.resolve(undefined);
     const tableCommentLoad = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata) : undefined;
     const tableCommentPromise = tableCommentLoad
       ? tableCommentLoad.then((result) => {
@@ -2161,10 +3317,8 @@ async function loadStructure(
     if (nextColumns) {
       if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
         try {
-          const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog }, { force: options.forceDdl });
-          const dialect = sqlFormatDialectForDbType(databaseType.value);
-          const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
-          ddlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
+          const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs }, { force: options.forceDdl });
+          rawDdlContent.value = await formatStructureDdl(ddl);
           ddlFetched.value = true;
           nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
         } catch {
@@ -2183,7 +3337,8 @@ async function loadStructure(
       if (!options.preserveDraft) clearColumnSelection();
     }
 
-    await loadMysqlAutoIncrementCounter(options.preserveDraft === true);
+    // Loading missing index metadata must not rebase a restored column counter again.
+    if (!options.preserveDraft || effectiveScope.columns) await loadMysqlAutoIncrementCounter(options.preserveDraft === true);
 
     const nextTableComment = await tableCommentPromise;
     if (nextTableComment !== undefined) {
@@ -2195,6 +3350,9 @@ async function loadStructure(
     if (requestId === structureLoadRequestId) {
       partitionStatusKnown.value = partitionStatus.known;
       isPartitionedParent.value = partitionStatus.status.isPartitionedParent;
+      isTablePartition.value = partitionStatus.status.isPartition;
+      isForeignTable.value = partitionStatus.status.isForeign;
+      partitionStatusResolved.value = true;
       // Availability inputs changed: fail closed while the status is unknown,
       // but preserve the user's Concurrent intent so a later successful probe
       // can regenerate the same SQL. Definitive unsupported states still clear
@@ -2206,7 +3364,7 @@ async function loadStructure(
       }
     }
     const applySecondaryMetadata = async () => {
-      const [indexesResult, foreignKeysResult, constraintsResult, triggersResult] = await Promise.allSettled([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise]);
+      const [indexesResult, foreignKeysResult, constraintsResult, triggersResult, partitioningResult] = await Promise.allSettled([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise, partitioningPromise]);
       if (requestId !== structureLoadRequestId) return;
 
       type SecondaryMetadataResult = { facet: ObjectMetadataFacet; result: PromiseSettledResult<unknown> };
@@ -2231,7 +3389,8 @@ async function loadStructure(
       const nextConstraints = constraintsResult.status === "fulfilled" ? constraintsResult.value : undefined;
       const nextTriggers = triggersResult.status === "fulfilled" ? triggersResult.value : undefined;
       if (nextIndexes) {
-        indexes.value = createIndexDrafts(nextIndexes);
+        // An empty lazy load changes no draft data and should not trigger another save.
+        if (nextIndexes.length || indexes.value.length) indexes.value = createIndexDrafts(nextIndexes);
         loadedMetadataFacets.add("indexes");
       }
       if (nextForeignKeys) {
@@ -2247,6 +3406,17 @@ async function loadStructure(
         triggers.value = createTriggerDrafts(nextTriggers);
         triggersLoaded.value = true;
         loadedMetadataFacets.add("triggers");
+      }
+      if (partitioningResult.status === "fulfilled" && partitioningResult.value !== undefined) {
+        partitioning.value = partitioningResult.value;
+        loadedMetadataFacets.add("partitions");
+      } else if (partitioningResult.status === "rejected") {
+        console.warn("[DBX][structure-editor:partitions-metadata-failed]", partitioningResult.reason);
+        if (showErrors) partitionsError.value = partitioningResult.reason?.message || String(partitioningResult.reason);
+        // Mark the facet loaded even on failure: the tab-activation watcher
+        // only refetches unloaded facets, so leaving it unloaded would retry in
+        // a loop. The toolbar Refresh clears the facet and retries explicitly.
+        loadedMetadataFacets.add("partitions");
       }
     };
 
@@ -2299,7 +3469,7 @@ async function revalidateCachedStructureMetadata(loadRequestId: number, scope: {
   const tableName = props.tableName;
   if (!connectionId || !database || !tableName) return;
   const revalidationId = ++structureMetadataRevalidationId;
-  const metadataRequest = { connectionId, database, schema, tableName, catalog };
+  const metadataRequest = { connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs };
   try {
     await store.ensureConnected(connectionId);
     // Force alone only clears this facet's own key; the web backend keeps its
@@ -2348,11 +3518,28 @@ async function refreshStructureAfterSave(scope: TableStructureRefreshScope, char
   }
 }
 
-async function focusColumnNameInput(columnId: string) {
+function renderedColumnRow(index: number): HTMLElement | undefined {
+  return rootRef.value?.querySelector<HTMLElement>(`[data-column-row-index="${index}"]`) ?? undefined;
+}
+
+async function scrollColumnRowIntoView(index: number, block: ScrollLogicalPosition = "nearest"): Promise<HTMLElement | undefined> {
   await nextTick();
-  const row = Array.from(rootRef.value?.querySelectorAll<HTMLElement>("[data-column-row-index]") ?? []).find((element) => element.dataset.columnId === columnId);
+  let row = renderedColumnRow(index);
+  if (!row) {
+    const virtualScroller = columnsScrollerRef.value;
+    if (virtualScroller && !(virtualScroller instanceof HTMLElement)) virtualScroller.scrollToItem?.(index, { align: block });
+    await nextTick();
+    row = renderedColumnRow(index);
+  }
+  row?.scrollIntoView({ block, inline: "nearest" });
+  return row;
+}
+
+async function focusColumnNameInput(columnId: string) {
+  const index = columns.value.findIndex((column) => column.id === columnId);
+  if (index < 0) return;
+  const row = await scrollColumnRowIntoView(index);
   const input = row?.querySelector<HTMLInputElement>("[data-column-name-input]");
-  row?.scrollIntoView({ block: "nearest" });
   input?.focus();
   input?.select();
 }
@@ -2361,11 +3548,18 @@ function columnIsSelectable(column: EditableStructureColumn): boolean {
   return !column.markedForDrop && columns.value.some((item) => item.id === column.id);
 }
 
-/** Replace the whole selection state (set + active + shift anchor) atomically. */
+/**
+ * Replace the whole selection state (set + active + shift anchor) atomically.
+ * Header-column selection and row selection are exclusive modes, so any row
+ * selection also clears the header-column keys, mirroring how
+ * `setStructureColumnSelection` clears the row selection.
+ */
 function setColumnSelection(ids: Iterable<string>, activeId: string | null, anchorId: string | null) {
   selectedColumnIds.value = new Set(ids);
   selectedColumnId.value = activeId;
   columnSelectionAnchorId.value = anchorId;
+  selectedStructureColumnKeys.value = new Set();
+  structureColumnSelectionAnchorKey.value = null;
 }
 
 function clearColumnSelection() {
@@ -2442,6 +3636,97 @@ function onColumnRowActivate(column: EditableStructureColumn) {
   selectSingleColumn(column);
 }
 
+const copySourceConnection = computed(() => store.getConfig(copySourceConnectionId.value));
+function isCompatibleCopyConnection(config: ConnectionConfig): boolean {
+  const sourceType = tableStructureDatabaseTypeForConnection(config);
+  // Unknown JDBC dialects cannot be assumed compatible across connections.
+  return config.id === props.connectionId || (!!sourceType && sourceType !== "jdbc" && sourceType === databaseType.value);
+}
+const copySourceConnections = computed(() => store.connections.filter(isCompatibleCopyConnection));
+const copySourceCompatible = computed(() => !!copySourceConnection.value && isCompatibleCopyConnection(copySourceConnection.value));
+const copySourceRootSchemaMode = computed(() => namespaceOptionsAreSchemas(copySourceConnection.value));
+const copySourceHasSchema = computed(() => !copySourceRootSchemaMode.value && !connectionUsesDatabaseObjectTreeMode(copySourceConnection.value) && isSchemaAware(tableStructureDatabaseTypeForConnection(copySourceConnection.value)));
+const copySourceMetadataSchema = computed(() => connectionObjectTreeQuerySchema(copySourceConnection.value, copySourceDatabase.value, copySourceSchema.value));
+const copySourceTargetCatalog = computed(() => normalizedQueryTabCatalog(copySourceCatalogs.value, copySourceCatalog.value));
+
+function resetCopySourceTables() {
+  clearCopySourceTableSearchTimer();
+  ++copySourceTablesRequestId;
+  copySourceTablesLoading.value = false;
+  copySourceTables.value = [];
+  copySourceTablesOffset.value = 0;
+  copySourceTablesHasMore.value = false;
+  clearCopySourceTableSelection();
+}
+
+// Explicit cascade steps keep stale namespace requests from restoring old selections.
+async function changeCopySourceScope(level: "connection" | "catalog" | "database" | "schema", value: string, prefill = false) {
+  const requestId = ++copySourceScopeRequestId;
+  resetCopySourceTables();
+  copySourceTableSearch.value = "";
+  copySourceError.value = "";
+  copySourceScopeReady.value = false;
+  copySourceScopeLoading.value = true;
+  if (level === "connection") {
+    copySourceConnectionId.value = value;
+    copySourceCatalog.value = "";
+    copySourceCatalogs.value = [];
+  }
+  if (level === "catalog") copySourceCatalog.value = value;
+  if (level === "connection" || level === "catalog") {
+    copySourceDatabase.value = "";
+    copySourceDatabases.value = [];
+  }
+  if (level === "database") copySourceDatabase.value = value;
+  if (level !== "schema") {
+    copySourceSchema.value = "";
+    copySourceSchemas.value = [];
+  } else copySourceSchema.value = value;
+  const config = copySourceConnection.value;
+  const current = () => requestId === copySourceScopeRequestId && copyColumnsDialogOpen.value;
+  try {
+    if (!config || !isCompatibleCopyConnection(config)) return;
+    await store.ensureConnected(config.id, { activate: false });
+    if (!current() || !copySourceCompatible.value) return;
+    if (level === "connection" && connectionIsDorisFamilyCatalogCapable(config)) {
+      const catalogs = await api.listDorisCatalogs(config.id);
+      if (!current()) return;
+      copySourceCatalogs.value = catalogs;
+      copySourceCatalog.value = selectedQueryCatalogName(catalogs, prefill ? props.catalog : undefined);
+      if (!copySourceCatalog.value) return;
+    }
+    if (level === "connection" || level === "catalog") {
+      const catalog = copySourceTargetCatalog.value;
+      const databases = catalog ? await fetchCatalogNamespaceOptions(config.id, catalog, config) : await fetchNamespaceOptionsForConnection(config.id, config);
+      if (!current()) return;
+      copySourceDatabases.value = databases;
+      const preferred = prefill ? props.database : namespaceOptionsAreSchemas(config) ? config.username : config.database;
+      copySourceDatabase.value = databases.includes(preferred || "") ? preferred || "" : (databases[0] ?? "");
+    }
+    if (!copySourceDatabases.value.includes(copySourceDatabase.value)) return;
+    if (copySourceRootSchemaMode.value) {
+      // Oracle/Dameng expose their owner as the namespace immediately below a connection.
+      copySourceSchema.value = copySourceDatabase.value;
+    } else if (copySourceHasSchema.value && level !== "schema") {
+      const database = copySourceDatabase.value;
+      const schemas = await api.listSchemas(config.id, database);
+      if (!current()) return;
+      copySourceSchemas.value = schemaOptionsForConnection(schemas, config, database);
+      const preferred = prefill ? metadataSchema.value : "";
+      copySourceSchema.value = copySourceSchemas.value.includes(preferred) ? preferred : (copySourceSchemas.value[0] ?? "");
+    }
+    if (copySourceHasSchema.value && !copySourceSchemas.value.includes(copySourceSchema.value)) return;
+    // Preserve explicit metadata scope for an unknown JDBC driver on the current connection.
+    if (prefill && !copySourceRootSchemaMode.value && !copySourceHasSchema.value) copySourceSchema.value = props.schema || "";
+    copySourceScopeReady.value = true;
+  } catch (error: any) {
+    if (current()) copySourceError.value = error?.message || String(error);
+  } finally {
+    if (current()) copySourceScopeLoading.value = false;
+  }
+  if (current() && copySourceScopeReady.value) await loadCopySourceTables();
+}
+
 function normalizedColumnSearch(value: string): string {
   return value.trim().toLowerCase();
 }
@@ -2451,14 +3736,14 @@ const copyableSourceColumns = computed(() => {
   const existingNames = new Set(columns.value.filter((column) => !column.markedForDrop).map((column) => tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)));
   return copySourceColumns.value.map((column) => ({
     column,
+    details: copySourceColumnDetails(column, databaseType.value),
     alreadyExists: existingNames.has(tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)),
   }));
 });
 
 const filteredCopyableSourceColumns = computed(() => {
-  const search = normalizedColumnSearch(copySourceColumnSearch.value);
-  if (!search) return copyableSourceColumns.value;
-  return copyableSourceColumns.value.filter(({ column }) => [column.name, column.data_type, column.comment ?? ""].some((value) => normalizedColumnSearch(value).includes(search)));
+  if (!normalizedColumnSearch(copySourceColumnSearch.value)) return copyableSourceColumns.value;
+  return copyableSourceColumns.value.filter(({ column }) => matchesCopySourceColumnSearch(column, copySourceColumnSearch.value, databaseType.value));
 });
 
 const copyableSourceColumnNames = computed(() => copyableSourceColumns.value.filter(({ alreadyExists }) => !alreadyExists).map(({ column }) => column.name));
@@ -2477,7 +3762,9 @@ function clearCopySourceTableSearchTimer() {
 
 function isCopySourceTable(table: TableInfo): boolean {
   const databaseInfo = connection.value?.database_info;
-  return isCreateMode.value || tableStructureIdentifierComparisonKey(table.name, databaseType.value, databaseInfo) !== tableStructureIdentifierComparisonKey(props.tableName, databaseType.value, databaseInfo);
+  const sameNamespace =
+    copySourceConnectionId.value === props.connectionId && copySourceDatabase.value === props.database && copySourceMetadataSchema.value === metadataSchema.value && (copySourceTargetCatalog.value || "") === (normalizedQueryTabCatalog(copySourceCatalogs.value, props.catalog || "") || "");
+  return isCreateMode.value || !sameNamespace || tableStructureIdentifierComparisonKey(table.name, databaseType.value, databaseInfo) !== tableStructureIdentifierComparisonKey(props.tableName, databaseType.value, databaseInfo);
 }
 
 function clearCopySourceTableSelection() {
@@ -2490,14 +3777,13 @@ function clearCopySourceTableSelection() {
 }
 
 async function loadCopySourceTables(offset = 0) {
-  if (!props.connectionId || !props.database) return;
+  if (!copyColumnsDialogOpen.value || !copySourceScopeReady.value || !copySourceCompatible.value || copySourceScopeLoading.value) return;
   clearCopySourceTableSelection();
   const requestId = ++copySourceTablesRequestId;
   copySourceTablesLoading.value = true;
   copySourceError.value = "";
   try {
-    await store.ensureConnected(props.connectionId);
-    const tables = await api.listTables(props.connectionId, props.database, metadataSchema.value, copySourceTableSearch.value.trim() || undefined, COPY_SOURCE_TABLE_PAGE_PROBE_SIZE, offset, ["TABLE"], props.catalog);
+    const tables = await api.listTables(copySourceConnectionId.value, copySourceDatabase.value, copySourceMetadataSchema.value, copySourceTableSearch.value.trim() || undefined, COPY_SOURCE_TABLE_PAGE_PROBE_SIZE, offset, ["TABLE"], copySourceTargetCatalog.value);
     if (requestId !== copySourceTablesRequestId) return;
     copySourceTables.value = tables.slice(0, COPY_SOURCE_TABLE_PAGE_SIZE).filter(isCopySourceTable);
     copySourceTablesOffset.value = offset;
@@ -2516,50 +3802,52 @@ async function loadCopySourceTables(offset = 0) {
 
 function updateCopySourceTableSearch(value: string | number) {
   copySourceTableSearch.value = String(value);
-  clearCopySourceTableSelection();
+  // Invalidate any in-flight load and restart the debounce, but keep the
+  // current list visible until the new results land to avoid a blank flicker.
   clearCopySourceTableSearchTimer();
+  ++copySourceTablesRequestId;
   copySourceTableSearchTimer = setTimeout(() => {
     copySourceTableSearchTimer = undefined;
     void loadCopySourceTables();
   }, COPY_SOURCE_TABLE_SEARCH_DEBOUNCE_MS);
 }
 
-watch(copyColumnsDialogOpen, (open) => {
-  if (open) return;
-  clearCopySourceTableSearchTimer();
-  copySourceTablesRequestId++;
-  copySourceColumnsRequestId++;
-});
+watch(
+  copyColumnsDialogOpen,
+  (open) => {
+    if (open) return;
+    ++copySourceScopeRequestId;
+    copySourceScopeReady.value = false;
+    copySourceScopeLoading.value = false;
+    resetCopySourceTables();
+  },
+  { flush: "sync" },
+);
+
+watch(
+  () => [props.connectionId, props.database, props.schema, props.catalog, props.tableName],
+  () => {
+    copyColumnsDialogOpen.value = false;
+  },
+  { flush: "sync" },
+);
 
 async function openCopyColumnsDialog() {
   if (!canAddColumn.value || !props.connectionId || !props.database) return;
   copyColumnsDialogOpen.value = true;
-  copySourceTableName.value = "";
-  copySourceTableSearch.value = "";
-  copySourceColumns.value = [];
-  copySourceColumnSearch.value = "";
-  selectedCopySourceColumnNames.value = [];
-  copySourceError.value = "";
-  copySourceColumnsRequestId++;
-  copySourceColumnsLoading.value = false;
-  copySourceTables.value = [];
-  copySourceTablesOffset.value = 0;
-  copySourceTablesHasMore.value = false;
-  clearCopySourceTableSearchTimer();
-  await loadCopySourceTables();
+  await changeCopySourceScope("connection", props.connectionId, true);
 }
 
 async function loadCopySourceColumns(tableName: string) {
+  if (!copySourceScopeReady.value || !copySourceCompatible.value || copySourceScopeLoading.value || copySourceTablesLoading.value) return;
+  clearCopySourceTableSelection();
   copySourceTableName.value = tableName;
-  copySourceColumns.value = [];
-  copySourceColumnSearch.value = "";
-  selectedCopySourceColumnNames.value = [];
   copySourceError.value = "";
-  if (!tableName || !props.connectionId || !props.database) return;
+  if (!tableName) return;
   const requestId = ++copySourceColumnsRequestId;
   copySourceColumnsLoading.value = true;
   try {
-    const sourceColumns = await api.getColumns(props.connectionId, props.database, metadataSchema.value, tableName, props.catalog);
+    const sourceColumns = await api.getColumns(copySourceConnectionId.value, copySourceDatabase.value, copySourceMetadataSchema.value, tableName, copySourceTargetCatalog.value);
     if (requestId !== copySourceColumnsRequestId) return;
     copySourceColumns.value = sourceColumns;
     selectedCopySourceColumnNames.value = copyableSourceColumns.value.filter(({ alreadyExists }) => !alreadyExists).map(({ column }) => column.name);
@@ -2576,7 +3864,15 @@ function toggleCopySourceColumns() {
 }
 
 function applyCopiedColumns() {
-  const copiedColumns = createCopiedColumnDrafts(selectedCopySourceColumns.value, databaseType.value, uuid);
+  if (!canAddColumn.value || !copySourceCompatible.value || !copySourceScopeReady.value || copySourceScopeLoading.value || copySourceTablesLoading.value || copySourceColumnsLoading.value || copySourceError.value) return;
+  const names = new Set(columns.value.filter((column) => !column.markedForDrop).map((column) => tableStructureIdentifierComparisonKey(column.name, databaseType.value, connection.value?.database_info)));
+  const sourceColumns = selectedCopySourceColumns.value.filter((column) => {
+    const key = tableStructureIdentifierComparisonKey(column.name, databaseType.value, connection.value?.database_info);
+    if (names.has(key)) return false;
+    names.add(key);
+    return true;
+  });
+  const copiedColumns = createCopiedColumnDrafts(sourceColumns, databaseType.value, uuid);
   if (!copiedColumns.length) return;
   const insertAt = resolveInsertColumnIndex(columns.value, selectedColumnId.value);
   columns.value.splice(insertAt, 0, ...copiedColumns);
@@ -2680,12 +3976,27 @@ function canDropColumnAt(sourceIndex: number, insertionIndex: number): boolean {
   if (!sourceColumn) return false;
   const crossedColumns = insertionIndex < sourceIndex ? columns.value.slice(insertionIndex, sourceIndex) : columns.value.slice(sourceIndex + 1, insertionIndex);
   if (crossedColumns.some((column) => column.markedForDrop)) return false;
+  if (!isCreateMode.value && databaseType.value === "starrocks" && structureCapabilities.value.reorderColumn) {
+    const reordered = [...columns.value];
+    reordered.splice(sourceIndex, 1);
+    reordered.splice(insertionIndex > sourceIndex ? insertionIndex - 1 : insertionIndex, 0, sourceColumn);
+    const keys = new Set(starrocksAlterContext.value?.keyColumns.map((name) => name.toLowerCase()) ?? []);
+    let sawValue = false;
+    for (const column of reordered) {
+      if (column.markedForDrop) continue;
+      if (keys.has(column.original?.name.toLowerCase() ?? "")) {
+        if (sawValue) return false;
+      } else {
+        sawValue = true;
+      }
+    }
+  }
   if (canShowColumnDragControls.value) return true;
   if (sourceColumn.original) return false;
   return crossedColumns.every((column) => !column.original);
 }
 
-const usesLocalTableColumnOrder = computed(() => !isCreateMode.value && supportsLocalTableColumnReorder(databaseType.value, connection.value?.db_type));
+const usesLocalTableColumnOrder = computed(() => !isCreateMode.value && (databaseType.value === "starrocks" ? !!starrocksAlterContext.value?.model && starrocksAlterContext.value.model !== "duplicate" : supportsLocalTableColumnReorder(databaseType.value, connection.value?.db_type)));
 const canShowColumnDragControls = computed(() => isCreateMode.value || structureCapabilities.value.reorderColumn || usesLocalTableColumnOrder.value);
 
 function localTableColumnOrderScopeKey(): string {
@@ -2981,7 +4292,8 @@ function columnDragInsertionIndexFromPoint(clientY: number): number | null {
   const rows = Array.from(rootRef.value?.querySelectorAll<HTMLElement>("[data-column-row-index]") ?? []);
   if (!rows.length) return null;
   const firstRect = rows[0].getBoundingClientRect();
-  if (clientY < firstRect.top) return 0;
+  const firstIndex = Number(rows[0].dataset.columnRowIndex);
+  if (clientY < firstRect.top) return Number.isInteger(firstIndex) ? firstIndex : 0;
   for (const row of rows) {
     const rowIndex = Number(row.dataset.columnRowIndex);
     if (!Number.isInteger(rowIndex)) continue;
@@ -2990,7 +4302,8 @@ function columnDragInsertionIndexFromPoint(clientY: number): number | null {
       return clientY > rect.top + rect.height / 2 ? rowIndex + 1 : rowIndex;
     }
   }
-  return rows.length;
+  const lastIndex = Number(rows[rows.length - 1]?.dataset.columnRowIndex);
+  return Number.isInteger(lastIndex) ? lastIndex + 1 : rows.length;
 }
 
 function onColumnDragStart(index: number, event: DragEvent) {
@@ -3037,8 +4350,14 @@ function columnRowClass(column: EditableStructureColumn, index: number) {
   const dragState = columnDragState.value;
   const isSearchMatch = filteredColumnRowIds.value.has(column.id);
   const isSelected = selectedColumnIds.value.has(column.id) && !column.markedForDrop;
+  const kind = columnIndexKind(column);
   return {
     "bg-destructive/5 opacity-60": column.markedForDrop,
+    "structure-column-primary-key": kind === "primary",
+    "structure-column-unique-key": kind === "unique",
+    "structure-column-index-key": kind === "index",
+    "structure-column-fulltext-key": kind === "fulltext",
+    "structure-column-spatial-key": kind === "spatial",
     "structure-column-search-match": isSearchMatch,
     // Reuse the existing search-current highlight for the active/selected row.
     "structure-column-search-current": highlightedColumnId.value === column.id || isSelected,
@@ -3092,13 +4411,12 @@ function scrollToColumnSearchMatch(direction: 1 | -1 = 1) {
     focusColumnSearch();
     return;
   }
-  const rows = Array.from(rootRef.value?.querySelectorAll<HTMLElement>("[data-column-row-index]") ?? []);
   const matches = columns.value.map((column, index) => ({ column, index })).filter(({ column }) => columnMatchesSearch(column));
   if (!matches.length) return;
   const currentIndex = highlightedColumnId.value ? matches.findIndex(({ column }) => column.id === highlightedColumnId.value) : -1;
   const nextMatch = matches[(currentIndex + direction + matches.length) % matches.length] ?? matches[0];
   highlightedColumnId.value = nextMatch.column.id;
-  rows[nextMatch.index]?.scrollIntoView({ block: "center", inline: "nearest" });
+  void scrollColumnRowIntoView(nextMatch.index, "center");
   if (columnHighlightTimer) window.clearTimeout(columnHighlightTimer);
   columnHighlightTimer = window.setTimeout(() => {
     highlightedColumnId.value = null;
@@ -3132,8 +4450,14 @@ function indexFieldMatchesSearch(value: string | null | undefined): boolean {
 
 function indexRowClass(index: EditableStructureIndex) {
   const isSearchMatch = filteredIndexRowIds.value.has(index.id);
+  const kind = structureIndexKind(index);
   return {
     "bg-destructive/5 opacity-60": index.markedForDrop,
+    "structure-index-primary-key": kind === "primary",
+    "structure-index-unique-key": kind === "unique",
+    "structure-index-normal-key": kind === "index",
+    "structure-index-fulltext-key": kind === "fulltext",
+    "structure-index-spatial-key": kind === "spatial",
     "structure-column-search-match": isSearchMatch,
     "structure-column-search-current": highlightedIndexId.value === index.id,
   };
@@ -3253,7 +4577,7 @@ async function copyColumnRows(targets: EditableStructureColumn[]) {
 
 /** Batch drop: new rows are removed outright, existing rows are marked for drop. */
 function dropOrRemoveColumns(targets: EditableStructureColumn[]) {
-  for (const column of [...targets]) {
+  for (const column of targets) {
     if (column.original) {
       if (!column.markedForDrop) toggleDropColumn(column);
     } else {
@@ -3276,6 +4600,7 @@ function columnContextMenuItems(column: EditableStructureColumn): ContextMenuIte
   const count = targets.length;
   const allDroppable = targets.every((item) => !item.original || canDropColumn(item));
   return [
+    ...columnIndexContextMenuItems(targets),
     {
       label: isBatchContext ? t("structureEditor.copySelectedColumns", { count }) : t("structureEditor.copyColumn"),
       icon: Copy,
@@ -3292,11 +4617,159 @@ function columnContextMenuItems(column: EditableStructureColumn): ContextMenuIte
   ];
 }
 
+/**
+ * The delete control is icon-only and swaps between three actions, so its
+ * tooltip has to name the action instead of only showing the shortcut (#9870).
+ */
+function deleteColumnActionLabel(column: EditableStructureColumn): string {
+  if (!column.original) {
+    return t("structureEditor.remove");
+  }
+  return column.markedForDrop ? t("structureEditor.restore") : t("structureEditor.drop");
+}
+
+function activeColumnContextMenuItems(): ContextMenuItem[] {
+  const column = columnContextMenuTarget.value;
+  return column ? columnContextMenuItems(column) : [];
+}
+
+function openColumnContextMenu(event: MouseEvent, column: EditableStructureColumn, openContextMenu: (event: MouseEvent, itemsOverride?: ContextMenuItem[]) => void) {
+  const items = columnContextMenuItems(column);
+  columnContextMenuTarget.value = column;
+  openContextMenu(event, items);
+}
+
+function clearColumnContextMenuTarget() {
+  columnContextMenuTarget.value = null;
+}
+
+function canUseColumnIndexActions(targets: EditableStructureColumn[]): boolean {
+  return !loading.value && !saving.value && !indexesLoading.value && !secondaryMetadataErrors.value.indexes && (isCreateMode.value || loadedMetadataFacets.has("indexes")) && targets.length > 0 && targets.every((column) => columnIsSelectable(column) && !!column.name.trim());
+}
+
+function setColumnsPrimaryKey(targets: EditableStructureColumn[]) {
+  if (!canUseColumnIndexActions(targets) || targets.some(isPrimaryKeyDisabled)) return;
+  for (const column of targets) {
+    column.isPrimaryKey = true;
+    column.isNullable = false;
+  }
+  sqlPreviewCollapsed.value = false;
+}
+
+function createIndexFromColumns(targets: EditableStructureColumn[], isUnique: boolean, indexType = "") {
+  if (!canUseColumnIndexActions(targets) || !structureCapabilities.value.createIndex || specialIndexColumnIssue(structureDialect.value, indexType, targets, isUnique)) return;
+  const index = newIndexDraft();
+  index.columns = targets.map((column) => column.name.trim());
+  index.isUnique = isUnique;
+  index.indexType = indexType;
+  refreshAutoIndexName(index);
+  indexes.value.push(index);
+  sqlPreviewCollapsed.value = false;
+}
+
+function addColumnsToIndex(index: EditableStructureIndex, targets: EditableStructureColumn[]) {
+  if (!canUseColumnIndexActions(targets) || !canEditIndexDraft(index) || !canAddColumnsToIndex(index, targets)) return;
+  for (const column of targets) {
+    if (indexContainsColumn(index, column)) continue;
+    // Operator classes are positional; preserve existing entries when extending a key.
+    index.columnOpclasses = index.columns.map((_, position) => index.columnOpclasses?.[position] ?? null);
+    index.columns.push(column.name.trim());
+    index.columnOpclasses.push(null);
+    index.includedColumns = index.includedColumns.filter((name) => structureColumnComparisonKey(name) !== structureColumnComparisonKey(column.name));
+  }
+  refreshAutoIndexName(index);
+  sqlPreviewCollapsed.value = false;
+}
+
+function columnIndexContextMenuItems(targets: EditableStructureColumn[]): ContextMenuItem[] {
+  if (!tableMetadataCapabilities.value.indexes) return [];
+  const disabled = () => !canUseColumnIndexActions(targets);
+  const primaryColumns = columns.value.filter((column) => column.isPrimaryKey && !column.markedForDrop);
+  const createItems: ContextMenuItem[] = [
+    {
+      label: t("structureEditor.createPrimaryIndex"),
+      icon: KeyRound,
+      iconClass: "text-amber-600 dark:text-amber-400",
+      disabled: () => disabled() || primaryColumns.length > 0 || targets.some(isPrimaryKeyDisabled),
+      action: () => setColumnsPrimaryKey(targets),
+    },
+    ...([false, true] as const).map(
+      (unique): ContextMenuItem => ({
+        label: t(unique ? "structureEditor.createUniqueIndex" : "structureEditor.createNormalIndex"),
+        icon: KeyRound,
+        iconClass: indexIconClass(unique ? "unique" : "index"),
+        disabled: () =>
+          disabled() ||
+          !structureCapabilities.value.createIndex ||
+          indexes.value.some(
+            (index) =>
+              !index.markedForDrop &&
+              !index.isPrimary &&
+              index.isUnique === unique &&
+              !index.filter &&
+              (!index.indexType || index.indexType.toUpperCase() === "BTREE") &&
+              index.columns.length === targets.length &&
+              index.columns.every((name, position) => structureColumnComparisonKey(name) === structureColumnComparisonKey(targets[position].name)),
+          ),
+        action: () => createIndexFromColumns(targets, unique),
+      }),
+    ),
+    ...["FULLTEXT", "SPATIAL"]
+      .filter((type) => indexTypeOptions.value.includes(type))
+      .map(
+        (type): ContextMenuItem => ({
+          label: t(type === "FULLTEXT" ? "structureEditor.createFulltextIndex" : "structureEditor.createSpatialIndex"),
+          icon: KeyRound,
+          iconClass: indexIconClass(type === "FULLTEXT" ? "fulltext" : "spatial"),
+          disabled: () => disabled() || !structureCapabilities.value.createIndex || !!specialIndexColumnIssue(structureDialect.value, type, targets),
+          action: () => createIndexFromColumns(targets, false, type),
+        }),
+      ),
+  ];
+  const addItems: ContextMenuItem[] = indexes.value
+    .filter((index) => !index.markedForDrop && !index.isPrimary)
+    .map((index) => ({
+      label: `${index.name || t("structureEditor.addIndex")} (${index.columns.join(", ")})`,
+      icon: KeyRound,
+      iconClass: indexIconClass(structureIndexKind(index)),
+      disabled: () => disabled() || !canEditIndexDraft(index) || !canAddColumnsToIndex(index, targets) || targets.every((column) => indexContainsColumn(index, column)),
+      action: () => addColumnsToIndex(index, targets),
+    }));
+  if (primaryColumns.length)
+    addItems.unshift({
+      label: `PRIMARY (${primaryColumns.map((column) => column.name).join(", ")})`,
+      icon: KeyRound,
+      iconClass: "text-amber-600 dark:text-amber-400",
+      disabled: () => disabled() || targets.every((column) => column.isPrimaryKey) || targets.some(isPrimaryKeyDisabled),
+      action: () => setColumnsPrimaryKey(targets),
+    });
+  return [
+    { label: targets.length > 1 ? t("structureEditor.createCompositeIndex", { count: targets.length }) : t("structureEditor.createColumnIndex"), icon: Plus, disabled, children: createItems },
+    { label: t("structureEditor.addColumnsToIndex"), icon: KeyRound, disabled: () => disabled() || !addItems.length, children: addItems },
+    {
+      label: t("structureEditor.manageIndexes"),
+      icon: Settings,
+      action: () => {
+        activeTab.value = "indexes";
+      },
+    },
+    { label: "", separator: true },
+  ];
+}
+
 function isColumnNameDisabled(column: EditableStructureColumn): boolean {
   return column.markedForDrop || (!!column.original && !structureCapabilities.value.renameColumn);
 }
 
+/** Mirror in the input what the DDL builder does with the name, so the field the
+ * user sees matches the statement that will run. */
+function commitColumnNameInput(column: EditableStructureColumn) {
+  const normalized = draftColumnNameForSql(column.name, column.original?.name);
+  if (normalized !== column.name) column.name = normalized;
+}
+
 function isColumnTypeDisabled(column: EditableStructureColumn): boolean {
+  if (databaseType.value === "starrocks" && starRocksColumnDefinitionLocked(column, starrocksAlterContext.value)) return true;
   return column.markedForDrop || (!!column.original && !structureCapabilities.value.alterType);
 }
 
@@ -3317,11 +4790,13 @@ function isColumnLengthUnitDisabled(column: EditableStructureColumn): boolean {
 }
 
 function isColumnNullableDisabled(column: EditableStructureColumn): boolean {
+  if (databaseType.value === "starrocks" && (starRocksColumnDefinitionLocked(column, starrocksAlterContext.value) || column.original?.is_nullable)) return true;
   return column.markedForDrop || column.isPrimaryKey || (!!column.original && !structureCapabilities.value.alterNullability);
 }
 
 function isColumnDefaultDisabled(column: EditableStructureColumn): boolean {
-  return column.markedForDrop || (!!column.original && !structureCapabilities.value.alterDefault);
+  if (databaseType.value === "starrocks" && starRocksColumnDefinitionLocked(column, starrocksAlterContext.value)) return true;
+  return column.markedForDrop || (!!column.original && !structureCapabilities.value.alterDefault) || isMysqlGeneratedActive(column);
 }
 
 function isColumnCommentDisabled(column: EditableStructureColumn): boolean {
@@ -3342,6 +4817,7 @@ function isPrimaryKeyDisabled(column: EditableStructureColumn): boolean {
 }
 
 function canDropColumn(column: EditableStructureColumn): boolean {
+  if (databaseType.value === "starrocks" && (starRocksColumnDefinitionLocked(column, starrocksAlterContext.value) || starrocksAlterContext.value?.keyColumns.some((name) => name.toLowerCase() === column.original?.name.toLowerCase()))) return false;
   return !!column.original && !column.isPrimaryKey && !isProtectedManticoreIdColumn(databaseType.value, column.original.name) && structureCapabilities.value.dropColumn;
 }
 
@@ -3349,10 +4825,8 @@ function isManticoreColumnPropertyDisabled(column: EditableStructureColumn): boo
   return !canEditManticoreColumnProperties(databaseType.value, !!column.original) || column.markedForDrop;
 }
 
-function addIndex() {
-  if (!structureCapabilities.value.createIndex || indexesLoading.value) return;
-  activeTab.value = "indexes";
-  indexes.value.push({
+function newIndexDraft(): EditableStructureIndex {
+  return {
     id: `new:${uuid()}`,
     name: "",
     columns: [],
@@ -3366,7 +4840,13 @@ function addIndex() {
     concurrently: false,
     columnOpclasses: [],
     markedForDrop: false,
-  });
+  };
+}
+
+function addIndex() {
+  if (!structureCapabilities.value.createIndex || indexesLoading.value) return;
+  activeTab.value = "indexes";
+  indexes.value.push(newIndexDraft());
   void nextTick(() => {
     const indexRows = rootRef.value?.querySelectorAll<HTMLElement>('[data-new-index-row="true"]');
     const row = indexRows?.[indexRows.length - 1];
@@ -3385,26 +4865,27 @@ function existingIndexNamesForDraft(index: EditableStructureIndex): string[] {
   return indexes.value.filter((item) => item.id !== index.id && !item.markedForDrop).map((item) => item.name);
 }
 
-function generatedIndexNameForDraft(index: EditableStructureIndex, columnsForName = index.columns): string {
-  const name = generateUniqueIndexName(structureIndexTableName(), columnsForName, existingIndexNamesForDraft(index));
-  // GaussDB M-mode expects lowercase index names (MySQL-compatible).
+function generatedIndexNameForDraft(index: EditableStructureIndex): string {
+  const firstColumn = index.autoNameColumn ?? index.columns[0] ?? "";
+  const existingNames = existingIndexNamesForDraft(index);
+  if (usesNativeMysqlIndexNames.value) return generateUniqueShortIndexName(firstColumn, existingNames, { ...index, maxLength: 64 });
+  // Index names can be schema-wide outside MySQL. Retain the original table-qualified rule.
+  const name = generateUniqueIndexName(structureIndexTableName(), firstColumn ? [firstColumn] : [], existingNames);
   return connection.value?.driver_profile?.toLowerCase() === "gaussdb-m" ? name.toLowerCase() : name;
 }
 
-function refreshAutoIndexName(index: EditableStructureIndex, previousColumns = index.columns) {
-  if (index.original || index.nameEdited) return;
-  const isGaussdbM = connection.value?.driver_profile?.toLowerCase() === "gaussdb-m";
-  const previousName = generateIndexName(structureIndexTableName(), previousColumns);
-  const previousUniqueName = generateUniqueIndexName(structureIndexTableName(), previousColumns, existingIndexNamesForDraft(index));
-  const currentName = index.name.trim();
-  if (currentName) {
-    if (isGaussdbM) {
-      if (currentName.toLowerCase() !== previousName.toLowerCase() && currentName.toLowerCase() !== previousUniqueName.toLowerCase()) return;
-    } else if (currentName !== previousName && currentName !== previousUniqueName) {
-      return;
-    }
-  }
+function refreshAutoIndexName(index: EditableStructureIndex, typeChanged = false) {
+  if (index.original || index.nameEdited !== false) return;
+  index.autoNameColumn ??= index.columns[0];
+  if (index.name && !typeChanged) return;
   index.name = generatedIndexNameForDraft(index);
+}
+
+function regenerateIndexName(index: EditableStructureIndex) {
+  if (!canEditIndexDraft(index) || !index.columns.length) return;
+  index.autoNameColumn = index.columns[0];
+  index.name = generatedIndexNameForDraft(index);
+  index.nameEdited = !!index.original;
 }
 
 function onIndexNameInput(index: EditableStructureIndex, value: string | number) {
@@ -3419,18 +4900,80 @@ const availableColumnNames = computed(() =>
     .filter(Boolean),
 );
 
-const colSearch = ref("");
+const defaultIndexColumnOptions = computed(() => {
+  return availableColumnNames.value.map((name) => {
+    const column = activeColumnByName.value.get(name);
+    return { name, dataType: column?.dataType ?? "", disabled: false };
+  });
+});
 
-function filteredIndexColumnNames(selectedColumns: readonly string[]): string[] {
-  return filterStructureIndexColumnOptions(availableColumnNames.value, selectedColumns, colSearch.value);
+function indexColumnPickerOptions(index: EditableStructureIndex, included = false) {
+  const selected = included ? index.includedColumns : index.columns;
+  const isSpecial = !included && canIndexTypeHaveSpecialIssue(structureDialect.value, index.indexType);
+  const availableSet = new Set(availableColumnNames.value);
+  const hasUnavailableSelected = selected.some((name) => name.trim() && !availableSet.has(name));
+
+  if (!isSpecial && !hasUnavailableSelected) {
+    return defaultIndexColumnOptions.value;
+  }
+
+  return filterStructureIndexColumnOptions(availableColumnNames.value, selected).map((name) => {
+    const column = activeColumnByName.value.get(name);
+    return { name, dataType: column?.dataType ?? "", disabled: !included && !canToggleIndexColumn(index, name) };
+  });
 }
 
 function toggleIndexColumn(index: EditableStructureIndex, col: string) {
-  const previousColumns = [...index.columns];
+  if (!canEditIndexDraft(index) || !canToggleIndexColumn(index, col)) return;
   const i = index.columns.indexOf(col);
-  if (i >= 0) index.columns.splice(i, 1);
-  else index.columns.push(col);
-  refreshAutoIndexName(index, previousColumns);
+  index.columnOpclasses = index.columns.map((_, position) => index.columnOpclasses?.[position] ?? null);
+  if (i >= 0) {
+    index.columns.splice(i, 1);
+    index.columnOpclasses.splice(i, 1);
+  } else {
+    index.columns.push(col);
+    index.columnOpclasses.push(null);
+  }
+  refreshAutoIndexName(index);
+}
+
+function indexColumnsIssue(index: EditableStructureIndex, names = index.columns, indexType = index.indexType, isUnique = index.isUnique) {
+  if (!canIndexTypeHaveSpecialIssue(structureDialect.value, indexType)) return null;
+  const fields = names.flatMap((name) => {
+    const column = activeColumnByComparisonKey.value.get(structureColumnComparisonKey(name));
+    return column ? [column] : [];
+  });
+  return specialIndexColumnIssue(structureDialect.value, indexType, fields, isUnique);
+}
+
+function needsIndexColumnValidation(index: EditableStructureIndex): boolean {
+  if (indexChanged(index)) return true;
+  // Untouched server metadata must not block unrelated edits under newer UI rules.
+  return columns.value.some((column) => indexContainsColumn(index, column) && (!column.original || column.markedForDrop || column.dataType !== column.original.data_type || column.isNullable !== column.original.is_nullable));
+}
+
+function canToggleIndexColumn(index: EditableStructureIndex, name: string): boolean {
+  if (!canIndexTypeHaveSpecialIssue(structureDialect.value, index.indexType)) return true;
+  return index.columns.includes(name) || !indexColumnsIssue(index, [...index.columns, name]);
+}
+
+function canAddColumnsToIndex(index: EditableStructureIndex, targets: EditableStructureColumn[]): boolean {
+  const names = [...index.columns, ...targets.filter((column) => !indexContainsColumn(index, column)).map((column) => column.name.trim())];
+  return !indexColumnsIssue(index, names);
+}
+
+function onIndexUniqueChange(index: EditableStructureIndex, unique: boolean) {
+  if (!canEditIndexDraft(index) || indexColumnsIssue(index, index.columns, index.indexType, unique)) return;
+  index.isUnique = unique;
+  refreshAutoIndexName(index, true);
+}
+
+function onIndexTypeChange(index: EditableStructureIndex, value: unknown) {
+  const type = String(value ?? "");
+  if (!canEditIndexDraft(index) || indexColumnsIssue(index, index.columns, type, false)) return;
+  index.indexType = type;
+  if (structureIndexKind({ indexType: type }) === "fulltext" || structureIndexKind({ indexType: type }) === "spatial") index.isUnique = false;
+  refreshAutoIndexName(index, true);
 }
 
 function toggleIncludedColumn(index: EditableStructureIndex, col: string) {
@@ -3611,6 +5154,7 @@ function addTrigger() {
     timing: isOracleTriggerEditor.value ? "BEFORE EACH ROW" : isSqlServerTriggerEditor.value ? "AFTER" : "BEFORE",
     event: "INSERT",
     statement: isOracleTriggerEditor.value ? "BEGIN\n  NULL;\nEND" : isSqlServerTriggerEditor.value ? "BEGIN\n  SET NOCOUNT ON;\nEND" : "BEGIN\n  \nEND",
+    enabled: true,
     markedForDrop: false,
   };
   triggers.value.push(draft);
@@ -3627,7 +5171,13 @@ function toggleDropTrigger(trigger: EditableStructureTrigger) {
 }
 
 function canEditTriggerDraft(trigger: EditableStructureTrigger): boolean {
-  return !triggersLoading.value && canEditTriggers.value && !trigger.markedForDrop && canEditStructuredTriggerDraft(databaseType.value, trigger);
+  return canToggleTriggerEnabled(trigger) && canEditStructuredTriggerDraft(databaseType.value, trigger);
+}
+
+// ALTER TRIGGER ... ENABLE/DISABLE leaves the source untouched, so it stays available for
+// triggers whose source the structured form cannot rebuild.
+function canToggleTriggerEnabled(trigger: EditableStructureTrigger): boolean {
+  return !triggersLoading.value && canEditTriggers.value && !trigger.markedForDrop;
 }
 
 function primarySqlOperation(sql: string): string {
@@ -3656,6 +5206,20 @@ async function recordStructureHistory(sql: string, start: number, success: boole
     });
   } catch (e) {
     console.warn("[DBX][structure-history:save-failed]", e);
+  }
+}
+
+const copyColumnNamesDialogOpen = ref(false);
+// Fields marked for drop no longer exist after saving, so they are excluded.
+const copyableStructureColumnNames = computed(() => structureColumnNamesForCopy(columns.value));
+const copyableStructureColumnComments = computed(() => structureColumnCommentsForCopy(columns.value));
+
+async function copyColumnNamesText(text: string) {
+  try {
+    await copyToClipboard(text);
+    toast(t("grid.copied"));
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -3698,6 +5262,7 @@ async function applyChanges() {
     return false;
   }
   const sql = previewSqlText.value;
+  const submittedStarRocksTarget = starrocksStatusTarget.value;
   const connection = store.getConfig(props.connectionId);
   const productionContext = productionContextForDatabase(connection, props.database);
   if (productionContext.active) {
@@ -3711,15 +5276,24 @@ async function applyChanges() {
     if (!confirmed) return false;
   }
   saving.value = true;
+  if (databaseType.value === "starrocks") starrocksSubmittedSql.value = undefined;
   errorMessage.value = "";
   // A hand-written DDL script can change anything about the table, and the
   // structure draft it was applied from is clean, so the change-derived scope
   // would be empty: reload every facet instead of leaving the tabs stale.
-  const refreshScope = ddlDirty.value ? { columns: true, indexes: true, foreignKeys: true, constraints: true, triggers: true, tableComment: true } : captureStructureRefreshScope();
+  const refreshScope = ddlDirty.value ? { columns: true, indexes: true, foreignKeys: true, constraints: true, triggers: true, partitions: true, tableComment: true } : captureStructureRefreshScope();
+  const starrocksPhysicalOrderChanged = !ddlDirty.value && databaseType.value === "starrocks" && structureCapabilities.value.reorderColumn && columns.value.some((column, index) => column.original && column.originalPosition !== index);
   // Plan A guard: concurrent builds only run with a long-enough query timeout
   // (a cancelled build leaves an INVALID index behind), and are blocked
   // up-front when a same-name INVALID index already exists.
   const hasConcurrentIndexBuild = pendingStatements.value.some((statement) => statement.includes("CONCURRENTLY"));
+  // Partition DDL (create parent + initial partitions, attach/detach/drop
+  // chains, ...) must land atomically: a mid-batch failure would otherwise
+  // leave a half-created hierarchy behind. CONCURRENTLY statements cannot run
+  // inside a transaction block, so their presence keeps the batch on the
+  // auto-commit path (the core also refuses that combination).
+  const partitionDdlPending = partitionOperations.value.length > 0 || (isCreateMode.value && createPartitioningEnabled.value);
+  const useTransaction = !hasConcurrentIndexBuild && partitionDdlPending;
   if (hasConcurrentIndexBuild && !isCreateMode.value && databaseType.value === "postgres" && props.tableName) {
     const concurrentIndexNames = concurrentIndexNamesInStatements(pendingStatements.value);
     if (concurrentIndexNames.length > 0) {
@@ -3757,7 +5331,8 @@ async function applyChanges() {
     const result =
       hasSqliteTypeChange.value && !ddlDirty.value
         ? await api.applySqliteTableStructureChange(props.connectionId, props.database, structureChangeOptions(), sqliteSchemaRevision.value!)
-        : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, executionTimeoutSecs);
+        : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, executionTimeoutSecs, useTransaction);
+    if (databaseType.value === "starrocks") starrocksSubmittedSql.value = { target: submittedStarRocksTarget, sql };
     await recordStructureHistory(sql, startedAt, true, result);
     if (!isCreateMode.value && props.tableName) {
       const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
@@ -3766,20 +5341,36 @@ async function applyChanges() {
       await invalidateObjectDdl(ddlRequest());
       loadedMetadataFacets.clear();
     }
-    toast(t("structureEditor.saved"), 2500);
+    toast(t(isCreateMode.value ? "structureEditor.created" : databaseType.value === "starrocks" && refreshScope.columns ? "starrocksLayout.alterSubmitted" : "structureEditor.saved"), 4000);
     sqlPreviewPending.value = false;
     sqlPreviewLoading.value = false;
     pendingStatements.value = [];
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
+    // Partition operations are applied in place; drop them now so the reload
+    // below reflects the new catalog state instead of replaying them.
+    partitionOperations.value = [];
+    if (databaseType.value === "starrocks") {
+      starrocksAlterContext.value = undefined;
+      starrocksSortColumns.value = undefined;
+    }
     ddlFetched.value = false;
-    ddlContent.value = "";
+    rawDdlContent.value = "";
     ddlDraft.value = null;
     if (isCreateMode.value) {
       clearDraft();
-      emit("saved", tableComment.value !== originalTableComment.value);
-      emit("close");
+      // The created tab must query the name the server actually stored: plain
+      // Oracle names are created unquoted and stored upper-folded, plain
+      // Informix-family names lower-folded, and every quoted name keeps its
+      // exact spelling — mirror the DDL generator's quoting rule here.
+      emit("saved", tableComment.value !== originalTableComment.value, foldCreatedTableName(newTableName.value, databaseType.value));
     } else {
+      // An old local-only preference must not mask the newly submitted schema order.
+      if (starrocksPhysicalOrderChanged) {
+        const scopeKey = localTableColumnOrderScopeKey();
+        removeTableDataGridColumnOrder(scopeKey);
+        notifyTableDataGridColumnOrderChanged(scopeKey);
+      }
       // Refresh persisted keys after successful renames/additions before metadata reloads.
       persistLocalColumnOrder(false);
       saving.value = false;
@@ -3794,11 +5385,39 @@ async function applyChanges() {
     // A cancelled/errored concurrent build leaves a same-name INVALID index
     // behind; surface that so retries are not silently doomed.
     const invalidIndexHint = hasConcurrentIndexBuild && /already exists/i.test(rawMessage) ? `\n\n${t("structureEditor.invalidIndexRetryHint")}` : "";
-    errorMessage.value = `${rawMessage}${invalidIndexHint}`;
-    await recordStructureHistory(sql, startedAt, false, undefined, errorMessage.value);
+    const starrocksSchemaChangeBusy = databaseType.value === "starrocks" && /a schema change operation is in progress on the table\b/i.test(rawMessage);
+    errorMessage.value = starrocksSchemaChangeBusy ? t("starrocksLayout.schemaChangeBusy", { table: props.tableName }) : `${rawMessage}${invalidIndexHint}`;
+    await recordStructureHistory(sql, startedAt, false, undefined, starrocksSchemaChangeBusy ? rawMessage : errorMessage.value);
     return false;
   } finally {
     saving.value = false;
+    if (databaseType.value === "starrocks") starrocksStatusRevision.value++;
+  }
+}
+
+async function onStarRocksAlterCompleted() {
+  if (saving.value || loading.value || starrocksDraftDirty.value) return;
+  const requestId = structureLoadRequestId;
+  const target = JSON.stringify([props.connectionId, props.database, props.tableName, props.schema, props.catalog]);
+  const metadataRequest = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName!, catalog: props.catalog };
+  try {
+    invalidateTableMetadataCache(metadataRequest);
+    await Promise.all([invalidateObjectMetadataCache(metadataRequest), invalidateObjectDdl(ddlRequest())]);
+    const [nextColumns, ddlResult] = await Promise.all([api.getColumns(props.connectionId, props.database, metadataSchema.value, props.tableName!, props.catalog), loadObjectDdl(ddlRequest(), { force: true })]);
+    const formatted = await formatStructureDdl(ddlResult.ddl);
+    // Editing while the fetch is in flight must preserve the new draft.
+    if (requestId !== structureLoadRequestId || target !== JSON.stringify([props.connectionId, props.database, props.tableName, props.schema, props.catalog]) || saving.value || loading.value || starrocksDraftDirty.value) return;
+    columns.value = applyStoredLocalColumnOrder(createColumnDrafts(nextColumns, databaseType.value));
+    starrocksAlterContext.value = starRocksAlterOptionsFromDdl(ddlResult.ddl, connection.value?.database_info?.productVersion);
+    starrocksSortColumns.value = [...(starrocksAlterContext.value.sortColumns ?? [])];
+    rawDdlContent.value = formatted;
+    ddlFetched.value = true;
+    scheduleSqlPreviewRefresh();
+    syncDraftToParent();
+    skipNextRefreshVersion = true;
+    emit("saved", false);
+  } catch {
+    toast(t("starrocksStatus.structureRefreshFailed"), 5000);
   }
 }
 
@@ -3836,6 +5455,10 @@ function isShiftEnterShortcut(event: KeyboardEvent): boolean {
   return !event.isComposing && event.key === "Enter" && event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
 }
 
+function isPlainStructureRefreshShortcut(event: KeyboardEvent): boolean {
+  return !event.isComposing && !event.repeat && event.key === "F5" && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+}
+
 function isPlainModDeleteShortcut(event: KeyboardEvent): boolean {
   if (isPlainModShortcut(event, "delete")) return true;
   if (!event.metaKey || event.ctrlKey || !isPlainModShortcut(event, "backspace")) return false;
@@ -3846,7 +5469,37 @@ function isPlainModDeleteShortcut(event: KeyboardEvent): boolean {
 }
 
 function onStructureEditorKeydown(event: KeyboardEvent) {
+  // Desktop blocks F5 before this bubble listener and marks it defaultPrevented.
+  // Handle the shortcut first so that guard still refreshes the open table (#11850).
+  if (isPlainStructureRefreshShortcut(event)) {
+    // Only react when the keypress originates inside this editor: the listener is
+    // window-level and every activated structure editor registers one, so without
+    // this check a plain F5 typed into another editor group (where F5 is the global
+    // refresh-data shortcut) would silently discard THIS editor's unsaved drafts.
+    const target = event.target;
+    if (!(target instanceof Element) || !rootRef.value?.contains(target)) return;
+    if (target.closest('[role="dialog"], [role="alertdialog"]')) return;
+    if (isCreateMode.value) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!loading.value && !saving.value && !ddlLoading.value) void reloadStructureFromDatabase();
+    return;
+  }
   if (event.defaultPrevented) return;
+  if (activeTab.value === "columns" && !eventTargetUsesNativeClipboard(event)) {
+    if (isPlainClipboardShortcut(event, "a")) {
+      event.preventDefault();
+      event.stopPropagation();
+      selectAllStructureColumns();
+      return;
+    }
+    if (isPlainClipboardShortcut(event, "c") && selectedStructureColumnKeys.value.size > 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      void copySelectedStructureColumns();
+      return;
+    }
+  }
   const focusedColumn = activeTab.value === "columns" ? focusedEditableColumn(event.target) : undefined;
   if (focusedColumn && isShiftEnterShortcut(event) && canAddColumn.value) {
     event.preventDefault();
@@ -3940,7 +5593,7 @@ onMounted(() => {
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
   } else if (activeTab.value === "ddl") {
-    void Promise.all([fetchDdl(), loadVisibleTableComment()]).then(markDraftHydratedAndSync);
+    void Promise.all([fetchDdl(), loadVisibleTableComment(), probePartitionsTabVisibility()]).then(markDraftHydratedAndSync);
   } else {
     void loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true }).then(() => applyInitialStructureTarget());
   }
@@ -3968,6 +5621,10 @@ onActivated(() => {
   if (activeTab.value === "ddl") scheduleDdlEditorInit();
 });
 onDeactivated(() => {
+  copyColumnsDialogOpen.value = false;
+  flushStructureScrollDraftSync();
+  if (structureColumnScrollingTimer) clearTimeout(structureColumnScrollingTimer);
+  structureColumnScrollingTimer = undefined;
   unregisterStructureEditorShortcuts();
   structureHorizontalScrollbarObserverGeneration += 1;
   structureHorizontalScrollbarResizeObserver?.disconnect();
@@ -3976,7 +5633,14 @@ onDeactivated(() => {
   destroyDdlEditor();
 });
 onBeforeUnmount(() => {
+  ++copySourceScopeRequestId;
+  resetCopySourceTables();
+  structureLoadRequestId++;
+  flushStructureScrollDraftSync();
+  if (structureColumnScrollingTimer) clearTimeout(structureColumnScrollingTimer);
+  structureColumnScrollingTimer = undefined;
   clearCopySourceTableSearchTimer();
+  if (partitionDialogSqlTimer) clearTimeout(partitionDialogSqlTimer);
   stopColumnDragTracking();
   stopStructureHorizontalScrollbarDrag();
   structureHorizontalScrollbarObserverGeneration += 1;
@@ -3986,7 +5650,6 @@ onBeforeUnmount(() => {
   clearSqlPreviewState();
   if (columnHighlightTimer) window.clearTimeout(columnHighlightTimer);
   if (indexHighlightTimer) window.clearTimeout(indexHighlightTimer);
-  if (structureScrollFrame) window.cancelAnimationFrame(structureScrollFrame);
   persistStructureDensity();
 });
 
@@ -4063,6 +5726,14 @@ watch(tableMetadataCapabilities, (capabilities) => {
   if (!localIsStructureMetadataTabSupported(activeTab.value, capabilities)) activeTab.value = localFirstStructureMetadataTab(capabilities);
 });
 
+// The Partitions tab vanishes for a non-partitioned table, so an active (or
+// navigation-requested) partitions tab must fall back once the probe settles.
+watch([activeTab, partitionStatusResolved, isPartitionedParent, isTablePartition], () => {
+  if (activeTab.value !== "partitions" || isCreateMode.value || !partitionStatusResolved.value) return;
+  if (isPartitionedParent.value || isTablePartition.value) return;
+  activeTab.value = localFirstStructureMetadataTab();
+});
+
 watch(structureCapabilities, () => {
   // Capability loss (e.g. PostgreSQL < 11 without concurrent index support)
   // invalidates any selected Concurrent flag the same way a probe failure
@@ -4084,6 +5755,8 @@ watch([() => props.connectionId, () => props.database, databaseType], () => {
   void loadDynamicDataTypeOptions();
 });
 
+watch(() => connection.value?.database_info?.productVersion, scheduleSqlPreviewRefresh);
+
 watch(
   [
     isCreateMode,
@@ -4101,6 +5774,9 @@ watch(
     mysqlAutoIncrementLoadError,
     mysqlTableEngine,
     originalMysqlTableEngine,
+    physicalOptions,
+    starrocksPhysicalOptions,
+    starrocksSortColumns,
     mysqlTableEngineLoading,
     mysqlTableEngineLoadError,
     mysqlTableDefaultCollation,
@@ -4110,6 +5786,11 @@ watch(
     indexes,
     foreignKeys,
     triggers,
+    partitionOperations,
+    createPartitioningEnabled,
+    createPartitioningKind,
+    createPartitioningColumns,
+    createPartitioningExpression,
   ],
   () => {
     scheduleSqlPreviewRefresh();
@@ -4129,6 +5810,12 @@ watch(activeTab, () => {
 });
 
 watch([activeTab, loading, indexesLoading, visibleColWidths, indexColWidths], observeStructureHorizontalScroller, { deep: true, flush: "post", immediate: true });
+
+// Font sizes change with density, so start measuring again instead of keeping a stale maximum.
+watch(localStructureDensity, () => {
+  extendedPropertiesContentWidth.value = 0;
+});
+watch([columns, localStructureDensity], updateExtendedPropertiesContentWidth, { deep: true, flush: "post" });
 
 watch(
   columns,
@@ -4153,12 +5840,6 @@ watch(secondaryMetadataLoading, (value) => {
   scheduleSqlPreviewRefresh();
 });
 
-watch([() => props.tableName, newTableName], () => {
-  for (const index of indexes.value) {
-    refreshAutoIndexName(index);
-  }
-});
-
 watch(refreshVersion, (version, previous) => {
   if (version === previous || !version || isCreateMode.value) return;
   if (skipNextRefreshVersion) {
@@ -4173,13 +5854,17 @@ watch(refreshVersion, (version, previous) => {
     constraints.value = [];
     constraintsLoaded.value = false;
   }
+  if (activeTab.value !== "partitions") {
+    partitioning.value = null;
+    loadedMetadataFacets.delete("partitions");
+  }
   void loadStructure(true, visibleTableStructureRefreshScope(activeTab.value));
 });
 
 async function loadActiveTableStructureMetadataIfNeeded() {
   if (!structureEditorReady || isCreateMode.value) return;
   if (activeTab.value === "ddl") {
-    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true)]);
+    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true), probePartitionsTabVisibility()]);
     return;
   }
   if (loading.value || secondaryMetadataLoading.value) return;
@@ -4222,15 +5907,43 @@ watch(
 
 <template>
   <div ref="rootRef" class="flex h-full min-h-0 flex-col gap-2 overflow-hidden p-[var(--structure-shell-padding)] text-[length:var(--structure-font-size)]" :data-structure-density="localStructureDensity" :style="structureDensityStyle">
+    <StarRocksLayoutCopyDialog
+      v-if="!isCreateMode && databaseType === 'starrocks' && props.tableName"
+      v-model:open="starrocksLayoutCopyOpen"
+      :connection-id="props.connectionId"
+      :database="props.database"
+      :schema="props.schema"
+      :catalog="props.catalog"
+      :table-name="props.tableName"
+      :server-version="connection?.database_info?.productVersion"
+      :timeout-secs="queryTimeoutSecsForConnection(connection, settingsStore.editorSettings.globalQueryTimeoutSecs)"
+      :authorize="authorizeStarRocksLayoutCopy"
+      @created="emit('saved', false)"
+    />
     <div class="flex shrink-0 items-center gap-2 rounded-md border bg-muted/20 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
       <Database :class="[structureIconClass, 'text-muted-foreground']" />
       <span class="min-w-0 flex-1 truncate font-medium">{{ targetLabel || t("editor.noDatabase") }}</span>
       <Badge variant="outline">{{ connection?.driver_label || databaseType }}</Badge>
-      <Button v-if="!isCreateMode" variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="loading || saving || ddlLoading" @click="reloadStructureFromDatabase">
+      <Button v-if="!isCreateMode" variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="loading || saving || ddlLoading" :title="t('structureEditor.refresh') + ' (F5)'" aria-keyshortcuts="F5" data-refresh-structure-shortcut @click="reloadStructureFromDatabase">
         <RefreshCw :class="structureIconClass" />
         {{ t("structureEditor.refresh") }}
       </Button>
     </div>
+
+    <StarRocksAlterStatus
+      v-if="!isCreateMode && databaseType === 'starrocks' && props.tableName"
+      :connection-id="props.connectionId"
+      :database="props.database"
+      :table-name="props.tableName"
+      :schema="metadataSchema"
+      :catalog="props.catalog"
+      :paused="saving || loading || postSaveRefreshing"
+      :revision="starrocksStatusRevision"
+      :dirty="starrocksDraftDirty"
+      :submitted-sql="starrocksSubmittedSql?.target === starrocksStatusTarget ? starrocksSubmittedSql.sql : undefined"
+      @busy="starrocksStatusBusy = $event"
+      @completed="onStarRocksAlterCompleted"
+    />
 
     <div v-if="isCreateMode" class="flex shrink-0 items-center gap-2">
       <label class="shrink-0 font-medium text-muted-foreground">{{ t("structureEditor.tableName") }}</label>
@@ -4246,6 +5959,11 @@ watch(
         </TooltipTrigger>
         <TooltipContent>{{ t("structureEditor.tableCommentUnsupported") }}</TooltipContent>
       </Tooltip>
+    </div>
+
+    <div v-if="canEditPrimaryKeyName" class="flex shrink-0 items-center gap-2">
+      <label class="shrink-0 font-medium text-muted-foreground">{{ t("structureEditor.primaryKeyName") }}</label>
+      <Input v-model="primaryKeyName" :placeholder="t('structureEditor.primaryKeyNamePlaceholder')" :class="[structureControlClass, 'max-w-[320px]']" :disabled="saving || loading" data-primary-key-name-input />
     </div>
 
     <div v-if="supportsMysqlEngine" class="flex shrink-0 items-center gap-2">
@@ -4270,6 +5988,8 @@ watch(
         <TooltipContent>{{ t("structureEditor.mysqlTableEngineLoadFailed", { message: mysqlTableEngineLoadError }) }}</TooltipContent>
       </Tooltip>
     </div>
+
+    <TablePhysicalOptionsEditor v-if="isCreateMode && databaseType === 'transwarp'" v-model="physicalOptions" :config="INCEPTOR_PHYSICAL_OPTIONS" :columns="columns.filter((column) => !column.markedForDrop && !!column.name.trim())" :disabled="saving" />
 
     <div v-if="supportsTableOwner" class="flex shrink-0 items-center gap-2">
       <label class="flex shrink-0 items-center gap-1 font-medium text-muted-foreground">
@@ -4312,8 +6032,8 @@ watch(
 
     <div v-else class="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
       <div class="min-h-0 min-w-0 flex-1 overflow-hidden rounded-md border">
-        <Tabs v-model="activeTab" class="flex h-full min-h-0 flex-col">
-          <div class="flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
+        <Tabs v-model="activeTab" class="structure-tabs h-full min-h-0">
+          <div class="col-start-1 row-start-1 flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
             <TabsList>
               <TabsTrigger v-if="tableMetadataCapabilities.ddl && !isCreateMode" value="ddl">
                 DDL
@@ -4324,8 +6044,13 @@ watch(
               <TabsTrigger v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.constraints" value="constraints">{{ t("structureEditor.constraints") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.triggers" value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
+              <TabsTrigger v-if="showPartitionsTab" value="partitions">{{ t("structureEditor.partitions") }}</TabsTrigger>
             </TabsList>
             <div class="flex shrink-0 items-center gap-1.5">
+              <Button v-if="!isCreateMode" size="sm" variant="outline" :class="structureToolbarButtonClass" data-structure-view-data @click="emit('viewData')">
+                <Rows3 :class="structureIconClass" />
+                {{ t("contextMenu.viewData") }}
+              </Button>
               <div class="flex items-center gap-1.5">
                 <SlidersHorizontal :class="[structureIconClass, 'text-muted-foreground']" />
                 <div ref="structureDensityMenuRef" class="relative">
@@ -4387,9 +6112,25 @@ watch(
                 </TooltipTrigger>
                 <TooltipContent side="bottom" class="font-mono font-medium" data-add-column-shortcut-content>Shift+Enter</TooltipContent>
               </Tooltip>
+              <Button
+                v-if="activeTab === 'columns' && !isCreateMode && databaseType === 'starrocks'"
+                variant="outline"
+                size="sm"
+                :class="structureToolbarButtonClass"
+                :disabled="loading || saving || hasPendingStructureChanges() || ddlDirty"
+                :title="hasPendingStructureChanges() || ddlDirty ? t('starrocksLayout.copySaveFirst') : undefined"
+                @click="starrocksLayoutCopyOpen = true"
+                data-starrocks-layout-copy-button
+              >
+                <SlidersHorizontal :class="structureIconClass" />{{ t("starrocksLayout.copyButton") }}
+              </Button>
               <Button v-if="activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="openCopyColumnsDialog">
                 <Copy :class="structureIconClass" />
                 {{ t("structureEditor.copyColumns") }}
+              </Button>
+              <Button v-if="activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="copyableStructureColumnNames.length === 0" @click="copyColumnNamesDialogOpen = true">
+                <ClipboardList :class="structureIconClass" />
+                {{ t("grid.copyColumnNames") }}
               </Button>
               <Button v-if="isCreateMode && activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="applyColumnTemplate(PRESET_FIELDS_TEMPLATE_ID)">
                 <Copy :class="structureIconClass" />
@@ -4431,465 +6172,572 @@ watch(
             </div>
           </div>
 
-          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
-            <table class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
-              <thead class="sticky top-0 z-10 bg-background">
-                <tr>
-                  <th
-                    v-for="(columnLabel, i) in colLabels"
-                    :key="columnLabel.key"
-                    :class="[structureHeaderCellClass, { 'text-center': columnLabel.key === 'primaryKey' }]"
-                    :style="{
-                      width: visibleColWidths[i] + 'px',
-                      minWidth: visibleColWidths[i] + 'px',
-                    }"
-                  >
-                    <template v-if="columnLabel.key === 'actions'">
-                      <div class="flex min-w-0 items-center">
-                        <span class="shrink-0 border-r pr-0.5 text-center text-muted-foreground" :style="{ width: columnOrdinalIndicatorWidth + 'px' }">#</span>
-                        <span class="min-w-0 flex-1 pl-0.5 text-center">{{ columnLabel.label }}</span>
-                      </div>
-                    </template>
-                    <template v-else>{{ columnLabel.label }}</template>
-                    <div v-if="columnLabel.key !== 'actions' && i < colLabels.length - 1" class="absolute right-0 top-0 z-20 h-full w-1 cursor-col-resize hover:bg-primary/30" :class="colResizing?.col === columnWidthIndex(i) ? 'bg-primary/30' : ''" @mousedown="onColResize($event, i)" />
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                <CustomContextMenu v-for="(column, index) in columns" :key="column.id" :items="() => columnContextMenuItems(column)" v-slot="{ onContextMenu, isOpen }">
-                  <tr
-                    :class="[columnRowClass(column, index), { 'structure-column-search-current': isOpen && !column.markedForDrop && !selectedColumnIds.has(column.id) }]"
-                    :data-new-column-row="!column.original ? 'true' : undefined"
-                    :data-column-row-index="index"
-                    :data-column-id="column.id"
-                    @mousedown="onColumnRowMouseDown($event)"
-                    @click="onColumnRowClick(column, $event)"
-                    @focusin="onColumnRowActivate(column)"
-                    @contextmenu="onContextMenu"
-                    @dragover="onColumnDragOver(index, $event)"
-                    @drop="onColumnDrop(index, $event)"
-                  >
-                    <td :class="structureCellClass">
-                      <div class="flex min-w-0 items-center">
-                        <div class="flex shrink-0 items-center justify-center gap-1 border-r pr-0.5 text-muted-foreground" :style="{ width: columnOrdinalIndicatorWidth + 'px' }">
-                          <span class="tabular-nums">{{ index + 1 }}</span>
-                          <KeyRound v-if="column.isPrimaryKey" :class="[structureIconClass, 'shrink-0 text-amber-500']" />
-                        </div>
-                        <div class="flex min-w-0 items-center gap-0.5 pl-0.5">
-                          <Button
-                            v-if="canShowColumnDragControls"
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            :class="[structureActionButtonClass, canDragColumn(index) ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed', hasLocalColumnOrderChange ? 'border-primary/30 bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary' : '']"
-                            :disabled="!canDragColumn(index)"
-                            :title="t('structureEditor.dragColumn')"
-                            :aria-label="t('structureEditor.dragColumn')"
-                            :draggable="canDragColumn(index)"
-                            @pointerdown="onColumnDragPointerDown(index, $event)"
-                            @dragstart="onColumnDragStart(index, $event)"
-                            @dragend="onColumnDragEnd"
-                          >
-                            <ListChevronsUpDown :class="structureIconClass" />
-                          </Button>
-                          <Tooltip :delay-duration="FIELD_SHORTCUT_TOOLTIP_DELAY_MS" data-copy-column-shortcut-tooltip>
-                            <TooltipTrigger as-child>
-                              <Button variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canAddColumn || column.markedForDrop" :aria-label="t('structureEditor.copyColumn')" @click.stop="copyColumn(column)">
-                                <Copy :class="structureIconClass" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom" class="font-mono font-medium" data-copy-column-shortcut-content>⌘/Ctrl+D</TooltipContent>
-                          </Tooltip>
-                          <Tooltip :delay-duration="FIELD_SHORTCUT_TOOLTIP_DELAY_MS" data-delete-column-shortcut-tooltip>
-                            <TooltipTrigger as-child>
-                              <Button v-if="column.original" variant="ghost" size="icon" :class="structureActionButtonClass" :disabled="!canDropColumn(column)" :aria-label="column.markedForDrop ? t('structureEditor.restore') : t('structureEditor.drop')" @click.stop="toggleDropColumn(column)">
-                                <RefreshCw v-if="column.markedForDrop" :class="structureIconClass" />
-                                <Trash2 v-else :class="structureIconClass" />
-                              </Button>
-                              <Button v-else variant="ghost" size="icon" :class="structureActionButtonClass" :aria-label="t('structureEditor.remove')" @click.stop="removeNewColumn(column)">
-                                <X :class="structureIconClass" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom" class="font-mono font-medium" data-delete-column-shortcut-content>
-                              {{ column.markedForDrop ? t("structureEditor.restore") : "⌘/Ctrl+Del" }}
-                            </TooltipContent>
-                          </Tooltip>
-                        </div>
-                      </div>
-                    </td>
-                    <td :class="structureCellClass">
-                      <Input v-model="column.name" :class="[structureControlClass, columnSearchFieldClass(column, column.name)]" :disabled="isColumnNameDisabled(column)" data-column-name-input />
-                    </td>
-                    <td :class="structureCellClass">
-                      <SearchableSelect
-                        v-if="!isColumnTypeDisabled(column)"
-                        :model-value="dataTypeBaseInputValue(databaseType, column.dataType)"
-                        :options="dataTypeOptions"
-                        :placeholder="t('structureEditor.typePlaceholder')"
-                        :search-placeholder="t('structureEditor.typePlaceholder')"
-                        :empty-text="t('structureEditor.noMatchingType')"
-                        :loading-text="t('common.loading')"
-                        :allow-custom="true"
-                        :option-tooltip="dataTypeTooltip"
-                        :display-name="gaussdbMDataTypeDisplayName"
-                        :trigger-class="[structureMonoControlClass, 'w-full']"
-                        @update:model-value="(v: string) => updateColumnDataType(column, v)"
-                      />
-                      <Input v-else :model-value="gaussdbMDataTypeDisplayName(dataTypeBaseInputValue(databaseType, column.dataType))" :class="[structureMonoControlClass, 'w-full']" disabled />
-                    </td>
-                    <td v-if="columnEditorControls.length" :class="structureCellClass">
-                      <Popover v-if="isMysqlEnumDataType(databaseType, column.dataType)">
-                        <PopoverTrigger as-child>
-                          <Button variant="outline" size="sm" :class="[structureMonoControlClass, 'w-full justify-between px-2']" :disabled="isColumnTypeDisabled(column)">
-                            <span>{{ t("structureEditor.enumValueCount", { count: column.enumValues?.length ?? 0 }) }}</span>
-                            <ListChevronsUpDown :class="structureIconClass" />
-                          </Button>
-                        </PopoverTrigger>
-                        <PopoverContent class="w-80 p-3" align="start">
-                          <div class="mb-2 flex items-center justify-between gap-2">
-                            <span class="text-sm font-medium">{{ t("structureEditor.enumValues") }}</span>
-                            <Button variant="outline" size="sm" class="h-7 px-2" @click="addMysqlEnumValue(column)">
-                              <Plus class="mr-1 h-3.5 w-3.5" />
-                              {{ t("structureEditor.addEnumValue") }}
-                            </Button>
-                          </div>
-                          <div class="max-h-64 space-y-1.5 overflow-y-auto pr-1">
-                            <div v-for="(value, valueIndex) in column.enumValues" :key="valueIndex" class="flex items-center gap-1.5">
-                              <Input :model-value="value" :class="structureMonoControlClass" :placeholder="t('structureEditor.enumValuePlaceholder')" @update:model-value="updateMysqlEnumValue(column, valueIndex, $event)" />
-                              <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" :disabled="(column.enumValues?.length ?? 0) <= 1" :title="t('structureEditor.removeEnumValue')" @click="removeMysqlEnumValue(column, valueIndex)">
-                                <Trash2 class="h-3.5 w-3.5" />
-                              </Button>
+          <TabsContent v-if="tableMetadataCapabilities.columns" value="columns" class="col-start-1 row-start-2 m-0 min-h-0 flex-1 overflow-hidden p-0">
+            <CustomContextMenu :items="activeColumnContextMenuItems" @close="clearColumnContextMenuTarget" v-slot="columnContextMenuSlot">
+              <RecycleScroller
+                ref="columnsScrollerRef"
+                class="structure-column-virtual-scroller structure-table-scroller h-full overflow-auto"
+                :style="{ '--structure-column-table-width': columnTableWidth + 'px' }"
+                :items="columnVirtualRows"
+                :item-size="columnVirtualItemSize"
+                :min-item-size="structureColumnRowHeight"
+                size-field="size"
+                :buffer="STRUCTURE_COLUMN_VIRTUAL_BUFFER_PX"
+                :prerender="STRUCTURE_COLUMN_VIRTUAL_PRERENDER_ROWS"
+                :emit-update="true"
+                :flow-mode="useColumnVirtualFlowMode"
+                :skip-hover="true"
+                key-field="id"
+                item-class="structure-column-virtual-row"
+                list-class="structure-column-virtual-list"
+                @scroll.passive="onStructureContentScroll('columns', $event)"
+                @update="onColumnVirtualRowsUpdated"
+              >
+                <template #before>
+                  <table class="structure-column-virtual-header-table border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ width: columnTableWidth + 'px', minWidth: columnTableWidth + 'px' }">
+                    <colgroup>
+                      <col v-for="(width, index) in visibleColWidths" :key="index" :style="{ width: width + 'px' }" />
+                    </colgroup>
+                    <thead class="bg-background">
+                      <tr>
+                        <th
+                          v-for="(columnLabel, i) in colLabels"
+                          :key="columnLabel.key"
+                          :class="[structureHeaderCellClass, 'bg-background select-none', { 'text-center': columnLabel.key === 'primaryKey' || columnLabel.key === 'nullable' }]"
+                          :data-column-selected="columnLabel.key === 'actions' ? undefined : selectedStructureColumnKeys.has(columnLabel.key)"
+                          :style="{
+                            width: visibleColWidths[i] + 'px',
+                            minWidth: visibleColWidths[i] + 'px',
+                          }"
+                          @click="selectStructureColumnKey(columnLabel.key, $event)"
+                        >
+                          <template v-if="columnLabel.key === 'actions'">
+                            <div class="flex min-w-0 items-center">
+                              <span class="shrink-0 border-r pr-0.5 text-center text-muted-foreground" :style="{ width: columnOrdinalIndicatorWidth + 'px' }">#</span>
+                              <span class="min-w-0 flex-1 pl-0.5 text-center">{{ columnLabel.label }}</span>
                             </div>
-                          </div>
-                        </PopoverContent>
-                      </Popover>
-                      <div v-else-if="isPostgresGeometryDataType(databaseType, column.dataType)" class="flex min-w-0 flex-col gap-0.5">
-                        <div class="flex min-w-0 items-center gap-1" :title="t('structureEditor.geometrySridHint')">
-                          <SearchableSelect
-                            :model-value="postgresGeometryTypeValue(column.dataType)"
-                            :options="[...POSTGRES_GEOMETRY_TYPES]"
-                            :allow-custom="true"
-                            :clearable="true"
-                            :placeholder="t('structureEditor.geometryTypePlaceholder')"
-                            :search-placeholder="t('structureEditor.geometryTypePlaceholder')"
-                            :empty-text="t('structureEditor.noMatchingType')"
-                            :trigger-class="[structureMonoControlClass, 'min-w-0 flex-1']"
-                            :disabled="isColumnTypeDisabled(column)"
-                            @update:model-value="(v: string) => updatePostgresGeometryColumn(column, v, postgresGeometrySridValue(column.dataType))"
+                          </template>
+                          <template v-else>{{ columnLabel.label }}</template>
+                          <div
+                            v-if="columnLabel.key !== 'actions' && i < colLabels.length - 1"
+                            class="absolute right-0 top-0 z-20 h-full w-1 cursor-col-resize hover:bg-primary/30"
+                            :class="colResizing?.col === columnWidthIndex(i) ? 'bg-primary/30' : ''"
+                            @mousedown="onColResize($event, i)"
+                            @click.stop
                           />
-                          <Input
-                            :model-value="postgresGeometrySridValue(column.dataType)"
-                            :class="[structureMonoControlClass, 'w-20 shrink-0']"
-                            type="number"
-                            min="0"
-                            max="999999"
-                            :placeholder="t('structureEditor.sridPlaceholder')"
-                            :disabled="isColumnTypeDisabled(column)"
-                            @update:model-value="(v: string | number) => updatePostgresGeometryColumn(column, postgresGeometryTypeValue(column.dataType), String(v))"
-                          />
-                        </div>
-                        <p v-if="!postgresGeometryTypeValue(column.dataType) && postgresGeometrySridValue(column.dataType)" class="text-[length:var(--structure-font-size)] text-muted-foreground leading-tight">
-                          {{ t("structureEditor.geometryEmptyTypeHint") }}
-                        </p>
-                      </div>
-                      <div v-else class="flex min-w-0 items-center gap-1">
-                        <Input :model-value="dataTypeLengthInputValue(databaseType, column.dataType)" :class="[structureMonoControlClass, 'min-w-0 flex-1']" :disabled="isColumnLengthDisabled(column)" @update:model-value="updateColumnDataTypeLength(column, $event)" />
-                        <Select v-if="columnLengthUnitOptions(column).length" :model-value="dataTypeLengthUnitValue(databaseType, column.dataType) || '__default'" :disabled="isColumnLengthUnitDisabled(column)" @update:model-value="updateColumnDataTypeLengthUnit(column, $event)">
-                          <SelectTrigger
-                            :aria-label="t('structureEditor.lengthUnit')"
-                            :title="t('structureEditor.lengthUnit')"
-                            class="structure-grid-control h-[var(--structure-control-height)] w-16 shrink-0 rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25"
-                          >
-                            <SelectValue :placeholder="t('structureEditor.unitPlaceholder')" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="__default">{{ t("structureEditor.defaultAction") }}</SelectItem>
-                            <SelectItem v-for="unit in columnLengthUnitOptions(column)" :key="unit" :value="unit">{{ unit }}</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    </td>
-                    <td v-if="columnEditorControls.nullable" :class="structureCellClass">
-                      <label class="flex items-center gap-1.5">
-                        <input v-model="column.isNullable" type="checkbox" :class="structureCheckboxClass" :disabled="isColumnNullableDisabled(column)" />
-                        <span>{{ column.isNullable ? t("structureEditor.yes") : t("structureEditor.no") }}</span>
-                      </label>
-                    </td>
-                    <td v-if="columnEditorControls.primaryKey" :class="[structureCellClass, 'text-center']">
-                      <input
-                        v-model="column.isPrimaryKey"
-                        type="checkbox"
-                        :class="structureCheckboxClass"
-                        :disabled="isPrimaryKeyDisabled(column)"
-                        @change="
-                          () => {
-                            if (column.isPrimaryKey) column.isNullable = false;
-                          }
-                        "
-                      />
-                    </td>
-                    <td v-if="columnEditorControls.defaultValue" :class="structureCellClass">
-                      <div class="flex min-w-0 items-center gap-1">
-                        <Input v-model="column.defaultValue" :class="[structureMonoControlClass, 'flex-1']" :disabled="isColumnDefaultDisabled(column)" />
-                        <DropdownMenu>
-                          <DropdownMenuTrigger as-child>
-                            <Button variant="ghost" size="icon" :class="[structureIconButtonClass, 'shrink-0']" :disabled="isColumnDefaultDisabled(column)" :aria-label="t('structureEditor.defaultValuePresets')" :title="t('structureEditor.defaultValuePresets')">
-                              <ChevronDown :class="structureIconClass" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" class="max-h-56 min-w-36 overflow-y-auto">
-                            <DropdownMenuItem v-for="preset in defaultValuePresets" :key="preset.value" @click="column.defaultValue = preset.value">
-                              <code class="font-mono text-[length:var(--structure-font-size)]">{{ preset.label }}</code>
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </div>
-                    </td>
-                    <td v-if="columnEditorControls.comment" :class="structureCellClass">
-                      <div class="flex min-w-0 items-center gap-1">
-                        <Input v-model="column.comment" :class="[structureControlClass, 'flex-1', columnSearchFieldClass(column, column.comment)]" :disabled="isColumnCommentDisabled(column)" />
-                        <Popover>
-                          <PopoverTrigger as-child>
-                            <Button variant="ghost" size="icon" :class="[structureIconButtonClass, 'shrink-0']" :disabled="isColumnCommentDisabled(column)" :aria-label="t('structureEditor.editComment')" :title="t('structureEditor.editComment')">
-                              <Maximize2 :class="structureIconClass" />
-                            </Button>
-                          </PopoverTrigger>
-                          <PopoverContent align="end" class="w-[420px] p-2.5">
-                            <div class="mb-2 flex items-center justify-between gap-2">
-                              <span class="min-w-0 truncate text-xs font-medium">
-                                {{ t("structureEditor.editComment") }}
-                              </span>
-                              <span class="max-w-44 truncate font-mono text-[length:var(--structure-font-size)] text-muted-foreground">
-                                {{ column.name || t("structureEditor.columnName") }}
-                              </span>
+                        </th>
+                      </tr>
+                    </thead>
+                  </table>
+                </template>
+                <template #default="{ item: { column, index }, active }">
+                  <table class="structure-column-virtual-row-table border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]">
+                    <colgroup>
+                      <col v-for="(width, columnIndex) in visibleColWidths" :key="columnIndex" :style="{ width: width + 'px' }" />
+                    </colgroup>
+                    <tbody class="structure-edit-grid">
+                      <tr
+                        :class="[columnRowClass(column, index), { 'structure-column-search-current': columnContextMenuSlot.isOpen && columnContextMenuTarget?.id === column.id && !column.markedForDrop && !selectedColumnIds.has(column.id) }]"
+                        :data-new-column-row="!column.original ? 'true' : undefined"
+                        :data-column-row-index="index"
+                        :data-column-id="column.id"
+                        :data-column-row-active="active ? 'true' : 'false'"
+                        @mousedown="onColumnRowMouseDown($event)"
+                        @click="onColumnRowClick(column, $event)"
+                        @focusin="onColumnRowActivate(column)"
+                        @contextmenu="openColumnContextMenu($event, column, columnContextMenuSlot.onContextMenu)"
+                        @dragover="onColumnDragOver(index, $event)"
+                        @drop="onColumnDrop(index, $event)"
+                      >
+                        <td :class="[structureCellClass, structureColumnSelectionClass('actions')]">
+                          <div class="flex min-w-0 items-center">
+                            <div class="flex shrink-0 items-center justify-center gap-1 border-r pr-0.5 text-muted-foreground" :style="{ width: columnOrdinalIndicatorWidth + 'px' }">
+                              <span class="tabular-nums">{{ index + 1 }}</span>
+                              <KeyRound v-for="indicator in columnIndexIndicators(column)" :key="indicator.kind" :class="[structureIconClass, indexIconClass(indicator.kind), 'shrink-0']" :title="indicator.title" :aria-label="indicator.title" :data-index-kind="indicator.kind" />
                             </div>
-                            <textarea
-                              v-model="column.comment"
-                              class="min-h-36 w-full resize-y rounded-[6px] border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
-                              :placeholder="t('structureEditor.commentPlaceholder')"
-                              :disabled="isColumnCommentDisabled(column)"
-                            />
-                          </PopoverContent>
-                        </Popover>
-                      </div>
-                    </td>
-                    <td v-if="showCharacterSet" :class="structureCellClass">
-                      <SearchableSelect
-                        :model-value="columnCharset(column)"
-                        :options="mysqlCharsetOptions"
-                        :placeholder="t('structureEditor.charsetPlaceholder')"
-                        :search-placeholder="t('structureEditor.charsetPlaceholder')"
-                        :empty-text="t('structureEditor.noMatchingType')"
-                        :allow-custom="true"
-                        :disabled="isColumnCharsetDisabled(column)"
-                        :trigger-class="[structureMonoControlClass, 'w-full']"
-                        @update:model-value="(v: string) => onCharsetChange(column, v)"
-                      />
-                    </td>
-                    <td v-if="showCharacterSet" :class="structureCellClass">
-                      <SearchableSelect
-                        :model-value="columnCollation(column)"
-                        :options="collationOptionsForCharset(columnCharset(column))"
-                        :placeholder="t('structureEditor.collationPlaceholder')"
-                        :search-placeholder="t('structureEditor.collationPlaceholder')"
-                        :empty-text="t('structureEditor.noMatchingType')"
-                        :allow-custom="true"
-                        :disabled="isColumnCharsetDisabled(column)"
-                        :trigger-class="[structureMonoControlClass, 'w-full']"
-                        @update:model-value="(v: string) => (column.collation = v)"
-                      />
-                    </td>
-                    <td v-if="showExtendedProperties" :class="structureCellClass">
-                      <div :class="structurePropertyListClass">
-                        <!-- Manticore Search: character data type properties -->
-                        <template v-if="databaseType === 'manticoresearch'">
-                          <template v-if="isManticoreTextColumn(column)">
-                            <label :class="structurePropertyLabelClass" title="indexed">
-                              <input :checked="!!column.extra.manticoreIndexed" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreIndexed = ($event.target as HTMLInputElement).checked" />
-                              <span class="min-w-0 truncate">indexed</span>
-                            </label>
-                            <label :class="structurePropertyLabelClass" title="stored">
-                              <input :checked="!!column.extra.manticoreStored" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreStored = ($event.target as HTMLInputElement).checked" />
-                              <span class="min-w-0 truncate">stored</span>
-                            </label>
-                            <label :class="structurePropertyLabelClass" title="attribute">
-                              <input :checked="!!column.extra.manticoreAttribute" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreAttribute = ($event.target as HTMLInputElement).checked" />
-                              <span class="min-w-0 truncate">attribute</span>
-                            </label>
-                          </template>
-                          <template v-else-if="isManticoreJsonColumn(column)">
-                            <label :class="structurePropertyLabelClass" title="secondary_index">
-                              <input :checked="!!column.extra.manticoreSecondaryIndex" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreSecondaryIndex = ($event.target as HTMLInputElement).checked" />
-                              <span class="min-w-0 truncate">secondary_index</span>
-                            </label>
-                          </template>
-                        </template>
-                        <!-- MySQL: AUTO_INCREMENT + ON UPDATE CURRENT_TIMESTAMP -->
-                        <template v-else-if="structureDialect === 'sqlite'">
-                          <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.autoIncrement')">
-                            <input :checked="isSqliteAutoIncrement(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditSqliteAutoIncrement(column)" @change="setSqliteAutoIncrement(column, ($event.target as HTMLInputElement).checked)" />
-                            <span>{{ t("structureEditor.autoIncrement") }}</span>
-                          </label>
-                        </template>
-                        <template v-else-if="structureDialect === 'mysql'">
-                          <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.autoIncrement')">
-                            <input :checked="column.extra.autoIncrement" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" @change="setMysqlAutoIncrement(column, ($event.target as HTMLInputElement).checked)" />
-                            <span>{{ t("structureEditor.autoIncrement") }}</span>
-                          </label>
-                          <Popover v-if="isMysqlAutoIncrementCounterColumn(column)">
-                            <PopoverTrigger as-child>
+                            <div class="flex min-w-0 items-center gap-0.5 pl-0.5">
+                              <Button
+                                v-if="canShowColumnDragControls"
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                :class="[structureActionButtonClass, canDragColumn(index) ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed', hasLocalColumnOrderChange ? 'border-primary/30 bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary' : '']"
+                                :disabled="!canDragColumn(index)"
+                                :title="t('structureEditor.dragColumn')"
+                                :aria-label="t('structureEditor.dragColumn')"
+                                :draggable="canDragColumn(index)"
+                                @pointerdown="onColumnDragPointerDown(index, $event)"
+                                @dragstart="onColumnDragStart(index, $event)"
+                                @dragend="onColumnDragEnd"
+                              >
+                                <ListChevronsUpDown :class="structureIconClass" />
+                              </Button>
                               <Button
                                 variant="ghost"
                                 size="icon"
-                                :class="[structureIconButtonClass, 'mr-1 shrink-0']"
-                                :title="t('structureEditor.editMysqlAutoIncrementValue', { value: mysqlAutoIncrementValue || '—' })"
-                                :aria-label="t('structureEditor.editMysqlAutoIncrementValue', { value: mysqlAutoIncrementValue || '—' })"
-                                data-mysql-auto-increment-editor-trigger
+                                :class="structureActionButtonClass"
+                                :disabled="!canAddColumn || column.markedForDrop"
+                                :aria-label="t('structureEditor.copyColumn')"
+                                aria-keyshortcuts="Control+D Meta+D"
+                                :title="t('structureEditor.copyColumn') + ' ⌘/Ctrl+D'"
+                                data-copy-column-shortcut-button
+                                @click.stop="copyColumn(column)"
                               >
-                                <Loader2 v-if="mysqlAutoIncrementLoading" :class="[structureIconClass, 'animate-spin text-muted-foreground']" />
-                                <AlertTriangle v-else-if="mysqlAutoIncrementLoadError" :class="[structureIconClass, 'text-destructive']" />
-                                <Pencil v-else :class="structureIconClass" />
+                                <Copy :class="structureIconClass" />
+                              </Button>
+                              <Button
+                                v-if="column.original"
+                                variant="ghost"
+                                size="icon"
+                                :class="structureActionButtonClass"
+                                :disabled="!canDropColumn(column)"
+                                :aria-label="column.markedForDrop ? t('structureEditor.restore') : t('structureEditor.drop')"
+                                :aria-keyshortcuts="column.markedForDrop ? undefined : 'Control+Delete Meta+Delete'"
+                                :title="deleteColumnActionLabel(column) + (column.markedForDrop ? '' : ' ⌘/Ctrl+Del')"
+                                data-delete-column-shortcut-button
+                                @click.stop="toggleDropColumn(column)"
+                              >
+                                <RefreshCw v-if="column.markedForDrop" :class="structureIconClass" />
+                                <Trash2 v-else :class="structureIconClass" />
+                              </Button>
+                              <Button
+                                v-else
+                                variant="ghost"
+                                size="icon"
+                                :class="structureActionButtonClass"
+                                :aria-label="t('structureEditor.remove')"
+                                aria-keyshortcuts="Control+Delete Meta+Delete"
+                                :title="t('structureEditor.remove') + ' ⌘/Ctrl+Del'"
+                                data-delete-column-shortcut-button
+                                @click.stop="removeNewColumn(column)"
+                              >
+                                <X :class="structureIconClass" />
+                              </Button>
+                            </div>
+                          </div>
+                        </td>
+                        <td :class="[structureCellClass, structureColumnSelectionClass('name')]">
+                          <Input v-model="column.name" :class="[structureControlClass, columnSearchFieldClass(column, column.name)]" :title="columnIndexTitle(column) || undefined" :disabled="isColumnNameDisabled(column)" data-column-name-input @blur="commitColumnNameInput(column)" />
+                        </td>
+                        <td :class="[structureCellClass, 'structure-column-data-type', structureDataTypeToneClass(column.dataType), structureColumnSelectionClass('type')]">
+                          <SearchableSelect
+                            v-if="!isColumnTypeDisabled(column)"
+                            :model-value="dataTypeBaseInputValue(databaseType, column.dataType)"
+                            :options="dataTypeOptions"
+                            :placeholder="t('structureEditor.typePlaceholder')"
+                            :search-placeholder="t('structureEditor.typePlaceholder')"
+                            :empty-text="t('structureEditor.noMatchingType')"
+                            :loading-text="t('common.loading')"
+                            :allow-custom="true"
+                            :option-tooltip="dataTypeTooltip"
+                            :display-name="gaussdbMDataTypeDisplayName"
+                            :trigger-class="[structureMonoControlClass, 'w-full']"
+                            @update:model-value="(v: string) => updateColumnDataType(column, v)"
+                          >
+                            <template #option-label="{ option, label }">
+                              <span :class="['structure-data-type-option block truncate font-mono', structureDataTypeToneClass(option)]">{{ label }}</span>
+                            </template>
+                            <template #custom-option-label="{ value }">
+                              <span :class="['structure-data-type-option block truncate font-mono', structureDataTypeToneClass(value)]">{{ value }}</span>
+                            </template>
+                          </SearchableSelect>
+                          <Input v-else :model-value="gaussdbMDataTypeDisplayName(dataTypeBaseInputValue(databaseType, column.dataType))" :class="[structureMonoControlClass, 'w-full']" disabled />
+                        </td>
+                        <td v-if="columnEditorControls.length" :class="[structureCellClass, structureColumnSelectionClass('length')]">
+                          <Popover v-if="isMysqlEnumDataType(databaseType, column.dataType)">
+                            <PopoverTrigger as-child>
+                              <Button variant="outline" size="sm" :class="[structureMonoControlClass, 'w-full justify-between px-2']" :disabled="isColumnTypeDisabled(column)">
+                                <span>{{ t("structureEditor.enumValueCount", { count: column.enumValues?.length ?? 0 }) }}</span>
+                                <ListChevronsUpDown :class="structureIconClass" />
                               </Button>
                             </PopoverTrigger>
-                            <PopoverContent align="start" class="w-80 space-y-2 p-3">
-                              <label class="block text-xs font-medium text-foreground">{{ t("structureEditor.mysqlAutoIncrementNextValue") }}</label>
-                              <Input
-                                :model-value="mysqlAutoIncrementValue"
-                                inputmode="numeric"
-                                pattern="[0-9]*"
-                                autocomplete="off"
-                                data-mysql-auto-increment-counter
-                                :aria-label="t('structureEditor.mysqlAutoIncrementNextValue')"
-                                :placeholder="mysqlAutoIncrementLoading ? t('common.loading') : '—'"
-                                :title="mysqlAutoIncrementLoadError || undefined"
-                                class="w-full font-mono"
-                                :disabled="mysqlAutoIncrementLoading || !!mysqlAutoIncrementLoadError || originalMysqlAutoIncrementValue === undefined || saving"
-                                @input.capture="onMysqlAutoIncrementInput"
-                              />
-                              <p v-if="mysqlAutoIncrementLoadError" class="text-xs text-destructive">{{ mysqlAutoIncrementLoadError }}</p>
-                              <p class="text-xs leading-5 text-muted-foreground">{{ t("contextMenu.mysqlAutoIncrementNonemptyHint") }}</p>
+                            <PopoverContent class="w-80 p-3" align="start">
+                              <div class="mb-2 flex items-center justify-between gap-2">
+                                <span class="text-sm font-medium">{{ t("structureEditor.enumValues") }}</span>
+                                <Button variant="outline" size="sm" class="h-7 px-2" @click="addMysqlEnumValue(column)">
+                                  <Plus class="mr-1 h-3.5 w-3.5" />
+                                  {{ t("structureEditor.addEnumValue") }}
+                                </Button>
+                              </div>
+                              <div class="max-h-64 space-y-1.5 overflow-y-auto pr-1">
+                                <div v-for="(value, valueIndex) in column.enumValues" :key="valueIndex" class="flex items-center gap-1.5">
+                                  <Input :model-value="value" :class="structureMonoControlClass" :placeholder="t('structureEditor.enumValuePlaceholder')" @update:model-value="updateMysqlEnumValue(column, Number(valueIndex), $event)" />
+                                  <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" :disabled="(column.enumValues?.length ?? 0) <= 1" :title="t('structureEditor.removeEnumValue')" @click="removeMysqlEnumValue(column, Number(valueIndex))">
+                                    <Trash2 class="h-3.5 w-3.5" />
+                                  </Button>
+                                </div>
+                              </div>
                             </PopoverContent>
                           </Popover>
-                          <label :class="[structurePropertyLabelClass, 'flex-1 basis-0']" :title="t('structureEditor.onUpdateCurrentTimestamp')">
-                            <input v-model="column.extra.onUpdateCurrentTimestamp" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" />
-                            <span class="min-w-0 truncate">{{ t("structureEditor.onUpdateCurrentTimestamp") }}</span>
-                          </label>
-                        </template>
-                        <!-- Dameng: IDENTITY -->
-                        <template v-else-if="databaseType === 'dameng'">
-                          <label :class="structurePropertyLabelClass" :title="t('structureEditor.identity')">
-                            <input :checked="isDamengIdentityChecked(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditDamengIdentity(column)" @change="setDamengIdentity(column, ($event.target as HTMLInputElement).checked)" />
-                            <span class="min-w-0 truncate">{{ t("structureEditor.autoIncrement") }}</span>
-                          </label>
-                          <template v-if="isDamengIdentityChecked(column)">
-                            <Input
-                              :model-value="column.extra.identity?.seed?.toString() ?? '1'"
-                              type="number"
-                              :class="[structureControlClass, 'w-14']"
-                              :placeholder="t('structureEditor.identitySeed')"
-                              :disabled="!canEditDamengIdentityParameters(column)"
-                              @update:model-value="(v) => updateDamengIdentitySeed(column, v)"
-                            />
-                            <Input
-                              :model-value="column.extra.identity?.increment?.toString() ?? '1'"
-                              type="number"
-                              :class="[structureControlClass, 'w-14']"
-                              :placeholder="t('structureEditor.identityIncrement')"
-                              :disabled="!canEditDamengIdentityParameters(column)"
-                              @update:model-value="(v) => updateDamengIdentityIncrement(column, v)"
-                            />
-                          </template>
-                        </template>
-                        <!-- PostgreSQL: IDENTITY -->
-                        <template v-else-if="structureDialect === 'postgres'">
-                          <Select
-                            :model-value="column.extra.identity?.generation ?? 'none'"
-                            @update:model-value="
-                              (value: any) => {
-                                const generation = String(value ?? '');
-                                if (generation && generation !== 'none') {
-                                  column.extra.identity = {
-                                    ...column.extra.identity,
-                                    generation: generation as 'BY DEFAULT' | 'ALWAYS',
-                                  };
-                                } else {
-                                  column.extra.identity = undefined;
-                                }
+                          <div v-else-if="isPostgresGeometryDataType(databaseType, column.dataType)" class="flex min-w-0 flex-col gap-0.5">
+                            <div class="flex min-w-0 items-center gap-1" :title="t('structureEditor.geometrySridHint')">
+                              <SearchableSelect
+                                :model-value="postgresGeometryTypeValue(column.dataType)"
+                                :options="[...POSTGRES_GEOMETRY_TYPES]"
+                                :allow-custom="true"
+                                :clearable="true"
+                                :placeholder="t('structureEditor.geometryTypePlaceholder')"
+                                :search-placeholder="t('structureEditor.geometryTypePlaceholder')"
+                                :empty-text="t('structureEditor.noMatchingType')"
+                                :trigger-class="[structureMonoControlClass, 'min-w-0 flex-1']"
+                                :disabled="isColumnTypeDisabled(column)"
+                                @update:model-value="(v: string) => updatePostgresGeometryColumn(column, v, postgresGeometrySridValue(column.dataType))"
+                              />
+                              <Input
+                                :model-value="postgresGeometrySridValue(column.dataType)"
+                                :class="[structureMonoControlClass, 'w-20 shrink-0']"
+                                type="number"
+                                min="0"
+                                max="999999"
+                                :placeholder="t('structureEditor.sridPlaceholder')"
+                                :disabled="isColumnTypeDisabled(column)"
+                                @update:model-value="(v: string | number) => updatePostgresGeometryColumn(column, postgresGeometryTypeValue(column.dataType), String(v))"
+                              />
+                            </div>
+                            <p v-if="!postgresGeometryTypeValue(column.dataType) && postgresGeometrySridValue(column.dataType)" class="text-[length:var(--structure-font-size)] text-muted-foreground leading-tight">
+                              {{ t("structureEditor.geometryEmptyTypeHint") }}
+                            </p>
+                          </div>
+                          <div v-else class="flex min-w-0 items-center gap-1">
+                            <Input :model-value="dataTypeLengthInputValue(databaseType, column.dataType)" :class="[structureMonoControlClass, 'min-w-0 flex-1']" :disabled="isColumnLengthDisabled(column)" @update:model-value="updateColumnDataTypeLength(column, $event)" />
+                            <Select v-if="columnLengthUnitOptions(column).length" :model-value="dataTypeLengthUnitValue(databaseType, column.dataType) || '__default'" :disabled="isColumnLengthUnitDisabled(column)" @update:model-value="updateColumnDataTypeLengthUnit(column, $event)">
+                              <SelectTrigger
+                                :aria-label="t('structureEditor.lengthUnit')"
+                                :title="t('structureEditor.lengthUnit')"
+                                class="structure-grid-control h-[var(--structure-control-height)] w-16 shrink-0 rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25"
+                              >
+                                <SelectValue :placeholder="t('structureEditor.unitPlaceholder')" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="__default">{{ t("structureEditor.defaultAction") }}</SelectItem>
+                                <SelectItem v-for="unit in columnLengthUnitOptions(column)" :key="unit" :value="unit">{{ unit }}</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </td>
+                        <td v-if="columnEditorControls.nullable" :class="[structureCellClass, 'text-center', structureColumnSelectionClass('nullable')]">
+                          <input v-model="column.isNullable" type="checkbox" :class="structureCheckboxClass" :disabled="isColumnNullableDisabled(column)" :aria-label="t('structureEditor.nullable')" />
+                        </td>
+                        <td v-if="columnEditorControls.primaryKey" :class="[structureCellClass, 'text-center', structureColumnSelectionClass('primaryKey')]">
+                          <input
+                            v-model="column.isPrimaryKey"
+                            type="checkbox"
+                            :class="structureCheckboxClass"
+                            :disabled="isPrimaryKeyDisabled(column)"
+                            :aria-label="t('structureEditor.primaryKey')"
+                            @change="
+                              () => {
+                                if (column.isPrimaryKey) column.isNullable = false;
                               }
                             "
-                          >
-                            <SelectTrigger class="structure-grid-control h-[var(--structure-control-height)] w-28 rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="none">{{ t("structureEditor.no") }}</SelectItem>
-                              <SelectItem value="BY DEFAULT">BY DEFAULT</SelectItem>
-                              <SelectItem value="ALWAYS">ALWAYS</SelectItem>
-                            </SelectContent>
-                          </Select>
-                          <template v-if="column.extra.identity?.generation">
-                            <Input
-                              :model-value="column.extra.identity.seed?.toString() ?? ''"
-                              type="number"
-                              :class="[structureControlClass, 'w-14']"
-                              :placeholder="t('structureEditor.identitySeed')"
-                              @update:model-value="
-                                (v) => {
-                                  if (column.extra.identity) {
-                                    column.extra.identity.seed = v ? Number(v) : undefined;
+                          />
+                        </td>
+                        <td v-if="columnEditorControls.defaultValue" :class="[structureCellClass, 'structure-column-default-value', structureDefaultValueToneClass(column.defaultValue, column.dataType), structureColumnSelectionClass('defaultValue')]">
+                          <div class="flex min-w-0 items-center gap-1">
+                            <Input v-model="column.defaultValue" :class="[structureMonoControlClass, 'flex-1']" :disabled="isColumnDefaultDisabled(column)" />
+                            <DropdownMenu>
+                              <DropdownMenuTrigger as-child>
+                                <Button variant="ghost" size="icon" :class="[structureIconButtonClass, 'shrink-0']" :disabled="isColumnDefaultDisabled(column)" :aria-label="t('structureEditor.defaultValuePresets')" :title="t('structureEditor.defaultValuePresets')">
+                                  <ChevronDown :class="structureIconClass" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" class="max-h-56 w-max min-w-36 max-w-[calc(100vw-1rem)] overflow-y-auto">
+                                <DropdownMenuItem v-for="preset in columnDefaultValuePresets(column)" :key="preset.value" @click="column.defaultValue = preset.value">
+                                  <code :class="['structure-data-type-option block truncate font-mono text-[length:var(--structure-font-size)]', structureDefaultValueToneClass(preset.value, preset.dataType)]">{{ preset.label }}</code>
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
+                        </td>
+                        <td v-if="columnEditorControls.comment" :class="[structureCellClass, structureColumnSelectionClass('comment')]">
+                          <div class="flex min-w-0 items-center gap-1">
+                            <Input v-model="column.comment" :class="[structureControlClass, 'flex-1', columnSearchFieldClass(column, column.comment)]" :disabled="isColumnCommentDisabled(column)" />
+                            <Popover>
+                              <PopoverTrigger as-child>
+                                <Button variant="ghost" size="icon" :class="[structureIconButtonClass, 'shrink-0']" :disabled="isColumnCommentDisabled(column)" :aria-label="t('structureEditor.editComment')" :title="t('structureEditor.editComment')">
+                                  <Maximize2 :class="structureIconClass" />
+                                </Button>
+                              </PopoverTrigger>
+                              <PopoverContent align="end" class="w-[420px] p-2.5">
+                                <div class="mb-2 flex items-center justify-between gap-2">
+                                  <span class="min-w-0 truncate text-xs font-medium">
+                                    {{ t("structureEditor.editComment") }}
+                                  </span>
+                                  <span class="max-w-44 truncate font-mono text-[length:var(--structure-font-size)] text-muted-foreground">
+                                    {{ column.name || t("structureEditor.columnName") }}
+                                  </span>
+                                </div>
+                                <textarea
+                                  v-model="column.comment"
+                                  class="min-h-36 w-full resize-y rounded-[6px] border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
+                                  :placeholder="t('structureEditor.commentPlaceholder')"
+                                  :disabled="isColumnCommentDisabled(column)"
+                                />
+                              </PopoverContent>
+                            </Popover>
+                          </div>
+                        </td>
+                        <td v-if="showCharacterSet" :class="[structureCellClass, structureColumnSelectionClass('characterSet')]">
+                          <SearchableSelect
+                            :model-value="columnCharset(column)"
+                            :options="mysqlCharsetOptions"
+                            :placeholder="t('structureEditor.charsetPlaceholder')"
+                            :search-placeholder="t('structureEditor.charsetPlaceholder')"
+                            :empty-text="t('structureEditor.noMatchingType')"
+                            :allow-custom="true"
+                            :disabled="isColumnCharsetDisabled(column)"
+                            :trigger-class="[structureMonoControlClass, 'w-full']"
+                            @update:model-value="(v: string) => onCharsetChange(column, v)"
+                          />
+                        </td>
+                        <td v-if="showCharacterSet" :class="[structureCellClass, structureColumnSelectionClass('collation')]">
+                          <SearchableSelect
+                            :model-value="columnCollation(column)"
+                            :options="collationOptionsForCharset(columnCharset(column))"
+                            :placeholder="t('structureEditor.collationPlaceholder')"
+                            :search-placeholder="t('structureEditor.collationPlaceholder')"
+                            :empty-text="t('structureEditor.noMatchingType')"
+                            :allow-custom="true"
+                            :disabled="isColumnCharsetDisabled(column)"
+                            :trigger-class="[structureMonoControlClass, 'w-full']"
+                            @update:model-value="(v: string) => (column.collation = v)"
+                          />
+                        </td>
+                        <td v-if="showExtendedProperties" :class="[structureCellClass, structureColumnSelectionClass('extendedProperties')]">
+                          <div :class="structurePropertyListClass" data-structure-extended-properties>
+                            <!-- Manticore Search: character data type properties -->
+                            <template v-if="databaseType === 'manticoresearch'">
+                              <template v-if="isManticoreTextColumn(column)">
+                                <label :class="structurePropertyLabelClass" title="indexed">
+                                  <input :checked="!!column.extra.manticoreIndexed" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreIndexed = ($event.target as HTMLInputElement).checked" />
+                                  <span class="min-w-0 truncate">indexed</span>
+                                </label>
+                                <label :class="structurePropertyLabelClass" title="stored">
+                                  <input :checked="!!column.extra.manticoreStored" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreStored = ($event.target as HTMLInputElement).checked" />
+                                  <span class="min-w-0 truncate">stored</span>
+                                </label>
+                                <label :class="structurePropertyLabelClass" title="attribute">
+                                  <input :checked="!!column.extra.manticoreAttribute" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isManticoreColumnPropertyDisabled(column)" @change="column.extra.manticoreAttribute = ($event.target as HTMLInputElement).checked" />
+                                  <span class="min-w-0 truncate">attribute</span>
+                                </label>
+                              </template>
+                              <template v-else-if="isManticoreJsonColumn(column)">
+                                <label :class="structurePropertyLabelClass" title="secondary_index">
+                                  <input
+                                    :checked="!!column.extra.manticoreSecondaryIndex"
+                                    type="checkbox"
+                                    :class="[structureCheckboxClass, 'shrink-0']"
+                                    :disabled="isManticoreColumnPropertyDisabled(column)"
+                                    @change="column.extra.manticoreSecondaryIndex = ($event.target as HTMLInputElement).checked"
+                                  />
+                                  <span class="min-w-0 truncate">secondary_index</span>
+                                </label>
+                              </template>
+                            </template>
+                            <!-- MySQL: AUTO_INCREMENT + ON UPDATE CURRENT_TIMESTAMP -->
+                            <template v-else-if="structureDialect === 'sqlite'">
+                              <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.autoIncrement')">
+                                <input :checked="isSqliteAutoIncrement(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditSqliteAutoIncrement(column)" @change="setSqliteAutoIncrement(column, ($event.target as HTMLInputElement).checked)" />
+                                <span>{{ t("structureEditor.autoIncrement") }}</span>
+                              </label>
+                            </template>
+                            <template v-else-if="structureDialect === 'mysql'">
+                              <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.virtual')">
+                                <input :checked="isMysqlGeneratedChecked(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" @change="setMysqlGenerated(column, ($event.target as HTMLInputElement).checked)" />
+                                <span>{{ t("structureEditor.virtual") }}</span>
+                              </label>
+                              <Popover v-if="isMysqlGeneratedChecked(column)">
+                                <PopoverTrigger as-child>
+                                  <Button variant="ghost" size="icon" :class="[structureIconButtonClass, 'mr-1 shrink-0']" :title="t('structureEditor.generatedExpression')" :aria-label="t('structureEditor.generatedExpression')" data-mysql-generated-expression-trigger>
+                                    <SquareFunction :class="structureIconClass" />
+                                  </Button>
+                                </PopoverTrigger>
+                                <PopoverContent align="start" class="w-96 space-y-2 p-3">
+                                  <label class="block text-xs font-medium text-foreground">{{ t("structureEditor.generatedExpression") }}</label>
+                                  <Input
+                                    :model-value="column.extra.generated?.expression ?? ''"
+                                    class="w-full font-mono"
+                                    :placeholder="t('structureEditor.generatedExpressionPlaceholder')"
+                                    data-mysql-generated-expression
+                                    :aria-label="t('structureEditor.generatedExpression')"
+                                    @update:model-value="(v) => updateMysqlGeneratedExpression(column, String(v ?? ''))"
+                                  />
+                                  <p v-if="!isMysqlGeneratedActive(column)" class="text-xs text-destructive">{{ t("structureEditor.generatedExpressionEmptyHint") }}</p>
+                                  <div class="flex items-center gap-2">
+                                    <label class="text-xs text-muted-foreground">{{ t("structureEditor.generatedStorage") }}</label>
+                                    <Select :model-value="column.extra.generated?.storage ?? 'VIRTUAL'" @update:model-value="(v) => updateMysqlGeneratedStorage(column, String(v ?? 'VIRTUAL'))">
+                                      <SelectTrigger class="h-[var(--structure-control-height)] w-28 rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
+                                        <SelectValue />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="VIRTUAL">{{ t("structureEditor.generatedStorageVirtual") }}</SelectItem>
+                                        <SelectItem value="STORED">{{ t("structureEditor.generatedStorageStored") }}</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                  <p class="text-xs leading-5 text-muted-foreground">{{ t("structureEditor.generatedExpressionHint") }}</p>
+                                </PopoverContent>
+                              </Popover>
+                              <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.autoIncrement')">
+                                <input :checked="column.extra.autoIncrement" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isMysqlGeneratedActive(column)" @change="setMysqlAutoIncrement(column, ($event.target as HTMLInputElement).checked)" />
+                                <span>{{ t("structureEditor.autoIncrement") }}</span>
+                              </label>
+                              <Popover v-if="isMysqlAutoIncrementCounterColumn(column)">
+                                <PopoverTrigger as-child>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    :class="[structureIconButtonClass, 'mr-1 shrink-0']"
+                                    :title="t(isCreateMode ? 'structureEditor.editMysqlAutoIncrementStartValue' : 'structureEditor.editMysqlAutoIncrementValue', { value: mysqlAutoIncrementValue || '—' })"
+                                    :aria-label="t(isCreateMode ? 'structureEditor.editMysqlAutoIncrementStartValue' : 'structureEditor.editMysqlAutoIncrementValue', { value: mysqlAutoIncrementValue || '—' })"
+                                    data-mysql-auto-increment-editor-trigger
+                                  >
+                                    <Loader2 v-if="mysqlAutoIncrementLoading" :class="[structureIconClass, 'animate-spin text-muted-foreground']" />
+                                    <AlertTriangle v-else-if="mysqlAutoIncrementLoadError" :class="[structureIconClass, 'text-destructive']" />
+                                    <Pencil v-else :class="structureIconClass" />
+                                  </Button>
+                                </PopoverTrigger>
+                                <PopoverContent align="start" class="w-80 space-y-2 p-3">
+                                  <label class="block text-xs font-medium text-foreground">{{ t(isCreateMode ? "structureEditor.mysqlAutoIncrementStartValue" : "structureEditor.mysqlAutoIncrementNextValue") }}</label>
+                                  <Input
+                                    :model-value="mysqlAutoIncrementValue"
+                                    inputmode="numeric"
+                                    pattern="[0-9]*"
+                                    autocomplete="off"
+                                    data-mysql-auto-increment-counter
+                                    :aria-label="t(isCreateMode ? 'structureEditor.mysqlAutoIncrementStartValue' : 'structureEditor.mysqlAutoIncrementNextValue')"
+                                    :placeholder="isCreateMode ? '1' : mysqlAutoIncrementLoading ? t('common.loading') : '—'"
+                                    :title="mysqlAutoIncrementLoadError || undefined"
+                                    class="w-full font-mono"
+                                    :disabled="(!isCreateMode && (mysqlAutoIncrementLoading || !!mysqlAutoIncrementLoadError || originalMysqlAutoIncrementValue === undefined)) || saving"
+                                    @input.capture="onMysqlAutoIncrementInput"
+                                  />
+                                  <p v-if="mysqlAutoIncrementLoadError" class="text-xs text-destructive">{{ mysqlAutoIncrementLoadError }}</p>
+                                  <p class="text-xs leading-5 text-muted-foreground">{{ t(isCreateMode ? "structureEditor.mysqlAutoIncrementStartHint" : "contextMenu.mysqlAutoIncrementNonemptyHint") }}</p>
+                                </PopoverContent>
+                              </Popover>
+                              <label :class="[structurePropertyLabelClass, 'shrink-0']" :title="t('structureEditor.onUpdateCurrentTimestamp')">
+                                <input v-model="column.extra.onUpdateCurrentTimestamp" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="isMysqlGeneratedActive(column)" />
+                                <span>{{ t("structureEditor.onUpdateCurrentTimestamp") }}</span>
+                              </label>
+                            </template>
+                            <!-- Dameng: IDENTITY -->
+                            <template v-else-if="databaseType === 'dameng'">
+                              <label :class="structurePropertyLabelClass" :title="t('structureEditor.identity')">
+                                <input :checked="isDamengIdentityChecked(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditDamengIdentity(column)" @change="setDamengIdentity(column, ($event.target as HTMLInputElement).checked)" />
+                                <span class="min-w-0 truncate">{{ t("structureEditor.autoIncrement") }}</span>
+                              </label>
+                              <template v-if="isDamengIdentityChecked(column)">
+                                <Input
+                                  :model-value="column.extra.identity?.seed?.toString() ?? '1'"
+                                  type="number"
+                                  :class="[structureControlClass, 'w-14']"
+                                  :placeholder="t('structureEditor.identitySeed')"
+                                  :disabled="!canEditDamengIdentityParameters(column)"
+                                  @update:model-value="(v) => updateDamengIdentitySeed(column, v)"
+                                />
+                                <Input
+                                  :model-value="column.extra.identity?.increment?.toString() ?? '1'"
+                                  type="number"
+                                  :class="[structureControlClass, 'w-14']"
+                                  :placeholder="t('structureEditor.identityIncrement')"
+                                  :disabled="!canEditDamengIdentityParameters(column)"
+                                  @update:model-value="(v) => updateDamengIdentityIncrement(column, v)"
+                                />
+                              </template>
+                            </template>
+                            <!-- PostgreSQL: IDENTITY -->
+                            <template v-else-if="structureDialect === 'postgres'">
+                              <Select
+                                :model-value="column.extra.identity?.generation ?? 'none'"
+                                @update:model-value="
+                                  (value: any) => {
+                                    const generation = String(value ?? '');
+                                    if (generation && generation !== 'none') {
+                                      column.extra.identity = {
+                                        ...column.extra.identity,
+                                        generation: generation as 'BY DEFAULT' | 'ALWAYS',
+                                      };
+                                    } else {
+                                      column.extra.identity = undefined;
+                                    }
                                   }
-                                }
-                              "
-                            />
-                            <Input
-                              :model-value="column.extra.identity.increment?.toString() ?? ''"
-                              type="number"
-                              :class="[structureControlClass, 'w-14']"
-                              :placeholder="t('structureEditor.identityIncrement')"
-                              @update:model-value="
-                                (v) => {
-                                  if (column.extra.identity) {
-                                    column.extra.identity.increment = v ? Number(v) : undefined;
-                                  }
-                                }
-                              "
-                            />
-                          </template>
-                        </template>
-                        <!-- SQL Server: IDENTITY -->
-                        <template v-else-if="structureDialect === 'sqlserver'">
-                          <label :class="structurePropertyLabelClass" :title="canEditSqlServerIdentity(column) || isSqlServerIdentityChecked(column) ? t('structureEditor.identity') : t('structureEditor.sqlServerIdentityTypeHint')">
-                            <input :checked="isSqlServerIdentityChecked(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditSqlServerIdentity(column)" @change="setSqlServerIdentity(column, ($event.target as HTMLInputElement).checked)" />
-                            <span class="min-w-0 truncate">{{ t("structureEditor.autoIncrement") }}</span>
-                          </label>
-                          <template v-if="isSqlServerIdentityChecked(column)">
-                            <Input
-                              :model-value="column.extra.identity?.seed?.toString() ?? '1'"
-                              type="number"
-                              :class="[structureControlClass, 'w-14']"
-                              :placeholder="t('structureEditor.identitySeed')"
-                              :disabled="!canEditSqlServerIdentity(column)"
-                              @update:model-value="(v) => updateSqlServerIdentitySeed(column, v)"
-                            />
-                            <Input
-                              :model-value="column.extra.identity?.increment?.toString() ?? '1'"
-                              type="number"
-                              :class="[structureControlClass, 'w-14']"
-                              :placeholder="t('structureEditor.identityIncrement')"
-                              :disabled="!canEditSqlServerIdentity(column)"
-                              @update:model-value="(v) => updateSqlServerIdentityIncrement(column, v)"
-                            />
-                          </template>
-                        </template>
-                      </div>
-                    </td>
-                  </tr>
-                </CustomContextMenu>
-              </tbody>
-            </table>
+                                "
+                              >
+                                <SelectTrigger class="structure-grid-control h-[var(--structure-control-height)] w-28 rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="none">{{ t("structureEditor.no") }}</SelectItem>
+                                  <SelectItem value="BY DEFAULT">BY DEFAULT</SelectItem>
+                                  <SelectItem value="ALWAYS">ALWAYS</SelectItem>
+                                </SelectContent>
+                              </Select>
+                              <template v-if="column.extra.identity?.generation">
+                                <Input
+                                  :model-value="column.extra.identity.seed?.toString() ?? ''"
+                                  type="number"
+                                  :class="[structureControlClass, 'w-14']"
+                                  :placeholder="t('structureEditor.identitySeed')"
+                                  @update:model-value="
+                                    (v) => {
+                                      if (column.extra.identity) {
+                                        column.extra.identity.seed = v ? Number(v) : undefined;
+                                      }
+                                    }
+                                  "
+                                />
+                                <Input
+                                  :model-value="column.extra.identity.increment?.toString() ?? ''"
+                                  type="number"
+                                  :class="[structureControlClass, 'w-14']"
+                                  :placeholder="t('structureEditor.identityIncrement')"
+                                  @update:model-value="
+                                    (v) => {
+                                      if (column.extra.identity) {
+                                        column.extra.identity.increment = v ? Number(v) : undefined;
+                                      }
+                                    }
+                                  "
+                                />
+                              </template>
+                            </template>
+                            <!-- SQL Server: IDENTITY -->
+                            <template v-else-if="structureDialect === 'sqlserver'">
+                              <label :class="structurePropertyLabelClass" :title="canEditSqlServerIdentity(column) || isSqlServerIdentityChecked(column) ? t('structureEditor.identity') : t('structureEditor.sqlServerIdentityTypeHint')">
+                                <input :checked="isSqlServerIdentityChecked(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditSqlServerIdentity(column)" @change="setSqlServerIdentity(column, ($event.target as HTMLInputElement).checked)" />
+                                <span class="min-w-0 truncate">{{ t("structureEditor.autoIncrement") }}</span>
+                              </label>
+                              <template v-if="isSqlServerIdentityChecked(column)">
+                                <Input
+                                  :model-value="column.extra.identity?.seed?.toString() ?? '1'"
+                                  type="number"
+                                  :class="[structureControlClass, 'w-14']"
+                                  :placeholder="t('structureEditor.identitySeed')"
+                                  :disabled="!canEditSqlServerIdentity(column)"
+                                  @update:model-value="(v) => updateSqlServerIdentitySeed(column, v)"
+                                />
+                                <Input
+                                  :model-value="column.extra.identity?.increment?.toString() ?? '1'"
+                                  type="number"
+                                  :class="[structureControlClass, 'w-14']"
+                                  :placeholder="t('structureEditor.identityIncrement')"
+                                  :disabled="!canEditSqlServerIdentity(column)"
+                                  @update:model-value="(v) => updateSqlServerIdentityIncrement(column, v)"
+                                />
+                              </template>
+                            </template>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </template>
+              </RecycleScroller>
+            </CustomContextMenu>
           </TabsContent>
 
-          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
+          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="col-start-1 row-start-2 structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
             <div v-if="indexesLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -4897,13 +6745,13 @@ watch(
             <div v-else-if="secondaryMetadataErrors.indexes" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {{ secondaryMetadataErrors.indexes }}
             </div>
-            <table v-else class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+            <table v-else ref="indexesTableRef" class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
                     v-for="(label, i) in indexColLabels"
                     :key="i"
-                    :class="structureHeaderCellClass"
+                    :class="[structureHeaderCellClass, { 'text-center': i === 2 || i === 7 }]"
                     :style="{
                       width: indexColWidths[i] + 'px',
                       minWidth: indexColWidths[i] + 'px',
@@ -4916,62 +6764,76 @@ watch(
               </thead>
               <tbody>
                 <tr v-for="(index, rowIndex) in indexes" :key="index.id" :class="indexRowClass(index)" :data-new-index-row="!index.original ? 'true' : undefined" :data-index-row-index="rowIndex">
-                  <td :class="structureCellClass">
-                    <Input :model-value="index.name" :class="[structureControlClass, indexSearchFieldClass(index, index.name)]" :disabled="!canEditIndexDraft(index)" data-index-name-input @update:model-value="(value: string | number) => onIndexNameInput(index, value)" />
+                  <td :class="[structureCellClass, 'structure-index-name']">
+                    <div class="flex min-w-0 items-center gap-1">
+                      <KeyRound :class="[structureIconClass, 'structure-column-key-icon shrink-0']" :title="index.isPrimary ? 'PRIMARY' : index.isUnique ? 'UNIQUE' : index.indexType || 'INDEX'" />
+                      <Input
+                        :model-value="index.name"
+                        :class="[structureControlClass, 'flex-1', { 'disabled:opacity-100': index.isPrimary }, indexSearchFieldClass(index, index.name)]"
+                        :title="index.name"
+                        :disabled="!canEditIndexDraft(index)"
+                        data-index-name-input
+                        @update:model-value="(value: string | number) => onIndexNameInput(index, value)"
+                      />
+                      <LightTooltip v-if="!index.isPrimary" :text="t('structureEditor.regenerateIndexName')" side="top" nowrap>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          :class="[structureActionButtonClass, 'shrink-0']"
+                          :disabled="!canEditIndexDraft(index) || !index.columns.length"
+                          :aria-label="t('structureEditor.regenerateIndexName')"
+                          data-regenerate-index-name
+                          @click="regenerateIndexName(index)"
+                        >
+                          <RefreshCw :class="structureIconClass" />
+                        </Button>
+                      </LightTooltip>
+                    </div>
                   </td>
                   <td :class="[structureCellClass, 'overflow-hidden']">
-                    <DropdownMenu v-if="canEditIndexDraft(index)">
-                      <DropdownMenuTrigger as-child>
-                        <Button variant="outline" :class="[structureMonoControlClass, 'w-full justify-between']">
-                          <span class="truncate">{{ toColumnNames(index.columns) || t("structureEditor.indexColumnsPlaceholder") }}</span>
-                          <ChevronDown :class="[structureIconClass, 'ml-1 shrink-0 opacity-50']" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent class="max-h-56 min-w-44 overflow-y-auto" side="bottom" :side-offset="2" :avoid-collisions="false" @interactOutside="colSearch = ''">
-                        <div class="px-[var(--structure-cell-px)] pb-1 pt-0.5">
-                          <Input v-model="colSearch" :class="structureControlClass" :placeholder="t('grid.search')" @click.stop />
-                        </div>
-                        <DropdownMenuCheckboxItem v-for="col in filteredIndexColumnNames(index.columns)" :key="col" :checked="index.columns.includes(col)" :class="index.columns.includes(col) ? 'bg-primary/10' : ''" @select.prevent @click="toggleIndexColumn(index, col)">
-                          {{ col }}
-                        </DropdownMenuCheckboxItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                    <StructureIndexColumnPicker v-if="canEditIndexDraft(index)" :selected="index.columns" :options="indexColumnPickerOptions(index)" :placeholder="t('structureEditor.indexColumnsPlaceholder')" :trigger-class="structureMonoControlClass" @toggle="toggleIndexColumn(index, $event)">
+                      <template #type="{ column }">
+                        <span :class="[structureDataTypeToneClass(column.dataType), 'structure-data-type-option']">{{ column.dataType }}</span>
+                      </template>
+                    </StructureIndexColumnPicker>
                     <span v-else class="font-mono text-[length:var(--structure-font-size)] text-muted-foreground">{{ toColumnNames(index.columns) }}</span>
                   </td>
-                  <td :class="structureCellClass">
-                    <label class="flex items-center gap-1.5">
-                      <input v-model="index.isUnique" type="checkbox" :class="structureCheckboxClass" :disabled="!canEditIndexDraft(index)" />
-                      <span>{{ index.isUnique ? t("structureEditor.yes") : t("structureEditor.no") }}</span>
-                    </label>
+                  <td :class="[structureCellClass, 'text-center']">
+                    <input
+                      :checked="index.isUnique"
+                      type="checkbox"
+                      :class="structureCheckboxClass"
+                      :disabled="!canEditIndexDraft(index) || !!indexColumnsIssue(index, index.columns, index.indexType, true)"
+                      data-index-unique
+                      :aria-label="t('structureEditor.unique')"
+                      @change="onIndexUniqueChange(index, ($event.target as HTMLInputElement).checked)"
+                    />
                   </td>
                   <td :class="structureCellClass">
-                    <Select v-if="indexTypeOptions.length > 0" :model-value="index.indexType || 'BTREE'" :disabled="!canEditIndexDraft(index)" @update:model-value="(v: any) => (index.indexType = String(v ?? ''))">
+                    <Select v-if="indexTypeOptions.length > 0" :model-value="index.indexType || 'BTREE'" :disabled="!canEditIndexDraft(index)" data-index-type @update:model-value="(value: unknown) => onIndexTypeChange(index, value)">
                       <SelectTrigger class="structure-grid-control h-[var(--structure-control-height)] w-full rounded-[6px] px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem v-for="opt in indexTypeOptions" :key="opt" :value="opt">{{ opt }}</SelectItem>
+                        <SelectItem v-for="opt in indexTypeOptions" :key="opt" :value="opt" :disabled="!!indexColumnsIssue(index, index.columns, opt, false)">{{ opt }}</SelectItem>
                       </SelectContent>
                     </Select>
-                    <Input v-else v-model="index.indexType" :class="structureMonoControlClass" placeholder="BTREE" :disabled="!canEditIndexDraft(index) || !structureCapabilities.indexType" />
+                    <Input v-else :model-value="index.indexType" :class="structureMonoControlClass" placeholder="BTREE" :disabled="!canEditIndexDraft(index) || !structureCapabilities.indexType" @update:model-value="(value: unknown) => onIndexTypeChange(index, value)" />
                   </td>
                   <td :class="[structureCellClass, 'overflow-hidden']">
-                    <DropdownMenu v-if="canEditIndexDraft(index) && structureCapabilities.indexInclude">
-                      <DropdownMenuTrigger as-child>
-                        <Button variant="outline" :class="[structureMonoControlClass, 'w-full justify-between']">
-                          <span class="truncate">{{ index.includedColumns.join(", ") || t("structureEditor.includedColumnsPlaceholder") }}</span>
-                          <ChevronDown :class="[structureIconClass, 'ml-1 shrink-0 opacity-50']" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent class="max-h-56 min-w-44 overflow-y-auto" side="bottom" :side-offset="2" :avoid-collisions="false" @interactOutside="colSearch = ''">
-                        <div class="px-[var(--structure-cell-px)] pb-1 pt-0.5">
-                          <Input v-model="colSearch" :class="structureControlClass" :placeholder="t('grid.search')" @click.stop />
-                        </div>
-                        <DropdownMenuCheckboxItem v-for="col in filteredIndexColumnNames(index.includedColumns)" :key="col" :checked="index.includedColumns.includes(col)" :class="index.includedColumns.includes(col) ? 'bg-primary/10' : ''" @select.prevent @click="toggleIncludedColumn(index, col)">
-                          {{ col }}
-                        </DropdownMenuCheckboxItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                    <StructureIndexColumnPicker
+                      v-if="canEditIndexDraft(index) && structureCapabilities.indexInclude"
+                      :selected="index.includedColumns"
+                      :options="indexColumnPickerOptions(index, true)"
+                      :placeholder="t('structureEditor.includedColumnsPlaceholder')"
+                      :trigger-class="structureMonoControlClass"
+                      @toggle="toggleIncludedColumn(index, $event)"
+                    >
+                      <template #type="{ column }">
+                        <span :class="[structureDataTypeToneClass(column.dataType), 'structure-data-type-option']">{{ column.dataType }}</span>
+                      </template>
+                    </StructureIndexColumnPicker>
                     <span v-else class="text-[length:var(--structure-font-size)] text-muted-foreground">{{ index.includedColumns.join(", ") }}</span>
                   </td>
                   <td :class="structureCellClass">
@@ -4980,10 +6842,9 @@ watch(
                   <td :class="structureCellClass">
                     <Input v-model="index.comment" :class="[structureControlClass, indexSearchFieldClass(index, index.comment)]" :disabled="!canEditIndexComment(index)" />
                   </td>
-                  <td :class="structureCellClass">
-                    <label v-if="structureCapabilities.indexConcurrent" class="flex items-center gap-1.5" :title="concurrentIndexCellTitle(index)">
-                      <input v-model="index.concurrently" type="checkbox" :class="structureCheckboxClass" :disabled="!canEditIndexConcurrent(index)" />
-                      <span>{{ index.concurrently ? t("structureEditor.yes") : t("structureEditor.no") }}</span>
+                  <td :class="[structureCellClass, 'text-center']">
+                    <label v-if="structureCapabilities.indexConcurrent" class="inline-flex items-center justify-center" :title="concurrentIndexCellTitle(index)">
+                      <input v-model="index.concurrently" type="checkbox" :class="structureCheckboxClass" :disabled="!canEditIndexConcurrent(index)" :aria-label="t('structureEditor.concurrent')" />
                     </label>
                     <span v-else class="text-[length:var(--structure-font-size)] text-muted-foreground">—</span>
                   </td>
@@ -5003,11 +6864,27 @@ watch(
             </table>
           </TabsContent>
 
-          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar" @pointerdown="startStructureHorizontalScrollbarDrag">
+          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar col-start-1 row-start-3" @pointerdown="startStructureHorizontalScrollbarDrag">
             <div ref="structureHorizontalScrollbarThumbRef" class="structure-horizontal-scrollbar__thumb" />
           </div>
 
-          <TabsContent ref="foreignKeysScrollerRef" v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('foreignKeys', $event)">
+          <div
+            v-if="hasStructureVerticalOverflow && (activeTab === 'columns' || activeTab === 'indexes')"
+            ref="structureVerticalScrollbarTrackRef"
+            class="structure-vertical-scrollbar col-start-2 row-start-2"
+            :class="{ 'structure-vertical-scrollbar--scrolling': isStructureVerticalScrollbarScrolling, 'structure-vertical-scrollbar--dragging': isStructureVerticalScrollbarDragging }"
+            @pointerdown="onStructureVerticalScrollbarTrackPointerDown"
+          >
+            <div ref="structureVerticalScrollbarThumbRef" class="structure-vertical-scrollbar__thumb" @pointerdown.stop="onStructureVerticalScrollbarThumbPointerDown" />
+          </div>
+
+          <TabsContent
+            ref="foreignKeysScrollerRef"
+            v-if="tableMetadataCapabilities.foreignKeys"
+            value="foreignKeys"
+            class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]"
+            @scroll.passive="onStructureContentScroll('foreignKeys', $event)"
+          >
             <div v-if="foreignKeysLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5060,7 +6937,13 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="constraintsScrollerRef" v-if="tableMetadataCapabilities.constraints" value="constraints" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('constraints', $event)">
+          <TabsContent
+            ref="constraintsScrollerRef"
+            v-if="tableMetadataCapabilities.constraints"
+            value="constraints"
+            class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]"
+            @scroll.passive="onStructureContentScroll('constraints', $event)"
+          >
             <div v-if="constraintsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5072,12 +6955,12 @@ watch(
               {{ t("structureEditor.emptyReadonly") }}
             </div>
             <div v-else class="space-y-1.5">
-              <div v-for="constraint in constraintsForTab" :key="constraint.name" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="constraint.enabled ? '' : 'opacity-60'">
+              <div v-for="constraint in constraintsForTab" :key="constraint.name" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="constraint.enabled === false ? 'opacity-60' : ''">
                 <div class="flex flex-wrap items-center gap-1.5">
                   <span class="font-mono font-medium">{{ constraint.name }}</span>
                   <Badge variant="outline" class="shrink-0">{{ constraint.constraint_type }}</Badge>
-                  <Badge v-if="!constraint.enabled" variant="outline" class="shrink-0 text-muted-foreground">{{ t("structureEditor.constraintDisabled") }}</Badge>
-                  <Badge v-else-if="!constraint.valid" variant="outline" class="shrink-0 text-muted-foreground">{{ t("structureEditor.constraintNotValidated") }}</Badge>
+                  <Badge variant="outline" class="shrink-0 text-muted-foreground">{{ t(constraint.enabled === true ? "grid.tableInfoConstraintEnabled" : constraint.enabled === false ? "structureEditor.constraintDisabled" : "grid.tableInfoConstraintEnabledUnknown") }}</Badge>
+                  <Badge variant="outline" class="shrink-0 text-muted-foreground">{{ t(constraint.valid === true ? "grid.tableInfoConstraintValidated" : constraint.valid === false ? "structureEditor.constraintNotValidated" : "grid.tableInfoConstraintValidationUnknown") }}</Badge>
                 </div>
                 <div v-if="constraint.columns.length" class="mt-1 truncate font-mono text-muted-foreground">{{ constraint.columns.join(", ") }}</div>
                 <div v-if="constraint.ref_table" class="mt-1 truncate font-mono text-muted-foreground">-> {{ constraint.ref_schema ? `${constraint.ref_schema}.` : "" }}{{ constraint.ref_table }}{{ constraint.ref_columns.length ? `(${constraint.ref_columns.join(", ")})` : "" }}</div>
@@ -5086,7 +6969,7 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="triggersScrollerRef" v-if="tableMetadataCapabilities.triggers" value="triggers" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('triggers', $event)">
+          <TabsContent ref="triggersScrollerRef" v-if="tableMetadataCapabilities.triggers" value="triggers" class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('triggers', $event)">
             <div v-if="triggersLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5144,8 +7027,18 @@ watch(
                       <SelectItem v-for="event in triggerEventOptions" :key="event" :value="event">{{ event }}</SelectItem>
                     </SelectContent>
                   </Select>
-                  <Badge v-if="trigger.original && trigger.original.enabled !== undefined && trigger.original.enabled !== null" variant="outline" class="shrink-0 text-[length:var(--structure-font-size)]">
-                    {{ trigger.original.enabled ? t("damengJobAdmin.enabled") : t("damengJobAdmin.disabled") }}
+                  <Button
+                    v-if="isOracleTriggerEditor && trigger.enabled !== undefined"
+                    variant="outline"
+                    size="sm"
+                    :class="['h-[var(--structure-control-height)] shrink-0 px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]', !trigger.enabled ? 'text-muted-foreground' : '']"
+                    :disabled="!canToggleTriggerEnabled(trigger)"
+                    @click.stop="trigger.enabled = !trigger.enabled"
+                  >
+                    {{ trigger.enabled ? t("damengJobAdmin.enabled") : t("damengJobAdmin.disabled") }}
+                  </Button>
+                  <Badge v-else-if="trigger.enabled !== undefined && trigger.enabled !== null" variant="outline" class="shrink-0 text-[length:var(--structure-font-size)]">
+                    {{ trigger.enabled ? t("damengJobAdmin.enabled") : t("damengJobAdmin.disabled") }}
                   </Badge>
                   <Button v-if="trigger.original" variant="ghost" size="sm" :class="structureToolbarButtonClass" @click.stop="toggleDropTrigger(trigger)">
                     <Trash2 :class="structureIconClass" />
@@ -5172,13 +7065,164 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="ddlScrollerRef" v-if="tableMetadataCapabilities.ddl" value="ddl" force-mount class="relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden" @scroll.passive="onStructureContentScroll('ddl', $event)">
+          <TabsContent ref="partitionsScrollerRef" v-if="showPartitionsTab" value="partitions" class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
+            <div v-if="isCreateMode" class="space-y-3">
+              <label class="flex items-center gap-2 text-[length:var(--structure-font-size)]">
+                <input v-model="createPartitioningEnabled" type="checkbox" />
+                {{ t("structureEditor.partitionEnable") }}
+              </label>
+              <template v-if="createPartitioningEnabled">
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKind") }}</label>
+                  <Select v-model="createPartitioningKind">
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="range">{{ t("structureEditor.partitionKindRange") }}</SelectItem>
+                      <SelectItem value="list">{{ t("structureEditor.partitionKindList") }}</SelectItem>
+                      <SelectItem value="hash">{{ t("structureEditor.partitionKindHash") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKeyColumns") }}</label>
+                  <div class="flex flex-wrap gap-3">
+                    <label v-for="column in partitionCreatableColumns" :key="column" class="flex items-center gap-1 text-sm">
+                      <input v-model="createPartitioningColumns" type="checkbox" :value="column" :disabled="!!createPartitioningExpression.trim()" />
+                      <span class="font-mono">{{ column }}</span>
+                    </label>
+                  </div>
+                  <p v-if="partitionCreatableColumns.length === 0" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionKeyNoColumns") }}</p>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKeyExpression") }}</label>
+                  <Input v-model="createPartitioningExpression" class="font-mono" placeholder="date_trunc('month', ts)" />
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="text-[length:var(--structure-font-size)] font-medium">{{ t("structureEditor.partitionInitialPartitions") }}</span>
+                  <Button variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create', createPartitioningKind)">
+                    <Plus :class="[structureIconClass, 'mr-1']" />
+                    {{ t("structureEditor.partitionAdd") }}
+                  </Button>
+                </div>
+                <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                    <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
+                      <Trash2 :class="structureIconClass" />
+                    </Button>
+                  </div>
+                </div>
+                <p v-else class="text-sm text-muted-foreground">{{ t("structureEditor.partitionInitialPartitionsEmpty") }}</p>
+              </template>
+            </div>
+            <template v-else>
+              <div v-if="partitionsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
+                <Loader2 class="h-4 w-4 animate-spin" />
+                {{ t("common.loading") }}
+              </div>
+              <div v-else-if="partitionsError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {{ partitionsError }}
+              </div>
+              <div v-else-if="!partitioning || (!partitioning.isPartitioned && !partitioning.isPartition)" class="py-10 text-center text-muted-foreground">
+                {{ t("structureEditor.partitionsEmpty") }}
+              </div>
+              <div v-else class="space-y-2">
+                <div class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div class="flex flex-wrap items-center gap-1.5">
+                      <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
+                      <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
+                      <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
+                    </div>
+                    <div v-if="canManagePartitions" class="flex shrink-0 items-center gap-1.5">
+                      <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create')">
+                        <Plus :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionAdd") }}
+                      </Button>
+                      <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('attach')">
+                        <ListChevronsUpDown :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionAttach") }}
+                      </Button>
+                      <Button v-if="partitioning.isPartition" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openDetachSelfPartitionDialog">
+                        <X :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionDetachSelf") }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div v-if="partitioning.parent" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ partitioning.parent }}</div>
+                  <div v-if="partitioning.ownBound" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(partitioning.ownBound) }}</div>
+                  <div v-if="partitioning.defaultPartition" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ partitioning.defaultPartition }}</div>
+                </div>
+                <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="mb-1 font-medium">{{ t("structureEditor.partitionPendingOperations") }}</div>
+                  <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                    <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
+                      <Trash2 :class="structureIconClass" />
+                    </Button>
+                  </div>
+                </div>
+                <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
+                  {{ t("structureEditor.partitionsEmptyChildren") }}
+                </div>
+                <div v-if="partitionTreeRows.length > 0" class="divide-y overflow-hidden rounded-md border">
+                  <div v-for="row in partitionVisibleRows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-start gap-1 px-[var(--structure-cell-px)] py-1.5 text-[length:var(--structure-font-size)]">
+                    <span :data-partition-depth="row.depth" :style="{ width: `${row.depth * PARTITION_TREE_INDENT_PX}px` }" class="shrink-0 self-stretch" aria-hidden="true"></span>
+                    <button
+                      v-if="row.node.children.length"
+                      type="button"
+                      class="mt-px h-4 w-4 shrink-0 self-start text-muted-foreground transition-colors hover:text-foreground"
+                      :aria-label="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+                      :title="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+                      @click="togglePartitionRow(row.key)"
+                    >
+                      <ChevronRight v-if="collapsedPartitionKeys.has(row.key)" :class="structureIconClass" />
+                      <ChevronDown v-else :class="structureIconClass" />
+                    </button>
+                    <span v-else class="mt-px h-4 w-4 shrink-0 self-start" aria-hidden="true"></span>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex flex-wrap items-center justify-between gap-1.5">
+                        <div class="flex flex-wrap items-center gap-1.5">
+                          <span class="font-mono font-medium">{{ row.node.name }}</span>
+                          <Badge v-if="row.node.children.length" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionChildCount", { count: row.node.children.length }) }}</Badge>
+                          <Badge v-if="row.depth > 0" variant="outline" class="border-dashed text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</Badge>
+                          <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
+                          <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                        </div>
+                        <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row)">
+                            <X :class="structureIconClass" />
+                          </Button>
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row)">
+                            <Trash2 :class="structureIconClass" />
+                          </Button>
+                        </div>
+                      </div>
+                      <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-0.5 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </TabsContent>
+
+          <TabsContent
+            ref="ddlScrollerRef"
+            v-if="tableMetadataCapabilities.ddl"
+            value="ddl"
+            force-mount
+            class="col-start-1 row-start-2 structure-card-scroller relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden"
+            @scroll.passive="onStructureContentScroll('ddl', $event)"
+          >
             <div v-if="ddlLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
             </div>
             <template v-else>
               <div v-if="ddlContent && !ddlSearchOpen" class="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+                <DdlStorageToggle :database-type="databaseType" :disabled="ddlDirty" />
                 <Button v-if="ddlDirty" variant="outline" size="sm" class="h-7 gap-1 px-2" :title="t('structureEditor.resetDdl')" @click="resetDdlDraft">
                   <RotateCcw class="h-3.5 w-3.5" />
                   {{ t("structureEditor.resetDdl") }}
@@ -5194,6 +7238,12 @@ watch(
           </TabsContent>
         </Tabs>
       </div>
+
+      <p v-if="!isCreateMode && databaseType === 'starrocks'" class="shrink-0 px-3 py-2 text-xs text-muted-foreground">
+        {{ t("starrocksLayout.alterHint") }} {{ t(structureCapabilities.reorderColumn ? "starrocksLayout.reorderHint" : starrocksAlterContext?.model === "primary" ? "starrocksLayout.localReorderHint" : "starrocksLayout.reorderMetadataHint") }}
+      </p>
+      <StarRocksSortKeyEditor v-if="!isCreateMode && databaseType === 'starrocks' && activeTab === 'columns' && starrocksSortColumns" v-model="starrocksSortColumns" :context="starrocksAlterContext" :columns="columns" :disabled="saving || loading" />
+      <StarRocksPhysicalOptionsEditor v-if="isCreateMode && databaseType === 'starrocks'" v-model="starrocksPhysicalOptions" :columns="columns" :server-version="connection?.database_info?.productVersion" :disabled="saving" />
 
       <div :class="['flex min-w-0 shrink-0 flex-col overflow-hidden rounded-md border', sqlPreviewCollapsed ? '' : 'h-[28%] min-h-40 max-h-64']">
         <div class="flex shrink-0 items-center justify-between border-b px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)] font-medium">
@@ -5237,7 +7287,7 @@ watch(
           <div v-if="warnings.length" class="mb-2 space-y-1">
             <div v-for="warning in warnings" :key="warning" class="flex gap-1.5 rounded-md border border-yellow-300/40 bg-yellow-500/10 px-[var(--structure-cell-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] text-yellow-700 dark:text-yellow-300">
               <AlertTriangle :class="[structureIconClass, 'mt-0.5 shrink-0']" />
-              <span>{{ warning }}</span>
+              <span>{{ translateMysqlAutoIncrementWarning(t, warning) }}</span>
             </div>
           </div>
           <pre v-if="pendingStatements.length" class="select-text whitespace-pre-wrap break-words rounded-md bg-muted/40 p-2.5 font-mono text-[calc(var(--structure-font-size)+1px)] leading-5" v-html="highlightedSql" />
@@ -5263,24 +7313,87 @@ watch(
       </Button>
     </div>
 
+    <DataGridCopyColumnNamesDialog v-model:open="copyColumnNamesDialogOpen" :column-names="copyableStructureColumnNames" :database-type="databaseType" :column-comments="copyableStructureColumnComments" @copy="copyColumnNamesText" />
     <Dialog v-model:open="copyColumnsDialogOpen">
       <DialogContent class="max-w-xl">
         <DialogHeader>
           <DialogTitle>{{ t("structureEditor.copyColumnsTitle") }}</DialogTitle>
         </DialogHeader>
 
-        <div class="space-y-3 overflow-hidden">
+        <div class="max-h-[65vh] space-y-3 overflow-y-auto">
+          <p class="text-xs text-muted-foreground">{{ t("structureEditor.copyColumnsSameTypeOnly") }}</p>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <div class="grid gap-1.5 text-sm font-medium">
+              <label id="copy-source-connection-label">{{ t("structureEditor.copyColumnsSourceConnection") }}</label>
+              <SearchableSelect
+                :model-value="copySourceConnectionId"
+                :options="copySourceConnections.map((config) => config.id)"
+                :placeholder="t('structureEditor.copyColumnsSourceConnection')"
+                :search-placeholder="t('structureEditor.copyColumnsSourceConnection')"
+                :empty-text="t('common.noResults')"
+                aria-labelledby="copy-source-connection-label"
+                trigger-class="h-8 w-full justify-between text-xs"
+                :display-name="(id: string) => store.getConfig(id)?.name || id"
+                @update:model-value="(value: string) => changeCopySourceScope('connection', value)"
+              />
+            </div>
+            <div v-if="copySourceCatalogs.length > 0" class="grid gap-1.5 text-sm font-medium">
+              <label id="copy-source-catalog-label">{{ t("structureEditor.copyColumnsSourceCatalog") }}</label>
+              <SearchableSelect
+                :model-value="copySourceCatalog"
+                :options="copySourceCatalogs.map((catalog) => catalog.name)"
+                :placeholder="t('structureEditor.copyColumnsSourceCatalog')"
+                :search-placeholder="t('structureEditor.copyColumnsSourceCatalog')"
+                :empty-text="t('common.noResults')"
+                aria-labelledby="copy-source-catalog-label"
+                trigger-class="h-8 w-full justify-between text-xs"
+                :disabled="copySourceScopeLoading || !copySourceCatalogs.length"
+                @update:model-value="(value: string) => changeCopySourceScope('catalog', value)"
+              />
+            </div>
+            <div class="grid gap-1.5 text-sm font-medium">
+              <label id="copy-source-database-label">{{ t(copySourceRootSchemaMode ? "structureEditor.copyColumnsSourceSchema" : "structureEditor.copyColumnsSourceDatabase") }}</label>
+              <SearchableSelect
+                :model-value="copySourceDatabase"
+                :options="copySourceDatabases"
+                :placeholder="t(copySourceRootSchemaMode ? 'structureEditor.copyColumnsSourceSchema' : 'structureEditor.copyColumnsSourceDatabase')"
+                :search-placeholder="t(copySourceRootSchemaMode ? 'structureEditor.copyColumnsSourceSchema' : 'structureEditor.copyColumnsSourceDatabase')"
+                :empty-text="t('common.noResults')"
+                aria-labelledby="copy-source-database-label"
+                trigger-class="h-8 w-full justify-between text-xs"
+                :disabled="copySourceScopeLoading || !copySourceDatabases.length"
+                @update:model-value="(value: string) => changeCopySourceScope('database', value)"
+              />
+            </div>
+            <div v-if="copySourceHasSchema" class="grid gap-1.5 text-sm font-medium">
+              <label id="copy-source-schema-label">{{ t("structureEditor.copyColumnsSourceSchema") }}</label>
+              <SearchableSelect
+                :model-value="copySourceSchema"
+                :options="copySourceSchemas"
+                :placeholder="t('structureEditor.copyColumnsSourceSchema')"
+                :search-placeholder="t('structureEditor.copyColumnsSourceSchema')"
+                :empty-text="t('common.noResults')"
+                aria-labelledby="copy-source-schema-label"
+                trigger-class="h-8 w-full justify-between text-xs"
+                :disabled="copySourceScopeLoading || !copySourceSchemas.length"
+                @update:model-value="(value: string) => changeCopySourceScope('schema', value)"
+              />
+            </div>
+          </div>
           <div class="grid gap-1.5 text-sm font-medium">
             <label for="copy-source-table-search">{{ t("structureEditor.copyColumnsSourceTable") }}</label>
-            <Input id="copy-source-table-search" :model-value="copySourceTableSearch" :placeholder="t('structureEditor.copyColumnsSearchSourceTables')" @update:model-value="updateCopySourceTableSearch" />
+            <Input id="copy-source-table-search" :disabled="!copySourceScopeReady || copySourceScopeLoading" :model-value="copySourceTableSearch" :placeholder="t('structureEditor.copyColumnsSearchSourceTables')" @update:model-value="updateCopySourceTableSearch" />
           </div>
 
-          <div v-if="copySourceTablesLoading" class="flex items-center gap-2 py-5 text-sm text-muted-foreground">
+          <div v-if="copySourceScopeLoading || copySourceTablesLoading" class="flex items-center gap-2 py-5 text-sm text-muted-foreground">
             <Loader2 class="h-4 w-4 animate-spin" />
             {{ t("common.loading") }}
           </div>
           <div v-else-if="copySourceError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {{ copySourceError }}
+          </div>
+          <div v-else-if="!copySourceScopeReady" class="rounded-md border border-dashed px-3 py-5 text-center text-sm text-muted-foreground">
+            {{ t("common.noResults") }}
           </div>
           <div v-else-if="copySourceTables.length === 0" class="rounded-md border border-dashed px-3 py-5 text-center text-sm text-muted-foreground">
             {{ copySourceTableSearch ? t("structureEditor.copyColumnsNoMatchingSourceTables") : t("structureEditor.copyColumnsNoSourceTables") }}
@@ -5342,10 +7455,18 @@ watch(
               {{ t("structureEditor.copyColumnsNoMatchingFields") }}
             </div>
             <div v-else class="max-h-72 overflow-y-auto rounded-md border">
-              <label v-for="{ column, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-center gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
-                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="size-4 rounded border-input" />
-                <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
-                <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+              <label v-for="{ column, details, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-start gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
+                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="mt-0.5 size-4 shrink-0 rounded border-input" />
+                <span class="min-w-0 flex-1">
+                  <span class="flex min-w-0 items-center gap-2">
+                    <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
+                    <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+                  </span>
+                  <span v-if="(columnEditorControls.defaultValue && details.defaultValue) || (columnEditorControls.comment && details.comment)" class="mt-0.5 flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+                    <span v-if="columnEditorControls.defaultValue && details.defaultValue" class="min-w-0 truncate" :title="`${t('structureEditor.defaultValue')}: ${details.defaultValue}`">{{ t("structureEditor.defaultValue") }}: {{ details.defaultValue }}</span>
+                    <span v-if="columnEditorControls.comment && details.comment" class="min-w-0 truncate" :title="`${t('structureEditor.comment')}: ${details.comment}`">{{ t("structureEditor.comment") }}: {{ details.comment }}</span>
+                  </span>
+                </span>
                 <Badge v-if="alreadyExists" variant="secondary" class="shrink-0 text-[10px]">{{ t("structureEditor.copyColumnsAlreadyExists") }}</Badge>
               </label>
             </div>
@@ -5354,9 +7475,79 @@ watch(
 
         <DialogFooter>
           <Button variant="outline" @click="copyColumnsDialogOpen = false">{{ t("structureEditor.copyColumnsCancel") }}</Button>
-          <Button :disabled="copySourceColumnsLoading || selectedCopySourceColumns.length === 0" @click="applyCopiedColumns">
+          <Button :disabled="!canAddColumn || !copySourceCompatible || !copySourceScopeReady || copySourceScopeLoading || copySourceTablesLoading || copySourceColumnsLoading || !!copySourceError || selectedCopySourceColumns.length === 0" @click="applyCopiedColumns">
             {{ t("structureEditor.copyColumnsApply", { count: selectedCopySourceColumns.length }) }}
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="partitionDialogOpen">
+      <DialogContent class="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{{ partitionOperationLabel(partitionDialogMode) }}</DialogTitle>
+        </DialogHeader>
+        <div class="space-y-3">
+          <div class="space-y-1">
+            <label class="text-sm">{{ t("structureEditor.partitionName") }}</label>
+            <Input v-model="partitionDialogName" class="font-mono" :disabled="partitionDialogMode === 'detach' || partitionDialogMode === 'drop'" :placeholder="t('structureEditor.partitionNamePlaceholder')" />
+          </div>
+          <template v-if="partitionDialogNeedsBound">
+            <div class="space-y-1">
+              <label class="text-sm">{{ t("structureEditor.partitionBoundKind") }}</label>
+              <Select v-model="partitionDialogBoundKind">
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="range">{{ t("structureEditor.partitionKindRange") }}</SelectItem>
+                  <SelectItem value="list">{{ t("structureEditor.partitionKindList") }}</SelectItem>
+                  <SelectItem value="hash">{{ t("structureEditor.partitionKindHash") }}</SelectItem>
+                  <SelectItem value="default">{{ t("structureEditor.partitionBoundDefault") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <template v-if="partitionDialogBoundKind === 'range'">
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundFrom") }}</label>
+                <Input v-model="partitionDialogRangeFrom" class="font-mono" placeholder="MINVALUE / '2025-01-01'" />
+              </div>
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundTo") }}</label>
+                <Input v-model="partitionDialogRangeTo" class="font-mono" placeholder="'2026-01-01' / MAXVALUE" />
+              </div>
+            </template>
+            <div v-else-if="partitionDialogBoundKind === 'list'" class="space-y-1">
+              <label class="text-sm">{{ t("structureEditor.partitionBoundValues") }}</label>
+              <Input v-model="partitionDialogListValues" class="font-mono" placeholder="1, 2, 3" />
+            </div>
+            <div v-else-if="partitionDialogBoundKind === 'hash'" class="grid grid-cols-2 gap-2">
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundModulus") }}</label>
+                <Input v-model="partitionDialogModulus" class="font-mono" inputmode="numeric" />
+              </div>
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundRemainder") }}</label>
+                <Input v-model="partitionDialogRemainder" class="font-mono" inputmode="numeric" />
+              </div>
+            </div>
+          </template>
+          <label v-else-if="partitionDialogMode === 'detach' && partitionSupportsConcurrentDetach" class="flex items-center gap-2 text-sm">
+            <input v-model="partitionDialogConcurrently" type="checkbox" />
+            {{ t("structureEditor.partitionDetachConcurrently") }}
+          </label>
+          <p v-if="partitionDialogMode === 'detach'" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionDetachWarning") }}</p>
+          <p v-if="partitionDialogMode === 'drop'" class="text-sm text-destructive">{{ t("structureEditor.partitionDropWarning") }}</p>
+          <div v-if="partitionDialogSql || partitionDialogSqlWarnings.length" class="space-y-1">
+            <span class="text-sm text-muted-foreground">{{ t("structureEditor.partitionSqlPreview") }}</span>
+            <pre v-if="partitionDialogSql" class="max-h-40 overflow-auto rounded-md border bg-muted/40 p-2 text-xs font-mono whitespace-pre-wrap break-all">{{ partitionDialogSql }}</pre>
+            <p v-for="warning in partitionDialogSqlWarnings" :key="warning" class="text-xs text-destructive">{{ warning }}</p>
+          </div>
+          <p v-if="partitionDialogError" class="text-sm text-destructive">{{ partitionDialogError }}</p>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="partitionDialogOpen = false">{{ t("common.cancel") }}</Button>
+          <Button :variant="partitionDialogMode === 'drop' ? 'destructive' : 'default'" @click="confirmPartitionDialog">{{ t("common.confirm") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -5364,6 +7555,15 @@ watch(
 </template>
 
 <style scoped>
+.structure-grid-column-selected {
+  background-color: color-mix(in oklab, var(--primary) 14%, transparent) !important;
+}
+
+.structure-grid-column-selected :deep(input),
+.structure-grid-column-selected :deep(button) {
+  background-color: color-mix(in oklab, var(--primary) 10%, var(--background)) !important;
+}
+
 .structure-ddl-editor :deep(.cm-editor) {
   min-height: 100%;
   background: transparent;
@@ -5385,9 +7585,167 @@ watch(
   background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35)) !important;
 }
 
+/* DDL (CodeMirror) scrollbars match the grid scroller style. */
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar) {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-track) {
+  background: transparent;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-thumb) {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-thumb:hover) {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-table-scroller {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+/* Tab panel layout: toolbar, scrollable content and the custom horizontal bar
+   stack in the first column, while the custom vertical bar occupies the second
+   column of the content row. */
+.structure-tabs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+/* Both native scrollbars are replaced: the horizontal one by
+   `.structure-horizontal-scrollbar`, the vertical one by
+   `.structure-vertical-scrollbar`. */
 .structure-table-scroller::-webkit-scrollbar {
-  width: 8px;
+  width: 0;
   height: 0;
+}
+
+/* Foreign keys / constraints / triggers card lists: both scrollbars match. */
+.structure-card-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-card-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-card-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-card-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-table-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-table-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-table-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-column-virtual-scroller {
+  overflow-anchor: none;
+  overscroll-behavior: none;
+  will-change: scroll-position;
+  contain: layout style paint;
+}
+
+.structure-column-virtual-scroller :deep(.vue-recycle-scroller__slot) {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  min-width: var(--structure-column-table-width);
+  background: var(--background);
+}
+
+.structure-column-virtual-scroller :deep(.structure-column-virtual-list) {
+  min-width: var(--structure-column-table-width);
+  overflow: visible;
+}
+
+.structure-column-virtual-scroller :deep(.vue-recycle-scroller__item-view) {
+  contain: layout style paint;
+}
+
+.structure-column-virtual-scroller.is-scrolling :deep(.vue-recycle-scroller__item-view) {
+  pointer-events: none;
+}
+
+.structure-column-virtual-scroller.is-scrolling :deep(.structure-column-virtual-row *) {
+  transition: none !important;
+}
+
+.structure-column-virtual-scroller :deep(.structure-column-virtual-row) {
+  width: var(--structure-column-table-width);
+  min-width: var(--structure-column-table-width);
+}
+
+.structure-column-virtual-scroller :deep(.structure-column-virtual-row-table) {
+  width: var(--structure-column-table-width);
+  min-width: var(--structure-column-table-width);
+  table-layout: fixed;
+}
+
+.structure-vertical-scrollbar {
+  position: relative;
+  width: 10px;
+  cursor: default;
+  touch-action: none;
+}
+
+.structure-vertical-scrollbar__thumb {
+  position: absolute;
+  left: 3px;
+  width: 4px;
+  min-height: 24px;
+  border-radius: 999px;
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  transition:
+    left 120ms ease,
+    width 120ms ease,
+    background-color 120ms ease;
+}
+
+.structure-vertical-scrollbar:hover .structure-vertical-scrollbar__thumb,
+.structure-vertical-scrollbar--dragging .structure-vertical-scrollbar__thumb {
+  left: 2px;
+  width: 6px;
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
 .structure-horizontal-scrollbar {
@@ -5396,7 +7754,7 @@ watch(
   flex-shrink: 0;
   cursor: pointer;
   touch-action: none;
-  background: var(--background);
+  background: transparent;
 }
 
 .structure-horizontal-scrollbar__thumb {
@@ -5405,6 +7763,7 @@ watch(
   height: 4px;
   min-width: 24px;
   border-radius: 999px;
+  background: rgba(82, 82, 82, 0.3);
   background: color-mix(in oklab, var(--foreground) 30%, transparent);
   transition:
     top 120ms ease,
@@ -5416,6 +7775,7 @@ watch(
 .structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb {
   top: 2px;
   height: 6px;
+  background: rgba(82, 82, 82, 0.48);
   background: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
@@ -5427,20 +7787,178 @@ watch(
   box-shadow: none;
 }
 
-.structure-edit-grid > tbody > tr > td:hover {
+.structure-edit-grid > tbody > tr > td:hover,
+.structure-edit-grid > tr > td:hover {
   background-color: color-mix(in oklab, var(--muted) 36%, transparent);
 }
 
-.structure-edit-grid > tbody > tr > td:focus-within {
+.structure-edit-grid > tbody > tr > td:focus-within,
+.structure-edit-grid > tr > td:focus-within {
   background-color: color-mix(in oklab, var(--primary) 7%, transparent);
   outline: 1px solid color-mix(in oklab, var(--primary) 55%, transparent);
   outline-offset: -1px;
 }
 
-.structure-edit-grid > tbody > tr > td:focus-within :deep(.structure-grid-control) {
+.structure-edit-grid > tbody > tr > td:focus-within :deep(.structure-grid-control),
+.structure-edit-grid > tr > td:focus-within :deep(.structure-grid-control) {
   border-color: transparent;
   background-color: transparent;
   box-shadow: none;
+}
+
+.structure-column-primary-key,
+.structure-index-primary-key {
+  --structure-key-color: #d97706;
+}
+
+.structure-column-unique-key,
+.structure-index-unique-key {
+  --structure-key-color: #dc2626;
+}
+
+.structure-column-index-key,
+.structure-index-normal-key {
+  --structure-key-color: #15803d;
+}
+
+.structure-column-fulltext-key,
+.structure-index-fulltext-key {
+  --structure-key-color: #9333ea;
+}
+
+.structure-column-spatial-key,
+.structure-index-spatial-key {
+  --structure-key-color: #0e7490;
+}
+
+.structure-column-key-icon {
+  color: var(--structure-key-color);
+}
+
+.structure-column-primary-key > td:first-child,
+.structure-column-unique-key > td:first-child,
+.structure-column-index-key > td:first-child,
+.structure-column-fulltext-key > td:first-child,
+.structure-column-spatial-key > td:first-child {
+  box-shadow: inset 3px 0 0 var(--structure-key-color);
+}
+
+.structure-column-primary-key > td:nth-child(2) :deep(.structure-grid-control),
+.structure-column-unique-key > td:nth-child(2) :deep(.structure-grid-control),
+.structure-column-index-key > td:nth-child(2) :deep(.structure-grid-control),
+.structure-column-fulltext-key > td:nth-child(2) :deep(.structure-grid-control),
+.structure-column-spatial-key > td:nth-child(2) :deep(.structure-grid-control),
+.structure-index-name :deep(.structure-grid-control) {
+  color: var(--structure-key-color);
+  font-weight: 600;
+}
+
+.structure-column-data-type,
+.structure-column-default-value,
+.structure-data-type-option {
+  --structure-type-color: var(--muted-foreground);
+}
+
+.structure-data-type-option {
+  color: var(--structure-type-color);
+  font-weight: 500;
+}
+
+.structure-data-type-numeric,
+.structure-data-type-boolean {
+  --structure-type-color: #2563eb;
+}
+
+.structure-data-type-real {
+  --structure-type-color: #6366d1;
+}
+
+.structure-data-type-text,
+.structure-data-type-json {
+  --structure-type-color: #15803d;
+}
+
+.structure-data-type-temporal {
+  --structure-type-color: #b45309;
+}
+
+.structure-data-type-binary {
+  --structure-type-color: #9333b8;
+}
+
+.structure-data-type-enum,
+.structure-data-type-other {
+  --structure-type-color: #737323;
+}
+
+.structure-data-type-spatial {
+  --structure-type-color: #0e7490;
+}
+
+.structure-data-type-null {
+  --structure-type-color: var(--muted-foreground);
+}
+
+.dark .structure-column-primary-key,
+.dark .structure-index-primary-key {
+  --structure-key-color: #fbbf24;
+}
+
+.dark .structure-column-unique-key,
+.dark .structure-index-unique-key {
+  --structure-key-color: #f87171;
+}
+
+.dark .structure-column-index-key,
+.dark .structure-index-normal-key {
+  --structure-key-color: #86efac;
+}
+
+.dark .structure-column-fulltext-key,
+.dark .structure-index-fulltext-key {
+  --structure-key-color: #d8b4fe;
+}
+
+.dark .structure-column-spatial-key,
+.dark .structure-index-spatial-key {
+  --structure-key-color: #67e8f9;
+}
+
+.dark .structure-data-type-numeric,
+.dark .structure-data-type-boolean {
+  --structure-type-color: #93c5fd;
+}
+
+.dark .structure-data-type-real {
+  --structure-type-color: #a5b4fc;
+}
+
+.dark .structure-data-type-text,
+.dark .structure-data-type-json {
+  --structure-type-color: #86efac;
+}
+
+.dark .structure-data-type-temporal {
+  --structure-type-color: #fcd34d;
+}
+
+.dark .structure-data-type-binary {
+  --structure-type-color: #d8b4fe;
+}
+
+.dark .structure-data-type-enum,
+.dark .structure-data-type-other {
+  --structure-type-color: #d4d486;
+}
+
+.dark .structure-data-type-spatial {
+  --structure-type-color: #67e8f9;
+}
+
+.structure-column-data-type :deep(.structure-grid-control),
+.structure-column-default-value :deep(.structure-grid-control) {
+  color: var(--structure-type-color);
+  font-weight: 500;
 }
 
 /* --primary is rgb/oklch; use color-mix like DataGrid, not channel-based hsl wrappers. */
@@ -5461,9 +7979,50 @@ watch(
     inset 0 1px 0 color-mix(in oklab, var(--primary) 55%, transparent),
     inset 0 -1px 0 color-mix(in oklab, var(--primary) 55%, transparent);
 }
+</style>
 
-/* Inputs are bg-transparent; give them a solid surface on the selected row so fields stay readable. */
-.structure-column-search-current :is(input, button, [role="combobox"], [data-slot="select-trigger"]) {
-  background-color: var(--background);
+<style>
+/* Non-scoped so the scrollbar pseudo-elements on CodeMirror's cm-scroller actually match in WebView2.
+   Matches the grid / card scroller scrollbar style (10px track, 4px thumb, 6px on hover). */
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+html.dbx-legacy-webview.dark .structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-card-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-table-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar__thumb {
+  background: rgba(212, 212, 216, 0.3);
+}
+
+html.dbx-legacy-webview.dark .structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-card-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-table-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar:hover .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar:hover .structure-vertical-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar--dragging .structure-vertical-scrollbar__thumb {
+  background: rgba(212, 212, 216, 0.48);
 }
 </style>

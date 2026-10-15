@@ -9,6 +9,8 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { Label } from "@/components/ui/label";
+import { sidebarProductionBadgeScope } from "@/lib/sidebar/sidebarProductionBadge";
+import type { ProductionBadgeScope } from "@/types/database";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HelpTooltip, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -38,12 +40,15 @@ import type {
 import { CONNECTION_PICKER_OPTIONS, CONNECTION_PROFILES, CONNECTION_PROFILE_ICONS, type ConnectionPickerOption, type ConnectionProfileCategory, type ConnectionProfileDefinition } from "@/types/generated/connectionProfiles";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { VictoriaMetricsExternalConfig } from "@/types/victoriametrics";
+import type { SalesforceAuthContext, SalesforceAuthMode, SalesforceEnvironment, SalesforceExternalConfig, SalesforceOAuthAuthorizeParams, SalesforceOAuthDevicePollResult } from "@/types/salesforce";
+import { SALESFORCE_OAUTH_CALLBACK_URL } from "@/types/salesforce";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { MqttConnectionConfig } from "@/types/mqtt";
 import type { NacosAdminConfig, NacosApiPlane, NacosAuthConfig, NacosImplementation, NacosMetricsMode, NacosNamespaceInfo, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
+import { insertSqliteRemoteTransportLayer, isSqliteRemoteTransportLayerType, sqliteRemoteTransportError } from "@/lib/connection/sqliteRemoteTransport";
 import { sanitizeConnectionCredentials } from "@/lib/connection/credentialSanitizer";
 import { applySshAuthMethod, inferSshAuthMethod } from "@/lib/connection/sshAuthMethod";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
@@ -58,13 +63,25 @@ import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import PluginConnectionFields from "@/components/plugins/PluginConnectionFields.vue";
 import PluginIcon from "@/components/plugins/PluginIcon.vue";
 import * as api from "@/lib/backend/api";
-import { buildPluginConnectionConfig, createFrontendPluginRegistry, parsePluginConnectionProviderOptionValue, pluginConnectionActionsForDialog, pluginConnectionFormValues, pluginConnectionProviderIcon, pluginConnectionProviderOptionValue } from "@/lib/plugins/frontendPlugin";
+import {
+  buildPluginConnectionConfig,
+  createFrontendPluginRegistry,
+  parsePluginConnectionProviderOptionValue,
+  pluginConnectionActionsForDialog,
+  pluginConnectionConnectTimeoutDefault,
+  pluginConnectionFormValues,
+  pluginConnectionProviderIcon,
+  pluginConnectionProviderOptionValue,
+} from "@/lib/plugins/frontendPlugin";
 import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isWindows } from "@/lib/backend/platform";
 import { applyMeilisearchBasePathToExternalConfig, applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connection/connectionUrl";
-import { DEFAULT_QUERY_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS } from "@/lib/connection/timeoutLimits";
+import { hasXuguConnectionDatabase } from "@/lib/connection/xuguDatabase";
+import { DEFAULT_QUERY_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS, MAX_IDLE_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS, supportsIdleTimeout } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
-import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseServiceConnectionUrl, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
+import { applyConnectionDeepLinkUpdate, resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
+import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseConnectionDeepLinkUpdate, parseServiceConnectionUrl, type ConnectionDeepLinkDraft, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
 import { parseGaussdbHosts, serializeGaussdbHosts, type GaussdbHostEntry } from "@/lib/connection/gaussdbHosts";
 import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/database/h2Connection";
@@ -75,21 +92,25 @@ import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedV
 import { mongodbAuthFailureHint, mongoConnectionUsesOidc, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongo/mongoConnectionOptions";
 import { isMongoLegacyDriverProfile } from "@/lib/mongo/mongoCapabilities";
 import { mysqlCleartextPasswordAuthEnabled, setMysqlCleartextPasswordAuthEnabled } from "@/lib/database/mysqlConnectionOptions";
+import { supportsOracleDatabaseLinks } from "@/lib/database/oracleDatabaseLinks";
 import { applyDamengSslUrlParams, damengSslFormConfig } from "@/lib/database/damengSslOptions";
 import { DAMENG_BUILTIN_DRIVER_PROFILE, DAMENG_CUSTOM_DRIVER_PROFILE, DAMENG_DEFAULT_JDBC_DRIVER_CLASS, damengCustomJdbcUrl, damengDriverModeForConfig, defaultDamengJdbcUrl, type DamengDriverMode } from "@/lib/database/damengDriverOptions";
 import { doltSystemTablesVisible, isDoltDriverProfile, setDoltSystemTablesVisible } from "@/lib/database/doltProfile";
+import { SUNDB_DEFAULT_JDBC_DRIVER_CLASS, sundbJdbcDriverClass } from "@/lib/database/sundbDriverOptions";
 import { DamengJvmSystemPropertyError, damengJvmSystemPropertiesText, parseDamengJvmSystemProperties } from "@/lib/database/damengJvmOptions";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { configuredDatabaseProductName, connectionConfigFingerprint, databaseInfoCopyText, databaseInfoRows, normalizeDatabaseConnectionInfo, type DatabaseInfoField } from "@/lib/connection/connectionDatabaseInfo";
 import { agentDriverInstallKey, appendAgentDriverUpdateHint, connectionUsesSsh, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState, type DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriver";
 import { JDBCX_DEFAULT_URL, JDBCX_DRIVER_PROFILE, JDBCX_JDBC_DRIVER_CLASS, ensureJdbcxRuntimeDrivers, isJdbcxRuntimeBundle, isJdbcxRuntimePath, jdbcxHighPrivilegeExtensionsEnabled, setJdbcxHighPrivilegeExtensionsEnabled } from "@/lib/database/jdbcxBuiltinDriver";
+import { notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
 import { consulAgentAddressesMatch } from "@/lib/consul/agentTarget";
 import { appendConnectionErrorHints, isJdbcMissingRuntimeDependencyError } from "@/lib/connection/connectionErrorHints";
 import { buildCassandraExternalConfig, cassandraTlsConfigFromExternalConfig, type CassandraTlsConfig } from "@/lib/connection/cassandraTlsOptions";
-import { preventDialogDocumentSelectAll } from "@/lib/connection/dialogTextSelection";
+import { savedMysqlTlsFormFields, supportsMysqlTlsOptions as mysqlTlsOptionsSupported, supportsMysqlTlsTab } from "@/lib/connection/mysqlTlsCapabilities";
+import { copyDialogPasswordFieldValue, preventDialogDocumentSelectAll } from "@/lib/connection/dialogTextSelection";
 import { postgresLegacyTlsEnabled, postgresTlsModeForForm, setPostgresLegacyTlsEnabled } from "@/lib/connection/postgresTlsMode";
 import { buildMqKafkaConnectionExtra, mqKafkaConnectionTarget, resolveMqKafkaConnectionSource, type MqKafkaConnectionSource } from "@/lib/connection/mqKafkaConnection";
 import { assertCompleteDatabaseCategories, databaseSelectionForCategory } from "@/lib/connection/databaseCategoryOptions";
@@ -127,6 +148,7 @@ import {
   Pipette,
   Plus,
   RefreshCw,
+  Save,
   Search,
   ShieldAlert,
   ShieldCheck,
@@ -134,10 +156,11 @@ import {
   Trash2,
 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleObjectFiltersNeedReset } from "@/lib/connection/connectionVisibleDatabases";
-import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, filterSchemaNamesForVisiblePicker, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
-import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
+import { resolveVisibleDatabaseSaveAction } from "@/components/sidebar/visibleDatabasesDialogState";
+import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, filterSchemaNamesForVisiblePicker, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/database/visibleDatabases";
+import { isSchemaAware, isSingleDatabase, supportsDataDictionary } from "@/lib/database/databaseFeatureSupport";
 import { normalizeConnectionScope, normalizeConnectionTimeouts } from "@/lib/connection/connectionSubmitNormalization";
-import { databaseConnectionFormKind } from "@/lib/database/databaseDriverManifest";
+import { databaseConnectionFormKind, databaseManifestEntry } from "@/lib/database/databaseDriverManifest";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import CloudflareD1ConnectionFields from "@/components/connection/CloudflareD1ConnectionFields.vue";
 import SpannerConnectionFields from "@/components/connection/SpannerConnectionFields.vue";
@@ -219,6 +242,7 @@ const DREMIO_ARROW_FLIGHT_SQL_JDBC_DRIVER_CLASS = "org.apache.arrow.driver.jdbc.
 const DREMIO_LEGACY_JDBC_URL = "jdbc:dremio:direct=127.0.0.1:31010";
 const DREMIO_LEGACY_JDBC_DRIVER_CLASS = "com.dremio.jdbc.Driver";
 const DEFAULT_SSH_USER = "root";
+const DIRECT_SIDEBAR_OBJECT_TYPES = new Set<DatabaseType>(["redis", "etcd", "zookeeper", "consul", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "solr", "milvus", "qdrant", "weaviate", "chromadb", "mq", "mqtt", "nacos", "plugin"]);
 const ETCD_GRPC_MAX_INBOUND_DEFAULT_MIB = 32;
 const ETCD_GRPC_MAX_INBOUND_MIN_MIB = 1;
 const ETCD_GRPC_MAX_INBOUND_MAX_MIB = 256;
@@ -281,6 +305,7 @@ const isDesktop = isTauriRuntime();
 const props = defineProps<{
   editConfig?: ConnectionConfig;
   prefillConfig?: ConnectionDeepLinkDraft | null;
+  updatePrefill?: ConnectionDeepLinkUpdate | null;
   pluginProvider?: PluginCenterFocus | null;
   initialTab?: ConfigTab;
 }>();
@@ -406,6 +431,8 @@ const defaultForm = (): ConnectionForm => ({
   client_cert_path: "",
   client_key_path: "",
   sysdba: false,
+  oracle_oci_nls_lang: "",
+  oracle_oci_tns_admin: "",
   oracle_connection_type: "service_name",
   connection_string: undefined,
   jdbc_driver_class: undefined,
@@ -420,6 +447,7 @@ const defaultForm = (): ConnectionForm => ({
   redis_key_separator: ":",
   redis_scan_page_size: REDIS_SCAN_PAGE_SIZE_DEFAULT,
   redis_key_templates: [],
+  redis_key_filter: "",
   etcd_endpoints: "",
   gbase_server: "",
   informix_server: "",
@@ -428,8 +456,11 @@ const defaultForm = (): ConnectionForm => ({
   docs_notes_path: undefined,
   read_only: false,
   show_system_schemas: false,
+  show_database_links: true,
+  sidebar_auto_load_all_tables: false,
   is_production: false,
   production_databases: [],
+  production_badge_scope: "database",
   visible_databases: undefined,
   save_password: true,
 });
@@ -487,6 +518,7 @@ function defaultSshTunnel(): SshTunnelConfig {
     ssh_agent_sock_path: "",
     auth_method: "password",
     allow_exec_channel_proxy: false,
+    proxy_command: "",
   };
 }
 
@@ -507,6 +539,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     ssh_agent_sock_path: hop.ssh_agent_sock_path || "",
     auth_method: hop.auth_method || inferSshAuthMethod(hop),
     allow_exec_channel_proxy: !!hop.allow_exec_channel_proxy,
+    proxy_command: hop.proxy_command || "",
     profile_id: hop.profile_id || undefined,
   };
 }
@@ -652,6 +685,7 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
 }
 
 const form = ref(defaultForm());
+const supportsAutomaticTableLoading = computed(() => supportsDataDictionary(form.value.db_type) && !DIRECT_SIDEBAR_OBJECT_TYPES.has(form.value.db_type));
 const redisKeyTemplatesText = ref("");
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const showGaussdbConnectionMode = computed(() => form.value.db_type === "gaussdb");
@@ -822,6 +856,8 @@ const appliedConnectionUrlInput = ref("");
 const meilisearchHostInput = ref("");
 const appliedMeilisearchHostInput = ref("");
 const oracleTnsAdminPath = ref("");
+/** 每次进入 OCI 模式只提醒一次 Instant Client 目录，避免反复点“测试”时刷屏。 */
+const oracleOciClientPathReminded = ref(false);
 const oceanbaseSubMode = ref<"mysql" | "oracle">("mysql");
 const h2ConnectionMode = ref<H2ConnectionMode>("file");
 const dremioConnectionMode = ref<DremioConnectionMode>("legacy");
@@ -1200,6 +1236,8 @@ const driverProfiles: Record<string, ConnectionProfileDefinition> = {
   ...CONNECTION_PROFILES,
   ...jdbcProductDriverProfiles(),
 };
+const nebulaDriverProfiles = databaseManifestEntry("nebula")?.driverProfiles ?? [];
+const nebulaDefaultDriverProfile = nebulaDriverProfiles[0]?.profile ?? "nebula";
 
 function profileForConfig(config: ConnectionConfig) {
   if (config.db_type === "plugin" && config.plugin_id && config.plugin_connection_provider) {
@@ -1598,6 +1636,390 @@ function buildVictoriaMetricsExternalConfig(): VictoriaMetricsExternalConfig {
   return { apiPath, lookback };
 }
 
+// ---------------------------------------------------------------------------
+// Salesforce OAuth / device-code flow state
+// ---------------------------------------------------------------------------
+
+const salesforceAuthMode = ref<SalesforceAuthMode>("token");
+const salesforceEnvironment = ref<SalesforceEnvironment>("production");
+const salesforceLoginUrl = ref("");
+const salesforceClientId = ref("");
+const salesforceClientSecret = ref("");
+// Username-password (ROPC) mode credentials. The password is never
+// round-tripped from the backend; blank on edit unless re-typed.
+const salesforceUsername = ref("");
+const salesforceUserPassword = ref("");
+
+const salesforceOauthRunning = ref(false);
+const salesforceOauthError = ref("");
+const salesforceOauthSuccess = ref("");
+// When editing an existing connection whose credentials live in the backend's
+// secret store, refreshToken/clientSecret are intentionally not sent back to
+// the UI. Track "we have previously authorized" separately from whether we
+// still hold the tokens in-memory so the form can show a status chip.
+const salesforceOauthPreviouslyAuthorized = ref(false);
+
+type SalesforceDevicePhase = "idle" | "polling" | "success" | "expired" | "denied" | "error";
+const salesforceDevicePhase = ref<SalesforceDevicePhase>("idle");
+const salesforceDeviceUserCode = ref("");
+const salesforceDeviceVerificationUri = ref("");
+const salesforceDeviceCode = ref("");
+const salesforceDeviceIntervalSecs = ref(5);
+const salesforceDeviceSecondsLeft = ref(0);
+const salesforceDeviceError = ref("");
+const salesforceDeviceUserCodeCopied = ref(false);
+const salesforceDeviceVerificationCopied = ref(false);
+
+let salesforceDevicePollTimer: ReturnType<typeof setTimeout> | null = null;
+let salesforceDevicePollAbortId = 0;
+let salesforceDeviceExpiresTimer: ReturnType<typeof setInterval> | null = null;
+
+function salesforceAuthModeFromConfig(externalConfig: unknown, fallbackPassword?: string): SalesforceAuthMode {
+  const cfg = (externalConfig as SalesforceExternalConfig | undefined) ?? undefined;
+  const mode = cfg?.auth?.mode;
+  if (mode === "oauth" || mode === "device" || mode === "password") return mode;
+  if (cfg?.auth && (cfg.auth.refreshToken || cfg.auth.clientId || cfg.auth.authorizedAt)) return "oauth";
+  // No persisted auth context: if a password/token is present, treat as manual token.
+  if (fallbackPassword?.trim()) return "token";
+  return "token";
+}
+
+function resetSalesforceOAuthFields(externalConfig?: unknown, fallbackPassword?: string) {
+  const cfg = (externalConfig as SalesforceExternalConfig | undefined) ?? undefined;
+  const auth = cfg?.auth;
+  salesforceAuthMode.value = salesforceAuthModeFromConfig(externalConfig, fallbackPassword);
+  salesforceEnvironment.value = (auth?.environment as SalesforceEnvironment) || "production";
+  salesforceLoginUrl.value = auth?.loginUrl?.trim() || "";
+  salesforceClientId.value = auth?.clientId?.trim() || "";
+  // Client secret is never round-tripped from the backend for security; the
+  // input is blank on edit and only sent when the user re-types it.
+  salesforceClientSecret.value = "";
+  salesforceUsername.value = auth?.username?.trim() || "";
+  salesforceUserPassword.value = "";
+  salesforceOauthRunning.value = false;
+  salesforceOauthError.value = "";
+  salesforceOauthSuccess.value = "";
+  // A Client ID alone only means the form was filled in, not that anybody ever
+  // signed in; claiming "authorized" from it showed a false reassurance banner.
+  salesforceOauthPreviouslyAuthorized.value = !!(auth?.refreshToken || auth?.authorizedAt);
+  salesforceDevicePhase.value = "idle";
+  salesforceDeviceUserCode.value = "";
+  salesforceDeviceVerificationUri.value = "";
+  salesforceDeviceCode.value = "";
+  salesforceDeviceIntervalSecs.value = 5;
+  salesforceDeviceSecondsLeft.value = 0;
+  salesforceDeviceError.value = "";
+  salesforceDeviceUserCodeCopied.value = false;
+  salesforceDeviceVerificationCopied.value = false;
+  salesforceDeviceStopPolling();
+}
+
+function hydrateSalesforceOAuthFields(value: unknown, fallbackPassword?: string) {
+  resetSalesforceOAuthFields(value, fallbackPassword);
+}
+
+function salesforceBuildAuthorizeParams(): SalesforceOAuthAuthorizeParams {
+  const clientId = salesforceClientId.value.trim();
+  if (!clientId) throw new Error(t("connection.salesforceOauthClientIdRequired"));
+  const environment = salesforceEnvironment.value;
+  const loginUrl = environment === "custom" ? salesforceLoginUrl.value.trim() : undefined;
+  if (environment === "custom" && !loginUrl) {
+    throw new Error(t("connection.salesforceOauthLoginUrlRequired"));
+  }
+  const clientSecret = salesforceClientSecret.value.trim() || undefined;
+  return { environment, loginUrl, clientId, clientSecret };
+}
+
+function salesforceApplyTokenToForm(token: { accessToken: string; instanceUrl: string }) {
+  form.value.password = token.accessToken;
+  // The backend normalizes bare hostnames; we mirror it so the card preview
+  // shows the final instance URL even before the backend canonicalizes it.
+  let instanceUrl = token.instanceUrl.trim();
+  if (instanceUrl && !/^https?:\/\//i.test(instanceUrl)) {
+    instanceUrl = `https://${instanceUrl.replace(/\/+$/, "")}`;
+  }
+  if (instanceUrl) {
+    form.value.host = instanceUrl.replace(/\/+$/, "");
+  }
+}
+
+function salesforceBuildAuthContext(mode: SalesforceAuthMode, token?: { refreshToken?: string }): SalesforceAuthContext | undefined {
+  if (mode === "token") return undefined;
+  const context: SalesforceAuthContext = {
+    mode,
+    environment: salesforceEnvironment.value,
+    clientId: salesforceClientId.value.trim() || undefined,
+    authorizedAt: new Date().toISOString(),
+  };
+  if (salesforceEnvironment.value === "custom") {
+    context.loginUrl = salesforceLoginUrl.value.trim() || undefined;
+  }
+  // Only forward the client secret when the user explicitly typed it in this
+  // session — otherwise we would overwrite the backend-stored secret with "".
+  if (salesforceClientSecret.value.trim()) {
+    context.clientSecret = salesforceClientSecret.value.trim();
+  }
+  if (mode === "password") {
+    context.username = salesforceUsername.value.trim() || undefined;
+    if (salesforceUserPassword.value) {
+      context.password = salesforceUserPassword.value;
+    }
+  }
+  if (token?.refreshToken) {
+    context.refreshToken = token.refreshToken;
+  }
+  return context;
+}
+
+function salesforceMergeAuthIntoExternalConfig(mode: SalesforceAuthMode, token?: { refreshToken?: string }) {
+  const existing = (form.value.external_config && typeof form.value.external_config === "object" ? (form.value.external_config as Record<string, unknown>) : {}) as SalesforceExternalConfig & Record<string, unknown>;
+  const auth = salesforceBuildAuthContext(mode, token);
+  if (!auth) {
+    const { auth: _dropped, ...rest } = existing;
+    form.value.external_config = Object.keys(rest).length > 0 ? rest : undefined;
+    return;
+  }
+  // Preserve an existing refreshToken when the user re-authorizes without the
+  // backend returning a new one (e.g. refresh flow that omits a rotation).
+  if (!auth.refreshToken && existing.auth?.refreshToken) {
+    auth.refreshToken = existing.auth.refreshToken;
+  }
+  // Same for the ROPC password: it is not round-tripped for display, so an
+  // edit-without-retype must not clobber the stored credential.
+  if (!auth.password && existing.auth?.password) {
+    auth.password = existing.auth.password;
+  }
+  form.value.external_config = { ...existing, auth };
+}
+
+async function salesforceStartBrowserAuthorize() {
+  salesforceOauthError.value = "";
+  salesforceOauthSuccess.value = "";
+  salesforceOauthPreviouslyAuthorized.value = false;
+  let params: SalesforceOAuthAuthorizeParams;
+  try {
+    params = salesforceBuildAuthorizeParams();
+  } catch (e) {
+    salesforceOauthError.value = errorMessage(e);
+    return;
+  }
+  salesforceOauthRunning.value = true;
+  try {
+    const token = await api.salesforceOauthBrowserAuthorize(params);
+    salesforceApplyTokenToForm(token);
+    salesforceMergeAuthIntoExternalConfig("oauth", token);
+    salesforceOauthSuccess.value = t("connection.salesforceOauthSuccess", { instanceUrl: token.instanceUrl });
+    salesforceOauthPreviouslyAuthorized.value = true;
+  } catch (e) {
+    salesforceOauthError.value = errorMessage(e);
+  } finally {
+    salesforceOauthRunning.value = false;
+  }
+}
+
+async function salesforceStartPasswordLogin() {
+  salesforceOauthError.value = "";
+  salesforceOauthSuccess.value = "";
+  salesforceOauthPreviouslyAuthorized.value = false;
+  let params: SalesforceOAuthAuthorizeParams;
+  try {
+    params = salesforceBuildAuthorizeParams();
+  } catch (e) {
+    salesforceOauthError.value = errorMessage(e);
+    return;
+  }
+  const username = salesforceUsername.value.trim();
+  if (!username) {
+    salesforceOauthError.value = t("connection.salesforceUsernameRequired");
+    return;
+  }
+  if (!salesforceUserPassword.value) {
+    salesforceOauthError.value = t("connection.salesforceUserPasswordRequired");
+    return;
+  }
+  salesforceOauthRunning.value = true;
+  try {
+    const token = await api.salesforceOauthPasswordLogin(params, username, salesforceUserPassword.value);
+    salesforceApplyTokenToForm(token);
+    salesforceMergeAuthIntoExternalConfig("password", token);
+    salesforceOauthSuccess.value = t("connection.salesforceOauthSuccess", { instanceUrl: token.instanceUrl });
+    salesforceOauthPreviouslyAuthorized.value = true;
+  } catch (e) {
+    salesforceOauthError.value = errorMessage(e);
+  } finally {
+    salesforceOauthRunning.value = false;
+  }
+}
+
+function salesforceDeviceStopPolling() {
+  salesforceDevicePollAbortId++;
+  if (salesforceDevicePollTimer) {
+    clearTimeout(salesforceDevicePollTimer);
+    salesforceDevicePollTimer = null;
+  }
+  if (salesforceDeviceExpiresTimer) {
+    clearInterval(salesforceDeviceExpiresTimer);
+    salesforceDeviceExpiresTimer = null;
+  }
+}
+
+function salesforceDeviceStartExpiryCountdown(expiresInSecs: number) {
+  salesforceDeviceSecondsLeft.value = Math.max(0, Math.floor(expiresInSecs));
+  if (salesforceDeviceExpiresTimer) clearInterval(salesforceDeviceExpiresTimer);
+  salesforceDeviceExpiresTimer = setInterval(() => {
+    salesforceDeviceSecondsLeft.value = Math.max(0, salesforceDeviceSecondsLeft.value - 1);
+    if (salesforceDeviceSecondsLeft.value <= 0 && salesforceDevicePhase.value === "polling") {
+      salesforceDeviceStopPolling();
+      salesforceDevicePhase.value = "expired";
+    }
+  }, 1000);
+}
+
+async function salesforceDeviceRequestCode() {
+  salesforceOauthError.value = "";
+  salesforceOauthSuccess.value = "";
+  salesforceOauthPreviouslyAuthorized.value = false;
+  salesforceDeviceError.value = "";
+  salesforceDeviceUserCode.value = "";
+  salesforceDeviceVerificationUri.value = "";
+  salesforceDeviceUserCodeCopied.value = false;
+  salesforceDeviceVerificationCopied.value = false;
+  let params: SalesforceOAuthAuthorizeParams;
+  try {
+    params = salesforceBuildAuthorizeParams();
+  } catch (e) {
+    salesforceDeviceError.value = errorMessage(e);
+    salesforceDevicePhase.value = "error";
+    return;
+  }
+  salesforceOauthRunning.value = true;
+  salesforceDevicePhase.value = "idle";
+  try {
+    const start = await api.salesforceOauthDeviceStart(params);
+    salesforceDeviceUserCode.value = start.userCode;
+    salesforceDeviceVerificationUri.value = start.verificationUri;
+    salesforceDeviceCode.value = start.deviceCode;
+    salesforceDeviceIntervalSecs.value = Math.max(1, start.intervalSecs || 5);
+    salesforceDevicePhase.value = "polling";
+    salesforceDeviceStartExpiryCountdown(start.expiresInSecs);
+    await salesforceDevicePollLoop(params, start.deviceCode, salesforceDeviceIntervalSecs.value, salesforceDevicePollAbortId);
+  } catch (e) {
+    salesforceDeviceError.value = errorMessage(e);
+    salesforceDevicePhase.value = "error";
+    salesforceDeviceStopPolling();
+  } finally {
+    salesforceOauthRunning.value = false;
+  }
+}
+
+async function salesforceDevicePollLoop(params: SalesforceOAuthAuthorizeParams, deviceCode: string, intervalSecs: number, abortId: number): Promise<void> {
+  while (salesforceDevicePhase.value === "polling" && abortId === salesforceDevicePollAbortId) {
+    await new Promise<void>((resolve) => {
+      salesforceDevicePollTimer = setTimeout(() => resolve(), intervalSecs * 1000);
+    });
+    if (abortId !== salesforceDevicePollAbortId) return;
+    let result: SalesforceOAuthDevicePollResult;
+    try {
+      result = await api.salesforceOauthDevicePoll(params, deviceCode, intervalSecs);
+    } catch (e) {
+      // Transient network error: keep polling until the code expires.
+      if (salesforceDeviceSecondsLeft.value <= 0) {
+        salesforceDevicePhase.value = "expired";
+        salesforceDeviceStopPolling();
+        return;
+      }
+      salesforceDeviceError.value = errorMessage(e);
+      continue;
+    }
+    if (abortId !== salesforceDevicePollAbortId) return;
+    if (result.status === "pending") {
+      salesforceDeviceIntervalSecs.value = Math.max(1, result.intervalSecs || intervalSecs);
+      continue;
+    }
+    salesforceDeviceStopPolling();
+    if (result.status === "success") {
+      salesforceApplyTokenToForm(result.token);
+      salesforceMergeAuthIntoExternalConfig("device", result.token);
+      salesforceOauthSuccess.value = t("connection.salesforceOauthSuccess", { instanceUrl: result.token.instanceUrl });
+      salesforceOauthPreviouslyAuthorized.value = true;
+      salesforceDevicePhase.value = "success";
+      return;
+    }
+    if (result.status === "expired") {
+      salesforceDevicePhase.value = "expired";
+      return;
+    }
+    if (result.status === "denied") {
+      salesforceDeviceError.value = result.reason || t("connection.salesforceDeviceDenied");
+      salesforceDevicePhase.value = "denied";
+      return;
+    }
+  }
+}
+
+function salesforceDeviceCancel() {
+  salesforceDeviceStopPolling();
+  salesforceDevicePhase.value = "idle";
+  salesforceDeviceUserCode.value = "";
+  salesforceDeviceVerificationUri.value = "";
+  salesforceDeviceCode.value = "";
+}
+
+function salesforceDeviceRestart() {
+  salesforceDeviceCancel();
+  salesforceDeviceError.value = "";
+  salesforceOauthError.value = "";
+}
+
+async function salesforceCopyUserCode() {
+  if (!salesforceDeviceUserCode.value) return;
+  await copyToClipboard(salesforceDeviceUserCode.value);
+  salesforceDeviceUserCodeCopied.value = true;
+  setTimeout(() => {
+    salesforceDeviceUserCodeCopied.value = false;
+  }, 1500);
+}
+
+async function salesforceCopyVerificationUri() {
+  if (!salesforceDeviceVerificationUri.value) return;
+  await copyToClipboard(salesforceDeviceVerificationUri.value);
+  salesforceDeviceVerificationCopied.value = true;
+  setTimeout(() => {
+    salesforceDeviceVerificationCopied.value = false;
+  }, 1500);
+}
+
+function salesforceOpenVerificationPage() {
+  if (!salesforceDeviceVerificationUri.value) return;
+  // Same pattern as the update-flow "open release notes" action: defer to the
+  // shell helper that picks the right opener for desktop vs. web.
+  void (async () => {
+    try {
+      if (isDesktop) {
+        const { open } = await import("@tauri-apps/plugin-shell");
+        await open(salesforceDeviceVerificationUri.value);
+      } else {
+        globalThis.open(salesforceDeviceVerificationUri.value, "_blank", "noopener,noreferrer");
+      }
+    } catch (e) {
+      salesforceDeviceError.value = errorMessage(e);
+    }
+  })();
+}
+
+function salesforceSetAuthMode(mode: SalesforceAuthMode) {
+  // Switching modes resets any in-flight state so stale tokens from one flow
+  // never leak into another.
+  if (salesforceOauthRunning.value && mode !== salesforceAuthMode.value) return;
+  salesforceAuthMode.value = mode;
+  salesforceOauthError.value = "";
+  salesforceOauthSuccess.value = "";
+  if (mode !== "device") {
+    salesforceDeviceCancel();
+    salesforceDeviceError.value = "";
+  }
+}
+
 watch(influxDbVersion, (version, previousVersion) => {
   if (form.value.db_type !== "influxdb") return;
   if (version === "2" || version === "3") {
@@ -1991,6 +2413,7 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
   const operationId = beginAgentDriverInstall(driverKey, label);
   try {
     await api.installAgent(driverKey, operationId);
+    notifyComponentUpdatesChanged();
     await refreshLocalAgentDrivers();
     // A stale promise (cancelled then retried) must not close the retry's dialog.
     if (agentInstallOperationId.value === operationId) finishAgentDriverInstall(operationId);
@@ -2026,6 +2449,7 @@ async function ensureRequiredJdbcxDriverInstalled(config: ConnectionConfig): Pro
     testResult.value = { ok: true, message: "Installing JDBC plugin..." };
   });
   if (!result) return;
+  notifyComponentUpdatesChanged();
 
   jdbcMavenBundles.value = result.bundles;
   addJdbcDriverPaths(result.paths);
@@ -2039,6 +2463,7 @@ async function ensureRequiredJdbcxDriverInstalled(config: ConnectionConfig): Pro
 async function ensureRequiredJdbcProductRuntimeInstalled(config: ConnectionConfig): Promise<void> {
   const result = await ensureRegisteredJdbcProductRuntimeDrivers(config, api);
   if (!result) return;
+  notifyComponentUpdatesChanged();
 
   jdbcMavenBundles.value = result.bundles;
   jdbcDriverPathsInput.value = result.paths.join("\n");
@@ -2058,6 +2483,7 @@ async function ensureRequiredGaussdbMJdbcRuntime(config: ConnectionConfig): Prom
   if (status.installed && status.compatible) return;
   testResult.value = { ok: true, message: t("connection.gaussdbMJdbcPluginInstalling") };
   await api.installJdbcPlugin();
+  notifyComponentUpdatesChanged();
 }
 
 async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<boolean> {
@@ -2067,6 +2493,7 @@ async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<b
   const operationId = beginAgentDriverInstall(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, label);
   try {
     await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, operationId);
+    notifyComponentUpdatesChanged();
     await refreshLocalAgentDrivers();
     // A stale promise (cancelled then retried) must not close the retry's dialog.
     if (agentInstallOperationId.value === operationId) finishAgentDriverInstall(operationId);
@@ -2431,7 +2858,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   const previousDatabaseType = form.value.db_type;
   selectedType.value = val;
   form.value.db_type = profile.type;
-  form.value.driver_profile = val;
+  form.value.driver_profile = val === "nebula" ? nebulaDefaultDriverProfile : val;
   form.value.driver_label = isCustomCompatibleProfile() ? customDriverName.value.trim() || profile.label : profile.label;
   const preserveMeilisearchConfig = preserveConnectionFields && previousDatabaseType === "meilisearch" && profile.type === "meilisearch";
   if (profile.type !== "sqlserver" && !preserveMeilisearchConfig) {
@@ -2513,6 +2940,18 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       jdbcDriverPathsInput.value = "";
       jdbcManualClasspathOpen.value = true;
     }
+    if (profile.type === "sundb") {
+      // The SunDB Agent bundles the vendor JDBC driver, so the connection works
+      // without a JAR; the classpath field is only an override for anyone who
+      // wants the Agent to load a newer vendor JAR in isolation.
+      form.value.connection_string = undefined;
+      form.value.jdbc_driver_class = SUNDB_DEFAULT_JDBC_DRIVER_CLASS;
+      form.value.jdbc_driver_paths = [];
+      jdbcDriverPathsInput.value = "";
+    }
+    if (profile.type === "transwarp") {
+      form.value.connection_string = undefined;
+    }
     if (profile.type === "spanner") {
       // Google Cloud endpoints carry no host; the local emulator is opted into
       // by typing host `localhost` and port 9010 explicitly.
@@ -2565,7 +3004,10 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.connection_string = undefined;
       form.value.url_params = "";
     }
-    resetHiveKerberosFields(profile.type === "hive" || profile.type === "argo" || profile.type === "kyuubi" || profile.type === "impala" ? form.value : undefined);
+    if (profile.type === "salesforce") {
+      resetSalesforceOAuthFields(form.value.external_config, form.value.password);
+    }
+    resetHiveKerberosFields(profile.type === "hive" || profile.type === "argo" || profile.type === "transwarp" || profile.type === "kyuubi" || profile.type === "impala" ? form.value : undefined);
   }
   if (profile.type === "meilisearch") {
     syncMeilisearchHostInput(form.value);
@@ -2647,15 +3089,42 @@ function switchGbaseProfile(profile: "gbase8a" | "gbase8s") {
   resetTestState();
 }
 
+let applyingConnectionUpdate = false;
+let appliedConnectionUpdate: ConnectionDeepLinkUpdate | null = null;
+
+function finishApplyingConnectionUpdate() {
+  void nextTick(() => {
+    applyingConnectionUpdate = false;
+  });
+}
+
+// The external_config shaped by an update link must survive submit verbatim
+// only while the submitted values are still the ones the link patched: once
+// the user edits the port away from the patched value, or the patch targeted
+// another connection, the flag is re-derived from the form like any edit.
+function connectionUpdateExternalConfigPreserved(config: Pick<ConnectionConfig, "id" | "port">): boolean {
+  if (!appliedConnectionUpdate || appliedConnectionUpdate.connectionId !== config.id) return false;
+  const patchedPort = appliedConnectionUpdate.patch.port;
+  return patchedPort === undefined || patchedPort === config.port;
+}
+
 watch(
   [() => props.editConfig, open],
-  ([config, isOpen]) => {
-    const syncAction = connectionEditDraftSyncAction(config?.id ?? null, isOpen, editingId.value);
+  ([savedConfig, isOpen]) => {
+    const syncAction = connectionEditDraftSyncAction(savedConfig?.id ?? null, isOpen, editingId.value);
     if (syncAction === "preserve") return;
+    // Hydrate a detached edit draft before form watchers observe it. Do not
+    // mutate the saved record or apply create defaults to an ID update. Only
+    // flag the update as applied when the prefill really targeted this
+    // connection, so an ID mismatch cannot freeze port-flag recomputation.
+    const connectionUpdate = savedConfig && props.updatePrefill?.connectionId === savedConfig.id ? props.updatePrefill : null;
+    const config = connectionUpdate && savedConfig ? applyConnectionDeepLinkUpdate(savedConfig, connectionUpdate) : savedConfig;
     resetConnectionNoteVisibilityDraft(connectionNoteVisibilityDraft, settingsStore.editorSettings.sidebarShowConnectionNotes);
     editGlobalConnectTimeoutSecs.value = settingsStore.editorSettings.globalConnectTimeoutSecs;
     editGlobalQueryTimeoutSecs.value = settingsStore.editorSettings.globalQueryTimeoutSecs;
     if (syncAction === "hydrate" && config) {
+      appliedConnectionUpdate = connectionUpdate;
+      if (connectionUpdate) applyingConnectionUpdate = true;
       clearSavedDatabaseInfo();
       const legacyConfig = config as LegacyConnectionConfig;
       const profile = profileForConfig(config);
@@ -2669,7 +3138,7 @@ watch(
         db_type: oceanbasePatch?.db_type || profileConfig?.type || config.db_type,
         driver_profile: config.db_type === "plugin" ? "plugin" : oceanbasePatch?.driver_profile || config.driver_profile || profile,
         driver_label: config.driver_label || oceanbasePatch?.driver_label || driverProfiles[profile]?.label || config.db_type,
-        url_params: config.url_params || "",
+        ...savedMysqlTlsFormFields(config),
         agent_java_options: config.agent_java_options || [],
         host: config.db_type === "h2" && h2FilePathFromJdbcUrl(config.connection_string) ? h2FilePathFromJdbcUrl(config.connection_string) : config.host,
         port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
@@ -2686,14 +3155,12 @@ watch(
         query_timeout_inherit: config.query_timeout_inherit === true,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
         keepalive_interval_secs: config.keepalive_interval_secs ?? 30,
-        ssl: config.ssl || false,
-        ca_cert_path: config.ca_cert_path || "",
-        client_cert_path: config.client_cert_path || "",
-        client_key_path: config.client_key_path || "",
         sysdba: config.sysdba || isOracleSysUser(config),
+        oracle_oci_nls_lang: config.oracle_oci_nls_lang || "",
+        oracle_oci_tns_admin: config.oracle_oci_tns_admin || "",
         oracle_connection_type: config.oracle_connection_type || "service_name",
         connection_string: config.connection_string,
-        jdbc_driver_class: config.jdbc_driver_class,
+        jdbc_driver_class: config.db_type === "sundb" ? sundbJdbcDriverClass(config) : config.jdbc_driver_class,
         jdbc_driver_paths: config.jdbc_driver_paths || [],
         redis_connection_mode: config.redis_connection_mode || "standalone",
         redis_sentinel_master: config.redis_sentinel_master || "",
@@ -2705,6 +3172,7 @@ watch(
         redis_key_separator: config.redis_key_separator ?? ":",
         redis_scan_page_size: config.redis_scan_page_size ?? REDIS_SCAN_PAGE_SIZE_DEFAULT,
         redis_key_templates: normalizeRedisKeyTemplates(config.redis_key_templates),
+        redis_key_filter: config.redis_key_filter ?? "",
         redis_key_grouping: config.redis_key_grouping,
         etcd_endpoints: config.etcd_endpoints || "",
         gbase_server: config.gbase_server || "",
@@ -2715,8 +3183,11 @@ watch(
         docs_notes_path: config.docs_notes_path,
         read_only: config.read_only || false,
         show_system_schemas: config.show_system_schemas || false,
+        show_database_links: config.show_database_links !== false,
+        sidebar_auto_load_all_tables: config.sidebar_auto_load_all_tables === true,
         is_production: config.is_production || false,
         production_databases: config.production_databases || [],
+        production_badge_scope: sidebarProductionBadgeScope(config),
         visible_databases: config.visible_databases,
         visible_schemas: config.visible_schemas,
         save_password: config.save_password !== false,
@@ -2769,8 +3240,13 @@ watch(
       } else {
         resetVictoriaMetricsFields();
       }
+      if (config.db_type === "salesforce") {
+        hydrateSalesforceOAuthFields(config.external_config, config.password);
+      } else {
+        resetSalesforceOAuthFields(undefined, undefined);
+      }
       resetElasticsearchProxyFields(config.db_type === "elasticsearch" ? config.external_config : undefined);
-      resetHiveKerberosFields(config.db_type === "hive" || config.db_type === "argo" || config.db_type === "kyuubi" || config.db_type === "impala" ? config : undefined);
+      resetHiveKerberosFields(config.db_type === "hive" || config.db_type === "argo" || config.db_type === "transwarp" || config.db_type === "kyuubi" || config.db_type === "impala" ? config : undefined);
       resetDamengJvmOptions(config.db_type === "dameng" ? config : undefined);
       h2ConnectionMode.value = h2ConnectionModeForConfig(config);
       customColorInput.value = config.color || "";
@@ -2798,13 +3274,15 @@ watch(
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
       dialogStep.value = "config";
       configTab.value = initialConfigTab();
+      if (props.updatePrefill) finishApplyingConnectionUpdate();
       // Form/profile watchers normalize derived fields in this flush. Capture
       // the saved baseline afterwards so those initial changes are not treated
       // as user edits that invalidate persisted database metadata.
       void nextTick(() => {
-        if (open.value && props.editConfig?.id === config.id) applySavedDatabaseInfo(config);
+        if (open.value && props.editConfig?.id === config.id && !props.updatePrefill) applySavedDatabaseInfo(config);
       });
     } else {
+      appliedConnectionUpdate = null;
       clearSavedDatabaseInfo();
       editingId.value = null;
       selectedConnectionGroupId.value = initialConnectionGroupId();
@@ -2848,6 +3326,30 @@ watch(
   },
 );
 
+// 删除连接时若开启了「记住连接名与数据库」，新建同名**同类型**连接会自动选中记住的数据库。
+// 只在数据库字段为空、或仍是上一次自动回填的值时才覆盖，避免抢走用户手输的内容。
+const lastRememberedDatabaseAutofill = ref("");
+watch(
+  () => [open.value, editingId.value, form.value.name, form.value.db_type] as const,
+  ([isOpen, editing, rawName, dbType]) => {
+    if (!isOpen || editing) {
+      lastRememberedDatabaseAutofill.value = "";
+      return;
+    }
+    const name = (rawName ?? "").trim();
+    const remembered = name ? settingsStore.rememberedDatabaseForConnection(name, dbType) : "";
+    const current = (form.value.database ?? "").trim();
+    if (current === remembered) {
+      lastRememberedDatabaseAutofill.value = remembered;
+      return;
+    }
+    if (current && current !== lastRememberedDatabaseAutofill.value) return;
+    form.value.database = remembered || undefined;
+    lastRememberedDatabaseAutofill.value = remembered;
+  },
+  { immediate: true },
+);
+
 const databaseLabel = computed(() => {
   if (form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns") return t("connection.oracleTnsAlias");
   if (form.value.db_type === "oracle") return t("connection.serviceName");
@@ -2857,6 +3359,7 @@ const databaseLabel = computed(() => {
 
 const databasePlaceholder = computed(() => {
   if (form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns") return t("connection.oracleTnsAliasPlaceholder");
+  if (form.value.db_type === "xugu") return t("connection.databasePlaceholderRequired");
   if (form.value.db_type === "kingbase") return t("connection.databasePlaceholderRequired");
   const fallback = defaultDatabaseForProfile();
   if (!fallback) return t("connection.databasePlaceholder");
@@ -2878,8 +3381,8 @@ const gatewayAsConnectionInfo = computed(() => connectionInfoGatewayLayer.value?
 
 const tunnelProfiles = computed(() => {
   const profiles = tunnelProfileStore.profiles;
-  if (!sqliteSshOnlyTransport.value) return profiles;
-  return profiles.filter((profile) => profile.type === "ssh");
+  if (!sqliteRemoteTransportRestricted.value) return profiles;
+  return profiles.filter((profile) => isSqliteRemoteTransportLayerType(profile.type));
 });
 const gatewayTunnelProfiles = computed(() => tunnelProfiles.value.filter((profile) => profile.type === "dbx_gateway"));
 const compatibleTunnelProfiles = computed(() => tunnelProfiles.value.filter((profile) => profile.type === selectedTransportLayer.value?.type));
@@ -3107,6 +3610,12 @@ function switchEtcdApiVersion(profile: "etcd" | "etcd-v2") {
   resetTestState();
 }
 
+function switchNebulaDriverProfile(profile: unknown) {
+  if (typeof profile !== "string" || !nebulaDriverProfiles.some((entry) => entry.profile === profile)) return;
+  form.value.driver_profile = profile;
+  resetTestState();
+}
+
 function switchH2DriverProfile(profile: "h2" | "h2-v1" | "h2-v2" | "h2-v3" | "h2-custom") {
   form.value.driver_profile = profile;
   if (profile === "h2-custom") {
@@ -3120,6 +3629,156 @@ function switchH2DriverProfile(profile: "h2" | "h2-v1" | "h2-v2" | "h2-v3" | "h2
     jdbcManualClasspathOpen.value = false;
   }
   resetTestState();
+}
+
+/**
+ * Oracle driver mode: thin (go-ora agent, default) or OCI (thick driver,
+ * requires a globally configured Oracle Instant Client). The oci.dll path
+ * lives in the global settings on purpose — one configuration is shared by
+ * every OCI connection, and new OCI connections backfill it automatically.
+ */
+// OCI（thick）驱动目前只发布 Windows x64 产物：非 Windows 平台不显示模式切换，
+// 避免用户选到无法安装的驱动。已保存的 OCI 连接仍按原样打开（连接时会得到
+// 明确的“驱动未安装”错误），并把 Thin 按钮留在原地便于切回。
+const oracleOciDriverSelectable = isWindows();
+
+function switchOracleDriverMode(mode: "thin" | "oci") {
+  form.value.driver_profile = mode === "oci" ? "oci" : "oracle";
+  oracleOciClientPathReminded.value = false;
+  resetTestState();
+}
+
+function persistOracleOciClientPath() {
+  void settingsStore.updateEditorSettings({
+    oracleOciClientPath: settingsStore.editorSettings.oracleOciClientPath,
+  });
+}
+
+/**
+ * NLS_LANG is a per-connection override: an empty value follows the global
+ * default, a filled value makes this connection own a dedicated agent process
+ * (the variable is process-scoped for OCI). The dropdown lists the common
+ * client character sets; the save button promotes the current value to the
+ * global default for reuse.
+ */
+const OCI_NLS_LANG_FOLLOW_GLOBAL = "__follow_global__";
+const ORACLE_NLS_LANG_OPTIONS = [
+  "AMERICAN_AMERICA.AL32UTF8",
+  "AMERICAN_AMERICA.UTF8",
+  "AMERICAN_AMERICA.WE8ISO8859P1",
+  "AMERICAN_AMERICA.ZHS16GBK",
+  "SIMPLIFIED CHINESE_CHINA.AL32UTF8",
+  "SIMPLIFIED CHINESE_CHINA.ZHS16GBK",
+  "TRADITIONAL CHINESE_TAIWAN.AL32UTF8",
+  "TRADITIONAL CHINESE_TAIWAN.ZHT16MSWIN950",
+  "JAPANESE_JAPAN.AL32UTF8",
+  "JAPANESE_JAPAN.JA16SJIS",
+  "KOREAN_KOREA.AL32UTF8",
+  "KOREAN_KOREA.KO16MSWIN949",
+] as const;
+
+const oracleOciNlsLangSelection = computed(() => (form.value.oracle_oci_nls_lang?.trim() ? form.value.oracle_oci_nls_lang.trim() : OCI_NLS_LANG_FOLLOW_GLOBAL));
+
+/** A stored value that predates the preset list must stay selectable. */
+const oracleOciNlsLangCustomValue = computed(() => {
+  const value = form.value.oracle_oci_nls_lang?.trim();
+  if (!value) return null;
+  return (ORACLE_NLS_LANG_OPTIONS as readonly string[]).includes(value) ? null : value;
+});
+
+const oracleOciNlsLangPlaceholder = computed(() => {
+  const globalValue = settingsStore.editorSettings.oracleOciNlsLang?.trim();
+  return globalValue ? t("connection.oracleOciNlsLangPlaceholderGlobal", { value: globalValue }) : t("connection.oracleOciNlsLangPlaceholder");
+});
+
+/** Names the global default in effect, so promoting a value becomes visible in place. */
+const oracleOciNlsLangFollowGlobalLabel = computed(() => {
+  const globalValue = settingsStore.editorSettings.oracleOciNlsLang?.trim();
+  return globalValue ? t("connection.oracleOciNlsLangFollowGlobalValue", { value: globalValue }) : t("connection.oracleOciNlsLangFollowGlobal");
+});
+
+function onOciNlsLangSelected(value: unknown) {
+  const selected = typeof value === "string" ? value : "";
+  form.value.oracle_oci_nls_lang = selected === OCI_NLS_LANG_FOLLOW_GLOBAL ? "" : selected;
+  resetTestState();
+}
+
+async function saveOciNlsLangAsGlobalDefault() {
+  const value = form.value.oracle_oci_nls_lang?.trim();
+  if (!value) {
+    toast(t("connection.oracleOciNlsLangSaveGlobalEmpty"), 3000);
+    return;
+  }
+  try {
+    await settingsStore.updateEditorSettingsAndPersist({ oracleOciNlsLang: value });
+    toast(t("connection.oracleOciNlsLangSavedGlobal", { value }), 3000);
+  } catch (error) {
+    toast(error instanceof Error ? error.message : String(error), 5000);
+  }
+}
+
+/**
+ * 连接级 TNS_ADMIN（tnsnames.ora / sqlnet.ora / 钱包目录）：留空跟随全局默认，
+ * 填写后本连接使用自己的目录——ADB 钱包、sqlnet.ora 网络选项因此不依赖
+ * TNS 连接方式。目录同样是进程级的，随 agent 启动注入。
+ */
+const oracleOciTnsAdminPlaceholder = computed(() => {
+  const globalValue = settingsStore.editorSettings.oracleOciTnsAdmin?.trim();
+  return globalValue ? t("connection.oracleOciTnsAdminPlaceholderGlobal", { value: globalValue }) : t("connection.oracleTnsAdminPlaceholder");
+});
+
+async function saveOciTnsAdminAsGlobalDefault() {
+  const value = form.value.oracle_oci_tns_admin?.trim();
+  if (!value) {
+    toast(t("connection.oracleOciTnsAdminSaveGlobalEmpty"), 3000);
+    return;
+  }
+  try {
+    await settingsStore.updateEditorSettingsAndPersist({ oracleOciTnsAdmin: value });
+    toast(t("connection.oracleOciTnsAdminSavedGlobal", { value }), 3000);
+  } catch (error) {
+    toast(error instanceof Error ? error.message : String(error), 5000);
+  }
+}
+
+async function browseOciTnsAdminDirectory() {
+  if (!isTauriRuntime()) {
+    toast(t("connection.oraclePathPickerDesktopOnly"));
+    return;
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    title: t("connection.oracleTnsAdminBrowse"),
+    directory: true,
+    multiple: false,
+  });
+  if (typeof selected === "string") {
+    form.value.oracle_oci_tns_admin = selected;
+    resetTestState();
+  }
+}
+
+/**
+ * Prompts for the Oracle Instant Client directory. The desktop shell is the
+ * only runtime that can resolve a local path, so the picker explains itself
+ * on the web build instead of silently doing nothing.
+ */
+async function browseOciClientDirectory() {
+  if (!isTauriRuntime()) {
+    toast(t("connection.oraclePathPickerDesktopOnly"));
+    return;
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    title: t("connection.oracleOciPathBrowse"),
+    directory: true,
+    multiple: false,
+  });
+  if (typeof selected === "string") {
+    settingsStore.editorSettings.oracleOciClientPath = selected;
+    persistOracleOciClientPath();
+    resetTestState();
+  }
 }
 
 const damengDriverMode = computed(() => damengDriverModeForConfig(form.value));
@@ -3262,7 +3921,7 @@ function dbCategoryForOption(value: string): DbCategoryKey | undefined {
 
 const selectedDbIcon = computed(() => (isPluginConnection.value ? "plugin" : iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value));
 function supportsNativeAgentJdbcDriverConfigType(dbType: DatabaseType): boolean {
-  return dbType === "prestosql" || dbType === "bigquery" || dbType === "dameng";
+  return dbType === "prestosql" || dbType === "bigquery" || dbType === "dameng" || dbType === "sundb";
 }
 
 const jdbcBackedDatabaseTypes = new Set<DatabaseType>(["jdbc", "prestosql", "bigquery"]);
@@ -3278,6 +3937,11 @@ const jdbcxHighPrivilegeExtensionsAllowed = computed({
   },
 });
 const supportsNativeAgentJdbcDriverConfig = computed(() => supportsNativeAgentJdbcDriverConfigType(form.value.db_type) && (form.value.db_type !== "dameng" || isDamengCustomDriver.value));
+const nativeAgentJdbcDriverHint = computed(() => {
+  if (form.value.db_type === "dameng") return t("connection.damengCustomDriverHint");
+  if (form.value.db_type === "sundb") return t("connection.sundbCustomDriverHint");
+  return t("connection.jdbcPluginHint");
+});
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
 const isH2CustomDriver = computed(() => form.value.db_type === "h2" && form.value.driver_profile === "h2-custom");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
@@ -3314,6 +3978,7 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "elasticsearch",
   "easysearch",
   "meilisearch",
+  "solr",
   "hbase",
   "qdrant",
   "milvus",
@@ -3322,15 +3987,17 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "influxdb",
   "victoriametrics",
   "cassandra",
+  "nebula",
   "zookeeper",
 ]);
-const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
+const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type) || supportsMysqlTlsTab(form.value.db_type, selectedType.value));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse" || form.value.db_type === "victoriametrics");
-const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch" && form.value.db_type !== "hbase");
+const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch" && form.value.db_type !== "hbase" && form.value.db_type !== "nebula");
 const showGenericUrlParamsHint = computed(() => form.value.db_type === "mysql" || form.value.db_type === "doris" || form.value.db_type === "starrocks");
 const bareMysqlProfiles = new Set(["doris", "selectdb", "oceanbase"]);
-const supportsMysqlTlsOptions = computed(() => form.value.db_type === "starrocks" || (form.value.db_type === "mysql" && !bareMysqlProfiles.has(selectedType.value)));
+const supportsMysqlTlsOptions = computed(() => mysqlTlsOptionsSupported(form.value.db_type, selectedType.value));
 const supportsMysqlCleartextPasswordAuth = computed(() => form.value.db_type === "mysql" && !bareMysqlProfiles.has(selectedType.value));
+const supportsIdleTimeoutSetting = computed(() => supportsIdleTimeout(form.value.db_type));
 const supportsDoltSystemTables = computed(() => isDoltDriverProfile(form.value.driver_profile));
 const showDoltSystemTables = computed({
   get: () => doltSystemTablesVisible(form.value),
@@ -3427,6 +4094,31 @@ const postgresClientKeyPath = computed({
     form.value.url_params = setUrlParam(form.value.url_params, "sslkey", value);
   },
 });
+// Firebird 的 Java 驱动（Jaybird）默认按 JVM 编码（UTF-8）解码 CHARACTER SET NONE
+// 字段，历史数据若以 GBK 等编码存放就会显示为乱码。这里把连接字符集映射到 JDBC URL 的
+// charSet 参数（复用通用 URL 参数通道），交给用户按数据实际编码选择。
+const FIREBIRD_CHARSET_OPTIONS = ["UTF8", "GBK", "GB18030", "BIG5", "ISO8859_1", "Cp1252"];
+const firebirdCharsetItems = computed(() => {
+  const current = getUrlParam(form.value.url_params, "charSet");
+  return current && !FIREBIRD_CHARSET_OPTIONS.includes(current) ? [current, ...FIREBIRD_CHARSET_OPTIONS] : FIREBIRD_CHARSET_OPTIONS;
+});
+const firebirdCharset = computed({
+  get: () => getUrlParam(form.value.url_params, "charSet") || "default",
+  set: (value: string) => {
+    form.value.url_params = setUrlParam(form.value.url_params, "charSet", value === "default" ? "" : value);
+  },
+});
+const FIREBIRD_DATA_CHARSET_OPTIONS = ["GBK", "GB18030", "BIG5"];
+const firebirdDataCharsetItems = computed(() => {
+  const current = getUrlParam(form.value.url_params, "dataCharset");
+  return current && !FIREBIRD_DATA_CHARSET_OPTIONS.includes(current) ? [current, ...FIREBIRD_DATA_CHARSET_OPTIONS] : FIREBIRD_DATA_CHARSET_OPTIONS;
+});
+const firebirdDataCharset = computed({
+  get: () => getUrlParam(form.value.url_params, "dataCharset") || "default",
+  set: (value: string) => {
+    form.value.url_params = setUrlParam(form.value.url_params, "dataCharset", value === "default" ? "" : value);
+  },
+});
 const redisTlsInsecure = computed({
   get: () => getUrlParam(form.value.url_params, "insecure").toLowerCase() === "true",
   set: (value: boolean) => {
@@ -3473,7 +4165,7 @@ const canUseTransportLayers = computed(() => {
   }
   return true;
 });
-const sqliteSshOnlyTransport = computed(() => form.value.db_type === "sqlite");
+const sqliteRemoteTransportRestricted = computed(() => form.value.db_type === "sqlite");
 const sqliteUsesSsh = computed(() => form.value.db_type === "sqlite" && connectionUsesSsh(form.value));
 const sqliteWorkerPlacement = computed({
   get: () => getUrlParam(form.value.url_params, "dbx_sqlite_worker") || "session",
@@ -3755,7 +4447,7 @@ const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 
 function pluginFieldValue(field: PluginFormField): PluginFormFieldValue {
   if (field.binding === "name") return form.value.name;
-  return pluginFormValues.value[field.key] ?? field.default;
+  return pluginFormValues.value[field.key] ?? field.default ?? undefined;
 }
 
 function pluginFieldHasValue(field: PluginFormField): boolean {
@@ -4035,6 +4727,18 @@ function clearEditedConnectionErrorAfterSuccessfulTest() {
 
 function applyConnectionUrlToForm(input: string): boolean {
   try {
+    const update = parseConnectionDeepLinkUpdate(input);
+    if (update) {
+      if (update.connectionId !== editingId.value || props.editConfig?.one_time) throw new Error("Open the saved connection specified by this update link before applying it.");
+      const draft = applyConnectionDeepLinkUpdate(form.value, update);
+      applyingConnectionUpdate = true;
+      appliedConnectionUpdate = update;
+      form.value = draft;
+      finishApplyingConnectionUpdate();
+      resetTestState();
+      appliedConnectionUrlInput.value = input.trim();
+      return true;
+    }
     const draft = parseConnectionDeepLink(input) ?? parseServiceConnectionUrl(input);
     if (draft) {
       applyConnectionDraftToForm({ ...draft, oneTime: undefined });
@@ -4114,6 +4818,11 @@ function ensureConnectionHostResolvedFromUrl(): boolean {
 function formValueForSubmit(): Omit<ConnectionConfig, "id"> {
   const url = connectionUrlInput.value.trim();
   if (url && url !== appliedConnectionUrlInput.value) {
+    const update = parseConnectionDeepLinkUpdate(url);
+    if (update) {
+      if (update.connectionId !== editingId.value || props.editConfig?.one_time) throw new Error("Open the saved connection specified by this update link before applying it.");
+      return applyConnectionDeepLinkUpdate(form.value, update);
+    }
     const draft = parseConnectionDeepLink(url);
     if (draft) {
       return applyConnectionDraftToConfig(form.value, { ...draft, oneTime: undefined });
@@ -4245,13 +4954,35 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     }
     const existing = props.editConfig?.db_type === "plugin" && props.editConfig.plugin_id === entry.plugin.manifest.id && props.editConfig.plugin_connection_provider === entry.contribution.id ? props.editConfig : undefined;
     config = buildPluginConnectionConfig(entry.plugin.manifest.id, entry.contribution, values, existing) as LegacyConnectionConfig;
+    // buildPluginConnectionConfig already mirrored the provider's resolved
+    // connect_timeout_secs (declared default or advanced-form value) into the
+    // typed field; capture it before the generic form overwrite below.
+    const resolvedPluginConnectTimeout = pluginConnectionConnectTimeoutDefault(entry.contribution) === undefined ? undefined : config.connect_timeout_secs;
     config.id = id;
     config.name = form.value.name.trim() || config.name;
     config.note = form.value.note;
     config.color = form.value.color;
     config.transport_layers = form.value.transport_layers || [];
     config.connect_timeout_secs = form.value.connect_timeout_secs;
+    // buildPluginConnectionConfig rebuilds the config from scratch and drops
+    // the timeout inherit flags, so mirror the Advanced-tab radio state the
+    // same way the built-in branch keeps them via the form spread. Kept ahead
+    // of the resolvedPluginConnectTimeout override below, which intentionally
+    // forces connect inheritance off for providers declaring their own
+    // handshake timeout field.
+    config.connect_timeout_inherit = form.value.connect_timeout_inherit;
+    if (resolvedPluginConnectTimeout !== undefined) {
+      // A provider declaring its own connect_timeout_secs field makes it the
+      // single source of truth (declared default or advanced-form value): the
+      // typed timeout mirrors it, and the generic global/per-connection DBX
+      // timeout radios do not apply. Otherwise the host RPC deadline and the
+      // plugin's own handshake timeout could disagree and the host would kill
+      // slow connects first.
+      config.connect_timeout_secs = resolvedPluginConnectTimeout;
+      config.connect_timeout_inherit = false;
+    }
     config.query_timeout_secs = form.value.query_timeout_secs;
+    config.query_timeout_inherit = form.value.query_timeout_inherit;
     config.idle_timeout_secs = form.value.idle_timeout_secs;
     config.keepalive_interval_secs = form.value.keepalive_interval_secs;
     config.read_only = form.value.read_only;
@@ -4262,6 +4993,9 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   } else {
     config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
   }
+  if (config.db_type === "nebula" && (!config.driver_profile || config.driver_profile === "nebula")) {
+    config.driver_profile = nebulaDefaultDriverProfile;
+  }
   config.database_info = undefined;
   config.database = normalizeStoredConnectionDatabase(config.db_type, config.database);
   config.note = config.note?.trim() || undefined;
@@ -4270,6 +5004,12 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   }
   if (!config.name?.trim()) {
     config.name = generatedName.trim() || generateConnectionName();
+  }
+  if (config.db_type === "xugu") {
+    config.database = config.database?.trim() || undefined;
+    if (!hasXuguConnectionDatabase(config.database, config.connection_string)) {
+      throw new Error(t("connection.xuguDatabaseRequired"));
+    }
   }
   if (config.db_type === "kingbase") {
     config.database = config.database?.trim() || undefined;
@@ -4304,11 +5044,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     }
   }
   normalizeTransportLayersForSubmit(config);
-  if (
-    config.db_type === "oracle" &&
-    config.oracle_connection_type === "tns" &&
-    config.transport_layers?.some((layer) => layer.enabled !== false && (layer.type !== "dbx_gateway" || layer.use_as_connection_info === true))
-  ) {
+  if (config.db_type === "oracle" && config.oracle_connection_type === "tns" && config.transport_layers?.some((layer) => layer.enabled !== false && (layer.type !== "dbx_gateway" || layer.use_as_connection_info === true))) {
     throw new Error(t("connection.oracleTnsTransportUnsupported"));
   }
   if (config.db_type === "oracle" && config.oracle_connection_type === "tns") {
@@ -4323,6 +5059,11 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     // service, SID, and descriptor JDBC strings exactly as before.
     config.connection_string = undefined;
   }
+  if (config.db_type === "oracle" && config.driver_profile === "oci" && !settingsStore.editorSettings.oracleOciClientPath?.trim() && !oracleOciClientPathReminded.value) {
+    // 非阻断提醒：没有配置 Instant Client 目录时，agent 进程只能依赖系统 PATH 里已有的 oci.dll。
+    oracleOciClientPathReminded.value = true;
+    toast(t("connection.oracleOciClientPathMissing"), 5000);
+  }
   normalizeConnectionTimeouts(config, editGlobalConnectTimeoutSecs.value, editGlobalQueryTimeoutSecs.value);
   if (config.db_type === "manticoresearch") {
     config.url_params = "";
@@ -4332,7 +5073,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.ssl = !!config.ssl || damengSsl.enabled;
     config.url_params = applyDamengSslUrlParams(config.url_params, config.ssl, damengSsl.sslFilesPath, damengSsl.sslKeystorePassword, damengSsl.sslProtocol);
   }
-  if (config.db_type === "hive" || config.db_type === "argo" || config.db_type === "kyuubi" || config.db_type === "impala") {
+  if (config.db_type === "hive" || config.db_type === "argo" || config.db_type === "transwarp" || config.db_type === "kyuubi" || config.db_type === "impala") {
     if (hiveAuthMode.value === "kerberos" && !hivePrincipal.value.trim()) {
       throw new Error(t("connection.hiveKerberosPrincipalRequired"));
     }
@@ -4458,6 +5199,51 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.connection_string = undefined;
     config.database = "metrics";
     config.username = config.username.trim();
+  } else if (config.db_type === "salesforce") {
+    // Token-mode connections never carry auth context (the access token itself is
+    // the credential in `password`). OAuth/device modes merge the auth context
+    // into `external_config.auth`; the backend handles refreshToken encryption.
+    config.connection_string = undefined;
+    config.database = undefined;
+    config.username = config.username.trim();
+    const existing = (config.external_config && typeof config.external_config === "object" ? (config.external_config as Record<string, unknown>) : {}) as SalesforceExternalConfig & Record<string, unknown>;
+    if (salesforceAuthMode.value === "token") {
+      const { auth: _dropped, ...rest } = existing;
+      config.external_config = Object.keys(rest).length > 0 ? rest : undefined;
+    } else {
+      // Preserve an existing refreshToken/clientSecret when the user saves the
+      // form without re-authorizing or re-typing them (they're not round-tripped
+      // from the backend). The hydrate step flagged this via
+      // `salesforceOauthPreviouslyAuthorized`.
+      const auth: SalesforceAuthContext = {
+        mode: salesforceAuthMode.value,
+        environment: salesforceEnvironment.value,
+        clientId: salesforceClientId.value.trim() || existing.auth?.clientId,
+        authorizedAt: existing.auth?.authorizedAt,
+      };
+      if (salesforceEnvironment.value === "custom") {
+        auth.loginUrl = salesforceLoginUrl.value.trim() || existing.auth?.loginUrl;
+      }
+      if (salesforceClientSecret.value.trim()) {
+        auth.clientSecret = salesforceClientSecret.value.trim();
+      } else if (existing.auth?.clientSecret) {
+        // Preserve secret indicator without leaking the value to the client.
+        auth.clientSecret = existing.auth.clientSecret;
+      }
+      if (salesforceAuthMode.value === "password") {
+        auth.username = salesforceUsername.value.trim() || existing.auth?.username;
+        if (salesforceUserPassword.value) {
+          auth.password = salesforceUserPassword.value;
+        } else if (existing.auth?.password) {
+          // Stored ROPC credential (scrubbed into the backend secret store);
+          // keep it when the user edits the connection without retyping.
+          auth.password = existing.auth.password;
+        }
+      } else if (existing.auth?.refreshToken) {
+        auth.refreshToken = existing.auth.refreshToken;
+      }
+      config.external_config = { ...existing, auth };
+    }
   } else if (config.db_type === "elasticsearch") {
     config.external_config = buildElasticsearchExternalConfig(elasticsearchConnectionMode.value, elasticsearchKibanaBasePath.value, elasticsearchConnectivityCheckPath.value, elasticsearchIndexGroupingPattern.value, elasticsearchConnectivityCheckDisabled.value);
   } else if (config.db_type === "meilisearch") {
@@ -4465,7 +5251,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.password = config.password.trim();
     config.database = undefined;
   } else if (config.db_type === "sqlserver") {
-    config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
+    if (!connectionUpdateExternalConfigPreserved(config)) config.external_config = sqlServerPortExplicitFromConfig(config) ? { portExplicit: true } : undefined;
   } else if (supportsGaussdbIdentifierQuoteStyle(config)) {
     const style = gaussdbIdentifierQuoteStyle(config);
     const targetServerType = gaussdbTargetServerType(config);
@@ -4478,7 +5264,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     // Plugin connections keep `external_config`: the manifest-driven form
     // fields land there via buildPluginConnectionConfig. Only the built-in
     // drivers without an external-config payload get wiped here.
-    config.external_config = undefined;
+    if (!connectionUpdateExternalConfigPreserved(config)) config.external_config = undefined;
   }
   if (config.db_type === "mongodb" && !mongoUseUrl.value) {
     config.connection_string = undefined;
@@ -4507,9 +5293,25 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   if (config.db_type !== "oracle") {
     config.sysdba = undefined;
     config.oracle_connection_type = undefined;
+    config.oracle_oci_nls_lang = undefined;
+    config.oracle_oci_tns_admin = undefined;
   } else {
     config.sysdba = !!config.sysdba || isOracleSysUser(config);
     config.oracle_connection_type = config.oracle_connection_type || "service_name";
+    // Driver mode is encoded as the driver profile so the agent router picks
+    // the OCI (thick) agent; everything else stays on the thin agent.
+    if (config.driver_profile === "oci") {
+      config.driver_label = "Oracle (OCI)";
+      config.oracle_oci_nls_lang = config.oracle_oci_nls_lang?.trim() || undefined;
+      config.oracle_oci_tns_admin = config.oracle_oci_tns_admin?.trim() || undefined;
+    } else {
+      // Only default when empty: saved legacy profiles (oracle-legacy,
+      // oracle-10g) must survive edits untouched.
+      if (!config.driver_profile) config.driver_profile = "oracle";
+      config.driver_label = "Oracle";
+      config.oracle_oci_nls_lang = undefined;
+      config.oracle_oci_tns_admin = undefined;
+    }
   }
   if (config.db_type !== "redis") {
     config.redis_connection_mode = undefined;
@@ -4523,6 +5325,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.redis_scan_page_size = undefined;
     config.redis_database_aliases = undefined;
     config.redis_key_templates = undefined;
+    config.redis_key_filter = undefined;
     config.redis_key_grouping = undefined;
   } else if (config.redis_connection_mode === "sentinel") {
     config.redis_sentinel_master = config.redis_sentinel_master?.trim() || "";
@@ -4557,6 +5360,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   }
   if (config.db_type === "redis") {
     config.redis_key_separator = config.redis_key_separator?.trim() ?? ":";
+    config.redis_key_filter = config.redis_key_filter?.trim() || undefined;
     const scanSize = Number(config.redis_scan_page_size);
     config.redis_scan_page_size = Number.isFinite(scanSize) && scanSize >= REDIS_SCAN_PAGE_SIZE_MIN && scanSize <= REDIS_SCAN_PAGE_SIZE_MAX ? Math.round(scanSize) : REDIS_SCAN_PAGE_SIZE_DEFAULT;
     {
@@ -4602,12 +5406,12 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
       throw new Error(t("connection.etcdClientCertPairRequired"));
     }
-  } else if (form.value.db_type !== "consul" && config.db_type !== "elasticsearch" && config.db_type !== "easysearch") {
+  } else if (form.value.db_type !== "consul" && config.db_type !== "elasticsearch" && config.db_type !== "easysearch" && config.db_type !== "solr") {
     config.etcd_endpoints = undefined;
     config.client_cert_path = undefined;
     config.client_key_path = undefined;
   }
-  if (config.db_type === "elasticsearch" || config.db_type === "easysearch") {
+  if (config.db_type === "elasticsearch" || config.db_type === "easysearch" || config.db_type === "solr") {
     config.client_cert_path = config.client_cert_path?.trim() || "";
     config.client_key_path = config.client_key_path?.trim() || "";
     if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
@@ -4620,11 +5424,13 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.db_type !== "etcd" &&
     config.db_type !== "consul" &&
     config.db_type !== "starrocks" &&
+    config.db_type !== "doris" &&
     config.db_type !== "mongodb" &&
     config.db_type !== "victoriametrics" &&
     config.db_type !== "zookeeper" &&
     config.db_type !== "elasticsearch" &&
-    config.db_type !== "easysearch"
+    config.db_type !== "easysearch" &&
+    config.db_type !== "solr"
   ) {
     config.ca_cert_path = undefined;
   } else {
@@ -4645,6 +5451,13 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
       config.jdbc_driver_class = undefined;
       config.jdbc_driver_paths = [];
     }
+  }
+  if (config.db_type === "sundb") {
+    // The SunDB Agent bundles the vendor driver; an empty classpath means the
+    // Agent resolves the driver class on its own classloader. A non-empty
+    // classpath still overrides it with a user-supplied JAR.
+    config.jdbc_driver_class = sundbJdbcDriverClass(config);
+    config.jdbc_driver_paths = parsedJdbcDriverPaths();
   }
   if (jdbcBackedDatabaseTypes.has(config.db_type) || gaussdbConnectionMode(config) === "m-jdbc") {
     if (config.db_type === "jdbc") {
@@ -4679,6 +5492,10 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.jdbc_driver_paths = parsedJdbcDriverPaths();
   } else if (config.db_type === "gaussdb") {
     config.connection_string = undefined;
+    config.jdbc_driver_class = undefined;
+    config.jdbc_driver_paths = [];
+  }
+  if (config.db_type === "transwarp") {
     config.jdbc_driver_class = undefined;
     config.jdbc_driver_paths = [];
   }
@@ -4734,6 +5551,8 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
   }
   if (!config.show_system_schemas) config.show_system_schemas = undefined;
+  if (config.show_database_links !== false) config.show_database_links = undefined;
+  if (!config.sidebar_auto_load_all_tables) config.sidebar_auto_load_all_tables = undefined;
   if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   if (config.agent_java_options && config.agent_java_options.length === 0) config.agent_java_options = undefined;
   // Pasted credentials may carry invisible characters that trim() keeps (#9043).
@@ -5368,7 +6187,20 @@ function saveVisibleDatabaseSelection() {
       [key]: normalizeVisibleSchemaSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value),
     };
   } else {
-    form.value.visible_databases = normalizeVisibleDatabaseSelection([...visibleDatabaseSelection.value], visibleDatabaseNames.value);
+    // "全选"等价于不筛选：存成当时的库名快照会让之后新建的库永远看不到。
+    const action = resolveVisibleDatabaseSaveAction({
+      selection: visibleDatabaseSelection.value,
+      allNames: visibleDatabaseNames.value,
+      defaultVisibleNames: defaultListedVisibleDatabaseNames.value,
+      configured: form.value.visible_databases,
+      configuredPatterns: form.value.visible_database_patterns,
+      patterns: form.value.visible_database_patterns ?? [],
+    });
+    if (action.type === "clear") {
+      form.value.visible_databases = undefined;
+    } else if (action.type === "set") {
+      form.value.visible_databases = action.databaseNames;
+    }
   }
   showVisibleDatabasesDialog.value = false;
 }
@@ -5507,6 +6339,7 @@ function resetForm(options: { preservePickerState?: boolean } = {}) {
   appliedConnectionUrlInput.value = "";
   resetMeilisearchHostInput();
   oracleTnsAdminPath.value = "";
+  resetSalesforceOAuthFields(undefined, undefined);
   if (!options.preservePickerState) {
     dialogStep.value = "select";
     dbSearchQuery.value = "";
@@ -5662,7 +6495,9 @@ watch(
     });
     // Preload database names so the summary count is accurate right away.
     void nextTick(() => {
-      if (canChooseVisibleDatabases.value && hasVisibleDatabaseFilter.value) {
+      // An external update may change the endpoint while retaining its saved
+      // password. Do not send credentials until the user tests or saves it.
+      if (!props.updatePrefill && canChooseVisibleDatabases.value && hasVisibleDatabaseFilter.value) {
         void preloadVisibleDatabaseNames();
       }
     });
@@ -5699,7 +6534,7 @@ watch([() => form.value.db_type, () => form.value.username], () => {
 watch(
   () => connectionConfigSnapshotForVisibleDatabases(),
   (current, previous) => {
-    if (!previous || !visibleObjectFiltersNeedReset(previous, current)) return;
+    if (applyingConnectionUpdate || !previous || !visibleObjectFiltersNeedReset(previous, current)) return;
     form.value.visible_databases = undefined;
     form.value.visible_schemas = undefined;
     resetVisibleDatabaseDraftState();
@@ -5740,10 +6575,10 @@ watch(canUseTransportLayers, (value) => {
   }
 });
 
-watch(sqliteSshOnlyTransport, (sshOnly) => {
-  if (!sshOnly) return;
+watch(sqliteRemoteTransportRestricted, (restricted) => {
+  if (!restricted) return;
   const layers = form.value.transport_layers || [];
-  const next = layers.filter((layer) => layer.type === "ssh");
+  const next = layers.filter((layer) => isSqliteRemoteTransportLayerType(layer.type));
   if (next.length === layers.length) return;
   form.value.transport_layers = next;
   selectedTransportLayerId.value = next[0]?.id || null;
@@ -5770,16 +6605,16 @@ function addSshTunnel() {
 }
 
 function addProxyTunnel() {
-  if (sqliteSshOnlyTransport.value) return;
   const next: TransportLayerConfig = { type: "proxy", ...defaultProxyTunnel() };
   next.name = `Proxy ${transportLayers.value.length + 1}`;
-  form.value.transport_layers = normalizeGatewayLayerOrder([...transportLayers.value, next]);
+  const updated = sqliteRemoteTransportRestricted.value ? insertSqliteRemoteTransportLayer(transportLayers.value, next) : [...transportLayers.value, next];
+  form.value.transport_layers = normalizeGatewayLayerOrder(updated);
   selectedTransportLayerId.value = next.id;
   resetTestState();
 }
 
 function addHttpTunnel() {
-  if (sqliteSshOnlyTransport.value) return;
+  if (sqliteRemoteTransportRestricted.value) return;
   const next: TransportLayerConfig = { type: "http_tunnel", ...defaultHttpTunnel() };
   next.name = t("connection.httpTunnelDefaultName", { index: 1 });
   form.value.transport_layers = [next, ...transportLayers.value];
@@ -5802,9 +6637,10 @@ function normalizeGatewayLayerOrder(layers: TransportLayerConfig[]): TransportLa
 }
 
 function duplicateTransportLayer(layer: TransportLayerConfig) {
-  if ((sqliteSshOnlyTransport.value && layer.type !== "ssh") || layer.type === "dbx_gateway") return;
+  if ((sqliteRemoteTransportRestricted.value && !isSqliteRemoteTransportLayerType(layer.type)) || layer.type === "dbx_gateway") return;
   const next = normalizeTransportLayer({ ...layer, id: uuid(), name: layer.name ? `${layer.name} copy` : "" });
-  form.value.transport_layers = normalizeGatewayLayerOrder([...transportLayers.value, next]);
+  const updated = sqliteRemoteTransportRestricted.value ? insertSqliteRemoteTransportLayer(transportLayers.value, next) : [...transportLayers.value, next];
+  form.value.transport_layers = normalizeGatewayLayerOrder(updated);
   selectedTransportLayerId.value = next.id;
   resetTestState();
 }
@@ -5843,7 +6679,7 @@ function dropTransportLayer(targetId: string) {
 function changeSelectedTransportLayerType(type: "ssh" | "proxy" | "http_tunnel" | "dbx_gateway") {
   const selected = selectedTransportLayer.value;
   if (!selected || selected.type === type) return;
-  if (sqliteSshOnlyTransport.value && type !== "ssh") return;
+  if (sqliteRemoteTransportRestricted.value && !isSqliteRemoteTransportLayerType(type)) return;
   if (type === "dbx_gateway" && hasGatewayLayer.value) return;
   const replacement: TransportLayerConfig =
     type === "proxy"
@@ -5873,7 +6709,7 @@ function updateSelectedSshAuthMethod(value: unknown) {
 
 function validateTransportLayers(config: LegacyConnectionConfig) {
   const layers = config.transport_layers || [];
-  if (config.db_type === "sqlite" && layers.some((layer) => layer.enabled !== false && layer.type !== "ssh")) {
+  if (config.db_type === "sqlite" && sqliteRemoteTransportError(layers)) {
     throw new Error(t("connection.sqliteTransportSshOnly"));
   }
   const gatewayLayers = layers.filter((layer) => layer.enabled !== false && layer.type === "dbx_gateway" && layer.use_as_connection_info === true);
@@ -5946,6 +6782,15 @@ function clampConnectTimeoutInput(event: Event, target: "global" | "connection")
   else form.value.connect_timeout_secs = MAX_CONNECT_TIMEOUT_SECS;
 }
 
+function clampIdleTimeoutInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.value === "") return;
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value <= MAX_IDLE_TIMEOUT_SECS) return;
+  input.value = String(MAX_IDLE_TIMEOUT_SECS);
+  form.value.idle_timeout_secs = MAX_IDLE_TIMEOUT_SECS;
+}
+
 async function persistGlobalTimeoutDrafts() {
   const nextConnect = normalizeGlobalConnectTimeoutSecs(editGlobalConnectTimeoutSecs.value);
   const nextQuery = normalizeGlobalQueryTimeoutSecs(editGlobalQueryTimeoutSecs.value);
@@ -5985,6 +6830,14 @@ function startSavedConnection(config: ConnectionConfig) {
     });
 }
 
+function validateConnectionUpdateTarget() {
+  const update = props.updatePrefill ?? appliedConnectionUpdate;
+  if (!update) return;
+  const target = store.getConfig(update.connectionId);
+  resolveConnectionDeepLinkUpdate(update, target ? [target] : [], false);
+  if (editingId.value !== update.connectionId) throw new Error("The connection specified by the update link is no longer being edited.");
+}
+
 async function save(options: SaveConnectionOptions = {}): Promise<boolean> {
   if (!ensureConnectionHostResolvedFromUrl()) return false;
   if (isSaving.value) return false;
@@ -6001,10 +6854,12 @@ async function save(options: SaveConnectionOptions = {}): Promise<boolean> {
   let connectionSaved = false;
   try {
     let savedConfig: ConnectionConfig;
+    validateConnectionUpdateTarget();
     if (editingId.value) {
       const updated = withSavedDatabaseInfo(connectionConfigForSubmit(editingId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(updated);
       await ensureRequiredGaussdbMJdbcRuntime(updated);
+      validateConnectionUpdateTarget();
       await persistGlobalTimeoutDrafts();
       await store.updateConnection(updated);
       savedConfig = updated;
@@ -6199,12 +7054,17 @@ async function browseHiveKerberosFile(target: "krb5" | "jaas") {
 }
 
 async function browseOracleTnsNamesFile() {
-  if (!isTauriRuntime()) return;
+  // TNS_ADMIN is a directory; accept a folder pick. Desktop-only, so the web
+  // build gets an explanation instead of a silent no-op.
+  if (!isTauriRuntime()) {
+    toast(t("connection.oraclePathPickerDesktopOnly"));
+    return;
+  }
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({
     title: t("connection.oracleTnsAdminBrowse"),
+    directory: true,
     multiple: false,
-    filters: [{ name: "Oracle TNS names", extensions: ["ora"] }],
   });
   if (typeof selected === "string") {
     oracleTnsAdminPath.value = normalizeOracleTnsAdminPath(selected);
@@ -6362,7 +7222,6 @@ async function loadSshConfigHosts() {
 async function loadAgentDrivers() {
   try {
     agentDrivers.value = await api.listInstalledAgentsLocal();
-    if (!settingsStore.editorSettings.updateNotificationsEnabled) return;
     api
       .listInstalledAgents()
       .then((drivers) => {
@@ -6425,6 +7284,9 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenAgentInstallProgress?.();
   unlistenAgentInstallProgress = null;
+  // Stop any in-flight Salesforce device-code poll / expiry countdown so
+  // closing the dialog does not leave orphan timers running.
+  salesforceDeviceStopPolling();
 });
 
 function openExternalUrl(url: string) {
@@ -6438,7 +7300,16 @@ function openExternalUrl(url: string) {
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent :style="dialogContentStyle" class="connection-dialog-content" :class="connectionDialogContentClass" :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined" @interact-outside.prevent @escape-key-down="handleDialogEscape" @keydown="preventDialogDocumentSelectAll">
+    <DialogContent
+      :style="dialogContentStyle"
+      class="connection-dialog-content"
+      :class="connectionDialogContentClass"
+      :data-wide="shouldUseWideConnectionDialog ? 'true' : undefined"
+      @interact-outside.prevent
+      @escape-key-down="handleDialogEscape"
+      @keydown="preventDialogDocumentSelectAll"
+      @copy="copyDialogPasswordFieldValue"
+    >
       <DialogHeader class="cursor-move select-none" @pointerdown="onDialogHeaderPointerDown" @pointermove="onDialogHeaderPointerMove" @pointerup="onDialogHeaderPointerEnd" @pointercancel="onDialogHeaderPointerEnd">
         <DialogTitle>{{ editingId ? t("connection.editTitle") : t("connection.title") }}</DialogTitle>
       </DialogHeader>
@@ -6581,7 +7452,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent value="connection" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
               <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto pt-4 pr-2 pb-6" :class="{ 'connection-form-body--nacos': form.db_type === 'nacos' }">
-                <div v-if="!isPluginConnection && !isJdbcConnection && form.db_type !== 'nacos' && form.db_type !== 'consul' && form.db_type !== 'mq'" class="grid grid-cols-4 items-center gap-4">
+                <div v-if="!isPluginConnection && !isJdbcConnection && form.db_type !== 'nacos' && form.db_type !== 'consul' && form.db_type !== 'mq' && form.db_type !== 'salesforce'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelClass">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input v-model="connectionUrlInput" class="flex-1" :placeholder="connectionUrlPlaceholder" @keydown.enter.prevent="applyConnectionUrl" />
@@ -6613,6 +7484,20 @@ function openExternalUrl(url: string) {
                     <span class="min-w-0 flex-1 truncate text-sm text-left">{{ selectedProfile().label }}</span>
                     <Pencil class="h-3 w-3 text-muted-foreground" />
                   </button>
+                </div>
+
+                <div v-if="form.db_type === 'nebula'" class="grid grid-cols-4 items-center gap-4">
+                  <Label :class="connectionLabelClass">{{ t("connection.version") }}</Label>
+                  <div class="col-span-3">
+                    <Select :model-value="form.driver_profile === 'nebula' ? nebulaDefaultDriverProfile : form.driver_profile" @update:model-value="switchNebulaDriverProfile">
+                      <SelectTrigger class="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="profile in nebulaDriverProfiles" :key="profile.profile" :value="profile.profile">{{ profile.label }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
 
                 <!-- OceanBase mode toggle -->
@@ -6731,7 +7616,15 @@ function openExternalUrl(url: string) {
                                   <span class="min-w-0 flex-1 truncate" :title="edge.edge_id">{{ edge.edge_id }}</span>
                                   <span class="shrink-0 text-[11px]" :class="edge.online ? 'text-emerald-600' : 'text-muted-foreground'">{{ edge.online ? t("connection.gatewayEdgeOnline") : t("connection.gatewayEdgeOffline", { edge: edge.edge_id }) }}</span>
                                 </div>
-                                <button v-for="route in edge.routes" :key="route.target_id" type="button" class="flex h-9 w-full min-w-0 items-center rounded px-2 text-left text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50" :disabled="!edge.online" :title="`${edge.edge_id} / ${route.display_name || route.target_id}`" @click="selectConnectionInfoGatewayRoute(edge, route.target_id)">
+                                <button
+                                  v-for="route in edge.routes"
+                                  :key="route.target_id"
+                                  type="button"
+                                  class="flex h-9 w-full min-w-0 items-center rounded px-2 text-left text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  :disabled="!edge.online"
+                                  :title="`${edge.edge_id} / ${route.display_name || route.target_id}`"
+                                  @click="selectConnectionInfoGatewayRoute(edge, route.target_id)"
+                                >
                                   <span class="min-w-0 flex-1 truncate">{{ route.display_name || route.target_id }}</span>
                                   <span class="ml-2 max-w-40 shrink-0 truncate text-muted-foreground">{{ route.target_id }}</span>
                                 </button>
@@ -6740,7 +7633,9 @@ function openExternalUrl(url: string) {
                           </PopoverContent>
                         </Popover>
                         <Tooltip>
-                          <TooltipTrigger as-child><Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="isLoadingGatewayRoutes" @click="refreshGatewayRoutes"><RefreshCw class="h-4 w-4" :class="isLoadingGatewayRoutes ? 'animate-spin' : ''" /></Button></TooltipTrigger>
+                          <TooltipTrigger as-child
+                            ><Button type="button" variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="isLoadingGatewayRoutes" @click="refreshGatewayRoutes"><RefreshCw class="h-4 w-4" :class="isLoadingGatewayRoutes ? 'animate-spin' : ''" /></Button
+                          ></TooltipTrigger>
                           <TooltipContent>{{ t("connection.gatewayRoutesRefresh") }}</TooltipContent>
                         </Tooltip>
                       </div>
@@ -7004,7 +7899,7 @@ function openExternalUrl(url: string) {
                                 <span>{{ t(option.labelKey) }}</span>
                                 <Badge v-if="option.recommended" class="h-4 rounded-full px-1.5 text-[10px] leading-none">{{ t("connection.sqliteWorkerPlacementDefault") }}</Badge>
                               </div>
-                              <p class="text-[11px] leading-relaxed text-background/80">{{ t(option.hintKey) }}</p>
+                              <p class="text-[11px] leading-relaxed text-background-solid/80">{{ t(option.hintKey) }}</p>
                             </TooltipContent>
                           </Tooltip>
                         </div>
@@ -7420,8 +8315,8 @@ function openExternalUrl(url: string) {
                         </Button>
                       </div>
                     </div>
-                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ form.redis_connection_mode === "sentinel" ? t("connection.redisFirstSentinel") : form.redis_connection_mode === "cluster" ? t("connection.redisFirstClusterNode") : t("connection.host") }}</Label>
+                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ form.redis_connection_mode === "sentinel" ? t("connection.redisFirstSentinel") : form.redis_connection_mode === "cluster" ? t("connection.redisFirstClusterNode") : t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" />
                     </div>
@@ -7477,6 +8372,13 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.redisKeySeparator") }}</Label>
                       <Input v-model="form.redis_key_separator" class="col-span-3 h-8 text-xs" placeholder=":" />
+                    </div>
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <Label for="redis-key-filter" :class="connectionLabelTopClass">{{ t("connection.redisKeyFilter") }}</Label>
+                      <div class="col-span-3 space-y-1">
+                        <Input id="redis-key-filter" v-model="form.redis_key_filter" class="h-8 text-xs" placeholder="order:*" spellcheck="false" />
+                        <p class="text-xs text-muted-foreground">{{ t("connection.redisKeyFilterHint") }}</p>
+                      </div>
                     </div>
                     <div class="grid grid-cols-4 items-start gap-4">
                       <Label :class="connectionLabelTopClass">{{ t("connection.redisKeyTemplates") }}</Label>
@@ -7566,9 +8468,9 @@ function openExternalUrl(url: string) {
                     </div>
                   </template>
 
-                <!-- etcd: endpoints, user, password, TLS -->
-                <template v-else-if="form.db_type === 'etcd'">
-                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
+                  <!-- etcd: endpoints, user, password, TLS -->
+                  <template v-else-if="form.db_type === 'etcd'">
+                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">API</Label>
                       <div class="col-span-3 space-y-1.5">
                         <div class="flex flex-wrap gap-2">
@@ -7609,9 +8511,9 @@ function openExternalUrl(url: string) {
                     </div>
                   </template>
 
-                <!-- ZooKeeper: host, connect string, user, password -->
-                <template v-else-if="form.db_type === 'zookeeper'">
-                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
+                  <!-- ZooKeeper: host, connect string, user, password -->
+                  <template v-else-if="form.db_type === 'zookeeper'">
+                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" placeholder="127.0.0.1" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -7720,9 +8622,9 @@ function openExternalUrl(url: string) {
                           {{ t("connection.oidcBrowserAuthHint") }}
                         </p>
                       </div>
-                  </template>
-                  <template v-else>
-                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
+                    </template>
+                    <template v-else>
+                      <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                         <Input v-model="form.host" class="col-span-2" />
                         <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -7901,13 +8803,13 @@ function openExternalUrl(url: string) {
                       <Input v-model.number="mqttConnectTimeoutSecs" type="number" class="col-span-3 w-32" min="1" max="300" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">最大报文（字节）</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.mqttMaxPacketSize") }}</Label>
                       <Input v-model.number="mqttMaxPacketSizeBytes" type="number" class="col-span-3 w-40" min="1024" max="268435455" />
                     </div>
                   </template>
 
-                <template v-else-if="form.db_type === 'victoriametrics'">
-                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
+                  <template v-else-if="form.db_type === 'victoriametrics'">
+                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -8014,9 +8916,9 @@ function openExternalUrl(url: string) {
                     </div>
                   </template>
 
-                <!-- Turso: simplified form (URL + Token) -->
-                <template v-else-if="form.db_type === 'turso'">
-                  <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
+                  <!-- Turso: simplified form (URL + Token) -->
+                  <template v-else-if="form.db_type === 'turso'">
+                    <div v-if="!gatewayAsConnectionInfo" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-3" :placeholder="t('connection.tursoHostPlaceholder')" />
                     </div>
@@ -8044,6 +8946,289 @@ function openExternalUrl(url: string) {
 
                   <template v-else-if="form.db_type === 'cloudflare-d1'">
                     <CloudflareD1ConnectionFields v-model:account-id="form.host" v-model:database-id="form.database" v-model:api-token="form.password" />
+                  </template>
+
+                  <!-- Salesforce: instance URL + access token (SOQL) -->
+                  <template v-else-if="form.db_type === 'salesforce'">
+                    <!-- Instance URL (always visible so the user can confirm the
+                         target org; OAuth/device flows overwrite it after a
+                         successful authorize) -->
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.salesforceInstanceUrl") }}</Label>
+                      <div class="col-span-3 space-y-1.5">
+                        <div class="flex gap-2">
+                          <Input v-model="form.host" class="flex-1" :placeholder="t('connection.salesforceInstanceUrlPlaceholder')" />
+                          <Input v-model.number="form.port" type="number" class="w-24 shrink-0" />
+                        </div>
+                        <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceInstanceUrlHint") }}</p>
+                      </div>
+                    </div>
+
+                    <!-- Authentication mode picker -->
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.salesforceAuthMode") }}</Label>
+                      <div class="col-span-3 grid h-8 grid-cols-4 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
+                        <button
+                          type="button"
+                          class="h-7 rounded-sm px-2 text-xs transition-colors"
+                          :class="salesforceAuthMode === 'token' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                          :aria-pressed="salesforceAuthMode === 'token'"
+                          :disabled="salesforceOauthRunning"
+                          @click="salesforceSetAuthMode('token')"
+                        >
+                          {{ t("connection.salesforceAuthModeToken") }}
+                        </button>
+                        <button
+                          type="button"
+                          class="h-7 rounded-sm px-2 text-xs transition-colors"
+                          :class="salesforceAuthMode === 'oauth' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground disabled:text-muted-foreground/50'"
+                          :aria-pressed="salesforceAuthMode === 'oauth'"
+                          :disabled="salesforceOauthRunning || !isDesktop"
+                          :title="!isDesktop ? t('connection.salesforceAuthModeOauthDesktopOnly') : undefined"
+                          @click="salesforceSetAuthMode('oauth')"
+                        >
+                          {{ t("connection.salesforceAuthModeOauth") }}
+                        </button>
+                        <button
+                          type="button"
+                          class="h-7 rounded-sm px-2 text-xs transition-colors"
+                          :class="salesforceAuthMode === 'device' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                          :aria-pressed="salesforceAuthMode === 'device'"
+                          :disabled="salesforceOauthRunning"
+                          @click="salesforceSetAuthMode('device')"
+                        >
+                          {{ t("connection.salesforceAuthModeDevice") }}
+                        </button>
+                        <button
+                          type="button"
+                          class="h-7 rounded-sm px-2 text-xs transition-colors"
+                          :class="salesforceAuthMode === 'password' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                          :aria-pressed="salesforceAuthMode === 'password'"
+                          :disabled="salesforceOauthRunning"
+                          @click="salesforceSetAuthMode('password')"
+                        >
+                          {{ t("connection.salesforceAuthModePassword") }}
+                        </button>
+                      </div>
+                    </div>
+                    <div v-if="!isDesktop && salesforceAuthMode === 'oauth'" class="grid grid-cols-4 items-start gap-4">
+                      <span />
+                      <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceAuthModeOauthDesktopOnly") }}</p>
+                    </div>
+
+                    <!-- Manual access token -->
+                    <template v-if="salesforceAuthMode === 'token'">
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelClass">{{ t("connection.salesforceAccessToken") }}</Label>
+                        <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.salesforceAccessTokenPlaceholder')" />
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <span />
+                        <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceAccessTokenHint") }}</p>
+                      </div>
+                    </template>
+
+                    <!-- Shared OAuth / device-code fields -->
+                    <template v-else>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.salesforceEnvironment") }}</Label>
+                        <Select v-model="salesforceEnvironment" :disabled="salesforceOauthRunning">
+                          <SelectTrigger class="col-span-3">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="production">{{ t("connection.salesforceEnvironmentProduction") }}</SelectItem>
+                            <SelectItem value="sandbox">{{ t("connection.salesforceEnvironmentSandbox") }}</SelectItem>
+                            <SelectItem value="custom">{{ t("connection.salesforceEnvironmentCustom") }}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div v-if="salesforceEnvironment === 'custom'" class="grid grid-cols-4 items-start gap-4">
+                        <Label :class="connectionLabelClass">{{ t("connection.salesforceLoginUrl") }}</Label>
+                        <div class="col-span-3 space-y-1.5">
+                          <Input v-model="salesforceLoginUrl" :placeholder="t('connection.salesforceLoginUrlPlaceholder')" :disabled="salesforceOauthRunning" />
+                          <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceLoginUrlHint") }}</p>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <Label :class="connectionLabelSmallClass">
+                          {{ t("connection.salesforceClientId") }}
+                          <span class="ml-1 text-destructive">*</span>
+                        </Label>
+                        <div class="col-span-3 space-y-1.5">
+                          <Input v-model="salesforceClientId" :placeholder="t('connection.salesforceClientIdPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="off" />
+                          <!-- The callback URL only matters for the browser redirect flow; the
+                               other two modes never see one, so keep it out of their way. -->
+                          <p v-if="salesforceAuthMode === 'oauth'" class="text-xs leading-5 text-muted-foreground">
+                            {{ t("connection.salesforceClientIdHint", { callbackUrl: SALESFORCE_OAUTH_CALLBACK_URL }) }}
+                          </p>
+                          <p v-else class="text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceClientIdHintShared") }}</p>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelClass">{{ t("connection.salesforceClientSecret") }}</Label>
+                        <div class="col-span-3 space-y-1.5">
+                          <PasswordInput v-model="salesforceClientSecret" :placeholder="t('connection.salesforceClientSecretPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="new-password" />
+                        </div>
+                      </div>
+
+                      <!-- Username & password (ROPC) credentials -->
+                      <template v-if="salesforceAuthMode === 'password'">
+                        <div class="grid grid-cols-4 items-start gap-4">
+                          <Label :class="connectionLabelClass">{{ t("connection.salesforceUsernameLabel") }}</Label>
+                          <div class="col-span-3 space-y-1.5">
+                            <Input v-model="salesforceUsername" :placeholder="t('connection.salesforceUsernamePlaceholder')" :disabled="salesforceOauthRunning" autocomplete="off" />
+                            <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceUsernameHint") }}</p>
+                          </div>
+                        </div>
+                        <div class="grid grid-cols-4 items-start gap-4">
+                          <Label :class="connectionLabelClass">{{ t("connection.salesforceUserPasswordLabel") }}</Label>
+                          <div class="col-span-3 space-y-1.5">
+                            <PasswordInput v-model="salesforceUserPassword" :placeholder="t('connection.salesforceUserPasswordPlaceholder')" :disabled="salesforceOauthRunning" autocomplete="new-password" />
+                            <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceUserPasswordHint") }}</p>
+                          </div>
+                        </div>
+                      </template>
+
+                      <!-- Previously-authorized banner (edit flow) -->
+                      <div v-if="salesforceOauthPreviouslyAuthorized && !salesforceOauthRunning && salesforceDevicePhase !== 'polling'" class="grid grid-cols-4 items-center gap-4">
+                        <span />
+                        <div class="col-span-3 flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+                          <ShieldCheck class="h-4 w-4 shrink-0" />
+                          <span>{{ t("connection.salesforceOauthAuthorized") }}</span>
+                        </div>
+                      </div>
+
+                      <!-- Browser OAuth action -->
+                      <template v-if="salesforceAuthMode === 'oauth'">
+                        <div class="grid grid-cols-4 items-center gap-4">
+                          <span />
+                          <div class="col-span-3 flex items-center gap-2">
+                            <Button type="button" :disabled="salesforceOauthRunning || !salesforceClientId.trim() || !isDesktop" @click="salesforceStartBrowserAuthorize">
+                              <Loader2 v-if="salesforceOauthRunning" class="mr-2 h-4 w-4 animate-spin" />
+                              {{ salesforceOauthRunning ? t("connection.salesforceOauthAuthorizing") : salesforceOauthPreviouslyAuthorized ? t("connection.salesforceOauthReauthorize") : t("connection.salesforceOauthAuthorize") }}
+                            </Button>
+                          </div>
+                        </div>
+                        <div v-if="salesforceOauthRunning" class="grid grid-cols-4 items-start gap-4">
+                          <span />
+                          <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceOauthAuthorizingHint") }}</p>
+                        </div>
+                      </template>
+
+                      <!-- Username-password sign in -->
+                      <template v-if="salesforceAuthMode === 'password'">
+                        <div class="grid grid-cols-4 items-center gap-4">
+                          <span />
+                          <div class="col-span-3 flex items-center gap-2">
+                            <Button type="button" :disabled="salesforceOauthRunning || !salesforceClientId.trim() || !salesforceUsername.trim() || !salesforceUserPassword" @click="salesforceStartPasswordLogin">
+                              <Loader2 v-if="salesforceOauthRunning" class="mr-2 h-4 w-4 animate-spin" />
+                              {{ salesforceOauthRunning ? t("connection.salesforceOauthAuthorizing") : salesforceOauthPreviouslyAuthorized ? t("connection.salesforcePasswordSignInAgain") : t("connection.salesforcePasswordSignIn") }}
+                            </Button>
+                          </div>
+                        </div>
+                        <div class="grid grid-cols-4 items-start gap-4">
+                          <span />
+                          <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.salesforcePasswordRopcNote") }}</p>
+                        </div>
+                      </template>
+
+                      <!-- Device-code flow -->
+                      <template v-if="salesforceAuthMode === 'device'">
+                        <div v-if="salesforceDevicePhase === 'idle' || salesforceDevicePhase === 'error'" class="grid grid-cols-4 items-center gap-4">
+                          <span />
+                          <div class="col-span-3 flex items-center gap-2">
+                            <Button type="button" :disabled="salesforceOauthRunning || !salesforceClientId.trim()" @click="salesforceDeviceRequestCode">
+                              <Loader2 v-if="salesforceOauthRunning" class="mr-2 h-4 w-4 animate-spin" />
+                              {{ t("connection.salesforceDeviceGetCode") }}
+                            </Button>
+                          </div>
+                        </div>
+                        <div v-if="salesforceDevicePhase === 'idle' || salesforceDevicePhase === 'error'" class="grid grid-cols-4 items-start gap-4">
+                          <span />
+                          <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceDeviceFlowNote") }}</p>
+                        </div>
+
+                        <template v-if="salesforceDevicePhase === 'polling'">
+                          <div class="grid grid-cols-4 items-start gap-4">
+                            <Label :class="connectionLabelSmallClass">{{ t("connection.salesforceDeviceUserCodeLabel") }}</Label>
+                            <div class="col-span-3 space-y-1.5">
+                              <div class="flex items-center gap-2 rounded-md border border-input bg-muted/40 px-3 py-2">
+                                <span class="font-mono text-lg font-semibold tracking-widest">{{ salesforceDeviceUserCode }}</span>
+                                <Button type="button" variant="ghost" size="icon" class="h-7 w-7" @click="salesforceCopyUserCode">
+                                  <Check v-if="salesforceDeviceUserCodeCopied" class="h-4 w-4 text-emerald-600" />
+                                  <Copy v-else class="h-4 w-4" />
+                                </Button>
+                              </div>
+                              <div v-if="salesforceDeviceVerificationUri" class="flex items-center gap-2 text-xs">
+                                <a class="text-primary underline underline-offset-2 hover:no-underline" href="#" @click.prevent="salesforceOpenVerificationPage">{{ t("connection.salesforceDeviceOpenVerification") }}</a>
+                                <code class="truncate rounded bg-muted px-1 py-0.5 text-[11px]">{{ salesforceDeviceVerificationUri }}</code>
+                                <Button type="button" variant="ghost" size="icon" class="h-6 w-6" @click="salesforceCopyVerificationUri">
+                                  <Check v-if="salesforceDeviceVerificationCopied" class="h-3.5 w-3.5 text-emerald-600" />
+                                  <Copy v-else class="h-3.5 w-3.5" />
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                          <div class="grid grid-cols-4 items-center gap-4">
+                            <span />
+                            <div class="col-span-3 flex items-center gap-3 text-xs text-muted-foreground">
+                              <Loader2 class="h-4 w-4 animate-spin" />
+                              <span>{{ t("connection.salesforceDevicePolling") }}</span>
+                              <span v-if="salesforceDeviceSecondsLeft > 0">· {{ t("connection.salesforceDeviceSecondsLeft", { seconds: salesforceDeviceSecondsLeft }) }}</span>
+                              <Button type="button" variant="outline" size="sm" class="ml-auto" @click="salesforceDeviceCancel">
+                                {{ t("connection.salesforceDeviceCancel") }}
+                              </Button>
+                            </div>
+                          </div>
+                          <div class="grid grid-cols-4 items-start gap-4">
+                            <span />
+                            <p class="col-span-3 text-xs leading-5 text-muted-foreground">{{ t("connection.salesforceDevicePollingHint") }}</p>
+                          </div>
+                        </template>
+
+                        <div v-else-if="salesforceDevicePhase === 'expired'" class="grid grid-cols-4 items-center gap-4">
+                          <span />
+                          <div class="col-span-3 flex flex-col gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs">
+                            <span class="text-amber-700 dark:text-amber-300">{{ t("connection.salesforceDeviceExpired") }}</span>
+                            <Button type="button" size="sm" variant="outline" class="self-start" @click="salesforceDeviceRestart">
+                              {{ t("connection.salesforceDeviceRestart") }}
+                            </Button>
+                          </div>
+                        </div>
+
+                        <div v-else-if="salesforceDevicePhase === 'denied'" class="grid grid-cols-4 items-center gap-4">
+                          <span />
+                          <div class="col-span-3 flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                            <span class="text-destructive">{{ salesforceDeviceError || t("connection.salesforceDeviceDenied") }}</span>
+                            <Button type="button" size="sm" variant="outline" class="self-start" @click="salesforceDeviceRestart">
+                              {{ t("connection.salesforceDeviceRestart") }}
+                            </Button>
+                          </div>
+                        </div>
+                      </template>
+                    </template>
+
+                    <!-- Shared status / error strip (oauth success + any error) -->
+                    <div v-if="salesforceOauthSuccess && (salesforceAuthMode === 'oauth' || salesforceAuthMode === 'password' || salesforceDevicePhase === 'success')" class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <div class="col-span-3 flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+                        <ShieldCheck class="h-4 w-4 shrink-0" />
+                        <span>{{ salesforceOauthSuccess }}</span>
+                      </div>
+                    </div>
+                    <div v-if="salesforceOauthError && (salesforceAuthMode === 'oauth' || salesforceAuthMode === 'password')" class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <div class="col-span-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                        {{ salesforceOauthError }}
+                      </div>
+                    </div>
+                    <div v-if="salesforceDeviceError && salesforceAuthMode === 'device' && salesforceDevicePhase !== 'polling' && salesforceDevicePhase !== 'denied'" class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <div class="col-span-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                        {{ salesforceDeviceError }}
+                      </div>
+                    </div>
                   </template>
 
                   <!-- MySQL / PostgreSQL: host, port, user, password, database -->
@@ -8126,7 +9311,7 @@ function openExternalUrl(url: string) {
                     </div>
 
                     <!-- GaussDB: multi-host dynamic list -->
-                  <template v-if="form.db_type === 'gaussdb' && !gatewayAsConnectionInfo">
+                    <template v-if="form.db_type === 'gaussdb' && !gatewayAsConnectionInfo">
                       <div class="grid grid-cols-4 items-start gap-4">
                         <Label :class="connectionLabelTopClass">{{ t("connection.host") }}</Label>
                         <div class="col-span-3 space-y-2">
@@ -8148,7 +9333,7 @@ function openExternalUrl(url: string) {
                       <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                       <Input v-model="meilisearchHostInput" class="col-span-3" :placeholder="connectionUrlPlaceholder" @input="resetTestState" />
                     </div>
-                  <div v-else-if="!gatewayAsConnectionInfo && (form.db_type !== 'oracle' || form.oracle_connection_type !== 'tns')" class="grid grid-cols-4 items-center gap-4">
+                    <div v-else-if="!gatewayAsConnectionInfo && (form.db_type !== 'oracle' || form.oracle_connection_type !== 'tns')" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ form.db_type === "elasticsearch" && elasticsearchConnectionMode === "kibana" ? t("connection.elasticsearchKibanaHost") : t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
                       <Input v-model.number="form.port" type="number" class="col-span-1" @input="markSqlServerPortExplicit" />
@@ -8220,7 +9405,7 @@ function openExternalUrl(url: string) {
                       </div>
                     </div>
 
-                    <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
+                    <div v-if="form.db_type !== 'hbase' && form.db_type !== 'meilisearch' && form.db_type !== 'solr' && form.db_type !== 'spanner'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ databaseLabel }}</Label>
                       <Input v-model="form.database" class="col-span-3" :placeholder="databasePlaceholder" />
                     </div>
@@ -8234,11 +9419,99 @@ function openExternalUrl(url: string) {
                       <SpannerConnectionFields v-model:database="form.database" @change="resetTestState" />
                     </template>
 
+                    <div v-if="form.db_type === 'oracle' && (oracleOciDriverSelectable || form.driver_profile === 'oci')" class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.oracleDriverMode") }}</Label>
+                      <div class="col-span-3 flex gap-2">
+                        <Button size="sm" :variant="form.driver_profile !== 'oci' ? 'default' : 'outline'" @click="switchOracleDriverMode('thin')"> Thin </Button>
+                        <Button v-if="oracleOciDriverSelectable" size="sm" :variant="form.driver_profile === 'oci' ? 'default' : 'outline'" @click="switchOracleDriverMode('oci')"> OCI </Button>
+                      </div>
+                    </div>
+
+                    <template v-if="form.db_type === 'oracle' && form.driver_profile === 'oci'">
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">oci.dll</Label>
+                        <div class="col-span-3 flex items-center gap-1">
+                          <Input v-model="settingsStore.editorSettings.oracleOciClientPath" class="flex-1 font-mono" :placeholder="t('connection.oracleOciPathPlaceholder')" @change="persistOracleOciClientPath" />
+                          <Tooltip>
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseOciClientDirectory">
+                                <FolderOpen class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.oracleOciPathBrowse") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <span />
+                        <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.oracleOciPathHint") }}</p>
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">NLS_LANG</Label>
+                        <div class="col-span-3 flex items-center gap-1">
+                          <Select :model-value="oracleOciNlsLangSelection" @update:model-value="onOciNlsLangSelected">
+                            <SelectTrigger class="flex-1 font-mono" aria-label="NLS_LANG">
+                              <SelectValue :placeholder="oracleOciNlsLangPlaceholder" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem :value="OCI_NLS_LANG_FOLLOW_GLOBAL">
+                                {{ oracleOciNlsLangFollowGlobalLabel }}
+                              </SelectItem>
+                              <SelectItem v-for="option in ORACLE_NLS_LANG_OPTIONS" :key="option" :value="option">
+                                {{ option }}
+                              </SelectItem>
+                              <SelectItem v-if="oracleOciNlsLangCustomValue" :value="oracleOciNlsLangCustomValue">
+                                {{ oracleOciNlsLangCustomValue }}
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <Tooltip>
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :aria-label="t('connection.oracleOciNlsLangSaveGlobal')" @click="saveOciNlsLangAsGlobalDefault">
+                                <Save class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.oracleOciNlsLangSaveGlobal") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <span />
+                        <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.oracleOciNlsLangHint") }}</p>
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">TNS_ADMIN</Label>
+                        <div class="col-span-3 flex items-center gap-1">
+                          <Input v-model="form.oracle_oci_tns_admin" class="flex-1 font-mono" :placeholder="oracleOciTnsAdminPlaceholder" @change="resetTestState" />
+                          <Tooltip>
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :aria-label="t('connection.oracleTnsAdminBrowse')" @click="browseOciTnsAdminDirectory">
+                                <FolderOpen class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.oracleTnsAdminBrowse") }}</TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :aria-label="t('connection.oracleOciTnsAdminSaveGlobal')" @click="saveOciTnsAdminAsGlobalDefault">
+                                <Save class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.oracleOciTnsAdminSaveGlobal") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <span />
+                        <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.oracleOciTnsAdminHint") }}</p>
+                      </div>
+                    </template>
+
                     <div v-if="form.db_type === 'oracle' && form.oracle_connection_type === 'tns'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">TNS_ADMIN</Label>
                       <div class="col-span-3 flex items-center gap-1">
                         <Input v-model="oracleTnsAdminPath" class="flex-1" :placeholder="t('connection.oracleTnsAdminPlaceholder')" />
-                        <Tooltip v-if="isDesktop">
+                        <Tooltip>
                           <TooltipTrigger as-child>
                             <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseOracleTnsNamesFile">
                               <FolderOpen class="h-4 w-4" />
@@ -8254,7 +9527,7 @@ function openExternalUrl(url: string) {
                       <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.oracleTnsPathHint") }}</p>
                     </div>
 
-                    <template v-if="form.db_type === 'hive' || form.db_type === 'kyuubi' || form.db_type === 'impala'">
+                    <template v-if="form.db_type === 'hive' || form.db_type === 'transwarp' || form.db_type === 'kyuubi' || form.db_type === 'impala'">
                       <div class="grid grid-cols-4 items-center gap-4">
                         <Label :class="connectionLabelClass">{{ t("connection.hiveAuthMode") }}</Label>
                         <div class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5">
@@ -8373,6 +9646,38 @@ function openExternalUrl(url: string) {
                       </label>
                     </div>
 
+                    <div v-if="form.db_type === 'firebird'" class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelTopClass">{{ t("connection.firebirdCharset") }}</Label>
+                      <div class="col-span-3 space-y-1.5">
+                        <Select v-model="firebirdCharset">
+                          <SelectTrigger class="h-9">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="default">{{ t("common.default") }}</SelectItem>
+                            <SelectItem v-for="charset in firebirdCharsetItems" :key="charset" :value="charset">{{ charset }}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p class="text-xs leading-5 text-muted-foreground">
+                          {{ t("connection.firebirdCharsetHint") }}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div v-if="form.db_type === 'firebird'" class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelTopClass">{{ t("connection.firebirdDataCharset") }}</Label>
+                      <div class="col-span-3 space-y-1.5">
+                        <Select v-model="firebirdDataCharset">
+                          <SelectTrigger class="h-9"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="default">{{ t("common.default") }}</SelectItem>
+                            <SelectItem v-for="charset in firebirdDataCharsetItems" :key="charset" :value="charset">{{ charset }}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.firebirdDataCharsetHint") }}</p>
+                      </div>
+                    </div>
+
                     <div v-if="supportsGenericUrlParams" class="connection-url-params-row grid grid-cols-4 items-start gap-4" :class="{ 'connection-url-params-row--compact': !showGenericUrlParamsHint, 'connection-url-params-row--with-hint': showGenericUrlParamsHint }">
                       <Label :class="[connectionLabelClass, 'connection-url-params-label']">{{ t("connection.urlParams") }}</Label>
                       <div class="col-span-3 space-y-1.5">
@@ -8397,11 +9702,18 @@ function openExternalUrl(url: string) {
                                             ? 'catalog=paimon_catalog'
                                             : form.db_type === 'cassandra'
                                               ? 'localdatacenter=dc1'
-                                              : 'sslmode=prefer'
+                                              : form.db_type === 'transwarp'
+                                                ? 'fetchSize=500;auth=noSasl'
+                                                : form.db_type === 'firebird'
+                                                  ? 'charSet=GBK'
+                                                  : 'sslmode=prefer'
                           "
                         />
                         <p v-if="showGenericUrlParamsHint" class="text-xs leading-5 text-muted-foreground">
                           {{ t("connection.localInfilePathHint") }}
+                        </p>
+                        <p v-if="form.db_type === 'mysql'" class="text-xs leading-5 text-muted-foreground">
+                          {{ t("connection.sessionVariablesHint") }}
                         </p>
                       </div>
                     </div>
@@ -8468,7 +9780,7 @@ function openExternalUrl(url: string) {
                         <span />
                         <div class="col-span-3 space-y-2">
                           <p class="text-xs text-muted-foreground">
-                            {{ form.db_type === "dameng" ? t("connection.damengCustomDriverHint") : t("connection.jdbcPluginHint") }}
+                            {{ nativeAgentJdbcDriverHint }}
                           </p>
                           <div class="flex flex-wrap gap-2">
                             <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
@@ -8661,7 +9973,7 @@ function openExternalUrl(url: string) {
                   </label>
                 </div>
 
-                <template v-if="form.db_type === 'etcd' || form.db_type === 'consul' || form.db_type === 'zookeeper' || form.db_type === 'elasticsearch' || form.db_type === 'easysearch'">
+                <template v-if="form.db_type === 'etcd' || form.db_type === 'consul' || form.db_type === 'zookeeper' || form.db_type === 'elasticsearch' || form.db_type === 'easysearch' || form.db_type === 'nebula'">
                   <div class="grid grid-cols-4 items-start gap-4">
                     <Label :class="connectionLabelSmallPaddedClass">
                       <span class="inline-flex items-center justify-end gap-1">
@@ -8714,7 +10026,7 @@ function openExternalUrl(url: string) {
                           <TooltipContent>{{ t("connection.etcdClientKeyBrowse") }}</TooltipContent>
                         </Tooltip>
                       </div>
-                      <p class="text-[11px] leading-4 text-muted-foreground">
+                      <p v-if="form.db_type !== 'nebula'" class="text-[11px] leading-4 text-muted-foreground">
                         {{ t("connection.etcdClientCertHint") }}
                       </p>
                     </div>
@@ -9198,7 +10510,11 @@ function openExternalUrl(url: string) {
                     <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.etcdGrpcMaxInboundHint") }}</p>
                   </div>
                 </div>
-                <div class="grid grid-cols-4 items-center gap-4">
+                <!-- query_timeout_secs only feeds the database query pipeline
+                     (dataGrid/queryStore); plugin connections like SSH never
+                     consume it, so the generic radio would only suggest a
+                     budget the provider cannot honor. -->
+                <div v-if="!isPluginConnection" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.queryTimeout") }}</Label>
                   <div class="col-span-3 grid grid-cols-2 gap-2">
                     <div class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-1 rounded border px-2 py-1.5 sm:flex" :class="form.query_timeout_inherit === true ? 'border-primary/60 bg-background' : 'border-border bg-muted/30 text-muted-foreground'">
@@ -9218,9 +10534,12 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                 </div>
-                <div v-show="form.db_type === 'mongodb'" class="grid grid-cols-4 items-center gap-4">
-                  <Label :class="connectionLabelSmallClass">{{ t("connection.idleTimeout") }}</Label>
-                  <Input v-model.number="form.idle_timeout_secs" type="number" min="0" max="600" step="1" class="col-span-3" />
+                <div v-show="supportsIdleTimeoutSetting" class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.idleTimeout") }}</Label>
+                  <div class="col-span-3 space-y-1">
+                    <Input v-model.number="form.idle_timeout_secs" type="number" min="0" :max="MAX_IDLE_TIMEOUT_SECS" step="1" @input="clampIdleTimeoutInput($event)" />
+                    <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.idleTimeoutHint") }}</p>
+                  </div>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.keepaliveInterval") }}</Label>
@@ -9237,7 +10556,9 @@ function openExternalUrl(url: string) {
                   </label>
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
-                  <Label :class="connectionLabelSmallClass">{{ t("connection.readOnly") }}</Label>
+                  <Label :class="connectionLabelSmallClass">
+                    <span class="inline-flex items-center gap-1">{{ t("connection.readOnly") }} <HelpTooltip :label="t('connection.readOnlyExplanation')" /></span>
+                  </Label>
                   <label class="col-span-3 flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" v-model="form.read_only" class="mr-0" />
                     <span class="text-xs text-muted-foreground">{{ t("connection.readOnlyHint") }}</span>
@@ -9249,6 +10570,23 @@ function openExternalUrl(url: string) {
                     <input type="checkbox" v-model="form.show_system_schemas" class="mr-0" />
                     <span class="text-xs text-muted-foreground">{{ t("connection.showSystemSchemasHint") }}</span>
                   </label>
+                </div>
+                <div v-if="supportsOracleDatabaseLinks(form.db_type)" class="grid grid-cols-4 items-center gap-4">
+                  <Label :class="connectionLabelSmallClass">{{ t("connection.showDatabaseLinks") }}</Label>
+                  <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" v-model="form.show_database_links" class="mr-0" />
+                    <span class="text-xs text-muted-foreground">{{ t("connection.showDatabaseLinksHint") }}</span>
+                  </label>
+                </div>
+                <div v-if="supportsAutomaticTableLoading" class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.tableLoading") }}</Label>
+                  <div class="col-span-3 grid gap-1.5">
+                    <label class="flex cursor-pointer items-center gap-2">
+                      <Switch v-model="form.sidebar_auto_load_all_tables" />
+                      <span class="text-sm font-medium">{{ t("connection.autoLoadAllTables") }}</span>
+                    </label>
+                    <p class="text-xs leading-5 text-muted-foreground">{{ t("connection.autoLoadAllTablesHint") }}</p>
+                  </div>
                 </div>
                 <!-- Documentation notes are a relational-only feature, so this
                      follows the same isSchemaAware gate as the row above. -->
@@ -9263,7 +10601,7 @@ function openExternalUrl(url: string) {
                 </div>
                 <div v-if="!isPluginConnection" class="grid grid-cols-4 items-start gap-4 rounded-[6px] border border-red-500/25 bg-red-500/[0.035] px-3 py-2.5">
                   <Label :class="[connectionLabelSmallClass, 'pt-0.5 text-red-700 dark:text-red-300']">
-                    <span class="inline-flex items-center justify-end gap-1"><ShieldAlert class="h-3.5 w-3.5" />PROD</span>
+                    <span class="inline-flex items-center justify-end gap-1"><ShieldAlert class="h-3.5 w-3.5" />PROD <HelpTooltip :label="t('production.explanation')" trigger-class="text-red-700/70 dark:text-red-300/70" /></span>
                   </Label>
                   <div class="col-span-3 grid gap-2">
                     <div class="flex items-center justify-between gap-3">
@@ -9290,6 +10628,19 @@ function openExternalUrl(url: string) {
                           <ListFilter v-else class="mr-1.5 h-4 w-4" />
                           {{ t(productionScopePickerLabelKey) }}
                         </Button>
+                      </div>
+                      <div class="grid gap-1.5 pt-1">
+                        <Label for="production-badge-scope" class="text-xs font-medium">{{ t("production.badgeScope") }}</Label>
+                        <Select :model-value="form.production_badge_scope || 'database'" @update:model-value="form.production_badge_scope = $event as ProductionBadgeScope">
+                          <SelectTrigger id="production-badge-scope" class="h-8" :aria-label="t('production.badgeScope')"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="connection">{{ t("production.badgeScopeConnection") }}</SelectItem>
+                            <SelectItem value="database">{{ t("production.badgeScopeDatabase") }}</SelectItem>
+                            <SelectItem value="table">{{ t("production.badgeScopeTable") }}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p class="text-xs leading-5 text-muted-foreground">{{ t(`production.badgeScopeHint${form.production_badge_scope === "connection" ? "Connection" : form.production_badge_scope === "table" ? "Table" : "Database"}`) }}</p>
+                        <p class="text-xs leading-5 text-muted-foreground">{{ t("production.badgeScopeSafetyHint") }}</p>
                       </div>
                     </template>
                   </div>
@@ -9366,11 +10717,11 @@ function openExternalUrl(url: string) {
                         <Plus class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.sshHopAdd") }}
                       </Button>
-                      <Button v-if="!sqliteSshOnlyTransport" type="button" variant="outline" size="sm" @click="addProxyTunnel">
+                      <Button type="button" variant="outline" size="sm" @click="addProxyTunnel">
                         <Plus class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.proxy") }}
                       </Button>
-                      <Button v-if="!sqliteSshOnlyTransport" type="button" variant="outline" size="sm" @click="addHttpTunnel">
+                      <Button v-if="!sqliteRemoteTransportRestricted" type="button" variant="outline" size="sm" @click="addHttpTunnel">
                         <Plus class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.httpTunnelAdd") }}
                       </Button>
@@ -9487,7 +10838,7 @@ function openExternalUrl(url: string) {
                       </div>
                     </div>
                   </template>
-                  <div v-if="!selectedLayerProfileId && !sqliteSshOnlyTransport" class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="!selectedLayerProfileId" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">Type</Label>
                     <Select :model-value="selectedTransportLayer.type" @update:model-value="(value: any) => changeSelectedTransportLayerType(value)">
                       <SelectTrigger class="col-span-3 h-9">
@@ -9496,8 +10847,8 @@ function openExternalUrl(url: string) {
                       <SelectContent>
                         <SelectItem value="ssh">SSH</SelectItem>
                         <SelectItem value="proxy">Proxy</SelectItem>
-                        <SelectItem value="http_tunnel">{{ t("connection.httpTunnel") }}</SelectItem>
-                        <SelectItem value="dbx_gateway">{{ t("connection.gateway") }}</SelectItem>
+                        <SelectItem v-if="!sqliteRemoteTransportRestricted" value="http_tunnel">{{ t("connection.httpTunnel") }}</SelectItem>
+                        <SelectItem v-if="!sqliteRemoteTransportRestricted" value="dbx_gateway">{{ t("connection.gateway") }}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -9573,6 +10924,13 @@ function openExternalUrl(url: string) {
                         <span class="text-xs text-muted-foreground">{{ t("connection.sshAllowExecChannelProxy") }}</span>
                       </label>
                     </div>
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshProxyCommand") }}</Label>
+                      <div class="col-span-3 space-y-1">
+                        <Input v-model="selectedSshLayer.proxy_command" :placeholder="t('connection.sshProxyCommandPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                        <p class="text-xs text-muted-foreground">{{ t("connection.sshProxyCommandHint") }}</p>
+                      </div>
+                    </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshConnectTimeout") }}</Label>
                       <Input v-model.number="selectedSshLayer.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedSshLayer.enabled === false" />
@@ -9608,15 +10966,15 @@ function openExternalUrl(url: string) {
                   <template v-else-if="selectedHttpTunnelLayer && !selectedLayerProfileId">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelUrl") }}</Label>
-                      <Input v-model="selectedHttpTunnelLayer.url" class="col-span-3" placeholder="https://dbx.example.com/dbx_tunnel.php" :disabled="selectedHttpTunnelLayer.enabled === false" />
+                      <Input v-model="selectedHttpTunnelLayer!.url" class="col-span-3" placeholder="https://dbx.example.com/dbx_tunnel.php" :disabled="selectedHttpTunnelLayer!.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelToken") }}</Label>
-                      <PasswordInput v-model="selectedHttpTunnelLayer.token" class="col-span-3" :placeholder="t('connection.httpTunnelTokenPlaceholder')" :disabled="selectedHttpTunnelLayer.enabled === false" />
+                      <PasswordInput v-model="selectedHttpTunnelLayer!.token" class="col-span-3" :placeholder="t('connection.httpTunnelTokenPlaceholder')" :disabled="selectedHttpTunnelLayer!.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelConnectTimeout") }}</Label>
-                      <Input v-model.number="selectedHttpTunnelLayer.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedHttpTunnelLayer.enabled === false" />
+                      <Input v-model.number="selectedHttpTunnelLayer!.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedHttpTunnelLayer!.enabled === false" />
                     </div>
                   </template>
                 </template>

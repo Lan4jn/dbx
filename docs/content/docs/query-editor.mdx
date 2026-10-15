@@ -5,6 +5,19 @@ description: Write, understand, parameterize, execute, analyze, and reuse SQL in
 
 The query editor is the SQL workspace in DBX. It combines dialect-aware highlighting and completion, semantic diagnostics, parameter input, execution progress, multiple results, execution plans, query history, the SQL library, and AI assistance in one tab.
 
+## Vim configuration
+
+In the desktop app, enable Vim mode in **Editor Settings** to load commands from `~/.dbx/vimrc`. Create the file if needed, then restart DBX after editing it. Blank lines and lines beginning with `"` are ignored. Commands supported by CodeMirror Vim, such as these mappings, apply to every SQL editor tab:
+
+```vim
+" DBX Vim mappings
+imap jj <Esc>
+nmap Y y$
+set clipboard=unnamedplus
+```
+
+With `set clipboard=unnamedplus`, Vim yanks and deletes write to the system clipboard, and normal-mode `p` and `P` read from it. Unsupported commands do not prevent the editor from starting.
+
 ## Basic Workflow
 
 <Steps>
@@ -140,6 +153,8 @@ Explain Plan accepts query-like SQL that is safe to analyze, such as `SELECT`, `
 `EXPLAIN` semantics vary by database, and some engines provide only table or text output. A plan reflects optimizer estimates rather than real production performance; evaluate it together with data volume, statistics, indexes, and measured runtime.
 
 ## Query History
+
+In **Settings → Data → Query history retention**, choose **200**, **1000** (default), **5000**, **10000**, or **Unlimited**. The limit is shared by all connections and execution sources, including MCP. A lower limit takes effect the next time a history entry is recorded: older entries beyond the limit are deleted. Raising the limit does not recover deleted entries. History page sizes remain unchanged.
 
 Query history stores executed SQL per connection with time and context. You can:
 

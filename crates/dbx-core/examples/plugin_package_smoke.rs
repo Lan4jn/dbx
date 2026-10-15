@@ -77,19 +77,19 @@ async fn run() -> Result<(), String> {
     }))
     .map_err(|error| error.to_string())?;
 
-    let test = host.test_connection(&config, "localhost", 22).await?;
+    let test = host.test_connection(&config, "localhost", 22, None).await?;
     if !test.message.contains("localhost:22") {
         return Err(format!("Unexpected connection-test result: {}", test.message));
     }
 
-    let action = host.invoke_connection_action(&config, "suggest-greeting", "localhost", 22).await?;
+    let action = host.invoke_connection_action(&config, "suggest-greeting", "localhost", 22, None).await?;
     if action.message.as_deref() != Some("Greeting updated by the plugin action.")
         || action.field_values.get("greeting").and_then(Value::as_str) != Some("Hello from plugin action")
     {
         return Err(format!("Unexpected connection-action result: {action:?}"));
     }
 
-    let handle = host.connect_connection(&config, "localhost", 22).await?;
+    let handle = host.connect_connection(&config, "localhost", 22, None).await?;
     if !handle.is_running() {
         return Err("Plugin connection handle is not running".to_string());
     }
@@ -149,7 +149,7 @@ async fn run() -> Result<(), String> {
     }
 
     handle.disconnect().await?;
-    host.stop_all().await;
+    host.stop_all().await?;
     installer.uninstall(PLUGIN_ID)?;
     if !PluginRegistry::new_with_app_version(store.path().to_path_buf(), APP_VERSION).list_installed()?.is_empty() {
         return Err("Plugin store is not empty after uninstall".to_string());

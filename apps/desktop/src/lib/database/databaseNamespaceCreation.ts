@@ -1,5 +1,4 @@
 import type { ConnectionConfig, DatabaseType, TreeNodeType } from "@/types/database";
-import { isMongoLegacyDriverProfile } from "@/lib/mongo/mongoCapabilities";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 
 export type DatabaseNamespaceCreationTarget = "database" | "schema" | "attach" | "special";
@@ -33,6 +32,9 @@ export const DATABASE_NAMESPACE_CREATION_MATRIX = {
   elasticsearch: { deferred: "index creation is not modeled as database creation" },
   easysearch: { deferred: "index creation is not modeled as database creation" },
   meilisearch: { deferred: "index creation is not modeled as database creation" },
+  salesforce: { deferred: "Salesforce orgs do not expose database creation through SOQL" },
+  solr: { deferred: "core creation is not modeled as database creation" },
+  couchdb: { deferred: "database creation is not modeled as SQL database creation" },
   hbase: { deferred: "namespace creation needs dedicated HBase namespace options" },
   qdrant: { deferred: "collection creation is separate from database creation" },
   milvus: { deferred: "collection/database lifecycle needs a dedicated vector workflow" },
@@ -69,12 +71,14 @@ export const DATABASE_NAMESPACE_CREATION_MATRIX = {
   prestosql: { database: "schema" },
   hive: { deferred: "Hive database creation needs agent metadata validation first" },
   argo: { deferred: "ArgoDB database creation needs agent metadata validation first" },
+  transwarp: { connection: "database" },
   kyuubi: { deferred: "Kyuubi database creation needs dedicated metadata validation first" },
   impala: { deferred: "Impala database creation needs dedicated metadata validation first" },
   spark: { deferred: "Spark database creation needs agent metadata validation first" },
   db2: { database: "schema" },
   informix: { connection: "database" },
   neo4j: { deferred: "database creation depends on edition/admin privileges" },
+  nebula: { deferred: "space creation requires partition, replica and VID type options" },
   cassandra: { deferred: "keyspace creation requires replication options" },
   bigquery: { deferred: "dataset creation needs project/location options" },
   spanner: { deferred: "database creation requires the Cloud Spanner Admin API" },
@@ -113,7 +117,6 @@ function namespaceCreationMatrixEntry(connection: NonNullable<CreationConnection
 
 export function connectionNamespaceCreationTarget(connection: CreationConnection): ConnectionCreationTarget | null {
   if (!connection || connectionIsEffectivelyReadOnly(connection)) return null;
-  if (connection.db_type === "mongodb" && isMongoLegacyDriverProfile(connection.driver_profile)) return null;
   if (connection.db_type === "sqlite" && (connection.host?.trim().toLowerCase() === ":memory:" || Boolean(connection.password))) {
     return null;
   }

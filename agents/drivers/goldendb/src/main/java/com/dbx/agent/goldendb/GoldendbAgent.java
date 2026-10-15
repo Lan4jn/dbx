@@ -127,7 +127,7 @@ public final class GoldendbAgent extends AbstractJdbcAgent {
         return unchecked(() -> {
             List<ObjectInfo> result = new ArrayList<>();
             for (TableInfo table : listTables(schema)) {
-                result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment()));
+                result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment(), table.getValid()));
             }
 
             try (java.sql.PreparedStatement stmt = requireConnected().prepareStatement(
@@ -195,6 +195,26 @@ public final class GoldendbAgent extends AbstractJdbcAgent {
                 }
             }
             return constraints.withoutPaging().filterObjects(result);
+        });
+    }
+
+    @Override
+    public String getTableDdl(String schema, String table) {
+        return unchecked(() -> {
+            String qualifiedTable = JdbcIdentifiers.INSTANCE.backtick(table);
+            if (schema != null && !schema.isBlank()) {
+                qualifiedTable = JdbcIdentifiers.INSTANCE.backtick(schema) + "." + qualifiedTable;
+            }
+            try (java.sql.Statement statement = requireConnected().createStatement();
+                 ResultSet result = statement.executeQuery("SHOW CREATE TABLE " + qualifiedTable)) {
+                if (result.next()) {
+                    String ddl = result.getString(2);
+                    if (ddl != null && !ddl.isBlank()) {
+                        return ddl;
+                    }
+                }
+                throw new IllegalStateException("DDL not found for " + qualifiedTable);
+            }
         });
     }
 
@@ -436,6 +456,12 @@ public final class GoldendbAgent extends AbstractJdbcAgent {
                 case Types.BOOLEAN:
                 case Types.BIT:
                     value = rs.getBoolean(index);
+                    break;
+                case Types.BINARY:
+                case Types.VARBINARY:
+                case Types.LONGVARBINARY:
+                case Types.BLOB:
+                    value = JdbcExecutor.bytesToHex(rs.getBytes(index));
                     break;
                 default:
                     value = rs.getString(index);

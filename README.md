@@ -1,8 +1,8 @@
 <div align="center">
-  <p style="font-size: 18px; white-space: nowrap;"><strong>90+ databases in 25 MB. Desktop, Docker, CLI, built-in AI assistant, and MCP Server.</strong></p>
+  <p style="font-size: 18px; white-space: nowrap;"><strong>100+ databases in 25 MB. Desktop, Docker, CLI, built-in AI assistant, and MCP Server.</strong></p>
 
   <p>
-    <img src="https://dl.dbxio.com/assets/readme-hero-20260820.png" alt="DBX screenshot" width="820" />
+    <img src="https://dl.dbxio.com/assets/readme-hero-20260925.png" alt="DBX screenshot" width="820" />
   </p>
 
   <p>
@@ -29,6 +29,7 @@
     <img src="https://img.shields.io/badge/Oracle-F80000?logo=oracle&logoColor=white" />
     <img src="https://img.shields.io/badge/Elasticsearch-005571?logo=elasticsearch&logoColor=white" />
     <img src="https://img.shields.io/badge/Meilisearch-FF5CAA?logo=meilisearch&logoColor=white" />
+    <img src="https://img.shields.io/badge/Apache%20CouchDB-E42528?logo=apachecouchdb&logoColor=white" />
     <img src="https://img.shields.io/badge/MariaDB-003545?logo=mariadb&logoColor=white" />
     <img src="https://img.shields.io/badge/TiDB-DC150B?logo=tidb&logoColor=white" />
     <img src="https://img.shields.io/badge/Doris-0052CC?logoColor=white" />
@@ -70,6 +71,17 @@
 <table>
   <tr>
     <td align="center" valign="middle" width="200">
+      <a href="https://www.jumpserver.org/" target="_blank">
+        <img src="docs/public/sponsors/jumpserver-card.png" alt="JumpServer" width="175" />
+      </a>
+    </td>
+    <td>
+      JumpServer is an Open-source Privileged Access Management (PAM) platform with AI-powered capabilities, providing DevOps and IT teams a unified workspace to securely access SSH, RDP, Kubernetes, databases, websites, RemoteApp, VirtualApp, and more.
+      <a href="https://github.com/jumpserver/jumpserver" target="_blank">Visit JumpServer</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="200">
       <a href="https://www.rainyun.com/MTE5Mjc4Ng==_" target="_blank">
         <img src="docs/public/sponsors/rainyun-card.png" alt="RainYun" width="175" />
       </a>
@@ -77,17 +89,6 @@
     <td>
       RainYun is a cloud service provider offering cloud servers, physical servers, game hosting, and developer-friendly infrastructure services.
       <a href="https://www.rainyun.com/MTE5Mjc4Ng==_" target="_blank">Visit RainYun</a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" valign="middle" width="200">
-      <a href="https://www.trustasia.com/ssl/trustasia/code-signing" target="_blank">
-        <img src="docs/public/sponsors/trustasia-card.png" alt="TrustAsia" width="175" />
-      </a>
-    </td>
-    <td>
-      TrustAsia provides cloud-based code signing service for DBX, enabling trusted software through automated CI/CD builds.
-      <a href="https://www.trustasia.com/ssl/trustasia/code-signing" target="_blank">Visit TrustAsia</a>
     </td>
   </tr>
   <tr>
@@ -103,13 +104,13 @@
   </tr>
   <tr>
     <td align="center" valign="middle" width="200">
-      <a href="https://www.ucloud.cn/site/active/kuaijiesale.html?ytag=geo_waituo_github_dbx" target="_blank">
-        <img src="docs/public/sponsors/astraflow-card.png" alt="AstraFlow" width="175" />
+      <a href="https://www.aicodemirror.ai/register?invitecode=9A50BU" target="_blank">
+        <img src="docs/public/sponsors/aicodemirror-card.png" alt="AICodeMirror" width="175" />
       </a>
     </td>
     <td>
-      UCloud is the first public cloud provider listed on China's STAR Market, with 28 global regions for cloud hosting, databases, and CDN; its AstraFlow platform offers one-click access to 200+ mainstream LLMs.
-      <a href="https://www.ucloud.cn/site/active/kuaijiesale.html?ytag=geo_waituo_github_dbx" target="_blank">Visit UCloud</a>
+      Special thanks to AICodeMirror for sponsoring this project! AICodeMirror provides a high-stability official relay service for Claude Code / Codex / Gemini CLI, with enterprise-grade concurrency, fast invoicing, and 7×24 dedicated support. Official-channel pricing for Claude Code / Codex / Gemini is as low as 38% / 2% / 9% of list price, with extra discounts on top-ups! AICodeMirror offers a special benefit for DBX users: register through this link to enjoy 20% off your first top-up, and enterprise customers up to 25% off.
+      <a href="https://www.aicodemirror.ai/register?invitecode=9A50BU" target="_blank">Visit AICodeMirror</a>
     </td>
   </tr>
   <tr>
@@ -121,6 +122,62 @@
     <td>
       HuaLongAI is a model API relay built for heavy AI developers, offering 100% official-source Codex and Claude models with transparent token-level billing, enterprise contracts, and invoicing.
       <a href="https://api.hualong.online/register?promo=DBX%26HUALONG" target="_blank">Visit HuaLongAI</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="200">
+      <a href="https://www.hiapi.ai/invite/dbx?utm_source=dbx&utm_medium=affiliate&utm_campaign=backlink&utm_content=readme-en" target="_blank">
+        <img src="docs/public/sponsors/hiapi-card.png" alt="HiAPI" width="175" />
+      </a>
+    </td>
+    <td>
+      HiAPI is a developer-focused API platform for image, video, audio, and text models — GPT Image 2.5 (Flare & Sunburst), OpenAI-compatible text endpoints, and Remote MCP/Agent Skills for Claude Code, Cursor, and more. Pay as you go with no minimum spend; new users get 200 Credits on signup, plus 10% bonus Credits on top-ups.
+      <a href="https://www.hiapi.ai/invite/dbx?utm_source=dbx&utm_medium=affiliate&utm_campaign=backlink&utm_content=readme-en" target="_blank">Visit HiAPI</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="200">
+      <a href="https://www.ucloud.cn/site/active/kuaijiesale.html?ytag=geo_waituo_github_dbx" target="_blank">
+        <img src="docs/public/sponsors/astraflow-card.png" alt="AstraFlow" width="175" />
+      </a>
+    </td>
+    <td>
+      UCloud is the first public cloud provider listed on China's STAR Market, with 28 global regions for cloud hosting, databases, and CDN; its AstraFlow platform offers one-click access to 200+ mainstream LLMs.
+      <a href="https://www.ucloud.cn/site/active/kuaijiesale.html?ytag=geo_waituo_github_dbx" target="_blank">Visit UCloud</a>
+    </td>
+  </tr>
+
+  <tr>
+    <td align="center" valign="middle" width="200">
+      <a href="https://www.packyapi.ai/register?aff=wyDA" target="_blank">
+        <img src="docs/public/sponsors/packyapi-card.png" alt="PackyCode" width="175" />
+      </a>
+    </td>
+    <td>
+      PackyCode is a stable, efficient API relay for mainstream AI models. Access them with one API endpoint and one API key — automatic failover keeps access fast and reliable, with dedicated high-speed routes for Codex and Claude Code. Get started with $1 in free credits, a first top-up discount, and up to 80% off eligible routes; pay in RMB with no currency conversion markups or extra top-up fees.
+      <a href="https://www.packyapi.ai/register?aff=wyDA" target="_blank">Visit PackyCode</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="200">
+      <a href="https://mate.vip/ee/" target="_blank">
+        <img src="docs/public/sponsors/taiyi-card.png" alt="太一企业版" width="175" />
+      </a>
+    </td>
+    <td>
+      太一智能体企业版是面向央国企的私有化智能体平台，采用“1+N+N”架构：1 个平台、N 个终端、N 个场景。<strong>可信</strong>：Java 微服务架构，私有化部署，全程留痕可审计。<strong>可控</strong>：关键操作人工审批，资料按密级管理。<strong>可达</strong>：按单位模板直接生成公文、台账和汇报材料。<strong>可复制</strong>：场景方案包化交付，便于推广和二次开发。欢迎预约演示，或在 GitHub 搜索 MateClaw。
+      <a href="https://mate.vip/ee/" target="_blank">访问太一企业版</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="200">
+      <a href="https://www.trustasia.com/ssl/trustasia/code-signing" target="_blank">
+        <img src="docs/public/sponsors/trustasia-card.png" alt="TrustAsia" width="175" />
+      </a>
+    </td>
+    <td>
+      TrustAsia provides cloud-based code signing service for DBX, enabling trusted software through automated CI/CD builds.
+      <a href="https://www.trustasia.com/ssl/trustasia/code-signing" target="_blank">Visit TrustAsia</a>
     </td>
   </tr>
   <tr>
@@ -197,13 +254,23 @@
       <p>Native app on macOS, Windows, and Linux. Self-host via Docker for team access. Web version for browser-only environments. Same feature set. Same connections.</p>
     </td>
   </tr>
+  <tr>
+    <td>
+      <h3>📨 Not just databases</h3>
+      <p>Message queues and middleware get first-class consoles: Kafka, RocketMQ, RabbitMQ, Pulsar, and MQTT, plus Nacos, Consul, ZooKeeper, and etcd. Inspect topics and messages next to your databases — no extra tool.</p>
+    </td>
+    <td>
+      <h3>🧩 Plugin ecosystem</h3>
+      <p>Extend DBX with signed, sandboxed plugins from the built-in store — S3, Kubernetes, LDAP, and more. Build your own with the Go / TypeScript SDK.</p>
+    </td>
+  </tr>
 </table>
 
 ## Features
 
-### 90+ Databases, One Tool
+### 100+ Databases, One Tool
 
-MySQL, PostgreSQL, SQLite, Cloudflare D1, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, Easysearch, Meilisearch, Qdrant, Milvus, Weaviate, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingbaseES, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Manticore Search, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, UXDB, Dolt, and more. Agent-based profiles extend DBX to H2, Snowflake, Trino, PrestoSQL, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Cloud Spanner, Kylin, SunDB, JDBCX, and custom JDBC connections. New native and agent-driven drivers also cover Databricks, SAP HANA, Teradata, Vertica, Firebird, Exasol, YashanDB, GBase 8a/8s, Databend, RQLite, Turso, InfluxDB, QuestDB, IoTDB, etcd, ZooKeeper, Nacos, Consul KV, IRIS, and more. Message queue admin is also available for Pulsar, Kafka, and RocketMQ. All in a single ~25 MB app. No bundled Chromium.
+MySQL, PostgreSQL, SQLite, Cloudflare D1, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, Easysearch, Meilisearch, CouchDB, Qdrant, Milvus, Weaviate, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingbaseES, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Manticore Search, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, UXDB, Dolt, and more. Agent-based profiles extend DBX to H2, Snowflake, Trino, PrestoSQL, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Cloud Spanner, Kylin, SunDB, JDBCX, and custom JDBC connections. New native and agent-driven drivers also cover Databricks, SAP HANA, Teradata, Vertica, Firebird, Exasol, YashanDB, GBase 8a/8s, Databend, RQLite, Turso, InfluxDB, QuestDB, IoTDB, etcd, ZooKeeper, Nacos, Consul KV, IRIS, and more. All in a single ~25 MB app. No bundled Chromium.
 
 ### Query Editor
 
@@ -242,6 +309,18 @@ Virtual-scrolled table that handles large result sets. Inline editing, SQL previ
 
 - **Redis** — key pattern search, batch key operations, command runner, TTL editing, and all data types (String, Hash, List, Set, ZSet, Stream)
 - **MongoDB** — document CRUD with pagination, Atlas & replica set URL connection
+
+### Message Queue & Middleware Consoles
+
+- **Kafka / RocketMQ / RabbitMQ / Pulsar** — topics, consumer groups, message browsing, query and trace, broker monitoring, permissions and policies
+- **MQTT** — topic tree navigation, subscribe, and publish
+- **Nacos / Consul / ZooKeeper / etcd** — service discovery, KV / config browsing, health, and ACL
+
+### Plugin System
+
+- **Extensible by design** — new connection types and tools arrive as plugins: S3 browsing, Kubernetes, LDAP, and more from the built-in store
+- **Signed & sandboxed** — every plugin package is signature-verified before install; plugin UI runs sandboxed with its own sidecar process
+- **Build your own** — Go / TypeScript SDKs with `npx @dbx-app/plugin-cli` scaffolding; publish to the Marketplace via [`t8y2/dbx-store`](https://github.com/t8y2/dbx-store)
 
 ### Safety & Connectivity
 
@@ -302,9 +381,12 @@ DBX also provides a dedicated CLI package for terminal, script, and Codex workfl
 npm install -g @dbx-app/cli
 # or via Homebrew
 brew tap t8y2/tap && brew install dbx-cli
+dbx agent setup
 dbx connections list --json
 dbx query local "select 1" --json
 ```
+
+The CLI includes the official DBX Agent Skill. `dbx agent setup` installs or updates it offline under `~/.agents/skills/dbx`, so shell-capable AI agents know how to use DBX CLI safely.
 
 See the [MCP server README](packages/mcp-server/README.md) and [CLI README](packages/cli/README.md) for details.
 
@@ -342,11 +424,18 @@ Updates then arrive through the regular `flatpak update`. See the [DBX page on F
 
 ## Self-Hosted (Docker)
 
+For scheduled backups after closing the desktop app or browser, see
+[Background Database Backups](docs/background-database-backups.md), including
+Windows/macOS/Linux startup and persistent container backup volumes.
+
 DBX provides a web version that can be deployed via Docker. The examples use
 the `latest` tag to pull the current release.
 
 ```bash
-docker run -d --pull=always --name dbx -p 4224:4224 -v dbx-data:/app/data t8y2/dbx:latest
+# The default keeps the key in the persistent /app/data volume.
+docker run -d --pull=always --name dbx -p 4224:4224 \
+  -v dbx-data:/app/data \
+  t8y2/dbx:latest
 ```
 
 This uses the cross-platform `dbx-data` named volume. Users in China can use
@@ -375,9 +464,68 @@ services:
 
 volumes:
   dbx-data:
+
 ```
 
 Open `http://localhost:4224` in your browser. Multi-arch images (amd64 / arm64) are available.
+
+Connection, plugin, AI, and tunnel credentials are encrypted before they are
+written to `dbx.db`. Desktop builds use the local platform credential store
+(macOS Keychain, Windows Credential Manager, or Linux Secret Service).
+Web/Docker and directly running `dbx-web` use the same managed data-directory
+key by default: `${DBX_DATA_DIR}/.dbx/secret.key`. The key is created only when
+migration starts or the first sensitive value is written, and must be backed up
+together with `dbx.db`. Persisting `/app/data` is therefore sufficient for a
+normal Docker deployment. This key protects the database contents, but cannot
+protect the whole data volume if the volume itself is copied or exposed.
+
+Windows portable builds are the exception to the desktop platform-key rule.
+To remain portable across computers, they keep the local storage key at
+`data/.dbx/secret.key`; move and back up the complete `data` directory. If an
+older portable profile already contains ciphertext protected by Windows
+Credential Manager, launch the new build once on the original computer so DBX
+can verify and copy that key to the USB drive. If the original computer or key
+is gone, the ciphertext cannot be recovered automatically; restore the original
+key or a pre-migration backup. Keeping the key beside the database means anyone
+who obtains or copies the whole drive can also decrypt its credentials.
+
+For production deployments, replace the managed key with a Docker/Kubernetes
+Secret by setting `DBX_SECRET_KEY_FILE`, or provide `DBX_SECRET_KEY` through a
+secret manager. Explicit keys take precedence and must never be rotated while
+encrypted data is in use. Without a usable key, business APIs remain blocked
+and the browser displays the data security upgrade screen.
+
+When running the binary directly, set `DBX_DATA_DIR=/var/lib/dbx` to use
+`/var/lib/dbx/.dbx/secret.key` with the same lifecycle and backup rules.
+
+When upgrading from a release that stored credentials in plain text, Desktop
+and Web display a **Data Security Upgrade** wizard before opening the main
+application. Choose **Start upgrade** to create a restricted backup, migrate
+legacy database/JSON credentials, and verify that encrypted values can be
+read. Failures retain the original data and backup; fix the issue shown in
+the wizard and choose **Retry**. The backup path is shown after success.
+Once you have verified your connections, **Delete migration backups** asks
+for confirmation and removes the migration backup directory and the legacy
+JSON `.bak` files created by that migration. Unrelated backup files are kept.
+Users with no legacy data proceed directly after the initial check.
+
+Local CLI and standalone MCP can reuse the existing platform credential
+store on the same device, or read an explicitly configured
+`DBX_SECRET_KEY_FILE`/`DBX_SECRET_KEY`. They do not create keys during the
+startup check or automatically migrate legacy data. A
+`DATA_MIGRATION_REQUIRED` error means that you must first open the same data
+directory in Desktop or Web and complete its upgrade wizard. For headless
+hosts without a platform credential store, configure the persistent key.
+
+Cross-device exports use a separate sync passphrase and never contain the
+local storage key. For installed builds, or when copying only `dbx.db`, platform
+keys do not move with the database; use encrypted export/import instead. A
+Windows portable build must move the complete `data` directory containing both
+`dbx.db` and `.dbx/secret.key`.
+
+For the complete design, migration state machine, implementation map,
+troubleshooting, and test plan, see
+[DBX Data Security Upgrade and Migration](docs/data-security-migration.md).
 
 To publish DBX under a reverse-proxy context path such as `/dbx`, set the
 runtime base path and proxy the same prefix to the container:

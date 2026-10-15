@@ -27,6 +27,12 @@ function installApiMocks() {
     saveEditorSettings: vi.fn().mockResolvedValue(undefined),
     saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
     loadSidebarLayout: vi.fn().mockResolvedValue(null),
+    loadTableVGroups: vi.fn().mockResolvedValue({}),
+    saveTableVGroups: vi.fn().mockResolvedValue(undefined),
+    deleteTableVGroupsForConnection: vi.fn().mockResolvedValue(undefined),
+    // 关闭页签会顺带回收结果/客户端会话；缺失的导出会让清理路径报错刷屏。
+    closeQuerySession: vi.fn().mockResolvedValue(undefined),
+    closeClientConnectionSession: vi.fn().mockResolvedValue(undefined),
     connectionDatabaseInfo: vi.fn().mockResolvedValue(undefined),
     listInstalledAgents: vi.fn().mockResolvedValue([]),
     sessionCredentialStatus: vi.fn().mockResolvedValue(false),
@@ -64,6 +70,35 @@ describe("connectionStore one_time runtime cleanup", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("cancels source and target schema compares and drains metadata before disconnecting pools", async () => {
+    installApiMocks();
+    const { registerSchemaDiffTask } = await import("@/lib/schema/schemaDiffCancellation");
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { disconnectDb } = await import("@/lib/backend/api");
+    const store = useConnectionStore();
+    store.connections = [previewConnection({ id: "saved-1", one_time: false })];
+    const controllers = [new AbortController(), new AbortController(), new AbortController()];
+    const finish: Array<() => void> = [];
+    for (const [i, ids] of [
+      ["saved-1", "target"],
+      ["source", "saved-1"],
+      ["other", "target"],
+    ].entries()) {
+      registerSchemaDiffTask(ids, controllers[i], new Promise<void>((resolve) => finish.push(resolve)));
+    }
+    const disconnecting = store.disconnect("saved-1");
+    expect(controllers.map((controller) => controller.signal.aborted)).toEqual([true, true, false]);
+    expect(disconnectDb).not.toHaveBeenCalled();
+    finish[0]();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disconnectDb).not.toHaveBeenCalled();
+    finish[1]();
+    await disconnecting;
+    expect(disconnectDb).toHaveBeenCalledOnce();
+    expect(disconnectDb).toHaveBeenCalledWith("saved-1", undefined);
+    finish[2]();
   });
 
   // One-time connections are never persisted, so the backend's save_connections
@@ -111,6 +146,49 @@ describe("connectionStore one_time runtime cleanup", () => {
     expect(store.connections).toEqual([]);
   });
 
+  it("reloads externally added, copied and deleted connections while preserving existing tree state", async () => {
+    installApiMocks();
+    const { loadConnections } = await import("@/lib/backend/api");
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const kept = previewConnection({ id: "kept", one_time: false });
+    const temporary = previewConnection({ id: "temporary" });
+    store.connections = [kept, previewConnection({ id: "removed", one_time: false }), temporary];
+    store.connectedIds.add("kept");
+    store.treeNodes = [{ id: "kept", label: kept.name, type: "connection", connectionId: "kept", isExpanded: true, children: [{ id: "kept:app", label: "app", type: "database", connectionId: "kept", database: "app", isExpanded: true }] }];
+    vi.mocked(loadConnections).mockResolvedValue([kept, previewConnection({ id: "added", one_time: false }), previewConnection({ id: "copied", one_time: false })]);
+
+    await store.reloadFromDisk();
+
+    expect(store.connections.map((connection) => connection.id)).toEqual(["kept", "added", "copied", "temporary"]);
+    expect(store.treeNodes.map((node) => node.id)).toEqual(["kept", "added", "copied", "temporary"]);
+    expect(store.treeNodes[0]).toMatchObject({ isExpanded: true, children: expect.arrayContaining([expect.objectContaining({ id: "kept:app", isExpanded: true })]) });
+    expect(store.connectedIds.has("kept")).toBe(true);
+  });
+
+  it("reads a fresh snapshot when an external change arrives during an in-flight reload", async () => {
+    installApiMocks();
+    const { loadConnections } = await import("@/lib/backend/api");
+    let finishFirstRead!: (connections: ConnectionConfig[]) => void;
+    vi.mocked(loadConnections)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishFirstRead = resolve;
+        }),
+      )
+      .mockResolvedValueOnce([previewConnection({ id: "new", one_time: false })]);
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const initialLoad = store.initFromDisk();
+    await vi.waitFor(() => expect(loadConnections).toHaveBeenCalledOnce());
+    const externalReload = store.reloadFromDisk();
+    finishFirstRead([]);
+    await Promise.all([initialLoad, externalReload]);
+
+    expect(loadConnections).toHaveBeenCalledTimes(2);
+    expect(store.getConfig("new")).toBeDefined();
+  });
+
   it("removeConnection leaves saved connections to the save_connections sync", async () => {
     installApiMocks();
     const { useConnectionStore } = await import("@/stores/connectionStore");
@@ -123,9 +201,10 @@ describe("connectionStore one_time runtime cleanup", () => {
     expect(disconnectDb).not.toHaveBeenCalled();
   });
 
-  // The connection is gone for good, so its tabs can never reconnect: executing in
-  // one would fail with "Connection config not found".
-  it("removeConnection closes the tabs of a one_time connection", async () => {
+  // 删除连接是终态，页签一律由「删除连接」策略决定，one_time 连接也不例外——它的页签虽然
+  // 无法再执行，但里面的 SQL 文本是用户的工作。默认 close-tabs 仍会关闭页签，只是未保存的
+  // 草稿必须先经保存/放弃确认，不能像以前那样被静默丢弃。
+  it("removeConnection asks before discarding an unsaved SQL draft of a one_time connection", async () => {
     installApiMocks();
     const { useConnectionStore } = await import("@/stores/connectionStore");
     const { useQueryStore } = await import("@/stores/queryStore");
@@ -138,7 +217,28 @@ describe("connectionStore one_time runtime cleanup", () => {
 
     await store.removeConnection("preview-1");
 
+    expect(queryStore.showCloseConfirm).toBe(true);
+    expect(queryStore.pendingCloseTabId).toBe(queryId);
+
+    queryStore.forceCloseAllPendingTabs();
     expect(queryStore.tabs.some((tab) => tab.connectionId === "preview-1")).toBe(false);
+  });
+
+  it("removeConnection keeps the SQL tabs of a one_time connection when the policy says so", async () => {
+    installApiMocks();
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    useSettingsStore().updateEditorSettings({ deleteConnectionTabHandlingMode: "keep-all-tabs" });
+    const store = useConnectionStore();
+    const queryStore = useQueryStore();
+    store.connections = [previewConnection()];
+    const queryId = queryStore.createTab("preview-1", "", "sales.parquet", "query");
+    queryStore.updateSql(queryId, "select 1;");
+
+    await store.removeConnection("preview-1");
+
+    expect(queryStore.tabs.some((tab) => tab.id === queryId)).toBe(true);
     expect(queryStore.showCloseConfirm).toBe(false);
   });
 
@@ -163,7 +263,9 @@ describe("connectionStore one_time runtime cleanup", () => {
     expect(queryStore.tabs.some((tab) => tab.connectionId === "preview-1")).toBe(false);
   });
 
-  it("removeConnection keeps the tabs of a saved connection for the disconnect handling mode", async () => {
+  // 删除连接是终态（配置已从磁盘移除、无法重连），因此页签由「删除连接」策略决定，
+  // 不再复用「断开连接」策略。默认 close-tabs：删除即关闭该连接的页签。
+  it("removeConnection applies the delete tab handling mode to a saved connection", async () => {
     installApiMocks();
     const { useConnectionStore } = await import("@/stores/connectionStore");
     const { useQueryStore } = await import("@/stores/queryStore");
@@ -174,6 +276,6 @@ describe("connectionStore one_time runtime cleanup", () => {
 
     await store.removeConnection("saved-1");
 
-    expect(queryStore.tabs.some((tab) => tab.connectionId === "saved-1")).toBe(true);
+    expect(queryStore.tabs.some((tab) => tab.connectionId === "saved-1")).toBe(false);
   });
 });

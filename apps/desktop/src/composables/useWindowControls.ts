@@ -2,6 +2,7 @@ import { ref, onMounted, onUnmounted } from "vue";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { isMacOS } from "@/lib/backend/platform";
 import * as api from "@/lib/backend/api";
+import { raiseDetachedWindowsAboveMain, WINDOW_ALWAYS_ON_TOP_CHANGED_EVENT, type WindowAlwaysOnTopChangedPayload } from "@/lib/app/windowAlwaysOnTop";
 
 const MIN_UI_SCALE = 0.75;
 const MAX_UI_SCALE = 2;
@@ -41,22 +42,53 @@ export function shouldDrawDesktopWindowFrame(isMac: boolean, isDesktop = true, i
   return isDesktop && !isMac && !isWindows;
 }
 
+export interface LinuxFloatingFrameState {
+  isLinux: boolean;
+  isDesktop: boolean;
+  /** Only the main window is created transparent; detached-tab and plugin windows are opaque. */
+  isMainWindow: boolean;
+  /** The main window is only transparent when a compositing manager is running. */
+  compositing: boolean;
+  /** Login/setup pages paint the whole window themselves. */
+  showingAuthPage: boolean;
+  isMaximized: boolean;
+  isFullscreen: boolean;
+}
+
+// Compositors draw neither shadow nor rounded corners for undecorated windows, so on Linux
+// the transparent main window (see create_linux_main_window) paints its own: a transparent
+// margin that carries the shadow, and a rounded shell. Maximized/fullscreen windows must fill
+// the screen, so the floating frame is dropped there.
+export function shouldDrawLinuxFloatingFrame(state: LinuxFloatingFrameState): boolean {
+  return state.isDesktop && state.isLinux && state.isMainWindow && state.compositing && !state.showingAuthPage && !state.isMaximized && !state.isFullscreen;
+}
+
 export function useWindowControls() {
   const isMaximized = ref(false);
   const isFullscreen = ref(false);
+  const isAlwaysOnTop = ref(false);
   const isMac = isMacOS();
   const isDesktop = isTauriRuntime();
   const showControls = shouldShowWindowControls(isMac, isDesktop);
 
-  let unlisten: (() => void) | null = null;
+  let unlistenResize: (() => void) | null = null;
+  let unlistenFocus: (() => void) | null = null;
+  let unlistenAlwaysOnTop: (() => void) | null = null;
 
   async function updateWindowState() {
     if (!isDesktop) return;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const currentWindow = getCurrentWindow();
-    const [maximized, fullscreen] = await Promise.all([currentWindow.isMaximized(), currentWindow.isFullscreen()]);
+    const [maximized, fullscreen, alwaysOnTop] = await Promise.all([currentWindow.isMaximized(), currentWindow.isFullscreen(), currentWindow.isAlwaysOnTop()]);
     isMaximized.value = maximized;
     isFullscreen.value = fullscreen;
+    isAlwaysOnTop.value = alwaysOnTop;
+  }
+
+  async function refreshAlwaysOnTopState() {
+    if (!isDesktop) return;
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    isAlwaysOnTop.value = await getCurrentWindow().isAlwaysOnTop();
   }
 
   async function minimize() {
@@ -70,6 +102,18 @@ export function useWindowControls() {
     setTimeout(updateWindowState, 50);
   }
 
+  async function toggleAlwaysOnTop() {
+    if (!isDesktop) return;
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const currentWindow = getCurrentWindow();
+    const next = !isAlwaysOnTop.value;
+    await currentWindow.setAlwaysOnTop(next);
+    isAlwaysOnTop.value = await currentWindow.isAlwaysOnTop();
+    if (next && currentWindow.label === "main") {
+      await raiseDetachedWindowsAboveMain();
+    }
+  }
+
   async function close() {
     if (!isDesktop) return;
     await api.requestAppClose();
@@ -79,14 +123,26 @@ export function useWindowControls() {
     if (!isDesktop) return;
     await updateWindowState();
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    const unlistenFn = await getCurrentWindow().onResized(() => {
+    const currentWindow = getCurrentWindow();
+    const windowLabel = currentWindow.label;
+    unlistenResize = await currentWindow.onResized(() => {
       void updateWindowState();
     });
-    unlisten = unlistenFn;
+    unlistenFocus = await currentWindow.onFocusChanged(({ payload: focused }) => {
+      if (focused) void refreshAlwaysOnTopState();
+    });
+    const { listen } = await import("@tauri-apps/api/event");
+    unlistenAlwaysOnTop = await listen<WindowAlwaysOnTopChangedPayload>(WINDOW_ALWAYS_ON_TOP_CHANGED_EVENT, (event) => {
+      const payload = event.payload;
+      if (!payload || payload.windowLabel !== windowLabel || typeof payload.alwaysOnTop !== "boolean") return;
+      isAlwaysOnTop.value = payload.alwaysOnTop;
+    });
   });
 
   onUnmounted(() => {
-    unlisten?.();
+    unlistenResize?.();
+    unlistenFocus?.();
+    unlistenAlwaysOnTop?.();
   });
 
   return {
@@ -95,8 +151,10 @@ export function useWindowControls() {
     showControls,
     isMaximized,
     isFullscreen,
+    isAlwaysOnTop,
     minimize,
     toggleMaximize,
+    toggleAlwaysOnTop,
     close,
   };
 }

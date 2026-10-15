@@ -3,9 +3,11 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { Loader2, Check, CheckCircle2, XCircle, AlertCircle, X, FileDown, DatabaseBackup, FileCode2, ArrowRightLeft, Layers3, GitCompareArrows, ChevronRight, FolderOpen, Copy } from "@lucide/vue";
+import { Loader2, Check, CheckCircle2, XCircle, AlertCircle, X, FileDown, Database, DatabaseBackup, FileCode2, ArrowRightLeft, Layers3, GitCompareArrows, ChevronRight, FolderOpen, Copy } from "@lucide/vue";
 import { formatDataTransferDuration, useExportTracker, type ExportTask } from "@/composables/useExportTracker";
-import { dataTransferFailureCopyText, sqlFileFailureCopyText } from "@/components/export/failureDetailCopyText";
+import { dataTransferFailureCopyText } from "@/components/export/failureDetailCopyText";
+import SqlFileProgressIndicator from "@/components/sql-file/SqlFileProgressIndicator.vue";
+import FailureDetailsList from "@/components/sql-file/FailureDetailsList.vue";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
@@ -60,16 +62,13 @@ const progressPercent = (totalRows: number | null, rowsExported: number) => {
 };
 
 const progressValue = (task: ExportTask) => {
+  if (task.kind === "data-dictionary") {
+    return task.dictionaryTotal ? Math.min(95, Math.round(((task.dictionaryCompleted ?? 0) / task.dictionaryTotal) * 95)) : 0;
+  }
   if (task.kind === "database-export") {
     if (task.overallPercent !== undefined) return task.overallPercent;
     if (!task.totalObjects || task.totalObjects <= 0) return 0;
     return Math.min(100, Math.round(((task.objectIndex ?? 0) / task.totalObjects) * 100));
-  }
-  if (task.kind === "sql-file") {
-    const total = task.totalRows ?? task.statementIndex ?? 0;
-    if (task.status === "Done") return 100;
-    if (total <= 0) return 0;
-    return Math.min(95, Math.round((task.rowsExported / total) * 100));
   }
   if (task.kind === "data-transfer") {
     if (!task.totalTables || task.totalTables <= 0) return 0;
@@ -99,6 +98,7 @@ const taskFileName = (task: ExportTask) => {
 };
 
 const taskTitle = (task: ExportTask) => {
+  if (task.kind === "data-dictionary") return `${t("dataDictionary.title")}: ${task.tableName}`;
   // database-export and sql-file keep their task labels on purpose: the former
   // names the database (filePath may be a directory), the latter already names
   // the executed script. Only table-export synthesizes a misleading
@@ -109,6 +109,7 @@ const taskTitle = (task: ExportTask) => {
   }
   if (task.kind === "sql-file") return t("exportProgress.sqlFileTitle", { name: task.tableName });
   if (task.kind === "data-transfer") return t("exportProgress.dataTransferTitle", { name: task.tableName });
+  if (task.kind === "data-generation") return t("exportProgress.dataGenerationTitle", { name: task.tableName });
   if (task.kind === "multi-db-execution") return t("exportProgress.multiDbExecutionTitle", { name: task.tableName });
   if (task.kind === "schema-diff") return t("exportProgress.schemaDiffTitle", { name: task.tableName });
   if (task.kind === "data-compare") return t("exportProgress.dataCompareTitle", { name: task.tableName });
@@ -130,6 +131,14 @@ const comparePhaseText = (phase?: string) => {
 };
 
 const rowsText = (task: ExportTask) => {
+  if (task.kind === "data-dictionary") {
+    if (task.status === "Done") return [t("exportProgress.done"), task.dictionaryWarnings ? t("dataDictionary.warningCount", { count: task.dictionaryWarnings }) : ""].filter(Boolean).join(" · ");
+    if (task.status === "Error") return t("exportProgress.error");
+    const phase = t(`dataDictionary.phase${(task.dictionaryPhase ?? "preparing").replace(/^./, (letter) => letter.toUpperCase())}`);
+    const count = task.dictionaryPhase === "collecting" && task.dictionaryTotal ? t("exportProgress.objectsCount", { current: (task.dictionaryCompleted ?? 0).toLocaleString(), total: task.dictionaryTotal.toLocaleString() }) : "";
+    const warnings = task.dictionaryWarnings ? t("dataDictionary.warningCount", { count: task.dictionaryWarnings }) : "";
+    return [phase, count, task.dictionaryCurrent, warnings].filter(Boolean).join(" · ");
+  }
   if (task.kind === "schema-diff") {
     if (isActive(task.status)) {
       const progress = task.compareTotal ? `${task.compareCurrent ?? 0}/${task.compareTotal}` : "";
@@ -180,6 +189,16 @@ const rowsText = (task: ExportTask) => {
     const durationText = t("exportProgress.elapsed", { duration: formatDataTransferDuration(finishedAt - (task.startedAt ?? finishedAt)) });
     return task.currentTable ? `${tableText} · ${task.currentTable} · ${rowText} · ${durationText}` : `${tableText} · ${durationText}`;
   }
+  if (task.kind === "data-generation") {
+    const tableText = task.totalTables
+      ? t("exportProgress.tablesCount", {
+          current: (task.tableIndex ?? 0).toLocaleString(),
+          total: task.totalTables.toLocaleString(),
+        })
+      : "";
+    const rowText = task.totalRows ? `${task.rowsExported.toLocaleString()} / ${task.totalRows.toLocaleString()} ${t("exportProgress.rowsShort")}` : `${task.rowsExported.toLocaleString()} ${t("exportProgress.rowsShort")}`;
+    return [tableText, task.currentTable, rowText].filter(Boolean).join(" · ");
+  }
   if (task.kind === "multi-db-execution") {
     return t("exportProgress.multiDbTargets", {
       completed: (task.multiDbCompleted ?? 0).toLocaleString(),
@@ -222,8 +241,10 @@ const databaseObjectText = (task: ExportTask) => {
 const statusIcon = (task: ExportTask) => {
   if (isActive(task.status)) {
     if (task.kind === "database-export") return DatabaseBackup;
+    if (task.kind === "data-dictionary") return FileDown;
     if (task.kind === "sql-file") return FileCode2;
     if (task.kind === "data-transfer") return ArrowRightLeft;
+    if (task.kind === "data-generation") return Database;
     if (task.kind === "multi-db-execution") return Layers3;
     if (task.kind === "schema-diff" || task.kind === "data-compare") return GitCompareArrows;
   }
@@ -267,7 +288,7 @@ function toggleShowAll() {
 // Reveal is offered only for tasks that produce one local output file.
 // sql-file filePath can be a "; "-joined list of input scripts (not an
 // output), and data-transfer has no local file at all.
-const canRevealTaskFile = (task: ExportTask) => (task.kind === "table-export" || task.kind === "database-export") && task.status === "Done" && !!task.filePath && isTauriRuntime();
+const canRevealTaskFile = (task: ExportTask) => (task.kind === "table-export" || task.kind === "database-export" || task.kind === "data-dictionary") && task.status === "Done" && !!task.filePath && isTauriRuntime();
 
 async function revealTaskFile(task: ExportTask) {
   if (!canRevealTaskFile(task) || revealingTaskIds.value.includes(task.exportId)) return;
@@ -303,10 +324,6 @@ function hasUnlistedTaskError(task: ExportTask) {
 
 function dataTransferFailureDetailKey(taskId: string, table: string): string {
   return `data-transfer:${taskId}:${table}`;
-}
-
-function sqlFileFailureDetailKey(taskId: string, fileIndex: number | undefined, statementIndex: number): string {
-  return `sql-file:${taskId}:${fileIndex ?? -1}:${statementIndex}`;
 }
 
 async function copyFailureDetail(text: string, key: string): Promise<void> {
@@ -358,11 +375,13 @@ function openTask(task: ExportTask): void {
             </div>
 
             <!-- Progress bar -->
-            <div v-if="isActive(task.status)" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
+            <SqlFileProgressIndicator v-if="task.kind === 'sql-file'" :status="task.status" :bytes-read="task.bytesRead" :total-bytes="task.totalBytes" :phase="task.sqlFilePhase" />
+            <div v-else-if="isActive(task.status)" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
               <div
                 v-if="
                   task.totalRows ||
                   (task.kind === 'database-export' && (task.totalObjects || task.overallPercent !== undefined)) ||
+                  (task.kind === 'data-dictionary' && task.dictionaryPhase === 'collecting' && task.dictionaryProgressKnown && task.dictionaryTotal) ||
                   (task.kind === 'data-transfer' && task.totalTables) ||
                   (task.kind === 'multi-db-execution' && task.multiDbTotal) ||
                   ((task.kind === 'schema-diff' || task.kind === 'data-compare') && task.compareTotal)
@@ -384,21 +403,28 @@ function openTask(task: ExportTask): void {
 
             <div class="min-w-0 text-muted-foreground">
               <span class="break-words tabular-nums">{{ rowsText(task) }}</span>
+              <span v-if="task.kind === 'sql-file' && task.elapsedMs !== undefined" class="ml-1 tabular-nums">{{ t("exportProgress.elapsed", { duration: formatDataTransferDuration(task.elapsedMs) }) }}</span>
               <span v-if="task.kind !== 'data-transfer' && task.startedAt !== undefined" class="ml-1 tabular-nums">{{ elapsedText(task) }}</span>
               <span v-if="taskStatusText(task)" class="ml-1 font-medium text-primary">{{ taskStatusText(task) }}</span>
               <span v-if="hasUnlistedTaskError(task)" class="mt-1 block whitespace-normal break-words text-destructive" :title="translateBackendError(t, task.errorMessage!)">
                 {{ translateBackendError(t, task.errorMessage!) }}
               </span>
               <template v-if="(task.kind === 'data-transfer' || task.kind === 'sql-file') && failureDetailCount(task) > 0">
-                <button class="mt-1.5 flex items-center gap-1 text-xs font-medium text-foreground hover:text-primary" :aria-expanded="failureDetailsExpanded(task.exportId)" @click="toggleFailureDetails(task.exportId)">
-                  <ChevronRight class="h-3.5 w-3.5 shrink-0 transition-transform" :class="{ 'rotate-90': failureDetailsExpanded(task.exportId) }" />
-                  {{ failureDetailsExpanded(task.exportId) ? t("exportProgress.hideFailureDetails") : t("exportProgress.showFailureDetails", { count: failureDetailCount(task) }) }}
-                </button>
-                <div v-if="failureDetailsExpanded(task.exportId)" class="mt-1.5 max-h-44 overflow-y-auto rounded border border-destructive/20 bg-destructive/5">
-                  <template v-if="task.kind === 'data-transfer'">
+                <!-- SQL file failures share one implementation with the execution
+                     dialog (selection, copy and export of the complete
+                     statements); transfer failures keep their own list. -->
+                <FailureDetailsList v-if="task.kind === 'sql-file'" class="mt-1.5" :execution-id="task.exportId" :failures="task.sqlFileFailures ?? []" :omitted="task.sqlFileFailuresOmitted ?? 0" :file-name-hint="task.tableName" variant="popover" />
+                <template v-else>
+                  <button class="mt-1.5 flex items-center gap-1 text-xs font-medium text-foreground hover:text-primary" :aria-expanded="failureDetailsExpanded(task.exportId)" @click="toggleFailureDetails(task.exportId)">
+                    <ChevronRight class="h-3.5 w-3.5 shrink-0 transition-transform" :class="{ 'rotate-90': failureDetailsExpanded(task.exportId) }" />
+                    {{ failureDetailsExpanded(task.exportId) ? t("exportProgress.hideFailureDetails") : t("exportProgress.showFailureDetails", { count: failureDetailCount(task) }) }}
+                  </button>
+                  <div v-if="failureDetailsExpanded(task.exportId)" class="mt-1.5 max-h-44 overflow-y-auto rounded border border-destructive/20 bg-destructive/5">
                     <div v-for="failure in task.transferFailures" :key="failure.table" class="border-b border-destructive/15 px-2.5 py-2 last:border-b-0">
                       <div class="flex min-w-0 items-start justify-between gap-2">
-                        <div class="min-w-0 break-all font-mono font-medium text-foreground">{{ failure.table }}</div>
+                        <div class="flex min-w-0 items-center gap-1.5 font-medium text-foreground">
+                          <span class="truncate" :title="failure.table">{{ failure.table }}</span>
+                        </div>
                         <button
                           type="button"
                           class="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-muted"
@@ -410,36 +436,12 @@ function openTask(task: ExportTask): void {
                           <Copy v-else class="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" aria-hidden="true" />
                         </button>
                       </div>
-                      <div class="mt-0.5 select-text whitespace-pre-wrap break-words text-destructive">{{ failure.error }}</div>
-                      <div v-if="failure.truncated" class="mt-0.5 text-muted-foreground">{{ t("exportProgress.failureDetailTruncated") }}</div>
-                    </div>
-                    <div v-if="task.transferFailuresOmitted" class="px-2.5 py-2 text-muted-foreground">{{ t("exportProgress.failureDetailsOmitted", { count: task.transferFailuresOmitted }) }}</div>
-                  </template>
-                  <template v-else>
-                    <div v-for="failure in task.sqlFileFailures" :key="`${failure.fileIndex ?? -1}:${failure.statementIndex}`" class="border-b border-destructive/15 px-2.5 py-2 last:border-b-0">
-                      <div class="flex min-w-0 items-start justify-between gap-2">
-                        <div class="flex min-w-0 items-center gap-1.5 font-medium text-foreground">
-                          <span class="shrink-0">#{{ failure.statementIndex }}</span>
-                          <span v-if="failure.fileName" class="truncate text-muted-foreground" :title="failure.fileName">{{ failure.fileName }}</span>
-                        </div>
-                        <button
-                          type="button"
-                          class="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-muted"
-                          :title="copiedFailureDetailKey === sqlFileFailureDetailKey(task.exportId, failure.fileIndex, failure.statementIndex) ? t('exportProgress.failureDetailCopied') : t('exportProgress.copyFailureDetail')"
-                          :aria-label="copiedFailureDetailKey === sqlFileFailureDetailKey(task.exportId, failure.fileIndex, failure.statementIndex) ? t('exportProgress.failureDetailCopied') : t('exportProgress.copyFailureDetail')"
-                          @click.stop="copyFailureDetail(sqlFileFailureCopyText(failure, translateBackendError(t, failure.error)), sqlFileFailureDetailKey(task.exportId, failure.fileIndex, failure.statementIndex))"
-                        >
-                          <Check v-if="copiedFailureDetailKey === sqlFileFailureDetailKey(task.exportId, failure.fileIndex, failure.statementIndex)" class="h-3.5 w-3.5 text-green-500" aria-hidden="true" />
-                          <Copy v-else class="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" aria-hidden="true" />
-                        </button>
-                      </div>
-                      <div v-if="failure.statementSummary" class="mt-0.5 select-text whitespace-pre-wrap break-words font-mono text-foreground">{{ failure.statementSummary }}</div>
                       <div class="mt-0.5 select-text whitespace-pre-wrap break-words text-destructive">{{ translateBackendError(t, failure.error) }}</div>
                       <div v-if="failure.truncated" class="mt-0.5 text-muted-foreground">{{ t("exportProgress.failureDetailTruncated") }}</div>
                     </div>
-                    <div v-if="task.sqlFileFailuresOmitted" class="px-2.5 py-2 text-muted-foreground">{{ t("exportProgress.failureDetailsOmitted", { count: task.sqlFileFailuresOmitted }) }}</div>
-                  </template>
-                </div>
+                    <div v-if="task.transferFailuresOmitted" class="px-2.5 py-2 text-muted-foreground">{{ t("exportProgress.failureDetailsOmitted", { count: task.transferFailuresOmitted }) }}</div>
+                  </div>
+                </template>
               </template>
             </div>
           </div>

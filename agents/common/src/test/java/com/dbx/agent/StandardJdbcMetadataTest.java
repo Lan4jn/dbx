@@ -1,6 +1,8 @@
 package com.dbx.agent;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -8,12 +10,14 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -46,10 +50,12 @@ class StandardJdbcMetadataTest {
     @Test
     void scopesSchemasToTheConnectionCatalog() {
         AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        AtomicInteger schemaCalls = new AtomicInteger();
         DatabaseMetaData meta = proxy(DatabaseMetaData.class, new MethodHandler() {
             @Override
             public Object handle(Method method, Object[] args) {
                 if ("getSchemas".equals(method.getName())) {
+                    schemaCalls.incrementAndGet();
                     capturedArgs.set(args);
                     return rows(row("TABLE_SCHEM", "APP"));
                 }
@@ -72,6 +78,57 @@ class StandardJdbcMetadataTest {
         assertEquals(List.of("APP"), StandardJdbcMetadata.INSTANCE.listSchemas(conn, profile, "initial_catalog"));
         assertEquals("regular_catalog", capturedArgs.get()[0]);
         assertEquals(null, capturedArgs.get()[1]);
+        assertEquals(1, schemaCalls.get());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false, true", "true, false, true", "false, true, true", "false, false, false"})
+    void retriesEmptyCatalogSchemasBeforeAddingCurrentSchema(boolean fallbackFails, boolean currentCatalog, boolean fallbackEnabled) {
+        List<String> catalogs = new ArrayList<>();
+        DatabaseMetaData meta = proxy(DatabaseMetaData.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getSchemas".equals(method.getName())) {
+                    String catalog = (String) args[0];
+                    catalogs.add(catalog);
+                    if (catalog != null) {
+                        return rows();
+                    }
+                    if (fallbackFails) {
+                        throw new UnsupportedOperationException("Unscoped schemas unavailable");
+                    }
+                    return rows(row("TABLE_SCHEM", "DBX_USER"), row("TABLE_SCHEM", "DBX_DEMO"), row("TABLE_SCHEM", "SYS"));
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+        Connection conn = proxy(Connection.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getMetaData".equals(method.getName())) {
+                    return meta;
+                }
+                if ("getCatalog".equals(method.getName())) {
+                    return currentCatalog ? "HXE" : null;
+                }
+                if ("getSchema".equals(method.getName())) {
+                    return "DBX_USER";
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+
+        JdbcAgentProfile effectiveProfile = fallbackEnabled ? profile : new JdbcAgentProfile("example.Driver", "jdbc:example:") {
+            @Override
+            public boolean getCatalogFallbackEnabled() {
+                return false;
+            }
+        };
+        assertEquals(
+            fallbackFails || !fallbackEnabled ? List.of("DBX_USER") : List.of("DBX_DEMO", "DBX_USER"),
+            StandardJdbcMetadata.INSTANCE.listSchemas(conn, effectiveProfile, currentCatalog ? "initial_catalog" : "HXE")
+        );
+        assertEquals(fallbackEnabled ? Arrays.asList("HXE", null) : List.of("HXE"), catalogs);
     }
 
     @Test
@@ -592,6 +649,46 @@ class StandardJdbcMetadataTest {
         assertEquals("VARCHAR", columns.getCandidates().get(0).getData_type());
         assertEquals("ACCOUNTS", capturedColumnArgs.get()[2]);
         assertEquals("DISPLAY%", capturedColumnArgs.get()[3]);
+    }
+
+    @ParameterizedTest
+    @CsvSource(value = {
+        "/|DBX_I7539_1001|DBX/_I7539/_1001%",
+        "/|A/B_%|A//B/_/%%",
+        "\\|A\\B_%|A\\\\B\\_\\%%",
+        "''|A_%|A_%%",
+        "|A_%|A_%%",
+        "/|''|%"
+    }, delimiter = '|')
+    void completionUsesDriverEscapeForTableAndColumnMasks(String escape, String mask, String prefixPattern) {
+        for (CompletionAssistantMatchMode mode : Arrays.asList(CompletionAssistantMatchMode.PREFIX, CompletionAssistantMatchMode.CONTAINS)) {
+            for (CompletionAssistantObjectKind kind : Arrays.asList(CompletionAssistantObjectKind.TABLE, CompletionAssistantObjectKind.COLUMN)) {
+                AtomicReference<String> capturedPattern = new AtomicReference<>();
+                DatabaseMetaData meta = proxy(DatabaseMetaData.class, (method, args) -> {
+                    switch (method.getName()) {
+                        case "getSearchStringEscape": return escape;
+                        case "getTableTypes": return rows(row("TABLE_TYPE", "TABLE"));
+                        case "getTables":
+                            capturedPattern.set((String) args[2]);
+                            return rows(row("TABLE_NAME", mask + "MATCH", "TABLE_TYPE", "TABLE"));
+                        case "getColumns":
+                            capturedPattern.set((String) args[3]);
+                            return rows(row("COLUMN_NAME", mask + "MATCH", "TYPE_NAME", "VARCHAR"));
+                        default: return defaultValue(method.getReturnType());
+                    }
+                });
+                Connection conn = proxy(Connection.class, (method, args) ->
+                    "getMetaData".equals(method.getName()) ? meta : defaultValue(method.getReturnType()));
+                CompletionAssistantRequest request = request("sales", "APP", mask, Collections.singletonList(kind), "ACCOUNTS");
+                setField(request, "match_mode", mode);
+
+                CompletionAssistantResponse result = StandardJdbcMetadata.INSTANCE.completionAssistantSearch(conn, profile, "sales", request);
+
+                String expected = mode == CompletionAssistantMatchMode.CONTAINS && !mask.isEmpty() ? "%" + prefixPattern : prefixPattern;
+                assertEquals(expected, capturedPattern.get(), kind + " " + mode);
+                assertEquals(mask + "MATCH", result.getCandidates().get(0).getName());
+            }
+        }
     }
 
     private static Connection connection(

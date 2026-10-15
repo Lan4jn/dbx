@@ -92,10 +92,10 @@ const customThemeColors = {
   invalid: "#f38ba8", // 无效字符
 };
 
-export function resolveCustomThemeBackgrounds(colors?: Pick<CustomThemeColors, "background">, isDark: boolean = true): { background: string; gutterBackground: string } {
+export function resolveCustomThemeBackgrounds(colors?: Pick<CustomThemeColors, "background" | "gutterBackground">, isDark: boolean = true): { background: string; gutterBackground: string } {
   return {
     background: colors?.background ?? (isDark ? "#1e1e2e" : "#fafafa"),
-    gutterBackground: colors?.background ?? customThemeColors.gutterBackground,
+    gutterBackground: colors?.gutterBackground ?? colors?.background ?? customThemeColors.gutterBackground,
   };
 }
 
@@ -228,7 +228,7 @@ function createCustomTheme(EditorView: typeof import("@codemirror/view").EditorV
   return [theme, syntaxHighlighting(highlightStyle)];
 }
 
-type IdeEditorThemeColors = {
+export type IdeEditorThemeColors = {
   dark: boolean;
   background: string;
   foreground: string;
@@ -263,7 +263,7 @@ type IdeEditorThemeColors = {
   numberBold?: boolean;
 };
 
-const IDE_EDITOR_THEMES = {
+export const IDE_EDITOR_THEMES = {
   ideaLight: {
     dark: false,
     background: "#ffffff",
@@ -398,7 +398,10 @@ const IDE_EDITOR_THEMES = {
     dark: false,
     background: "#fcfcfc",
     foreground: "#141414eb",
-    selection: "#1414141e",
+    // Cursor/VS Code light `editor.selectionBackground`. The previous translucent
+    // neutral (#1414141e) composited to a near-background #e1e1e1 on the #fcfcfc
+    // canvas, so a mouse selection was barely visible.
+    selection: "#add6ff",
     selectionMatch: "#14141411",
     cursor: "#141414eb",
     gutterBackground: "#fcfcfc",
@@ -429,7 +432,10 @@ const IDE_EDITOR_THEMES = {
     dark: true,
     background: "#181818",
     foreground: "#e4e4e4eb",
-    selection: "#40404099",
+    // Cursor/VS Code dark `editor.selectionBackground`. The previous translucent
+    // neutral (#40404099) composited to #303030 on the #181818 canvas — visually
+    // almost indistinguishable from the editor background.
+    selection: "#264f78",
     selectionMatch: "#404040cc",
     cursor: "#e4e4e4eb",
     gutterBackground: "#181818",
@@ -528,9 +534,6 @@ function createIdeEditorTheme(EditorView: typeof import("@codemirror/view").Edit
         color: c.foreground,
         [EDITOR_SELECTION_BACKGROUND_CSS_VAR]: c.selection,
         [SQL_TABLE_COLOR_CSS_VAR]: c.table,
-      },
-      ".cm-scroller": {
-        backgroundColor: c.background,
       },
       ".cm-content": {
         caretColor: c.cursor,
@@ -639,6 +642,21 @@ const DATABASE_LINK_ICON: LucideIconNode = [
 ];
 
 const SCHEMA_ICON: LucideIconNode = [["path", { d: "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2v11z" }]];
+
+const SEQUENCE_ICON: LucideIconNode = [
+  ["path", { d: "M8 5h13" }],
+  ["path", { d: "M13 12h8" }],
+  ["path", { d: "M13 19h8" }],
+  ["path", { d: "M3 10a2 2 0 0 0 2 2h3" }],
+  ["path", { d: "M3 5v12a2 2 0 0 0 2 2h3" }],
+];
+
+const VARIABLE_ICON: LucideIconNode = [
+  ["path", { d: "M8 21s-4-3-4-9 4-9 4-9" }],
+  ["path", { d: "M16 3s4 3 4 9-4 9-4 9" }],
+  ["line", { x1: "15", x2: "9", y1: "9", y2: "15" }],
+  ["line", { x1: "9", x2: "15", y1: "9", y2: "15" }],
+];
 
 function encodeSvgIcon(iconNode: LucideIconNode): string {
   const body = iconNode
@@ -824,6 +842,16 @@ export function buildEditorFontThemeRules(opts?: { fixedHeight?: boolean; scroll
     ".cm-trimmedSelection-bottomRight": {
       borderBottomRightRadius: "3px",
     },
+    // CodeMirror's base theme gives `.cm-gutter` `min-height: 100%` inside a
+    // `.cm-gutters` box that is itself sized by `height: 100%` of a scroller
+    // whose height comes from the content. That percentage cycle makes WebKit
+    // re-run layout for the whole gutter subtree on every layout pass, which
+    // costs ~160ms per collapse with a few hundred lines selected. The gutter's
+    // own spacers already span the full content height and the background is
+    // painted by `.cm-gutters`, so dropping the cyclic minimum is visually inert.
+    ".cm-gutter": {
+      minHeight: "0",
+    },
     ".cm-gutters": {
       borderRight: "0 !important",
       fontSize: `var(${EDITOR_FONT_SIZE_CSS_VAR}, ${defaults?.size ?? 13}px)`,
@@ -853,6 +881,36 @@ export function buildEditorFontThemeRules(opts?: { fixedHeight?: boolean; scroll
       justifyContent: "flex-end",
       paddingRight: "8px",
       userSelect: "none",
+    },
+    ".cm-foldGutter": {
+      width: "16px",
+    },
+    ".cm-foldGutter .cm-gutterElement": {
+      alignItems: "center",
+      cursor: "pointer",
+      display: "flex",
+      justifyContent: "center",
+      padding: "0",
+      userSelect: "none",
+    },
+    ".cm-foldMarker-svg": {
+      alignItems: "center",
+      color: "var(--muted-foreground)",
+      display: "inline-flex",
+      height: "16px",
+      justifyContent: "center",
+      opacity: "0.65",
+      transition: "opacity 0.15s",
+      verticalAlign: "middle",
+      width: "16px",
+    },
+    ".cm-foldMarker-svg:hover": {
+      opacity: "0.95",
+    },
+    ".cm-foldMarker-svg svg": {
+      display: "block",
+      height: "16px",
+      width: "16px",
     },
     ".cm-run-statement-gutter": {
       minWidth: "28px",
@@ -975,6 +1033,7 @@ export function buildSqlCompletionThemeRules(): CodeMirrorStyleSpec {
       boxSizing: "border-box",
     },
     ".cm-tooltip.cm-tooltip-autocomplete > ul": {
+      fontFamily: `var(${EDITOR_FONT_FAMILY_CSS_VAR}, var(--font-mono, monospace))`,
       maxHeight: "min(280px, calc(100vh - 32px))",
       minWidth: "min(280px, calc(100vw - 24px))",
       maxWidth: "inherit",
@@ -1081,6 +1140,16 @@ export function buildSqlCompletionThemeRules(): CodeMirrorStyleSpec {
       color: colorMixValue("var(--amber-500, #f59e0b)", "color-mix(in oklch, var(--amber-500, #f59e0b) 92%, var(--popover-foreground))"),
       ...lucideCompletionIconMask(SCHEMA_ICON),
     },
+    // Sequences previously reused "variable" without any icon mask, which
+    // rendered a blank slot (#12099). Match the sidebar's emerald ListTree.
+    ".cm-completionIcon-sequence": {
+      color: colorMixValue("var(--emerald-500, #10b981)", "color-mix(in oklch, var(--emerald-500, #10b981) 92%, var(--popover-foreground))"),
+      ...lucideCompletionIconMask(SEQUENCE_ICON),
+    },
+    ".cm-completionIcon-variable": {
+      color: colorMixValue("var(--rose-500, #f43f5e)", "color-mix(in oklch, var(--rose-500, #f43f5e) 92%, var(--popover-foreground))"),
+      ...lucideCompletionIconMask(VARIABLE_ICON),
+    },
     // Reuse the table glyph for aliases instead of CodeMirror's default text
     // icon, which is rendered as a solid black square in some themes.
     ".cm-completionIcon-text": {
@@ -1106,6 +1175,7 @@ export function buildSqlCompletionThemeRules(): CodeMirrorStyleSpec {
     },
     ".cm-completionDetail": {
       color: colorMixValue("var(--muted-foreground)", "color-mix(in oklch, var(--popover-foreground) 68%, var(--popover))"),
+      fontFamily: `var(${EDITOR_FONT_FAMILY_CSS_VAR}, var(--font-mono, monospace))`,
       fontSize: `clamp(11px, calc(var(${EDITOR_FONT_SIZE_CSS_VAR}, 13px) - 1px), 13px)`,
       fontWeight: "500",
       fontStyle: "normal",
@@ -1118,9 +1188,13 @@ export function buildSqlCompletionThemeRules(): CodeMirrorStyleSpec {
       whiteSpace: "nowrap",
     },
     ".cm-tooltip.cm-completionInfo": {
+      fontFamily: `var(${EDITOR_FONT_FAMILY_CSS_VAR}, var(--font-mono, monospace))`,
       maxWidth: "min(420px, calc(100vw - 24px))",
       overflowWrap: "anywhere",
       zIndex: "10000",
+    },
+    ".cm-tooltip.cm-completionInfo *": {
+      fontFamily: "inherit",
     },
   };
 }

@@ -1,23 +1,24 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 pub use dbx_core::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config,
     oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
 };
 pub use dbx_core::connection::{
-    agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_configs_pool_equivalent,
-    connection_configs_session_credentials_compatible, connection_url_for_endpoint, gaussdb_m_jdbc_config_for_endpoint,
-    gaussdb_uses_m_jdbc_driver, metadata_connection_config, prestosql_jdbc_config_for_endpoint,
-    probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
+    agent_connect_timeout, clickhouse_http_proxy, connect_bare_metadata_pool, connect_mysql_metadata_pool,
+    connection_configs_pool_equivalent, connection_configs_session_credentials_compatible, connection_url_for_endpoint,
+    gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver, metadata_connection_config,
+    prestosql_jdbc_config_for_endpoint, probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState,
+    MysqlMode, PoolKind,
 };
 use dbx_core::database_capabilities;
 use dbx_core::db;
 use dbx_core::db::agent_driver::{AgentDriverClient, AgentMethod};
 use dbx_core::models::connection::{
-    database_info_from_protocol_value, rewrite_jdbc_url_host, ConnectionConfig, ConnectionTestResult,
-    DatabaseConnectionInfo, DatabaseType,
+    database_info_from_protocol_value, rewrite_jdbc_url_host, ConnectionConfig, ConnectionLivenessMessage,
+    ConnectionTestResult, DatabaseConnectionInfo, DatabaseType,
 };
 pub use dbx_core::path_utils::expand_tilde;
 use dbx_core::runtime_config::{release_runtime_config_on_disconnect, should_retain_runtime_config};
@@ -111,14 +112,18 @@ async fn test_agent_connection(
     port: u16,
 ) -> Result<ConnectionTestResult, String> {
     let connect_params = agent_connect_params(config, host, port, config.database.as_deref().unwrap_or(""))?;
+    // Oracle OCI connections carry process-scoped client settings (`NLS_LANG`,
+    // Instant Client loader path): they have to reach the agent process itself.
+    let agent_env = state.agent_launch_env(config).await;
     let result = state
         .agent_manager
-        .call_daemon_method_with_timeout::<serde_json::Value>(
+        .call_daemon_method_with_timeout_and_env::<serde_json::Value>(
             &config.db_type,
             config.driver_profile.as_deref(),
             AgentMethod::TestConnection,
             connect_params,
             Some(agent_connect_timeout(config)),
+            &agent_env,
         )
         .await;
 
@@ -126,9 +131,10 @@ async fn test_agent_connection(
         Ok(response) => response,
         Err(err) => {
             if let Some(alternate_config) = oracle_alternate_connect_config(config, &err) {
+                let alternate_env = state.agent_launch_env(&alternate_config).await;
                 state
                     .agent_manager
-                    .call_daemon_method_with_timeout::<serde_json::Value>(
+                    .call_daemon_method_with_timeout_and_env::<serde_json::Value>(
                         &alternate_config.db_type,
                         alternate_config.driver_profile.as_deref(),
                         AgentMethod::TestConnection,
@@ -139,6 +145,7 @@ async fn test_agent_connection(
                             alternate_config.database.as_deref().unwrap_or(""),
                         )?,
                         Some(agent_connect_timeout(&alternate_config)),
+                        &alternate_env,
                     )
                     .await
                     .map_err(|alternate_err| {
@@ -174,7 +181,9 @@ async fn connect_agent_pool(
     port: u16,
 ) -> Result<PoolKind, String> {
     let connect_params = agent_connect_params(config, host, port, config.effective_database().unwrap_or(""))?;
-    let mut client = state.agent_manager.spawn(&config.db_type, config.driver_profile.as_deref()).await?;
+    let agent_env = state.agent_launch_env(config).await;
+    let mut client =
+        state.agent_manager.spawn_with_env(&config.db_type, config.driver_profile.as_deref(), &agent_env).await?;
     let connect_result = client
         .call_method_with_timeout::<serde_json::Value>(
             AgentMethod::Connect,
@@ -213,17 +222,22 @@ mod tests {
     #[cfg(feature = "mq-admin")]
     use super::load_connection_configs;
     use super::{
-        connect_sqlite_from_config, gaussdb_m_jdbc_command_config, jdbc_command_config_for_endpoint,
+        connect_db, connect_sqlite_from_config, gaussdb_m_jdbc_command_config, jdbc_command_config_for_endpoint,
         mark_mongo_legacy_driver, mongo_legacy_connect_params, mongo_legacy_fallback_error,
         persist_mongo_legacy_driver_profile, save_connection_configs, sync_connection_configs,
-        MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
+        test_connection_with_info_inner, MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
     };
     use dbx_core::connection::{AppState, PoolKind};
-    use dbx_core::models::connection::{AttachedDatabaseConfig, ConnectionConfig, DatabaseType};
-    use dbx_core::storage::Storage;
+    use dbx_core::models::connection::{
+        AttachedDatabaseConfig, ConnectionConfig, DatabaseType, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+    };
+    use std::time::Duration;
+    use tauri::Manager;
 
     fn mongodb_config() -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "mongo".to_string(),
             name: "MongoDB".to_string(),
@@ -243,6 +257,8 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -271,6 +287,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -287,7 +304,126 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
+        }
+    }
+
+    async fn clickhouse_desktop_proxy_fixture(
+        proxy_type: ProxyType,
+    ) -> (ConnectionConfig, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            if proxy_type == ProxyType::Socks5 {
+                let mut greeting = [0_u8; 2];
+                socket.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; greeting[1] as usize];
+                socket.read_exact(&mut methods).await.unwrap();
+                assert!(methods.contains(&0));
+                socket.write_all(&[5, 0]).await.unwrap();
+                let mut connect = [0_u8; 5];
+                socket.read_exact(&mut connect).await.unwrap();
+                assert_eq!(&connect[..4], &[5, 1, 0, 3]);
+                let mut hostname = vec![0_u8; connect[4] as usize];
+                socket.read_exact(&mut hostname).await.unwrap();
+                assert_eq!(hostname.as_slice(), b"clickhouse.desktop.invalid");
+                let mut port = [0_u8; 2];
+                socket.read_exact(&mut port).await.unwrap();
+                assert_eq!(u16::from_be_bytes(port), 8123);
+                socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+            }
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 16384);
+                let mut byte = [0_u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.extend_from_slice(&byte);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let target = if proxy_type == ProxyType::Socks5 {
+                "/?query=SELECT%201"
+            } else {
+                "http://clickhouse.desktop.invalid:8123/?query=SELECT%201"
+            };
+            assert!(request.starts_with(&format!("GET {target} HTTP/1.1\r\n")));
+            assert!(request.lines().any(|line| line.eq_ignore_ascii_case("host: clickhouse.desktop.invalid:8123")));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n1\n").await.unwrap();
+        });
+        let mut config = mongodb_config();
+        config.id = format!("clickhouse-desktop-{}", uuid::Uuid::new_v4());
+        config.db_type = DatabaseType::ClickHouse;
+        config.driver_profile = None;
+        config.driver_label = None;
+        config.connection_string = None;
+        config.url_params = None;
+        config.host = "clickhouse.desktop.invalid".to_string();
+        config.port = 8123;
+        config.ssl = false;
+        config.username.clear();
+        config.password.clear();
+        config.database = None;
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type,
+            host: "127.0.0.1".to_string(),
+            port: proxy_port,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+            profile_id: String::new(),
+        })];
+        (config, server)
+    }
+
+    #[tokio::test]
+    async fn clickhouse_test_connection_uses_runtime_proxy_without_local_dns() {
+        for proxy_type in [ProxyType::Socks5, ProxyType::Http] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = dbx_core::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
+            let state = std::sync::Arc::new(AppState::new_with_plugin_dir(storage, dir.path().join("plugins")));
+            let (config, server) = clickhouse_desktop_proxy_fixture(proxy_type).await;
+            let id = config.id.clone();
+            let result = tokio::time::timeout(Duration::from_secs(10), test_connection_with_info_inner(&state, config))
+                .await
+                .unwrap()
+                .expect("desktop test connection must route through the configured proxy");
+            assert_eq!(result.message, "Connection successful");
+            assert!(state.pool_handle(&id).await.is_none(), "test connection must not retain a pool");
+            tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+            state.shutdown(Duration::from_secs(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn clickhouse_connect_db_uses_runtime_proxy_without_local_dns() {
+        for proxy_type in [ProxyType::Socks5, ProxyType::Http] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = dbx_core::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
+            let state = std::sync::Arc::new(AppState::new_with_plugin_dir(storage, dir.path().join("plugins")));
+            let app = tauri::test::mock_builder()
+                .manage(state.clone())
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let (config, server) = clickhouse_desktop_proxy_fixture(proxy_type).await;
+            let id = config.id.clone();
+            let connected = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_db(app.state::<std::sync::Arc<AppState>>(), config, None),
+            )
+            .await
+            .unwrap()
+            .expect("desktop connection must route through the configured proxy");
+            assert_eq!(connected, id);
+            assert!(matches!(state.pool_handle(&id).await.as_ref(), Some(PoolKind::ClickHouse(_))));
+            tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+            state.shutdown(Duration::from_secs(5)).await;
         }
     }
 
@@ -414,7 +550,7 @@ mod tests {
     async fn saving_memory_sqlite_attachments_keeps_the_live_pool_intact() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-sqlite-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = sqlite_config(std::path::Path::new(":memory:"), "");
         let pool = dbx_core::db::sqlite::connect_path(":memory:").await.unwrap();
@@ -436,7 +572,7 @@ mod tests {
             name: "analytics".to_string(),
             path: dir.join("analytics.sqlite").to_string_lossy().to_string(),
         });
-        let error = save_connection_configs(&state, &[invalid]).await.unwrap_err();
+        let error = save_connection_configs(&state, &[invalid], Vec::new()).await.unwrap_err();
 
         assert!(error.contains("in-memory main database"), "{error}");
         assert!(state.pool_handle(&initial.id).await.is_some());
@@ -578,7 +714,7 @@ mod tests {
     async fn persist_mongo_legacy_driver_profile_updates_only_the_target_connection() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-mongo-profile-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let mongo = mongodb_config();
         let mut other = mongodb_config();
@@ -647,7 +783,7 @@ mod tests {
     async fn save_connection_configs_updates_runtime_cache_and_drops_mq_adapter() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
@@ -659,7 +795,7 @@ mod tests {
         let first = state.mq_registry.get_or_build(&initial).await.unwrap().adapter;
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
-        save_connection_configs(&state, std::slice::from_ref(&updated)).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&updated), Vec::new()).await.unwrap();
 
         let cached_admin_url = state
             .configs
@@ -684,7 +820,7 @@ mod tests {
     async fn load_connection_configs_syncs_runtime_cache_and_drops_stale_pool() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
@@ -719,7 +855,7 @@ mod tests {
     async fn save_connection_configs_removes_deleted_runtime_config_and_mq_adapter() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let kept = mongodb_config();
         let removed = mq_config("removed-mq", "http://127.0.0.1:8080");
@@ -730,7 +866,7 @@ mod tests {
         }
         let stale = state.mq_registry.get_or_build(&removed).await.unwrap().adapter;
 
-        save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&kept), Vec::new()).await.unwrap();
 
         let configs = state.configs.read().await;
         assert!(configs.contains_key(&kept.id));
@@ -766,7 +902,7 @@ mod tests {
     async fn save_connection_configs_retains_one_time_runtime_config_and_its_pool() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let persisted = mongodb_config();
         let preview = duckdb_preview_config();
@@ -791,14 +927,14 @@ mod tests {
     async fn save_connection_configs_keeps_session_credential_of_one_time_config() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let persisted = mongodb_config();
         let preview = duckdb_preview_config();
         state.configs.write().await.insert(preview.id.clone(), preview.clone());
         state.session_credentials.set("", &preview.id, "secret").expect("session credential fixture");
 
-        save_connection_configs(&state, std::slice::from_ref(&persisted)).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&persisted), Vec::new()).await.unwrap();
 
         // If the config is retained the credential must be retained with it, or the
         // next query re-prompts for a password that was already entered.
@@ -812,7 +948,7 @@ mod tests {
     async fn save_connection_configs_removes_deleted_connection_pools() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let kept = mongodb_config();
         let removed = mq_config("removed-mq", "http://127.0.0.1:8080");
@@ -827,7 +963,7 @@ mod tests {
             })
             .await;
 
-        save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&kept), Vec::new()).await.unwrap();
 
         assert!(state.pool_handle(&removed.id).await.is_none());
 
@@ -838,7 +974,7 @@ mod tests {
     async fn sync_connection_configs_ignores_password_only_changes() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
 
         let mut initial = mongodb_config();
@@ -871,7 +1007,7 @@ mod tests {
     async fn sync_connection_configs_preserves_nacos_session_password_for_scope_updates() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-nacos-scope-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = nacos_config("nacos-a");
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
@@ -904,14 +1040,22 @@ mod tests {
 }
 
 #[tauri::command]
-pub async fn save_connections(state: State<'_, Arc<AppState>>, configs: Vec<ConnectionConfig>) -> Result<(), String> {
+pub async fn save_connections(
+    state: State<'_, Arc<AppState>>,
+    configs: Vec<ConnectionConfig>,
+    removed_ids: Option<Vec<String>>,
+) -> Result<(), String> {
     let configs: Vec<ConnectionConfig> = configs.into_iter().map(|config| config.canonicalized()).collect();
-    save_connection_configs(state.inner(), &configs).await
+    save_connection_configs(state.inner(), &configs, removed_ids.unwrap_or_default()).await
 }
 
-async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> Result<(), String> {
+async fn save_connection_configs(
+    state: &AppState,
+    configs: &[ConnectionConfig],
+    removed_ids: Vec<String>,
+) -> Result<(), String> {
     for config in configs {
-        if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_ssh_worker_requested(config) {
+        if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_remote_worker_requested(config) {
             db::sqlite::validate_persistent_attachments(
                 &config.host,
                 &config.password,
@@ -919,8 +1063,15 @@ async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig])
             )?;
         }
     }
+    if !removed_ids.is_empty() {
+        state.storage.delete_connections(&removed_ids).await?;
+    }
     state.storage.save_connections(configs).await?;
-    let sync = sync_connection_configs(state, configs).await;
+    // Saving upserts, so the request only covers this window's connections. Sync
+    // against the whole persisted list to keep connections saved by another
+    // window/process alive in the runtime cache as well.
+    let persisted = state.storage.load_connections().await?;
+    let sync = sync_connection_configs(state, &persisted).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
@@ -1035,6 +1186,28 @@ pub async fn load_sidebar_layout(state: State<'_, Arc<AppState>>) -> Result<Opti
     state.storage.load_sidebar_layout().await
 }
 
+#[tauri::command]
+pub async fn save_table_vgroups(
+    state: State<'_, Arc<AppState>>,
+    scope_key: String,
+    layout: serde_json::Value,
+) -> Result<(), String> {
+    state.storage.save_table_vgroups(&scope_key, &layout).await
+}
+
+#[tauri::command]
+pub async fn load_table_vgroups(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    state.storage.load_table_vgroups().await
+}
+
+#[tauri::command]
+pub async fn delete_table_vgroups_for_connection(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<(), String> {
+    state.storage.delete_table_vgroups_for_connection(&connection_id).await
+}
+
 fn sqlite_extension_specs_from_config(config: &ConnectionConfig) -> Vec<db::sqlite::SqliteExtensionSpec> {
     db::sqlite::sqlite_extension_specs_from_url_params(config.url_params.as_deref())
         .into_iter()
@@ -1057,12 +1230,14 @@ async fn connect_sqlite_from_config_with_state(
     connection_id: &str,
     config: &ConnectionConfig,
 ) -> Result<db::sqlite::SqliteHandle, String> {
-    if db::sqlite_worker::sqlite_ssh_worker_requested(config) {
+    if db::sqlite_worker::sqlite_remote_worker_requested(config) {
         let state =
             state.ok_or_else(|| "Remote SQLite over SSH is only available in the DBX Desktop app".to_string())?;
         let transport_layers = state.resolved_transport_layers(config).await?;
         let worker = db::sqlite_worker::connect_sqlite_worker(
             &state.tunnels,
+            &state.proxy_tunnels,
+            &state.http_tunnels,
             &state.agent_manager,
             state.storage.data_dir(),
             connection_id,
@@ -1146,8 +1321,13 @@ async fn test_connection_with_info_inner(
     let tunnel_id = format!("{}:test", config.id);
     let has_transport_layers = config.has_effective_transport_layers();
     let connection_id = if has_transport_layers { tunnel_id.as_str() } else { config.id.as_str() };
-    let (host, port) = state.connection_host_port(connection_id, &config).await?;
-    let probe_result = probe_connection_endpoint(&config, &host, port).await;
+    let endpoint = state.plugin_connection_endpoint(connection_id, &config).await?;
+    let (host, port) = (endpoint.host.clone(), endpoint.port);
+    let runtime_proxy = endpoint.proxy;
+    // SOCKS-routed plugin tests dial through the route themselves; probing the
+    // logical endpoint (possibly empty host/port) would mislead.
+    let probe_result =
+        if runtime_proxy.is_some() { Ok(()) } else { probe_connection_endpoint(&config, &host, port).await };
     let url = connection_url_for_endpoint(&config, &host, port);
     let target = redacted_connection_url_for_endpoint(&config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(config.effective_connect_timeout_secs());
@@ -1155,7 +1335,7 @@ async fn test_connection_with_info_inner(
     let gaussdb_m_jdbc_config = gaussdb_m_jdbc_command_config(&config, &host, port);
     log::info!("[test_connection] db_type={:?} target={}", config.db_type, target);
     if config.db_type == DatabaseType::Plugin {
-        let result = state.plugin_host.test_connection(&config, &host, port).await;
+        let result = state.plugin_host.test_connection(&config, &host, port, runtime_proxy).await;
         if has_transport_layers {
             state.reset_connection_transport_for_config(&tunnel_id, &config).await;
         }
@@ -1379,12 +1559,13 @@ async fn test_connection_with_info_inner(
             DatabaseType::ClickHouse => {
                 let username = if config.username.is_empty() { None } else { Some(config.username.clone()) };
                 let password = if config.password.is_empty() { None } else { Some(config.password.clone()) };
-                let client = db::clickhouse_driver::ChClient::new_with_ca_cert(
+                let client = db::clickhouse_driver::ChClient::new_with_ca_cert_and_proxy(
                     &url,
                     username,
                     password,
                     Some(&config.ca_cert_path),
                     config.url_params.as_deref(),
+                    clickhouse_http_proxy(runtime_proxy.as_ref())?,
                     connect_timeout,
                 )?;
                 db::clickhouse_driver::test_connection(&client, connect_timeout)
@@ -1417,6 +1598,17 @@ async fn test_connection_with_info_inner(
                     .await
                     .map(|_| "Connection successful".to_string())
             }
+            DatabaseType::Salesforce => {
+                let client = db::salesforce_driver::SfClient::from_config(
+                    &url,
+                    Some(&config.password),
+                    config.external_config.as_ref(),
+                    connect_timeout,
+                )?;
+                db::salesforce_driver::SfClient::test_connection(&client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
             DatabaseType::Easysearch => {
                 let mut client = db::easysearch_driver::EasysearchClient::from_config(
                     &url,
@@ -1433,6 +1625,40 @@ async fn test_connection_with_info_inner(
                 db::easysearch_driver::test_connection(&mut client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
+            }
+            DatabaseType::Solr => {
+                let mut client = db::solr_driver::SolrClient::from_config(
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    config.ssl,
+                    config.url_params.as_deref(),
+                    config.external_config.as_ref(),
+                    connect_timeout,
+                    Some(config.ca_cert_path.as_str()),
+                    Some(config.client_cert_path.as_str()),
+                    Some(config.client_key_path.as_str()),
+                )?;
+                db::solr_driver::test_connection(&mut client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
+            DatabaseType::CouchDb => {
+                let client = db::couchdb_driver::CouchDbClient::from_config(
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    config.ssl,
+                    config.url_params.as_deref(),
+                    config.external_config.as_ref(),
+                    connect_timeout,
+                    Some(config.ca_cert_path.as_str()),
+                    Some(config.client_cert_path.as_str()),
+                    Some(config.client_key_path.as_str()),
+                )?;
+                db::couchdb_driver::test_connection(&client, connect_timeout).await?;
+                database_info = db::couchdb_driver::database_connection_info(&client).await.ok();
+                Ok("Connection successful".to_string())
             }
             DatabaseType::Meilisearch => {
                 let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
@@ -1671,7 +1897,7 @@ pub async fn connect_db(
     client_attempt: Option<u64>,
 ) -> Result<String, String> {
     let config = config.canonicalized();
-    if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_ssh_worker_requested(&config) {
+    if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_remote_worker_requested(&config) {
         db::sqlite::validate_persistent_attachments(
             &config.host,
             &config.password,
@@ -1687,11 +1913,22 @@ pub async fn connect_db(
     let mut connected_config = config.clone();
     let mut connected_db_config = db_config.clone();
 
-    state.remove_connection_pools_detached(&id).await;
+    // Plugin 连接的 connection/connect 是幂等 upsert：连接路径（首连、重推、
+    // 重连）只替换池条目，完全跳过旧池拆除——close 会向 sidecar 发
+    // connection/disconnect，其语义是"删注册表 + 杀掉该连接全部会话"，会把
+    // 同连接其他 tab 的活跃终端一起杀死。用户显式断开仍走 disconnect_db 的
+    // 完整关闭路径（会发 disconnect）。其他类型维持 detached 关闭不变。
+    if db_config.db_type == DatabaseType::Plugin {
+        state.drop_connection_pools_without_close(&id).await;
+    } else {
+        state.remove_connection_pools_detached(&id).await;
+    }
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&id)).await;
     state.reset_connection_transport_for_config(&id, &db_config).await;
 
-    let (host, port) = state.connection_host_port(&id, &db_config).await?;
+    let endpoint = state.plugin_connection_endpoint(&id, &db_config).await?;
+    let (host, port) = (endpoint.host, endpoint.port);
+    let runtime_proxy = endpoint.proxy;
     if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
         state.reset_connection_transport_for_config(&id, &db_config).await;
         return Err(err);
@@ -1839,12 +2076,13 @@ pub async fn connect_db(
             let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
             let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
             log::info!("[connect_db] ClickHouse url={url} user={:?} has_pass={}", username, password.is_some());
-            let client = db::clickhouse_driver::ChClient::new_with_ca_cert(
+            let client = db::clickhouse_driver::ChClient::new_with_ca_cert_and_proxy(
                 &url,
                 username,
                 password,
                 Some(&db_config.ca_cert_path),
                 db_config.url_params.as_deref(),
+                clickhouse_http_proxy(runtime_proxy.as_ref())?,
                 connect_timeout,
             )?;
             db::clickhouse_driver::test_connection(&client, connect_timeout).await?;
@@ -1867,6 +2105,16 @@ pub async fn connect_db(
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
         }
+        DatabaseType::Salesforce => {
+            let client = db::salesforce_driver::SfClient::from_config(
+                &url,
+                Some(&db_config.password),
+                db_config.external_config.as_ref(),
+                connect_timeout,
+            )?;
+            db::salesforce_driver::SfClient::test_connection(&client, connect_timeout).await?;
+            PoolKind::Salesforce(client)
+        }
         DatabaseType::Easysearch => {
             let mut client = db::easysearch_driver::EasysearchClient::from_config(
                 &url,
@@ -1882,6 +2130,38 @@ pub async fn connect_db(
             )?;
             db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Easysearch(client)
+        }
+        DatabaseType::Solr => {
+            let mut client = db::solr_driver::SolrClient::from_config(
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                db_config.ssl,
+                db_config.url_params.as_deref(),
+                db_config.external_config.as_ref(),
+                connect_timeout,
+                Some(db_config.ca_cert_path.as_str()),
+                Some(db_config.client_cert_path.as_str()),
+                Some(db_config.client_key_path.as_str()),
+            )?;
+            db::solr_driver::test_connection(&mut client, connect_timeout).await?;
+            PoolKind::Solr(client)
+        }
+        DatabaseType::CouchDb => {
+            let client = db::couchdb_driver::CouchDbClient::from_config(
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                db_config.ssl,
+                db_config.url_params.as_deref(),
+                db_config.external_config.as_ref(),
+                connect_timeout,
+                Some(db_config.ca_cert_path.as_str()),
+                Some(db_config.client_cert_path.as_str()),
+                Some(db_config.client_key_path.as_str()),
+            )?;
+            db::couchdb_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::CouchDb(client)
         }
         DatabaseType::Meilisearch => {
             let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
@@ -2051,9 +2331,9 @@ pub async fn connect_db(
         DatabaseType::Mqtt => {
             return Err("MQTT support is not compiled in this build. Rebuild with the 'mq-admin' feature.".to_string());
         }
-        DatabaseType::Plugin => {
-            PoolKind::PluginConnection(state.plugin_host.connect_connection(&db_config, &host, port).await?)
-        }
+        DatabaseType::Plugin => PoolKind::PluginConnection(
+            state.plugin_host.connect_connection(&db_config, &host, port, runtime_proxy).await?,
+        ),
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 
@@ -2084,7 +2364,7 @@ pub async fn connection_final_proxy_port(
         return Err("Connection has no configured transport layers".to_string());
     }
     if runtime_config.db_type == DatabaseType::Sqlite
-        && !db::sqlite_worker::sqlite_ssh_worker_requested(&runtime_config)
+        && !db::sqlite_worker::sqlite_remote_worker_requested(&runtime_config)
     {
         db::sqlite::validate_persistent_attachments(
             &runtime_config.host,
@@ -2195,6 +2475,65 @@ pub async fn refresh_connections(state: State<'_, Arc<AppState>>) -> Result<(), 
 #[tauri::command]
 pub async fn check_connection_health(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
     state.check_connection_health(&connection_id).await
+}
+
+/// Read-only counterpart of `check_connection_health`: reports whether the connection still
+/// has a pool, without probing, mutating, or triggering a reconnect.
+///
+/// The frontend uses it to confirm a keepalive liveness event before greying the sidebar
+/// (#4339). `check_connection_health` must never be used for that confirmation: it removes
+/// unhealthy pools and is the path `ensureConnected` uses to reconnect.
+#[tauri::command]
+pub async fn connection_is_open(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<bool, String> {
+    Ok(state.is_connection_open(&connection_id).await)
+}
+
+/// Relay backend-confirmed liveness losses to the frontend (#4339).
+///
+/// Mirrors `install_plugin_event_bridge`: the core publishes to a broadcast channel and each
+/// shell owns its transport, so core never needs a UI handle.
+pub fn install_connection_liveness_bridge(app: &tauri::AppHandle, state: Arc<AppState>) {
+    let app_handle = app.clone();
+    let mut events = state.subscribe_connection_liveness();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(message) => {
+                    let _ = app_handle.emit("dbx-connection-liveness", message);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The skipped messages are gone for good, so ask the frontend to re-check
+                    // every connection it still shows as connected. Dropping the transition
+                    // silently would leave a sidebar green indefinitely — exactly the state
+                    // this bridge exists to prevent.
+                    log::warn!("Desktop connection liveness bridge skipped {skipped} messages; requesting a resync");
+                    let _ = app_handle.emit("dbx-connection-liveness", ConnectionLivenessMessage::Resync);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Warm the driver and connection pool for a connection a tab is opening, so the
+/// first Run does not pay pool creation, tunnel setup, or external-driver (JDBC
+/// agent) startup while the user waits. Never removes an existing pool.
+#[tauri::command]
+pub async fn prewarm_connection(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: Option<String>,
+    catalog: Option<String>,
+    client_session_id: Option<String>,
+) -> Result<(), String> {
+    state
+        .prewarm_connection_pool(
+            &connection_id,
+            database.as_deref().filter(|value| !value.is_empty()),
+            catalog.as_deref().filter(|value| !value.is_empty()),
+            client_session_id.as_deref().filter(|value| !value.is_empty()),
+        )
+        .await
 }
 
 #[tauri::command]

@@ -4,7 +4,9 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use dbx_core::storage::{DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState};
+use dbx_core::storage::{
+    AppAppearanceSettings, AppAppearanceSettingsPatch, DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState,
+};
 use tauri::{AppHandle, Manager, State, Window};
 
 use super::connection::AppState;
@@ -97,14 +99,61 @@ pub async fn load_max_agent_turns(state: State<'_, Arc<AppState>>) -> Result<u32
 }
 
 #[tauri::command]
-pub fn set_app_locale(app: AppHandle, locale_state: State<'_, AppLocaleState>, locale: String) -> Result<(), String> {
+pub async fn load_app_appearance_settings(state: State<'_, Arc<AppState>>) -> Result<AppAppearanceSettings, String> {
+    state.storage.load_app_appearance_settings().await
+}
+
+#[tauri::command]
+pub async fn update_app_appearance_settings(
+    state: State<'_, Arc<AppState>>,
+    patch: AppAppearanceSettingsPatch,
+) -> Result<(), String> {
+    state.storage.update_app_appearance_settings(&patch).await
+}
+
+#[tauri::command]
+pub async fn set_app_locale(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    locale_state: State<'_, AppLocaleState>,
+    locale: String,
+) -> Result<(), String> {
     locale_state.set(locale);
-    refresh_native_menus(&app).map_err(|err| format!("failed to refresh native menus: {err}"))
+    let persistence = state
+        .storage
+        .update_app_appearance_settings(&AppAppearanceSettingsPatch {
+            locale: Some(locale_state.get()),
+            ..Default::default()
+        })
+        .await;
+    let refresh = refresh_native_menus(&app).map_err(|err| format!("failed to refresh native menus: {err}"));
+    persistence?;
+    refresh
 }
 
 #[tauri::command]
 pub async fn save_max_agent_turns(state: State<'_, Arc<AppState>>, max_agent_turns: u32) -> Result<(), String> {
     state.storage.save_max_agent_turns(max_agent_turns).await
+}
+
+#[tauri::command]
+pub async fn load_history_retention_limit(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    state.storage.load_history_retention_limit().await
+}
+
+#[tauri::command]
+pub async fn save_history_retention_limit(state: State<'_, Arc<AppState>>, limit: u32) -> Result<(), String> {
+    state.storage.save_history_retention_limit(limit).await
+}
+
+#[tauri::command]
+pub async fn load_mcp_history_retention_limit(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    state.storage.load_mcp_history_retention_limit().await
+}
+
+#[tauri::command]
+pub async fn save_mcp_history_retention_limit(state: State<'_, Arc<AppState>>, limit: u32) -> Result<(), String> {
+    state.storage.save_mcp_history_retention_limit(limit).await
 }
 
 #[tauri::command]
@@ -236,7 +285,9 @@ pub async fn load_mcp_global_policy(state: State<'_, Arc<AppState>>) -> Result<M
 
 #[tauri::command]
 pub async fn save_mcp_global_policy(state: State<'_, Arc<AppState>>, policy: McpGlobalPolicy) -> Result<(), String> {
-    state.storage.save_mcp_global_policy(&policy).await
+    state.storage.save_mcp_global_policy(&policy).await?;
+    super::mcp_bridge::clear_mcp_sql_approvals();
+    Ok(())
 }
 
 #[tauri::command]
@@ -247,6 +298,30 @@ pub async fn load_editor_settings(state: State<'_, Arc<AppState>>) -> Result<Opt
 #[tauri::command]
 pub async fn save_editor_settings(state: State<'_, Arc<AppState>>, settings: serde_json::Value) -> Result<(), String> {
     state.storage.save_editor_settings(&settings).await
+}
+
+const GLOBAL_SEARCH_SETTINGS_FILE: &str = "global-search-settings.json";
+
+#[tauri::command]
+pub async fn load_global_search_settings(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    let default_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let data_dir = crate::data_dir::resolve_data_dir_with_mode(default_data_dir).data_dir;
+    let path = data_dir.join(GLOBAL_SEARCH_SETTINGS_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+#[tauri::command]
+pub async fn save_global_search_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), String> {
+    let default_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let data_dir = crate::data_dir::resolve_data_dir_with_mode(default_data_dir).data_dir;
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("Failed to create {}: {e}", data_dir.display()))?;
+    let path = data_dir.join(GLOBAL_SEARCH_SETTINGS_FILE);
+    let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 #[tauri::command]

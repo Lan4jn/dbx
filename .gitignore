@@ -64,8 +64,10 @@ Thumbs.db
 # GitHub (keep workflows)
 .github/*
 !.github/CODEOWNERS
+!.github/FUNDING.yml
 !.github/workflows/
 !.github/scripts/
+!.github/ui-preview/
 !.github/ISSUE_TEMPLATE/
 
 # Env
@@ -85,6 +87,7 @@ issue-assets/
 outputs/
 target-ai-write-confirmation/
 .serena/
+.mimosa/
 
 # Code review tool artifacts
 review_diff.json

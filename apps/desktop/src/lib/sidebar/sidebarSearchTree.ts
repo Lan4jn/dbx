@@ -1,9 +1,17 @@
 import type { TableInfo, TreeNode, TreeNodeType } from "@/types/database";
 import { createSidebarLabelMatcher, matchSidebarLabel, type SidebarLabelMatcher, type SidebarSearchMatcherOptions } from "@/lib/sidebar/sidebarSearch";
 import { buildTableTreeNodes } from "@/lib/table/tableTree";
+import { stripTableVGroupsFromChildren } from "@/lib/table/tableVGroup";
 
 const preserveMatchedSubtreeTypes = new Set(["connection", "database", "schema", "table", "view", "mongo-db", "mongo-collection"]);
-const hiddenSearchNodeTypes = new Set<TreeNodeType>(["user-admin", "dameng-job-admin"]);
+// Synthetic connection utility entries (the isConnectionUtilityNode types in
+// connectionStore) are admin/navigation shortcuts, not schema objects. Their
+// labels are i18n keys that can never match a text query, so they never
+// self-match — but a few of them (oracle-db-links, group-tablespaces) are
+// groups whose children ARE real objects, so their children stay searchable
+// and the group only survives through a child hit. saved-sql-root is exempt:
+// its saved queries are real searchable files rather than a shortcut.
+const hiddenSearchNodeTypes = new Set<TreeNodeType>(["user-admin", "dameng-users", "dameng-roles", "dameng-job-admin", "group-tablespaces", "oracle-db-links"]);
 
 function bestMatch(matchLabel: SidebarLabelMatcher, label: string, comment?: string | null, aliases?: readonly string[]) {
   let best = matchLabel(label);
@@ -64,7 +72,7 @@ export function filterSidebarTree(nodes: TreeNode[], query: string, collapsedIds
   const matcherOptions = typeof options === "function" ? undefined : options;
   const matchLabel = query ? createSidebarLabelMatcher(query, matcherOptions) : undefined;
   if (!matchLabel && searchableNodeTypes === undefined) return nodes;
-  return filterSidebarTreeWithMatcher(nodes, matchLabel, collapsedIds, searchableNodeTypes, resolveLabel);
+  return filterSidebarTreeWithMatcher(nodes, matchLabel, collapsedIds, searchableNodeTypes, resolveLabel, query);
 }
 
 export function reuseLiveSidebarTreeNodes(indexedNodes: TreeNode[], liveNodes: readonly TreeNode[]): TreeNode[] {
@@ -87,15 +95,18 @@ export function filterLocallySearchedTables(nodes: TreeNode[], options: { enable
     // Table comments participate in matching, mirroring the global sidebar
     // search and the backend's name-or-comment metadata filter.
     const entryMatches = (name: string, comment?: string | null) => !!matchSidebarLabel(name, query) || (!!comment && !!matchSidebarLabel(comment, query));
+    // Grouped tables are flattened before matching so virtual groups stay
+    // transparent during local table search.
+    const flatChildren = stripTableVGroupsFromChildren(children);
     const matchingChildren =
       indexed === null
-        ? children.filter((child) => localTableSearchChildTypes.has(child.type) && entryMatches(child.label, child.comment))
+        ? flatChildren.filter((child) => localTableSearchChildTypes.has(child.type) && entryMatches(child.label, child.comment))
         : indexed
           ? reuseLiveSidebarTreeNodes(
               buildSidebarIndexedTableNodes({ parentNodeId: node.id, nodeType: node.type, connectionId: node.connectionId || "", database: node.database || "", schema: node.schema, catalog: node.catalog, entries: indexed.filter((entry) => entryMatches(entry.name, entry.comment)) }),
-              children,
+              flatChildren,
             )
-          : children.filter((child) => localTableSearchChildTypes.has(child.type) && entryMatches(child.label, child.comment));
+          : flatChildren.filter((child) => localTableSearchChildTypes.has(child.type) && entryMatches(child.label, child.comment));
     return { ...node, children: matchingChildren };
   });
 }
@@ -352,11 +363,19 @@ function preservedSearchChildren(node: TreeNode, collapsedIds: ReadonlySet<strin
   return node.children.filter((child) => !hiddenSearchNodeTypes.has(child.type)).map((child) => applySearchCollapsedState(child, collapsedIds));
 }
 
-function filterSidebarTreeWithMatcher(nodes: TreeNode[], matchLabel: SidebarLabelMatcher | undefined, collapsedIds: ReadonlySet<string>, searchableNodeTypes?: ReadonlySet<TreeNodeType>, resolveLabel?: (node: TreeNode) => string): TreeNode[] {
+function filterSidebarTreeWithMatcher(nodes: TreeNode[], matchLabel: SidebarLabelMatcher | undefined, collapsedIds: ReadonlySet<string>, searchableNodeTypes?: ReadonlySet<TreeNodeType>, resolveLabel?: (node: TreeNode) => string, query?: string): TreeNode[] {
   const filteredNodes: { node: TreeNode; score: number }[] = [];
 
   for (const node of nodes) {
-    if (matchLabel && hiddenSearchNodeTypes.has(node.type)) continue;
+    if (node.type === "load-more" && node.loadMore?.searchQuery !== undefined && node.loadMore.searchQuery === query && (!searchableNodeTypes || nodes.some((sibling) => searchableNodeTypes.has(sibling.type)))) {
+      filteredNodes.push({ node, score: -1 });
+      continue;
+    }
+    // Utility groups never match by their own label; groups without children
+    // (or not yet loaded) drop out entirely, while groups that hold real
+    // objects (db links, tablespaces) survive through a matching child.
+    const hiddenUtility = !!matchLabel && hiddenSearchNodeTypes.has(node.type);
+    if (hiddenUtility && !node.children?.length) continue;
     if (node.type === "object-browser" && node.hiddenChildren) {
       const matches = node.hiddenChildren.flatMap((child) => {
         if (searchableNodeTypes && !searchableNodeTypes.has(child.type)) return [];
@@ -369,7 +388,7 @@ function filterSidebarTreeWithMatcher(nodes: TreeNode[], matchLabel: SidebarLabe
     }
 
     const label = normalizedLabel(node, resolveLabel);
-    const canSelfMatch = !searchableNodeTypes || searchableNodeTypes.has(node.type);
+    const canSelfMatch = (!searchableNodeTypes || searchableNodeTypes.has(node.type)) && !hiddenUtility;
     const selfMatch = canSelfMatch ? (matchLabel ? bestMatch(matchLabel, label, node.comment, node.searchAliases) : { score: 0 }) : null;
     // Type-only filtering keeps matching rows and their ancestor path, but not
     // unrelated descendants that would make the selected type appear ignored.
@@ -380,7 +399,7 @@ function filterSidebarTreeWithMatcher(nodes: TreeNode[], matchLabel: SidebarLabe
     // Connection utility entries are synthetic navigation actions, not schema
     // search results. Keep real loaded descendants for connection-name matches,
     // but do not let those actions make a disconnected result look expanded.
-    const filteredChildren = preservesSubtree ? preservedSearchChildren(node, collapsedIds) : node.children ? filterSidebarTreeWithMatcher(node.children, matchLabel, collapsedIds, searchableNodeTypes, resolveLabel) : undefined;
+    const filteredChildren = preservesSubtree ? preservedSearchChildren(node, collapsedIds) : node.children ? filterSidebarTreeWithMatcher(node.children, matchLabel, collapsedIds, searchableNodeTypes, resolveLabel, query) : undefined;
 
     if (selfMatch || (filteredChildren && filteredChildren.length > 0)) {
       if (!node.children || preservesTypeMatchedTable) {
@@ -400,7 +419,16 @@ function filterSidebarTreeWithMatcher(nodes: TreeNode[], matchLabel: SidebarLabe
     }
   }
 
-  filteredNodes.sort((a, b) => b.score - a.score);
+  // 置顶优先（issue #11386）：store 已把置顶节点排在兄弟列表最前，但这里按匹配得分
+  // 重排会把置顶节点压到匹配度更高的兄弟之后。改为置顶节点恒在前，且置顶节点之间
+  // 保持 store 里用户自定义的置顶顺序（相等即稳定，不参与得分重排）；未置顶节点仍
+  // 按得分从高到低排序。
+  filteredNodes.sort((a, b) => {
+    const pinnedDiff = Number(b.node.pinned === true) - Number(a.node.pinned === true);
+    if (pinnedDiff !== 0) return pinnedDiff;
+    if (a.node.pinned === true) return 0;
+    return b.score - a.score;
+  });
   return filteredNodes.map((match) => match.node);
 }
 

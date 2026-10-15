@@ -27,7 +27,7 @@ import type { InspectorTarget } from "@/types/diagram";
 import DiagramInspector from "./DiagramInspector.vue";
 import DiagramSyncDialog from "./DiagramSyncDialog.vue";
 import CreateDraftTableDialog from "./CreateDraftTableDialog.vue";
-import { buildEngineeringDiagram } from "@/lib/diagram/engineeringDiagram";
+import { buildEngineeringDiagram, buildEngineeringDiagramConnections, sliceEngineeringDiagramForViewport, type EngineeringDiagramViewport } from "@/lib/diagram/engineeringDiagram";
 import { buildEngineeringDiagramSvg, buildTableDiagramSvg, buildTableRelationshipPolylines, computeTableDiagramCanvas } from "@/lib/export/diagramSvgExport";
 import { pointsToSvgPath } from "@/lib/diagram/edge-obstacle-router";
 import { buildDiagramDbml, buildDiagramJson, buildDiagramMermaid, diagramExportFileName, svgToPngBlob, type DiagramExportFormat } from "@/lib/export/diagramFormats";
@@ -35,7 +35,7 @@ import { saveDiagramBinaryExport, saveDiagramTextExport } from "@/lib/export/sav
 import { inferRelationships, filterByStorage } from "@/lib/diagram/match-engine";
 import { loadMatchConfirms, saveMatchConfirms, loadMatchIgnores, saveMatchIgnores, isAutoMatchEnabled } from "@/lib/diagram/match-storage";
 import { toVueFlowNodes, toVueFlowEdges, toDiagramEdges, toVueFlowLayerNodes, toAbsolutePosition, isTableCanvasVisible } from "@/lib/diagram/vue-flow-adapter";
-import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, LAYER_CONTENT_PADDING, LAYER_HEADER_HEIGHT, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY } from "@/lib/diagram/diagram-constants";
+import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, LAYER_CONTENT_PADDING, LAYER_HEADER_HEIGHT, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY, diagramTableCardHeight } from "@/lib/diagram/diagram-constants";
 import { sizeLayerToFit, findLayerAtPoint, placeNewLayer } from "@/lib/diagram/size-layer";
 import { computeLtrAutoLayout } from "@/lib/diagram/ltr-auto-layout";
 import { computeLayoutWithLayers } from "@/lib/diagram/elk-layout";
@@ -64,6 +64,7 @@ const layerStore = useLayerStore();
 const { nodes, edges, applyNodeChanges, applyEdgeChanges, setNodes, setEdges, zoomIn: vfZoomIn, zoomOut: vfZoomOut, fitView, getViewport, setViewport } = useVueFlow();
 
 const diagramPaneRef = ref<HTMLElement | null>(null);
+const engineeringViewportRef = ref<HTMLElement | null>(null);
 const edgeWaypoints = ref<Record<string, Point[]>>({});
 const edgeHandleHints = ref<Record<string, { sourceHandle?: string; targetHandle?: string }>>({});
 const highlightEdgeId = ref<string | null>(null);
@@ -291,6 +292,9 @@ const emit = defineEmits<{
 }>();
 
 const METADATA_BATCH_SIZE = 4;
+const LARGE_TABLE_DIAGRAM_THRESHOLD = 200;
+const LARGE_ENGINEERING_DIAGRAM_THRESHOLD = 2_000;
+const ENGINEERING_VIEWPORT_OVERSCAN = 800;
 
 const connectionId = ref("");
 const database = ref("");
@@ -327,6 +331,9 @@ async function setDiagramMode(mode: "table" | "engineering") {
   if (mode === "table") {
     await nextTick();
     fitDiagramView();
+  } else {
+    await nextTick();
+    syncEngineeringViewport();
   }
 }
 
@@ -530,7 +537,9 @@ const customRelationshipCount = computed(() => customRelationships.value.length)
 const matchRelationshipCount = computed(() => matchResult.value.relationships.length);
 
 function tableHeight(table: DiagramTable): number {
-  return CARD_HEADER_HEIGHT + table.columns.length * COLUMN_ROW_HEIGHT + CARD_BOTTOM_PADDING;
+  // Includes the rendered table/column comment lines so canvas bounds, layers,
+  // edge routing and auto layout match the card height.
+  return diagramTableCardHeight(table);
 }
 
 const canvasSize = computed(() => {
@@ -547,8 +556,50 @@ const canvasSize = computed(() => {
 });
 
 const engineeringDiagram = computed(() => buildEngineeringDiagram(visibleTables.value, visibleRelationships.value, positions.value));
+const engineeringConnections = computed(() => buildEngineeringDiagramConnections(engineeringDiagram.value));
+const virtualizeTableDiagram = computed(() => visibleTables.value.length > LARGE_TABLE_DIAGRAM_THRESHOLD);
+const virtualizeEngineeringDiagram = computed(() => engineeringDiagram.value.entities.length + engineeringDiagram.value.attributes.length + engineeringDiagram.value.relationships.length > LARGE_ENGINEERING_DIAGRAM_THRESHOLD);
+const engineeringViewport = ref<EngineeringDiagramViewport>({
+  left: -ENGINEERING_VIEWPORT_OVERSCAN,
+  top: -ENGINEERING_VIEWPORT_OVERSCAN,
+  right: 1920 + ENGINEERING_VIEWPORT_OVERSCAN,
+  bottom: 1080 + ENGINEERING_VIEWPORT_OVERSCAN,
+});
+const engineeringRenderSlice = computed(() => {
+  const diagram = engineeringDiagram.value;
+  const connections = engineeringConnections.value;
+  if (!virtualizeEngineeringDiagram.value) {
+    return {
+      entities: diagram.entities,
+      attributes: diagram.attributes,
+      relationships: diagram.relationships,
+      ...connections,
+    };
+  }
+  return sliceEngineeringDiagramForViewport(diagram, connections, engineeringViewport.value);
+});
 
 const activeCanvasSize = computed(() => (diagramMode.value === "engineering" ? engineeringDiagram.value.canvas : canvasSize.value));
+
+let engineeringViewportFrame: number | null = null;
+let engineeringResizeObserver: ResizeObserver | null = null;
+
+function syncEngineeringViewport() {
+  engineeringViewportFrame = null;
+  const viewport = engineeringViewportRef.value;
+  if (!viewport) return;
+  engineeringViewport.value = {
+    left: viewport.scrollLeft - ENGINEERING_VIEWPORT_OVERSCAN,
+    top: viewport.scrollTop - ENGINEERING_VIEWPORT_OVERSCAN,
+    right: viewport.scrollLeft + viewport.clientWidth + ENGINEERING_VIEWPORT_OVERSCAN,
+    bottom: viewport.scrollTop + viewport.clientHeight + ENGINEERING_VIEWPORT_OVERSCAN,
+  };
+}
+
+function scheduleEngineeringViewportSync() {
+  if (engineeringViewportFrame !== null) return;
+  engineeringViewportFrame = window.requestAnimationFrame(syncEngineeringViewport);
+}
 
 function handleAddLayer() {
   recordHistory();
@@ -1345,7 +1396,7 @@ async function setSelectedSchemas(values: string[]) {
   if (diagramReady.value) await loadDiagram();
 }
 
-async function loadTableDiagramData(tableName: string, querySchema: string): Promise<DiagramTable> {
+async function loadTableDiagramData(tableName: string, querySchema: string, tableComment?: string | null): Promise<DiagramTable> {
   try {
     const [columns, foreignKeys, indexes] = await Promise.all([
       api.getColumns(connectionId.value, database.value, querySchema, tableName),
@@ -1355,6 +1406,7 @@ async function loadTableDiagramData(tableName: string, querySchema: string): Pro
     return {
       name: tableName,
       schema: querySchema,
+      comment: tableComment ?? null,
       columns,
       foreignKeys,
       indexes: indexes.map((index) => ({
@@ -1374,7 +1426,7 @@ async function loadTableDiagramData(tableName: string, querySchema: string): Pro
   } catch (e) {
     failedTableCount.value += 1;
     console.warn(`[diagram] failed to load table metadata: ${querySchema}.${tableName}`, e);
-    return { name: tableName, schema: querySchema, columns: [], foreignKeys: [], indexes: [] };
+    return { name: tableName, schema: querySchema, comment: tableComment ?? null, columns: [], foreignKeys: [], indexes: [] };
   }
 }
 
@@ -1395,7 +1447,8 @@ async function loadDiagram() {
       targetSchemas.map(async (sc) => {
         try {
           const list = await api.listTables(connectionId.value, database.value, sc);
-          return list.filter((table) => table.table_type !== "VIEW" && table.table_type !== "MATERIALIZED_VIEW").map((table) => ({ name: table.name, schema: sc }));
+          // Keep the table comment so the card can render the table description.
+          return list.filter((table) => table.table_type !== "VIEW" && table.table_type !== "MATERIALIZED_VIEW").map((table) => ({ name: table.name, schema: sc, comment: table.comment ?? null }));
         } catch (e) {
           console.warn(`[diagram] failed to list tables for schema ${sc}`, e);
           return [];
@@ -1411,7 +1464,7 @@ async function loadDiagram() {
     const loadedTables: DiagramTable[] = [];
     for (let index = 0; index < baseTables.length; index += METADATA_BATCH_SIZE) {
       const batch = baseTables.slice(index, index + METADATA_BATCH_SIZE);
-      const batchTables = await Promise.all(batch.map((item) => loadTableDiagramData(item.name, item.schema)));
+      const batchTables = await Promise.all(batch.map((item) => loadTableDiagramData(item.name, item.schema, item.comment)));
       loadedTables.push(...batchTables);
       loadedTableCount.value = loadedTables.length;
     }
@@ -1843,7 +1896,9 @@ function currentDiagramSvg(): string {
 
   prepareTableDiagramExportGeometry();
 
-  const exportTables = canvasVisibleTables.value;
+  // Positions are keyed by the diagram table id (`getTableKey`), which is schema-qualified in
+  // multi-schema mode; hand that id to the exporter so cards are not all drawn at the origin.
+  const exportTables = canvasVisibleTables.value.map((table) => ({ ...table, diagramKey: getTableKey(table) }));
   const exportRelationships = canvasVisibleRelationships.value;
   const layers = exportSvgLayers();
   const geometryInput = {
@@ -2038,6 +2093,15 @@ watch(
   },
 );
 
+watch(engineeringViewportRef, (viewport) => {
+  engineeringResizeObserver?.disconnect();
+  engineeringResizeObserver = null;
+  if (!viewport || typeof ResizeObserver === "undefined") return;
+  engineeringResizeObserver = new ResizeObserver(scheduleEngineeringViewportSync);
+  engineeringResizeObserver.observe(viewport);
+  scheduleEngineeringViewportSync();
+});
+
 onMounted(() => {
   window.addEventListener("keydown", handleKeydown);
   window.addEventListener("keyup", handleKeyup);
@@ -2046,6 +2110,12 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener("keyup", handleKeyup);
+  if (engineeringViewportFrame !== null) {
+    window.cancelAnimationFrame(engineeringViewportFrame);
+    engineeringViewportFrame = null;
+  }
+  engineeringResizeObserver?.disconnect();
+  engineeringResizeObserver = null;
   teardownFullscreenListeners();
   if (diagramOwnedFullscreen) {
     void exitFullscreen();
@@ -2157,6 +2227,7 @@ onUnmounted(() => {
                 :min-zoom="0.05"
                 :max-zoom="2"
                 :fit-view-options="{ padding: 0.15, minZoom: 0.05, maxZoom: 2 }"
+                :only-render-visible-elements="virtualizeTableDiagram"
                 :pan-mode="isSpacePressed ? 'always' : undefined"
                 class="diagram-flow w-full h-full"
                 @nodes-change="handleNodesChange"
@@ -2172,67 +2243,16 @@ onUnmounted(() => {
               </VueFlow>
               <ZoomControls :can-undo="graphStore.canUndo" :can-redo="graphStore.canRedo" @undo="handleUndo" @redo="handleRedo" />
             </div>
-            <div v-else class="min-h-0 h-full overflow-auto">
+            <div v-else ref="engineeringViewportRef" class="min-h-0 h-full overflow-auto" @scroll.passive="scheduleEngineeringViewportSync">
               <div class="relative" :style="{ width: `${activeCanvasSize.width}px`, height: `${activeCanvasSize.height}px` }">
                 <svg class="absolute inset-0 h-full w-full overflow-visible pointer-events-none">
                   <g class="stroke-foreground/70">
-                    <line
-                      v-for="attribute in engineeringDiagram.attributes"
-                      :key="attribute.id"
-                      :x1="engineeringDiagram.entities.find((e) => e.name === attribute.tableName) ? engineeringDiagram.entities.find((e) => e.name === attribute.tableName)!.x + engineeringDiagram.entities.find((e) => e.name === attribute.tableName)!.width / 2 : 0"
-                      :y1="engineeringDiagram.entities.find((e) => e.name === attribute.tableName) ? engineeringDiagram.entities.find((e) => e.name === attribute.tableName)!.y + engineeringDiagram.entities.find((e) => e.name === attribute.tableName)!.height / 2 : 0"
-                      :x2="attribute.x + attribute.width / 2"
-                      :y2="attribute.y + attribute.height / 2"
-                      stroke-width="1.2"
-                    />
-                    <template v-for="relationship in engineeringDiagram.relationships" :key="relationship.id">
-                      <line
-                        :x1="
-                          engineeringDiagram.attributes.find((a) => a.tableName === relationship.sourceTable && a.columnName === relationship.sourceColumn)
-                            ? engineeringDiagram.attributes.find((a) => a.tableName === relationship.sourceTable && a.columnName === relationship.sourceColumn)!.x +
-                              engineeringDiagram.attributes.find((a) => a.tableName === relationship.sourceTable && a.columnName === relationship.sourceColumn)!.width / 2
-                            : engineeringDiagram.entities.find((e) => e.name === relationship.sourceTable)
-                              ? engineeringDiagram.entities.find((e) => e.name === relationship.sourceTable)!.x + engineeringDiagram.entities.find((e) => e.name === relationship.sourceTable)!.width / 2
-                              : 0
-                        "
-                        :y1="
-                          engineeringDiagram.attributes.find((a) => a.tableName === relationship.sourceTable && a.columnName === relationship.sourceColumn)
-                            ? engineeringDiagram.attributes.find((a) => a.tableName === relationship.sourceTable && a.columnName === relationship.sourceColumn)!.y +
-                              engineeringDiagram.attributes.find((a) => a.tableName === relationship.sourceTable && a.columnName === relationship.sourceColumn)!.height / 2
-                            : engineeringDiagram.entities.find((e) => e.name === relationship.sourceTable)
-                              ? engineeringDiagram.entities.find((e) => e.name === relationship.sourceTable)!.y + engineeringDiagram.entities.find((e) => e.name === relationship.sourceTable)!.height / 2
-                              : 0
-                        "
-                        :x2="relationship.x + relationship.width / 2"
-                        :y2="relationship.y + relationship.height / 2"
-                        stroke-width="1.4"
-                      />
-                      <line
-                        :x1="relationship.x + relationship.width / 2"
-                        :y1="relationship.y + relationship.height / 2"
-                        :x2="
-                          engineeringDiagram.attributes.find((a) => a.tableName === relationship.targetTable && a.columnName === relationship.targetColumn)
-                            ? engineeringDiagram.attributes.find((a) => a.tableName === relationship.targetTable && a.columnName === relationship.targetColumn)!.x +
-                              engineeringDiagram.attributes.find((a) => a.tableName === relationship.targetTable && a.columnName === relationship.targetColumn)!.width / 2
-                            : engineeringDiagram.entities.find((e) => e.name === relationship.targetTable)
-                              ? engineeringDiagram.entities.find((e) => e.name === relationship.targetTable)!.x + engineeringDiagram.entities.find((e) => e.name === relationship.targetTable)!.width / 2
-                              : 0
-                        "
-                        :y2="
-                          engineeringDiagram.attributes.find((a) => a.tableName === relationship.targetTable && a.columnName === relationship.targetColumn)
-                            ? engineeringDiagram.attributes.find((a) => a.tableName === relationship.targetTable && a.columnName === relationship.targetColumn)!.y +
-                              engineeringDiagram.attributes.find((a) => a.tableName === relationship.targetTable && a.columnName === relationship.targetColumn)!.height / 2
-                            : engineeringDiagram.entities.find((e) => e.name === relationship.targetTable)
-                              ? engineeringDiagram.entities.find((e) => e.name === relationship.targetTable)!.y + engineeringDiagram.entities.find((e) => e.name === relationship.targetTable)!.height / 2
-                              : 0
-                        "
-                        stroke-width="1.4"
-                      />
-                    </template>
+                    <line v-for="line in engineeringRenderSlice.attributeLines" :key="line.id" :x1="line.x1" :y1="line.y1" :x2="line.x2" :y2="line.y2" stroke-width="1.2" />
+                    <line v-for="line in engineeringRenderSlice.relationshipLines" :key="line.id" :x1="line.x1" :y1="line.y1" :x2="line.x2" :y2="line.y2" stroke-width="1.4" />
                   </g>
                 </svg>
                 <div
-                  v-for="attribute in engineeringDiagram.attributes"
+                  v-for="attribute in engineeringRenderSlice.attributes"
                   :key="attribute.id"
                   class="absolute flex items-center justify-center rounded-full border border-green-600/55 bg-green-100/80 px-3 text-center text-xs text-green-950 shadow-sm dark:bg-green-950/35 dark:text-green-100"
                   :class="attribute.primaryKey ? 'font-semibold underline underline-offset-2' : ''"
@@ -2242,7 +2262,7 @@ onUnmounted(() => {
                   <span class="truncate">{{ attribute.label }}</span>
                 </div>
                 <div
-                  v-for="relationship in engineeringDiagram.relationships"
+                  v-for="relationship in engineeringRenderSlice.relationships"
                   :key="relationship.id"
                   class="absolute flex items-center justify-center text-center text-xs font-medium text-red-950 dark:text-red-100"
                   :style="{ width: `${relationship.width}px`, height: `${relationship.height}px`, transform: `translate(${relationship.x}px, ${relationship.y}px)` }"
@@ -2252,7 +2272,7 @@ onUnmounted(() => {
                   <span class="relative max-w-[70px] truncate">{{ relationship.label }}</span>
                 </div>
                 <div
-                  v-for="entity in engineeringDiagram.entities"
+                  v-for="entity in engineeringRenderSlice.entities"
                   :key="entity.id"
                   class="absolute flex cursor-pointer items-center justify-center border border-blue-500/70 bg-blue-100/80 px-3 text-center text-sm font-semibold text-blue-950 shadow-sm dark:bg-blue-950/35 dark:text-blue-100"
                   :class="entity.name === focusTableName ? 'ring-2 ring-primary/40' : ''"

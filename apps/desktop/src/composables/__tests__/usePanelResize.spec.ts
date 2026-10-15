@@ -64,6 +64,41 @@ describe("usePanelResize", () => {
     expect(localStorage.getItem("dbx-ai-panel-width")).toBe("1060");
   });
 
+  it.each([0, 360])("lets history use the editor width with a %ipx AI sibling", (aiWidth) => {
+    const editor = document.createElement("div");
+    editor.setAttribute("data-editor-content", "");
+    const ai = document.createElement("div");
+    const panel = document.createElement("div");
+    const handle = document.createElement("div");
+    panel.append(handle);
+    document.body.append(editor, ai, panel);
+    vi.spyOn(editor, "getBoundingClientRect").mockReturnValue(rect(300, 900));
+    vi.spyOn(ai, "getBoundingClientRect").mockReturnValue(rect(1200, aiWidth));
+    vi.spyOn(panel, "getBoundingClientRect").mockReturnValue(rect(1200 + aiWidth, 288));
+
+    const { historyWidth, startHistoryResize } = usePanelResize();
+    handle.addEventListener("pointerdown", startHistoryResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 1200 + aiWidth));
+    document.dispatchEvent(pointerEvent("pointermove", -1000));
+    expect(panel.style.width).toBe("1188px");
+    document.dispatchEvent(pointerEvent("pointerup", -1000));
+    expect(historyWidth.value).toBe(1188);
+    expect(localStorage.getItem("dbx-history-width")).toBeNull();
+
+    vi.spyOn(panel, "getBoundingClientRect").mockReturnValue(rect(300 + aiWidth, 1188));
+    vi.spyOn(editor, "getBoundingClientRect").mockReturnValue(rect(300, 0));
+    handle.dispatchEvent(pointerEvent("pointerdown", 300 + aiWidth));
+    document.dispatchEvent(pointerEvent("pointermove", 500 + aiWidth));
+    document.dispatchEvent(pointerEvent("pointerup", 500 + aiWidth));
+    expect(historyWidth.value).toBe(988);
+  });
+
+  it("starts at 60% on every application launch even when a legacy width is stored", () => {
+    localStorage.setItem("dbx-history-width", String(window.innerWidth));
+    const { historyWidth } = usePanelResize();
+    expect(historyWidth.value).toBe(Math.round(window.innerWidth * 0.6));
+  });
+
   it("resizes from the flex-shrunk width after a wide panel is restored in a narrow window", () => {
     localStorage.setItem("dbx-ai-panel-width", "1060");
 
@@ -144,5 +179,62 @@ describe("usePanelResize", () => {
 
     restored.setTabBarCollapsed(false);
     expect(localStorage.getItem("dbx-tab-bar-collapsed")).toBe("false");
+  });
+
+  it("updates the outer workspace tab rail width and flex while dragging (issue #9977)", () => {
+    localStorage.setItem("dbx-tab-bar-width", "240");
+
+    const rail = document.createElement("div");
+    rail.setAttribute("data-workspace-tab-navigation", "");
+    rail.style.width = "240px";
+    rail.style.flex = "0 0 240px";
+    const target = document.createElement("div");
+    const tabBar = document.createElement("div");
+    tabBar.className = "app-tab-bar";
+    const handle = document.createElement("div");
+    tabBar.append(handle);
+    target.append(tabBar);
+    rail.append(target);
+    document.body.append(rail);
+
+    vi.spyOn(rail, "getBoundingClientRect").mockReturnValue(rect(0, 240));
+
+    const { tabBarWidth, startLeftTabBarResize } = usePanelResize();
+    handle.addEventListener("pointerdown", startLeftTabBarResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 240));
+    document.dispatchEvent(pointerEvent("pointermove", 320));
+
+    expect(rail.style.width).toBe("320px");
+    expect(rail.style.flex).toBe("0 0 320px");
+    expect(tabBar.style.width).toBe("");
+
+    document.dispatchEvent(pointerEvent("pointerup", 320));
+    expect(tabBarWidth.value).toBe(320);
+    expect(localStorage.getItem("dbx-tab-bar-width")).toBe("320");
+  });
+
+  it("shrinks a right-side tab rail toward the left edge while dragging", () => {
+    localStorage.setItem("dbx-tab-bar-width", "300");
+
+    const rail = document.createElement("div");
+    rail.setAttribute("data-special-page-navigation", "");
+    const tabBar = document.createElement("div");
+    const handle = document.createElement("div");
+    tabBar.append(handle);
+    rail.append(tabBar);
+    document.body.append(rail);
+
+    vi.spyOn(rail, "getBoundingClientRect").mockReturnValue(rect(900, 300));
+
+    const { tabBarWidth, startRightTabBarResize } = usePanelResize();
+    handle.addEventListener("pointerdown", startRightTabBarResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 900));
+    document.dispatchEvent(pointerEvent("pointermove", 960));
+
+    expect(rail.style.width).toBe("240px");
+    expect(rail.style.flex).toBe("0 0 240px");
+
+    document.dispatchEvent(pointerEvent("pointerup", 960));
+    expect(tabBarWidth.value).toBe(240);
   });
 });

@@ -5,6 +5,7 @@ import { useI18n } from "vue-i18n";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import type { ConnectionConfig, SidebarLayout, SidebarOrderEntry } from "@/types/database";
 
 type ScopeMode = "all" | "custom";
@@ -36,7 +37,7 @@ const props = withDefaults(
     allowedGroupIds: readonly string[];
     allowedConnectionIds: readonly string[] | null;
     groupPolicies?: readonly { groupId: string; readOnly: boolean; allowDangerousSql: boolean }[];
-    connectionPolicies?: readonly { connectionId: string; readOnly: boolean; allowDangerousSql: boolean; executionModeConfigured?: boolean }[];
+    connectionPolicies?: readonly { connectionId: string; readOnly: boolean; allowDangerousSql: boolean; executionModeConfigured?: boolean; allowSalesforceDml?: boolean }[];
     disabled?: boolean;
     busy?: boolean;
   }>(),
@@ -47,6 +48,7 @@ const emit = defineEmits<{
   "update:scope": [value: { allowedGroupIds: string[]; allowedConnectionIds: string[] | null }];
   "set:group-policy": [groupId: string, mode: ExecutionMode | "inherit"];
   "set:connection-policy": [connectionId: string, mode: ExecutionMode | "inherit"];
+  "set:connection-salesforce-dml": [connectionId: string, allowed: boolean];
 }>();
 
 const { t } = useI18n();
@@ -206,6 +208,28 @@ const visibleRows = computed(() => {
   return rows;
 });
 
+// Exceptions survive visibility-scope changes. Keep an editor for every saved
+// exception, even when its resource is unselected, collapsed, or filtered out.
+const hiddenPolicyExceptions = computed(() => {
+  const inlineEditors = new Set(scopeMode.value === "custom" ? visibleRows.value.filter((node) => (node.type === "group" ? selectedGroupIds.value.has(node.id) : explicitConnectionIds.value.has(node.id) || Boolean(selectedAncestor(node)))).map((node) => `${node.type}:${node.id}`) : []);
+  const result: ResourceNode[] = [];
+  const visit = (nodes: ResourceNode[]) => {
+    for (const node of nodes) {
+      const configured = node.type === "group" ? groupPolicyMode(node.id) !== "inherit" : connectionPolicyMode(node.id) !== "inherit" || (isSalesforceConnection(node) && props.connectionPolicies?.some((policy) => policy.connectionId === node.id && policy.allowSalesforceDml));
+      if (configured && !inlineEditors.has(`${node.type}:${node.id}`)) result.push(node);
+      if (node.type === "group") visit(node.children);
+    }
+  };
+  visit(resourceTree.value);
+  return result;
+});
+
+function exceptionInScope(node: ResourceNode): boolean {
+  if (scopeMode.value === "all") return true;
+  if (node.type === "connection") return effectiveConnectionIds.value.has(node.id);
+  return selectedGroupIds.value.has(node.id) || descendants(node).connectionIds.some((id) => effectiveConnectionIds.value.has(id));
+}
+
 function copyCustomScope(groupIds: readonly string[], connectionIds: readonly string[] | null): { allowedGroupIds: string[]; allowedConnectionIds: string[] } {
   return { allowedGroupIds: [...groupIds], allowedConnectionIds: [...(connectionIds ?? [])] };
 }
@@ -263,6 +287,18 @@ function groupPolicyMode(groupId: string): ExecutionMode | "inherit" {
 function connectionPolicyMode(connectionId: string): ExecutionMode | "inherit" {
   return policyMode(props.connectionPolicies?.find((policy) => policy.connectionId === connectionId));
 }
+
+// Salesforce writes are the one permission that cannot be expressed as an execution
+// mode: SOQL has no write verb, so a DML toggle is the only gate an agent can be given.
+// It is per-connection because it is per-org, and it stays hidden for every other driver.
+function isSalesforceConnection(node: ResourceNode): boolean {
+  return node.type === "connection" && node.connection.db_type === "salesforce";
+}
+
+function connectionAllowsSalesforceDml(connectionId: string): boolean {
+  const policy = props.connectionPolicies?.find((item) => item.connectionId === connectionId);
+  return policy?.allowSalesforceDml === true && policy.readOnly !== true;
+}
 </script>
 
 <template>
@@ -283,6 +319,36 @@ function connectionPolicyMode(connectionId: string): ExecutionMode | "inherit" {
         {{ t("settings.mcpResourceScopeModeCustom") }}
       </Button>
     </div>
+
+    <section v-if="hiddenPolicyExceptions.length" class="space-y-2 border-t p-3" :aria-label="t('settings.mcpPolicyExceptionsTitle')">
+      <p class="text-xs font-medium">{{ t("settings.mcpPolicyExceptionsTitle") }}</p>
+      <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpPolicyExceptionsDescription") }}</p>
+      <div class="max-h-80 space-y-2 overflow-auto">
+        <div v-for="node in hiddenPolicyExceptions" :key="`${node.type}:${node.id}`" class="flex flex-wrap items-center gap-2 rounded-md border p-2 text-xs">
+          <Folder v-if="node.type === 'group'" class="size-4 shrink-0 text-muted-foreground" />
+          <Database v-else class="size-4 shrink-0 text-muted-foreground" />
+          <span class="min-w-0 flex-1 break-words font-medium">{{ node.type === "group" ? node.pathNames.join(" / ") : node.connection.name }}</span>
+          <Badge variant="secondary" class="rounded font-normal">{{ t(exceptionInScope(node) ? "settings.mcpPolicyExceptionInScope" : "settings.mcpPolicyExceptionOutsideScope") }}</Badge>
+          <Select
+            :model-value="node.type === 'group' ? groupPolicyMode(node.id) : connectionPolicyMode(node.id)"
+            :disabled="disabled || busy"
+            @update:model-value="(value) => (node.type === 'group' ? emit('set:group-policy', node.id, value as ExecutionMode | 'inherit') : emit('set:connection-policy', node.id, value as ExecutionMode | 'inherit'))"
+          >
+            <SelectTrigger size="sm" class="h-7 w-44 text-[11px]" :aria-label="node.type === 'group' ? node.pathNames.join(' / ') : node.connection.name"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="inherit">{{ t("settings.mcpPolicyExceptionInherit") }}</SelectItem>
+              <SelectItem value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</SelectItem>
+              <SelectItem value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</SelectItem>
+              <SelectItem value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</SelectItem>
+            </SelectContent>
+          </Select>
+          <label v-if="isSalesforceConnection(node)" class="flex h-7 items-center gap-1 rounded border px-1.5 text-[11px]" :title="t('settings.mcpConnectionPolicyAllowSalesforceDmlHint')">
+            <input type="checkbox" class="size-3" :checked="connectionAllowsSalesforceDml(node.id)" :disabled="disabled || busy" :aria-label="t('settings.mcpConnectionPolicyAllowSalesforceDml')" @change="emit('set:connection-salesforce-dml', node.id, ($event.target as HTMLInputElement).checked)" />
+            {{ t("settings.mcpConnectionPolicyAllowSalesforceDml") }}
+          </label>
+        </div>
+      </div>
+    </section>
 
     <template v-if="scopeMode === 'custom'">
       <div class="border-t p-2">
@@ -325,32 +391,46 @@ function connectionPolicyMode(connectionId: string): ExecutionMode | "inherit" {
             <p class="truncate font-medium">{{ node.type === "group" ? node.name : node.connection.name }}</p>
             <p v-if="node.type === 'connection'" class="truncate font-mono text-[10px] text-muted-foreground">{{ node.connection.db_type }} · {{ node.connection.host || node.connection.database || node.id }}</p>
           </div>
-          <select
-            v-if="node.type === 'group' && selectedGroupIds.has(node.id)"
-            :value="groupPolicyMode(node.id)"
-            class="h-7 shrink-0 rounded border bg-background px-1.5 text-[11px]"
-            :disabled="disabled || busy"
-            @click.stop
-            @change="emit('set:group-policy', node.id, ($event.target as HTMLSelectElement).value as ExecutionMode | 'inherit')"
-          >
-            <option value="inherit">{{ t("settings.mcpConnectionPolicyInherit") }}</option>
-            <option value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</option>
-            <option value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</option>
-            <option value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</option>
-          </select>
-          <select
+          <Select v-if="node.type === 'group' && selectedGroupIds.has(node.id)" :model-value="groupPolicyMode(node.id)" :disabled="disabled || busy" @update:model-value="(value) => emit('set:group-policy', node.id, value as ExecutionMode | 'inherit')">
+            <SelectTrigger size="sm" class="h-7 w-44 shrink-0 text-[11px]" @click.stop><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="inherit">{{ t("settings.mcpConnectionPolicyInherit") }}</SelectItem>
+              <SelectItem value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</SelectItem>
+              <SelectItem value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</SelectItem>
+              <SelectItem value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select
             v-if="node.type === 'connection' && (explicitConnectionIds.has(node.id) || Boolean(selectedAncestor(node)))"
-            :value="connectionPolicyMode(node.id)"
-            class="h-7 shrink-0 rounded border bg-background px-1.5 text-[11px]"
+            :model-value="connectionPolicyMode(node.id)"
             :disabled="disabled || busy"
-            @click.stop
-            @change="emit('set:connection-policy', node.id, ($event.target as HTMLSelectElement).value as ExecutionMode | 'inherit')"
+            @update:model-value="(value) => emit('set:connection-policy', node.id, value as ExecutionMode | 'inherit')"
           >
-            <option value="inherit">{{ selectedAncestor(node) ? t("settings.mcpGroupPolicyInherit") : t("settings.mcpConnectionPolicyInherit") }}</option>
-            <option value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</option>
-            <option value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</option>
-            <option value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</option>
-          </select>
+            <SelectTrigger size="sm" class="h-7 w-44 shrink-0 text-[11px]" @click.stop><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="inherit">{{ selectedAncestor(node) ? t("settings.mcpGroupPolicyInherit") : t("settings.mcpConnectionPolicyInherit") }}</SelectItem>
+              <SelectItem value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</SelectItem>
+              <SelectItem value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</SelectItem>
+              <SelectItem value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</SelectItem>
+            </SelectContent>
+          </Select>
+          <label
+            v-if="isSalesforceConnection(node) && (explicitConnectionIds.has(node.id) || Boolean(selectedAncestor(node)))"
+            class="flex h-7 shrink-0 cursor-pointer items-center gap-1 rounded border bg-background px-1.5 text-[11px]"
+            :class="connectionAllowsSalesforceDml(node.id) ? 'border-primary/50 text-foreground' : 'text-muted-foreground'"
+            :title="t('settings.mcpConnectionPolicyAllowSalesforceDmlHint')"
+          >
+            <input
+              type="checkbox"
+              class="size-3"
+              :checked="connectionAllowsSalesforceDml(node.id)"
+              :disabled="disabled || busy"
+              :aria-label="t('settings.mcpConnectionPolicyAllowSalesforceDml')"
+              @click.stop
+              @change="emit('set:connection-salesforce-dml', node.id, ($event.target as HTMLInputElement).checked)"
+            />
+            {{ t("settings.mcpConnectionPolicyAllowSalesforceDml") }}
+          </label>
           <Badge v-if="selectedAncestor(node)" variant="secondary" class="shrink-0 rounded font-normal">{{ t("settings.mcpResourceScopeInherited", { group: groupLabel(selectedAncestor(node)!) }) }}</Badge>
           <Badge v-else-if="node.type === 'group' && selectedGroupIds.has(node.id)" variant="outline" class="shrink-0 rounded font-normal">{{ t("settings.mcpResourceScopeDynamic") }}</Badge>
           <Badge v-else-if="node.type === 'group' && groupHasSelectedDescendant(node)" variant="secondary" class="shrink-0 rounded font-normal">{{ t("settings.mcpResourceScopePartial") }}</Badge>

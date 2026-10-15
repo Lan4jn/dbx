@@ -1,6 +1,6 @@
 [package]
 name = "dbx"
-version = "0.6.15"
+version = "0.6.44"
 description = "Open-source database management tool"
 authors = ["skyler"]
 license = "Apache-2.0"
@@ -10,12 +10,14 @@ rust-version = "1.88.0"
 
 [lib]
 name = "dbx_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
-default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-multiple-ciphers", "system-fonts"]
+default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-multiple-ciphers", "system-fonts", "os-keyring", "sqlserver-native-attention"]
 custom-protocol = ["tauri/custom-protocol"]
 duckdb-sidecar = ["dbx-core/duckdb-sidecar"]
+os-keyring = ["dbx-core/os-keyring"]
+sqlserver-native-attention = ["dbx-core/sqlserver-native-attention"]
 dynamodb = ["dbx-core/dynamodb"]
 mq-admin = ["dbx-core/mq-admin"]
 sqlite-sqlcipher = ["dbx-core/sqlite-sqlcipher"]
@@ -30,6 +32,8 @@ tauri-build = { version = "2.5.6", features = [] }
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3"
+serde_yaml_ng = "0.10"
 base64 = "0.22"
 log = "0.4"
 tauri = { version = "2.10.3", features = ["tray-icon", "image-png"] }
@@ -50,13 +54,15 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "=2.10.1"
 tauri-plugin-process = "2"
 tauri-plugin-window-state = "2"
-redis = { version = "0.32.2", features = ["tokio-comp", "tls-rustls", "tokio-rustls-comp", "cluster-async"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "tls-rustls", "tokio-rustls-comp", "cluster-async"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 portpicker = "0.1.1"
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "chrono", "rust_decimal", "rustls", "sql-browser-tokio"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 regex = "1"
+grep = "0.3"
+ignore = "0.4"
 futures = "0.3"
 mongodb = { version = "3.2.5", features = ["socks5-proxy"] }
 percent-encoding = "2"
@@ -69,6 +75,8 @@ calamine = "0.30.1"
 zip = "4.6.1"
 dbx-core = { path = "../crates/dbx-core", default-features = false }
 dbx-mcp = { path = "../crates/dbx-mcp", default-features = false, features = ["duckdb-sidecar", "mq-admin"] }
+dbx-tauri-consul = { path = "../crates/dbx-tauri-consul" }
+dbx-tauri-schema = { path = "../crates/dbx-tauri-schema" }
 wry = { path = "../vendor/wry" }
 axum = { version = "0.8", features = ["ws"] }
 font-kit = "0.14.3"
@@ -77,6 +85,7 @@ sys-locale = "0.3"
 sysinfo = { version = "0.32", features = ["system"] }
 
 [dev-dependencies]
+dbx-core = { path = "../crates/dbx-core", default-features = false, features = ["test-support"] }
 tauri = { version = "2.10.3", features = ["test"] }
 tempfile = "3"
 time = "0.3"
@@ -84,16 +93,23 @@ time = "0.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDockTile", "NSEvent", "NSImage", "NSResponder", "NSView", "NSWindow"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDockTile", "NSEvent", "NSImage", "NSResponder", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSBundle", "NSData", "NSString"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
 libloading = "0.8"
+gtk = "0.18"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# 与 vendored wry / tauri-runtime-wry 同版本（Cargo.lock 只有一份 0.38.x），用于在
+# 快捷键录入态运行时切换 WebView2 的浏览器加速键开关（见 commands/shortcut_recording.rs）。
+webview2-com = "0.38"
+# `cast`（Settings → Settings3 的 QueryInterface）来自 windows-core 的 Interface trait，
+# 版本与 vendored wry / webview2-com-sys 一致。
+windows-core = "0.61"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(not(windows))'.dev-dependencies]
 dbx-gateway = { path = "../crates/dbx-gateway", features = ["server"] }

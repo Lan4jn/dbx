@@ -64,6 +64,12 @@ pub(in crate::schema) async fn list_tables(
         PoolKind::Easysearch(client) => {
             db::easysearch_driver::list_indices(client).await.map(|names| collection_names_to_tables(names, "INDEX"))
         }
+        PoolKind::Solr(client) => {
+            db::solr_driver::list_cores(client).await.map(|names| collection_names_to_tables(names, "CORE"))
+        }
+        PoolKind::CouchDb(client) => {
+            db::couchdb_driver::list_databases(client).await.map(|names| collection_names_to_tables(names, "DATABASE"))
+        }
         PoolKind::Meilisearch(client) => {
             db::meilisearch_driver::list_indexes(client).await.map(|names| collection_names_to_tables(names, "INDEX"))
         }
@@ -158,6 +164,8 @@ pub(in crate::schema) async fn get_columns(
         PoolKind::Turso(client) => db::turso_driver::get_columns(client, schema, table).await,
         PoolKind::Elasticsearch(client) => db::elasticsearch_driver::get_columns(client, table).await,
         PoolKind::Easysearch(client) => db::easysearch_driver::get_columns(client, table).await,
+        PoolKind::Solr(client) => db::solr_driver::get_columns(client, table).await,
+        PoolKind::CouchDb(client) => db::couchdb_driver::get_columns(client, table).await,
         PoolKind::Meilisearch(client) => db::meilisearch_driver::get_columns(client, table).await,
         PoolKind::HBase(client) => db::hbase_driver::get_columns(client, database, table).await,
         PoolKind::VectorDb(_) => Ok(vec![]),
@@ -322,6 +330,7 @@ fn collection_names_to_tables(names: Vec<String>, table_type: &str) -> Vec<db::T
         .map(|name| db::TableInfo {
             name,
             table_type: table_type.to_string(),
+            valid: None,
             comment: None,
             parent_schema: None,
             parent_name: None,

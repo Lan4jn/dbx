@@ -235,6 +235,9 @@ SELECT t.TRIGGER_NAME,
        t.TRIGGERING_EVENT,
        t.TRIGGER_TYPE,
        t.DESCRIPTION,
+       t.STATUS,
+       t.WHEN_CLAUSE,
+       t.REFERENCING_NAMES,
        s.LINE,
        s.TEXT
 FROM ALL_TRIGGERS t
@@ -285,6 +288,13 @@ type connectParams struct {
 	SysDBA           bool   `json:"sysdba"`
 	URLParams        string `json:"url_params"`
 	ConnectionString string `json:"connection_string"`
+	// DriverProfile 由 DBX 下传；"oci" 走 OCI（thick）驱动，其余走内置的 thin 驱动。
+	DriverProfile string `json:"driver_profile"`
+}
+
+// usesOCIProfile 判断本次连接是否选择了 OCI（thick）驱动。
+func usesOCIProfile(params connectParams) bool {
+	return strings.EqualFold(strings.TrimSpace(params.DriverProfile), "oci")
 }
 
 type completionAssistantRequest struct {
@@ -516,6 +526,7 @@ type triggerInfo struct {
 	Event     string  `json:"event"`
 	Timing    string  `json:"timing"`
 	Statement *string `json:"statement,omitempty"`
+	Enabled   *bool   `json:"enabled,omitempty"`
 }
 
 // constraintInfo represents primary key, unique, and check constraints for a
@@ -1068,6 +1079,9 @@ func oracleServerMajorVersionFromDBConn(ctx context.Context, db *sql.DB) (int, b
 }
 
 func oracleServerMajorVersionFromDriverConn(driverConn any) (int, bool) {
+	if guarded, ok := driverConn.(*oracleQueryConnection); ok {
+		driverConn = guarded.oracleThinConnection
+	}
 	conn, ok := driverConn.(*go_ora.Connection)
 	if !ok {
 		return 0, false
@@ -1256,6 +1270,11 @@ func openDB(params connectParams) (*sql.DB, error) {
 }
 
 func openDBWithStringConverter(params connectParams, stringConverter converters.IStringConverter) (*sql.DB, error) {
+	if usesOCIProfile(params) {
+		// OCI 由 Oracle 客户端负责字符集转换（NLS_LANG 在进程环境里生效），
+		// go-ora 的 string converter 机制不适用于它。
+		return openOCIDB(params)
+	}
 	dsn, err := buildDSNForConnect(params)
 	if err != nil {
 		return nil, err
@@ -1264,7 +1283,7 @@ func openDBWithStringConverter(params connectParams, stringConverter converters.
 	if stringConverter != nil {
 		go_ora.SetStringConverter(connector, stringConverter, nil)
 	}
-	db := sql.OpenDB(connector)
+	db := sql.OpenDB(oracleQueryConnector{connector})
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Minute)
@@ -1278,6 +1297,10 @@ func openAndPingDB(params connectParams, timeout time.Duration) (*sql.DB, error)
 	}
 	if err := pingDB(db, timeout); err != nil {
 		db.Close()
+		if usesOCIProfile(params) {
+			// OCI 的字符集由客户端决定，重试 go-ora 的转换器没有意义。
+			return nil, err
+		}
 		stringConverter, ok := oracleStringConverterForUnsupportedCharsetError(err)
 		if !ok {
 			return nil, err
@@ -1472,23 +1495,54 @@ var (
 func parseOracleJDBCURL(value string) jdbcURLInfo {
 	value = strings.TrimSpace(value)
 	lower := strings.ToLower(value)
-	if !strings.HasPrefix(lower, "jdbc:oracle:thin:@") {
+	prefix := ""
+	for _, candidate := range []string{"jdbc:oracle:thin:@", "jdbc:oracle:oci8:@", "jdbc:oracle:oci:@"} {
+		if strings.HasPrefix(lower, candidate) {
+			prefix = candidate
+			break
+		}
+	}
+	if prefix == "" {
 		return jdbcURLInfo{}
 	}
-	descriptor := strings.TrimSpace(value[len("jdbc:oracle:thin:@"):])
+	descriptor := strings.TrimSpace(value[len(prefix):])
 	if strings.HasPrefix(descriptor, "(") {
 		return jdbcURLInfo{Kind: "descriptor", Descriptor: descriptor}
 	}
-	if match := oracleJDBCServiceRegexp.FindStringSubmatch(value); len(match) == 4 {
+	if alias := oracleTnsAliasName(descriptor); alias != "" {
+		return jdbcURLInfo{Kind: "tns", Database: alias}
+	}
+	// 下面的正则按 thin 前缀书写，统一归一后再匹配，因此 oci8 与 thin 共用一套解析。
+	normalized := "jdbc:oracle:thin:@" + descriptor
+	if match := oracleJDBCServiceRegexp.FindStringSubmatch(normalized); len(match) == 4 {
 		return jdbcURLInfo{Kind: "service", Host: match[1], Port: parsePort(match[2]), Database: match[3]}
 	}
-	if match := oracleJDBCSIDRegexp.FindStringSubmatch(value); len(match) == 4 {
+	if match := oracleJDBCSIDRegexp.FindStringSubmatch(normalized); len(match) == 4 {
 		return jdbcURLInfo{Kind: "sid", Host: match[1], Port: parsePort(match[2]), Database: match[3]}
 	}
-	if match := oracleJDBCLegacyRegexp.FindStringSubmatch(value); len(match) == 4 {
+	if match := oracleJDBCLegacyRegexp.FindStringSubmatch(normalized); len(match) == 4 {
 		return jdbcURLInfo{Kind: "service", Host: match[1], Port: parsePort(match[2]), Database: match[3]}
 	}
 	return jdbcURLInfo{}
+}
+
+// oracleTnsAliasName 返回 `@` 之后、查询串之前的 TNS 别名；不是别名时返回空串。
+//
+// 判定与前端 parseOracleTnsConnectionString 保持一致：别名不含描述符括号、
+// 网络前缀（//）以及路径/端口分隔符（: / \）。
+func oracleTnsAliasName(value string) string {
+	alias := value
+	if index := strings.IndexByte(alias, '?'); index >= 0 {
+		alias = alias[:index]
+	}
+	alias = strings.TrimSpace(alias)
+	if alias == "" || strings.HasPrefix(alias, "(") || strings.HasPrefix(alias, "//") {
+		return ""
+	}
+	if strings.ContainsAny(alias, ":/\\") {
+		return ""
+	}
+	return alias
 }
 
 func parsePort(value string) int {
@@ -1648,12 +1702,23 @@ func oracleListSQLWithVisibleSchemas(baseSQL string, visibleSchemas []string) (s
 }
 
 func (s *server) currentSchema() (string, error) {
+	const sqlText = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL"
+	var schema string
+	// CURRENT_SCHEMA is per Oracle session. A manual transaction sets it only on
+	// its pinned connection and skips per-statement setSchema, so a pooled
+	// session would report the login user's schema and resolve unqualified
+	// tables against the wrong owner (#11258).
+	if s.manualTx != nil {
+		if err := s.manualTx.QueryRow(sqlText).Scan(&schema); err != nil {
+			return "", err
+		}
+		return strings.ToUpper(schema), nil
+	}
 	db, err := s.requireDB()
 	if err != nil {
 		return "", err
 	}
-	var schema string
-	if err := db.QueryRow("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL").Scan(&schema); err != nil {
+	if err := db.QueryRow(sqlText).Scan(&schema); err != nil {
 		return "", err
 	}
 	return strings.ToUpper(schema), nil
@@ -1943,7 +2008,7 @@ func completionRequestHasTableLikeKind(kinds []string) bool {
 func completionRequestHasRoutineKind(kinds []string) bool {
 	for _, kind := range kinds {
 		switch strings.ToLower(strings.TrimSpace(kind)) {
-		case "routine", "procedure", "function":
+		case "routine", "procedure", "function", "sequence":
 			return true
 		}
 	}
@@ -2389,13 +2454,54 @@ func oracleCompletionSynonymTargetsQuery(targets []oracleCompletionSynonymTarget
 	}
 }
 
+func oracleCompletionRoutineObjectTypes(kinds []string) []string {
+	if len(kinds) == 0 {
+		return []string{"'FUNCTION'", "'PROCEDURE'", "'PACKAGE'", "'SEQUENCE'"}
+	}
+	hasRoutine := false
+	hasProc := false
+	hasFunc := false
+	hasSeq := false
+	for _, kind := range kinds {
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "routine":
+			hasRoutine = true
+		case "procedure":
+			hasProc = true
+		case "function":
+			hasFunc = true
+		case "sequence":
+			hasSeq = true
+		}
+	}
+	types := make([]string, 0, 4)
+	if hasRoutine {
+		types = append(types, "'FUNCTION'", "'PROCEDURE'", "'PACKAGE'")
+	} else {
+		if hasProc {
+			types = append(types, "'PROCEDURE'")
+		}
+		if hasFunc {
+			types = append(types, "'FUNCTION'")
+		}
+	}
+	if hasSeq {
+		types = append(types, "'SEQUENCE'")
+	}
+	if len(types) == 0 {
+		return []string{"'FUNCTION'", "'PROCEDURE'", "'PACKAGE'"}
+	}
+	return types
+}
+
 func oracleCompletionRoutinesQuery(request completionAssistantRequest, preferredSchema string, limit int) oracleMetadataListQuery {
 	pattern := oracleCompletionLikePattern(request.Mask, request.MatchMode)
 	args := make([]any, 0, 5)
-	baseSQL := `
+	objectTypes := oracleCompletionRoutineObjectTypes(request.ObjectKinds)
+	baseSQL := fmt.Sprintf(`
 SELECT o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE, CAST(NULL AS VARCHAR2(128)) AS PARENT_NAME
 FROM ALL_OBJECTS o
-WHERE o.OBJECT_TYPE IN ('FUNCTION', 'PROCEDURE', 'PACKAGE')`
+WHERE o.OBJECT_TYPE IN (%s)`, strings.Join(objectTypes, ", "))
 	args = append(args, pattern)
 	nameParam := len(args)
 
@@ -2875,9 +2981,18 @@ func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
 	var result []triggerInfo
 	var currentName string
 	var currentDescription string
+	var currentStructured bool
 	var source strings.Builder
 	flush := func() {
 		if len(result) == 0 || currentName == "" {
+			return
+		}
+		if !currentStructured {
+			// Keep the declaration so callers can tell the source carries clauses the
+			// timing/event/body form cannot round-trip.
+			if body := strings.TrimSpace(strings.ReplaceAll(source.String(), "\r\n", "\n")); body != "" {
+				result[len(result)-1].Statement = &body
+			}
 			return
 		}
 		if body, ok := oracleTriggerBody(source.String(), currentDescription); ok {
@@ -2886,17 +3001,18 @@ func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
 	}
 	for rows.Next() {
 		var name, event, timing string
-		var description, lineText sql.NullString
+		var description, status, whenClause, referencingNames, lineText sql.NullString
 		var line sql.NullInt64
-		if err := rows.Scan(&name, &event, &timing, &description, &line, &lineText); err != nil {
+		if err := rows.Scan(&name, &event, &timing, &description, &status, &whenClause, &referencingNames, &line, &lineText); err != nil {
 			return nil, err
 		}
 		if name != currentName {
 			flush()
 			currentName = name
 			currentDescription = description.String
+			currentStructured = oracleTriggerIsStructured(description.String, whenClause.String, referencingNames.String)
 			source.Reset()
-			result = append(result, triggerInfo{Name: name, Event: event, Timing: timing})
+			result = append(result, triggerInfo{Name: name, Event: event, Timing: timing, Enabled: oracleTriggerEnabled(status)})
 		}
 		if line.Valid && lineText.Valid {
 			source.WriteString(lineText.String)
@@ -2904,6 +3020,33 @@ func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
 	}
 	flush()
 	return emptyIfNil(result), rows.Err()
+}
+
+var oracleTriggerUnstructuredClauseRegexp = regexp.MustCompile(`(?i)\b(?:FOLLOWS|PRECEDES|COMPOUND|CROSSEDITION)\b`)
+
+// oracleTriggerIsStructured reports whether a trigger is fully described by its timing, event and
+// PL/SQL body, so it can be rebuilt with CREATE OR REPLACE without dropping a WHEN condition,
+// custom REFERENCING names or FOLLOWS/PRECEDES ordering.
+func oracleTriggerIsStructured(description, whenClause, referencingNames string) bool {
+	if strings.TrimSpace(whenClause) != "" {
+		return false
+	}
+	if referencing := strings.Join(strings.Fields(strings.ToUpper(referencingNames)), " "); referencing != "" && referencing != "REFERENCING NEW AS NEW OLD AS OLD" {
+		return false
+	}
+	return !oracleTriggerUnstructuredClauseRegexp.MatchString(description)
+}
+
+func oracleTriggerEnabled(status sql.NullString) *bool {
+	switch strings.ToUpper(strings.TrimSpace(status.String)) {
+	case "ENABLED":
+		enabled := true
+		return &enabled
+	case "DISABLED":
+		enabled := false
+		return &enabled
+	}
+	return nil
 }
 
 func oracleTriggerBody(source, description string) (string, bool) {
@@ -3389,10 +3532,64 @@ func (s *server) buildViewDDL(schema, name string) (string, error) {
 	}
 	trimmed := strings.TrimSpace(source)
 	upperSource := strings.ToUpper(trimmed)
+	var ddl string
 	if strings.HasPrefix(upperSource, "CREATE ") || strings.HasPrefix(upperSource, "ALTER ") {
-		return trimmed, nil
+		ddl = trimmed
+	} else {
+		ddl = fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s", quoteIdentifier(schema), quoteIdentifier(name), trimmed)
 	}
-	return fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s", quoteIdentifier(schema), quoteIdentifier(name), trimmed), nil
+	return s.appendViewCommentDDLs(schema, name, ddl), nil
+}
+
+// appendViewCommentDDLs appends COMMENT ON TABLE/COLUMN statements for views.
+// Oracle stores view comments in ALL_TAB_COMMENTS / ALL_COL_COMMENTS the same way as tables.
+func (s *server) appendViewCommentDDLs(schema, name, viewDDL string) string {
+	comments, err := s.loadTableCommentDDLs(schema, name)
+	if err != nil || len(comments) == 0 {
+		return viewDDL
+	}
+	var builder strings.Builder
+	builder.WriteString(terminateOracleViewDDL(strings.TrimSpace(viewDDL)))
+	for _, comment := range comments {
+		appendOracleDDLFragment(&builder, comment)
+	}
+	return builder.String()
+}
+
+func terminateOracleViewDDL(ddl string) string {
+	var lastCode byte
+	trailingLineComment := false
+	for pos := 0; pos < len(ddl); pos++ {
+		if isSQLWhitespace(ddl[pos]) {
+			continue
+		}
+		if ddl[pos] == '-' && pos+1 < len(ddl) && ddl[pos+1] == '-' {
+			pos = skipLineCommentSQL(ddl, pos)
+			trailingLineComment = true
+			continue
+		}
+		if ddl[pos] == '/' && pos+1 < len(ddl) && ddl[pos+1] == '*' {
+			pos = skipBlockCommentSQL(ddl, pos)
+			trailingLineComment = false
+			continue
+		}
+		if end, ok := skipOracleAlternativeQuotedSQL(ddl, pos); ok {
+			pos = end
+		} else if ddl[pos] == '\'' {
+			pos = skipSingleQuotedSQL(ddl, pos)
+		} else if ddl[pos] == '"' {
+			pos = skipDoubleQuotedSQL(ddl, pos)
+		}
+		lastCode = ddl[pos]
+		trailingLineComment = false
+	}
+	if lastCode == ';' || lastCode == '/' {
+		return ddl
+	}
+	if trailingLineComment {
+		return ddl + "\n;"
+	}
+	return ddl + ";"
 }
 
 func (s *server) getViewSource(schema, name string) (string, error) {
@@ -3488,6 +3685,9 @@ func oracleColumnTypeDDL(column columnInfo) string {
 		return fmt.Sprintf("%s(%d)", dataType, *column.CharacterMaximumLength)
 	}
 	if dataType == "NUMBER" {
+		if column.NumericPrecision == nil && column.NumericScale != nil {
+			return fmt.Sprintf("NUMBER(*,%d)", *column.NumericScale)
+		}
 		if column.NumericPrecision != nil && *column.NumericPrecision > 0 {
 			if column.NumericScale != nil && *column.NumericScale != 0 {
 				return fmt.Sprintf("NUMBER(%d,%d)", *column.NumericPrecision, *column.NumericScale)
@@ -3496,7 +3696,7 @@ func oracleColumnTypeDDL(column columnInfo) string {
 		}
 		return "NUMBER"
 	}
-	if (dataType == "FLOAT" || dataType == "BINARY_FLOAT" || dataType == "BINARY_DOUBLE") &&
+	if dataType == "FLOAT" &&
 		column.NumericPrecision != nil && *column.NumericPrecision > 0 {
 		return fmt.Sprintf("%s(%d)", dataType, *column.NumericPrecision)
 	}
@@ -3570,7 +3770,13 @@ func (s *server) getExplainInfo(sqlText, database, schema string, timeoutSecs in
 	}
 
 	statementID := "DBX_" + strings.ToUpper(strconv.FormatInt(time.Now().UnixNano(), 36))
-	defer cleanupOracleExplainPlan(conn, statementID)
+	// EXPLAIN PLAN resolves its plan table in the session user's schema, while a bare
+	// PLAN_TABLE inside DBMS_XPLAN.DISPLAY resolves through CURRENT_SCHEMA - and the
+	// schema switch above changes CURRENT_SCHEMA. Name the table explicitly so the read
+	// and the cleanup hit the same object EXPLAIN PLAN wrote to, otherwise DISPLAY answers
+	// "cannot fetch plan for statement_id '...'".
+	planTable := oracleExplainPlanTableName(ctx, conn)
+	defer cleanupOracleExplainPlan(conn, statementID, planTable)
 	statementSQL := trimStatementSQL(sqlText)
 	explainArgs := oracleExplainPlanBindArgs(statementSQL)
 	if _, err := conn.ExecContext(ctx, "EXPLAIN PLAN SET STATEMENT_ID = '"+statementID+"' FOR "+statementSQL, explainArgs...); err != nil {
@@ -3578,7 +3784,7 @@ func (s *server) getExplainInfo(sqlText, database, schema string, timeoutSecs in
 	}
 	planRows, err := conn.QueryContext(
 		ctx,
-		"SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', :1, 'TYPICAL +PREDICATE'))",
+		"SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY('"+planTable+"', :1, 'TYPICAL +PREDICATE'))",
 		statementID,
 	)
 	if err != nil {
@@ -3608,10 +3814,40 @@ func oracleExplainTargetSchema(database, schema, configuredDatabase string) stri
 	return database
 }
 
-func cleanupOracleExplainPlan(conn *sql.Conn, statementID string) {
+// oracleExplainPlanTableName returns the explicitly qualified name of the plan table that
+// EXPLAIN PLAN resolves for this session: the session user's own object named PLAN_TABLE when
+// it exists, otherwise the table behind the PUBLIC synonym (usually SYS.PLAN_TABLE$). Falls
+// back to the bare name when neither can be resolved.
+func oracleExplainPlanTableName(ctx context.Context, conn *sql.Conn) string {
+	const probe = `SELECT
+		(SELECT OWNER FROM ALL_OBJECTS WHERE OWNER = USER AND OBJECT_NAME = 'PLAN_TABLE' AND ROWNUM = 1),
+		(SELECT OBJECT_NAME FROM ALL_OBJECTS WHERE OWNER = USER AND OBJECT_NAME = 'PLAN_TABLE' AND ROWNUM = 1),
+		(SELECT TABLE_OWNER FROM ALL_SYNONYMS WHERE OWNER = 'PUBLIC' AND SYNONYM_NAME = 'PLAN_TABLE' AND ROWNUM = 1),
+		(SELECT TABLE_NAME FROM ALL_SYNONYMS WHERE OWNER = 'PUBLIC' AND SYNONYM_NAME = 'PLAN_TABLE' AND ROWNUM = 1)
+	FROM DUAL`
+	var sessionOwner, sessionName, publicOwner, publicName sql.NullString
+	if err := conn.QueryRowContext(ctx, probe).Scan(&sessionOwner, &sessionName, &publicOwner, &publicName); err != nil {
+		return "PLAN_TABLE"
+	}
+	return oraclePlanTableName(sessionOwner.String, sessionName.String, publicOwner.String, publicName.String)
+}
+
+// oraclePlanTableName picks the qualified plan table name from the probe results, preferring
+// the session user's own PLAN_TABLE because that is what EXPLAIN PLAN writes to.
+func oraclePlanTableName(sessionOwner, sessionName, publicOwner, publicName string) string {
+	if strings.TrimSpace(sessionOwner) != "" && strings.TrimSpace(sessionName) != "" {
+		return quoteIdentifier(strings.TrimSpace(sessionOwner)) + "." + quoteIdentifier(strings.TrimSpace(sessionName))
+	}
+	if strings.TrimSpace(publicOwner) != "" && strings.TrimSpace(publicName) != "" {
+		return quoteIdentifier(strings.TrimSpace(publicOwner)) + "." + quoteIdentifier(strings.TrimSpace(publicName))
+	}
+	return "PLAN_TABLE"
+}
+
+func cleanupOracleExplainPlan(conn *sql.Conn, statementID, planTable string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _ = conn.ExecContext(ctx, "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = :1", statementID)
+	_, _ = conn.ExecContext(ctx, "DELETE FROM "+planTable+" WHERE STATEMENT_ID = :1", statementID)
 }
 
 type oracleBindParam struct {
@@ -3791,11 +4027,16 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 // projection so the remaining columns stay readable; panics on later pages
 // surface as errors instead.
 func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSize int, start time.Time) (queryPageResult, *querySession, error) {
+	// Until a cursor is handed to the caller, this function owns its rows,
+	// including panics while reading Columns/ColumnTypes before the first page.
+	var ownedRows *sql.Rows
+	defer func() { s.closeRows(ownedRows) }()
 	for attempt := 0; ; attempt++ {
 		rows, err := s.queryRowsWithOracleValueRewriteIfNeeded(sqlText, opts.TimeoutSecs, opts.DeferLOBs)
 		if err != nil {
 			return queryPageResult{}, nil, err
 		}
+		ownedRows = rows
 		columns, err := rows.Columns()
 		if err != nil {
 			s.closeRows(rows)
@@ -3812,7 +4053,7 @@ func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSiz
 		if err != nil {
 			s.closeRows(rows)
 			var panicErr oracleDriverPanicError
-			if attempt == 0 && errors.As(err, &panicErr) {
+			if attempt == 0 && !s.hasManualTransaction() && !oracleSQLLocksRows(sqlText) && errors.As(err, &panicErr) {
 				if placeholder, ok := oraclePlaceholderRetrySQL(sqlText, s.loadOracleColumnMeta); ok {
 					sqlText = placeholder
 					continue
@@ -3821,6 +4062,7 @@ func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSiz
 			return queryPageResult{}, nil, err
 		}
 		if result.HasMore {
+			ownedRows = nil
 			return result, session, nil
 		}
 		s.closeRows(rows)
@@ -4156,17 +4398,39 @@ func columnTypeNames(rows *sql.Rows) []string {
 	return result
 }
 
-func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeoutSecs int, deferLOBs bool) (*sql.Rows, error) {
+func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeoutSecs int, deferLOBs bool) (resultRows *sql.Rows, queryErr error) {
+	// A statement that keeps row locks while it runs is rewritten before the
+	// first attempt: when such a statement panics after the rows were locked,
+	// the locks stay behind and the retry below blocks on them until the query
+	// times out (issues #9344 / #9180).
+	if oracleSQLLocksRows(sqlText) {
+		rewritten, err := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, deferLOBs)
+		if err == nil && rewritten != sqlText {
+			return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+		}
+		return s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
+	}
 	if deferLOBs {
 		rewritten, err := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, true)
 		if err == nil && rewritten != sqlText {
-			return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+			rows, rewrittenErr := s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+			if rewrittenErr == nil {
+				return rows, nil
+			}
+			// A deferred projection can still read a value the driver cannot
+			// decode (user-defined object/collection columns). Only a panic is
+			// worth retrying through the value-rewrite fallback below; other
+			// failures keep their own error.
+			var panicErr oracleDriverPanicError
+			if s.hasManualTransaction() || !errors.As(rewrittenErr, &panicErr) {
+				return nil, rewrittenErr
+			}
 		}
 	}
 	rows, err := s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
 	if err != nil {
 		var panicErr oracleDriverPanicError
-		if errors.As(err, &panicErr) {
+		if !s.hasManualTransaction() && errors.As(err, &panicErr) {
 			rewritten, rewriteErr := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, false)
 			if rewriteErr == nil && rewritten != sqlText {
 				rewrittenRows, rewrittenErr := s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
@@ -4187,6 +4451,13 @@ func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeout
 		}
 		return nil, err
 	}
+	// Metadata access can panic too. Retain ownership until rows are actually
+	// returned; the caller cannot clean up rows it has not received.
+	defer func() {
+		if rows != resultRows {
+			s.closeRows(rows)
+		}
+	}()
 	typeNames := columnTypeNames(rows)
 	if !oracleColumnTypeNamesContainXMLType(typeNames) {
 		return rows, nil
@@ -4448,6 +4719,7 @@ func parseSingleOracleTableRef(fromSQL string) (oracleTableRef, bool) {
 		ref.Table = second.Name
 		pos = skipSQLWhitespace(fromSQL, afterSecond)
 	}
+	pos = parseOracleDatabaseLinkSuffix(fromSQL, pos)
 	if pos < len(fromSQL) {
 		if strings.HasPrefix(strings.TrimLeft(fromSQL[pos:], " \t\r\n"), ",") {
 			return oracleTableRef{}, false
@@ -4480,6 +4752,31 @@ func parseSingleOracleTableRef(fromSQL string) (oracleTableRef, bool) {
 		}
 	}
 	return ref, true
+}
+
+// parseOracleDatabaseLinkSuffix consumes the `@link` (or `@!link`) suffix of a
+// remote table reference so that the alias written after the link is still
+// recognized (issues #9171 / #9344). Without it `schema.table@link t` parsed as
+// an unaliased reference, so a `t.*` / `t.column` projection no longer matched
+// the table and go-ora panicked on the user-defined type columns the value
+// rewrite is meant to substitute.
+//
+// A suffix that cannot be read as a link name is left in place, which keeps the
+// previous shape for connect-string links and other unparsable spellings.
+func parseOracleDatabaseLinkSuffix(fromSQL string, pos int) int {
+	if pos >= len(fromSQL) || fromSQL[pos] != '@' {
+		return pos
+	}
+	linkStart := pos + 1
+	if linkStart < len(fromSQL) && fromSQL[linkStart] == '!' {
+		// `table@!link` keeps the same link name; the marker only changes where
+		// the link itself is resolved.
+		linkStart++
+	}
+	if _, afterLink, ok := readOracleIdentifierToken(fromSQL, linkStart); ok {
+		return skipSQLWhitespace(fromSQL, afterLink)
+	}
+	return pos
 }
 
 func splitOracleSelectListModifier(selectList string) (string, string) {
@@ -4535,6 +4832,8 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 					rewritten = append(rewritten, oracleGeometryExpression(column, columnRef, outputAlias))
 				} else if isOracleXMLType(column.DataType) && !deferLOBs {
 					rewritten = append(rewritten, oracleXMLSerializeExpression(columnRef, outputAlias))
+				} else if isOracleOpaqueObjectType(column) {
+					rewritten = append(rewritten, oracleOpaqueObjectExpression(column, columnRef, outputAlias))
 				} else if deferLOBs {
 					if expressions, ok := oracleDeferredLOBExpressions(columnRef, outputAlias, sourceIndex, column); ok {
 						rewritten = append(rewritten, expressions...)
@@ -4565,6 +4864,12 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 				}
 				if isOracleXMLType(meta.DataType) && !deferLOBs {
 					rewritten = append(rewritten, oracleXMLSerializeExpression(columnRef, outputAlias))
+					changed = true
+					sourceIndex++
+					continue
+				}
+				if isOracleOpaqueObjectType(meta) {
+					rewritten = append(rewritten, oracleOpaqueObjectExpression(meta, columnRef, outputAlias))
 					changed = true
 					sourceIndex++
 					continue
@@ -4620,6 +4925,41 @@ func oracleGeometryPlaceholder(column oracleColumnMeta) string {
 		return "<SDO_GEOMETRY>"
 	}
 	return "<ST_GEOMETRY>"
+}
+
+// oracleOpaqueObjectExpression projects a placeholder instead of the value of a
+// user-defined type (object, collection, ANYDATA, ...). go-ora cannot decode
+// those values over the wire and panics while scanning them, which fails the
+// whole statement and rolls the transaction back (issues #9344 / #9180). The
+// placeholder keeps the statement and the remaining columns readable.
+func oracleOpaqueObjectExpression(column oracleColumnMeta, columnRef, alias string) string {
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE '%s' END AS %s", columnRef, oracleOpaqueObjectPlaceholder(column), alias)
+}
+
+func oracleOpaqueObjectPlaceholder(column oracleColumnMeta) string {
+	name := strings.ToUpper(strings.TrimSpace(column.DataType))
+	if name == "" {
+		name = "OBJECT"
+	}
+	return "<" + name + ">"
+}
+
+// oracleSQLLocksRows reports whether a statement holds row locks while it runs
+// (FOR UPDATE, FOR UPDATE OF ..., NOWAIT / WAIT n / SKIP LOCKED). Such a
+// statement must not be retried after a driver panic: the failed attempt keeps
+// its locks, so the retry would block on them instead of returning.
+func oracleSQLLocksRows(sqlText string) bool {
+	for searchFrom := 0; searchFrom < len(sqlText); {
+		pos := findTopLevelSQLKeyword(sqlText, searchFrom, "for")
+		if pos < 0 {
+			return false
+		}
+		if sqlKeywordAt(sqlText, skipSQLWhitespace(sqlText, pos+len("for")), "update") {
+			return true
+		}
+		searchFrom = pos + len("for")
+	}
+	return false
 }
 
 func oracleDeferredLOBKind(dataType string) (kind, placeholder string, ok bool) {
@@ -4719,7 +5059,15 @@ func oracleQualifierMatchesTable(qualifier string, tableRef oracleTableRef) bool
 
 func oracleColumnsNeedValueRewrite(columns []oracleColumnMeta, deferLOBs bool) bool {
 	for _, column := range columns {
-		if isOracleGeometryType(column) || isOracleXMLType(column.DataType) || (deferLOBs && isOracleDeferredLOBType(column.DataType)) {
+		if isOracleGeometryType(column) || isOracleXMLType(column.DataType) {
+			return true
+		}
+		if deferLOBs && isOracleDeferredLOBType(column.DataType) {
+			return true
+		}
+		// Opaque user-defined types are substituted in both the plain and the
+		// deferred preview projection, so a preview never panics on them.
+		if isOracleOpaqueObjectType(column) {
 			return true
 		}
 	}
@@ -4766,6 +5114,18 @@ func isOracleSDOGeometry(column oracleColumnMeta) bool {
 
 func isOracleGeometryType(column oracleColumnMeta) bool {
 	return isOracleSTGeometry(column) || isOracleSDOGeometry(column)
+}
+
+// isOracleOpaqueObjectType reports whether a column's declared type is a named
+// user-defined type that the driver cannot decode. Built-in scalar types report
+// no DATA_TYPE_OWNER; named types (object, collection, ANYDATA, ...) do. Types
+// DBX is able to render — SDE/SDO geometry, XMLType and deferred LOBs — are
+// matched earlier, so they are never treated as opaque here.
+func isOracleOpaqueObjectType(column oracleColumnMeta) bool {
+	if isOracleGeometryType(column) || isOracleXMLType(column.DataType) || isOracleDeferredLOBType(column.DataType) {
+		return false
+	}
+	return strings.TrimSpace(column.DataTypeOwner) != ""
 }
 
 func leadingSQLSelectListStart(sqlText string) int {

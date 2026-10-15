@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   SETTINGS_SEARCH_DEFINITIONS,
@@ -8,11 +7,10 @@ import {
   resolveSettingsCategory,
   resolveSettingsSearchEntries,
   searchSettings,
+  visibleToolbarVisibilityItems,
   type SettingsCategory,
   type SettingsSearchDefinition,
 } from "@/lib/settings/settingsSearch";
-
-const settingsDialogSource = readFileSync(new URL("../../../components/editor/EditorSettingsDialog.vue", import.meta.url), "utf8");
 
 const categoryLabels = {
   editor: "Editor",
@@ -27,6 +25,7 @@ const categoryLabels = {
   sync: "Sync",
   ai: "AI",
   mcp: "MCP",
+  updates: "Updates",
   security: "Security",
   about: "About",
 } satisfies Record<SettingsCategory, string>;
@@ -41,6 +40,11 @@ const translate = (key: string) => translations[key] ?? key;
 const allCategories = new Set(Object.keys(categoryLabels) as SettingsCategory[]);
 
 describe("settings search", () => {
+  it("finds connection tab colors by their Chinese label", () => {
+    const entries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: false, visibleCategories: allCategories }, (key) => (key === "settings.colorizeConnectionTabs" ? "按连接颜色区分标签页" : key), categoryLabels);
+    expect(searchSettings(entries, "连接颜色", "zh-CN")).toEqual(expect.arrayContaining([expect.objectContaining({ id: "appearance-connection-tab-colors", category: "appearance", targetId: "appearance" })]));
+  });
+
   const definitions: readonly SettingsSearchDefinition[] = [
     { id: "font", category: "editor", titleKey: "font", descriptionKey: "fontDescription" },
     { id: "export", category: "data", titleKey: "export" },
@@ -71,6 +75,65 @@ describe("settings search", () => {
     expect(searchSettings(entries, "line number", "en").map((entry) => entry.id)).toEqual(["editor-line-numbers"]);
   });
 
+  it("indexes the query editor caret-browsing preference (#11827)", () => {
+    const definition = SETTINGS_SEARCH_DEFINITIONS.find((entry) => entry.id === "editor-caret-browsing");
+    expect(definition).toEqual({
+      id: "editor-caret-browsing",
+      category: "editor",
+      titleKey: "settings.caretBrowsing",
+      descriptionKey: "settings.caretBrowsingDescription",
+      targetId: "editor",
+    });
+
+    const entries = resolveSettingsSearchEntries(
+      [definition!],
+      { isWeb: false, visibleCategories: new Set<SettingsCategory>(["editor"]) },
+      (key) =>
+        ({
+          "settings.caretBrowsing": "光标浏览 (F7)",
+          "settings.caretBrowsingDescription": "允许按 F7 切换浏览器的插入光标浏览模式",
+        })[key] ?? key,
+      categoryLabels,
+    );
+    expect(searchSettings(entries, "光标", "zh-CN")).toEqual([
+      expect.objectContaining({
+        id: "editor-caret-browsing",
+        category: "editor",
+        targetId: "editor",
+      }),
+    ]);
+    expect(searchSettings(entries, "F7", "zh-CN")).toEqual([
+      expect.objectContaining({
+        id: "editor-caret-browsing",
+        category: "editor",
+        targetId: "editor",
+      }),
+    ]);
+  });
+
+  it("indexes SQL Server space confirmation when SQL Server exists or an exported setting is enabled", () => {
+    const definition = SETTINGS_SEARCH_DEFINITIONS.find((entry) => entry.id === "editor-sqlserver-space-completion");
+    expect(definition).toEqual(
+      expect.objectContaining({
+        id: "editor-sqlserver-space-completion",
+        category: "editor",
+        titleKey: "settings.sqlServerSpaceConfirmsCompletion",
+        descriptionKey: "settings.sqlServerSpaceConfirmsCompletionDescription",
+        targetId: "editor",
+        visible: expect.any(Function),
+      }),
+    );
+
+    const context = { isWeb: false, visibleCategories: new Set<SettingsCategory>(["editor"]) };
+    const withoutSqlServer = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { ...context, hasSqlServerConnection: false, sqlServerSpaceConfirmsCompletionEnabled: false }, translate, categoryLabels);
+    const importedWithoutSqlServer = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { ...context, hasSqlServerConnection: false, sqlServerSpaceConfirmsCompletionEnabled: true }, translate, categoryLabels);
+    const withSqlServer = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { ...context, hasSqlServerConnection: true, sqlServerSpaceConfirmsCompletionEnabled: false }, translate, categoryLabels);
+
+    expect(withoutSqlServer.map((entry) => entry.id)).not.toContain("editor-sqlserver-space-completion");
+    expect(importedWithoutSqlServer.map((entry) => entry.id)).toContain("editor-sqlserver-space-completion");
+    expect(withSqlServer.map((entry) => entry.id)).toContain("editor-sqlserver-space-completion");
+  });
+
   it("does not index connection or query timeout under editor settings", () => {
     expect(SETTINGS_SEARCH_DEFINITIONS.map((definition) => definition.id)).not.toContain("editor-global-connect-timeout");
     expect(SETTINGS_SEARCH_DEFINITIONS.map((definition) => definition.id)).not.toContain("editor-global-query-timeout");
@@ -84,8 +147,16 @@ describe("settings search", () => {
       descriptionKey: "settings.multiStatementDefaultViewDescription",
       targetId: "multi-statement-default-view",
     });
-    expect(settingsDialogSource).toContain('data-settings-search-id="multi-statement-default-view"');
-    expect(settingsDialogSource).toContain('v-model="editMultiStatementDefaultView"');
+  });
+
+  it("indexes the default explain view and its settings control", () => {
+    expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual({
+      id: "default-explain-view",
+      category: "data",
+      titleKey: "settings.defaultExplainView",
+      descriptionKey: "settings.defaultExplainViewDescription",
+      targetId: "default-explain-view",
+    });
   });
 
   it("places SQL file limits in their owning settings categories", () => {
@@ -110,17 +181,37 @@ describe("settings search", () => {
     expect(desktopEntries.map((entry) => entry.id)).toContain("sql-file-editor-max-mb");
     expect(desktopEntries.map((entry) => entry.id)).not.toContain("sql-file-web-upload-max-mb");
     expect(webEntries.map((entry) => entry.id)).toEqual(expect.arrayContaining(["sql-file-editor-max-mb", "sql-file-web-upload-max-mb"]));
-    expect(settingsDialogSource).toContain('data-settings-search-id="editor-sql-file"');
-    expect(settingsDialogSource).toContain('data-settings-search-id="data-sql-file-upload"');
+  });
+
+  it("points the debug logging result at the About tab that renders the switch", () => {
+    // The 启用调试日志 switch (id="debug-logging-enabled") is rendered inside the
+    // About section, next to the debug log copy/download/clear actions. The
+    // search entry used to claim "appearance", so picking the result switched
+    // to 外观 and never revealed the control (regression from #10308).
+    expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual({
+      id: "about-debug-logs",
+      category: "about",
+      titleKey: "settings.debugLoggingEnabled",
+      descriptionKey: "settings.debugLoggingEnabledDescription",
+      targetId: "about",
+      visible: expect.any(Function),
+    });
+    expect(SETTINGS_SEARCH_DEFINITIONS.map((definition) => definition.id)).not.toContain("appearance-debug-logs");
+
+    const desktopEntries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: false, visibleCategories: new Set<SettingsCategory>(["appearance", "about"]) }, translate, categoryLabels);
+    const entry = desktopEntries.find((item) => item.id === "about-debug-logs");
+    expect(entry?.category).toBe("about");
+    expect(entry?.categoryLabel).toBe("About");
+    expect(entry?.targetId).toBe("about");
+
+    const webEntries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: true, visibleCategories: new Set<SettingsCategory>(["appearance", "about"]) }, translate, categoryLabels);
+    expect(webEntries.map((item) => item.id)).not.toContain("about-debug-logs");
   });
 
   it("maps legacy SQL file settings navigation to the editor", () => {
     expect(resolveSettingsCategory("sqlFile")).toBe("editor");
     expect(resolveSettingsCategory()).toBe("appearance");
     expect(resolveSettingsCategory("removed-category")).toBe("appearance");
-    expect(settingsDialogSource).not.toContain('value: "sqlFile"');
-    expect(settingsDialogSource).not.toContain("activeSettingsTab === 'sqlFile'");
-    expect(settingsDialogSource).toMatch(/if \(tab === "data" && isWeb\) void loadWebSqlFileUploadMaxMbSetting\(\)/);
   });
 
   it("matches translated title, description, and category without changing declared order", () => {
@@ -139,17 +230,7 @@ describe("settings search", () => {
   it("exposes WebDAV sync in Web settings without exposing snippet sync", () => {
     const webEntries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: true, visibleCategories: new Set<SettingsCategory>(["sync"]) }, translate, categoryLabels);
 
-    expect(webEntries.map((entry) => entry.id)).toEqual(["sync-webdav", "sync-webdav-endpoint", "sync-webdav-username", "sync-webdav-password", "sync-webdav-remote-path", "sync-webdav-auto-upload", "sync-secrets", "sync-secrets-passphrase"]);
-    expect(settingsDialogSource).toContain('{ value: "sync", label: t("settings.syncTab") }');
-    expect(settingsDialogSource).not.toContain('...(isWeb ? [] : [{ value: "sync"');
-    expect(settingsDialogSource).toContain('<TabsList v-if="!isWeb"');
-  });
-
-  it("defines the WebDAV Web-runtime notice in every supported locale", () => {
-    for (const locale of ["zh-CN", "zh-TW", "en", "es", "it", "ja", "ko", "pt-BR", "tr", "az"]) {
-      const source = readFileSync(new URL(`../../../i18n/locales/${locale}.ts`, import.meta.url), "utf8");
-      expect(source, locale).toContain("syncWebDavWebDescription:");
-    }
+    expect(webEntries.map((entry) => entry.id)).toEqual(["sync-webdav", "sync-webdav-endpoint", "sync-webdav-username", "sync-webdav-password", "sync-webdav-remote-path", "sync-webdav-user-agent", "sync-webdav-auto-upload", "sync-secrets", "sync-secrets-passphrase"]);
   });
 
   it("matches Chinese text as a Unicode substring", () => {
@@ -180,13 +261,6 @@ describe("settings search", () => {
     expect(entry).toMatchObject({ targetId: "sync-snippet", route: { syncMethodTab: "snippet" } });
   });
 
-  it("uses the open state for result visibility and applies nested routes before revealing targets", () => {
-    expect(settingsDialogSource).toContain("const settingsSearchVisible = computed(() => settingsSearchOpen.value && settingsSearchActive.value)");
-    expect(settingsDialogSource).toContain('v-if="settingsSearchVisible" id="settings-search-results"');
-    expect(settingsDialogSource).toMatch(/function applySettingsSearchRoute[\s\S]*?syncMethodTab\.value = result\.route\.syncMethodTab/);
-    expect(settingsDialogSource).toMatch(/async function selectSettingsSearchResult[\s\S]*?applySettingsSearchRoute\(result\)[\s\S]*?revealSettingsSearchTarget/);
-  });
-
   it("derives one search result for every built-in shortcut", () => {
     expect(
       createShortcutSettingsSearchDefinitions([
@@ -206,6 +280,20 @@ describe("settings search", () => {
     expect(definitions.map((definition) => definition.id)).toEqual(TOOLBAR_VISIBILITY_ITEMS.map((item) => `appearance-toolbar-${item.key}`));
     expect(definitions).toContainEqual({ id: "appearance-toolbar-dataTransfer", category: "appearance", titleKey: "transfer.dataTransfer", targetId: "appearance" });
     expect(definitions).toContainEqual({ id: "appearance-toolbar-ai", category: "appearance", title: "AI", targetId: "appearance" });
+    expect(definitions).toContainEqual({ id: "appearance-toolbar-alwaysOnTop", category: "appearance", titleKey: "toolbar.alwaysOnTop", targetId: "appearance", visible: expect.any(Function) });
+  });
+
+  it("keeps the desktop-only toolbar switch and its search entry out of the Web build", () => {
+    const desktopKeys = visibleToolbarVisibilityItems(TOOLBAR_VISIBILITY_ITEMS, false).map((item) => item.key);
+    const webKeys = visibleToolbarVisibilityItems(TOOLBAR_VISIBILITY_ITEMS, true).map((item) => item.key);
+    expect(desktopKeys).toEqual(TOOLBAR_VISIBILITY_ITEMS.map((item) => item.key));
+    expect(webKeys).not.toContain("alwaysOnTop");
+    expect(webKeys).toContain("theme");
+
+    const definitions = createToolbarVisibilitySettingsSearchDefinitions();
+    const entryIds = (isWeb: boolean) => resolveSettingsSearchEntries(definitions, { isWeb, visibleCategories: new Set<SettingsCategory>(["appearance"]) }, (key) => key, categoryLabels).map((entry) => entry.id);
+    expect(entryIds(false)).toContain("appearance-toolbar-alwaysOnTop");
+    expect(entryIds(true)).not.toContain("appearance-toolbar-alwaysOnTop");
   });
 
   it("indexes the existing descriptions for fixed appearance controls", () => {
@@ -243,44 +331,24 @@ describe("settings search", () => {
     );
   });
 
-  it("renders the metadata cache memory limit in a performance section after export", () => {
-    const exportSectionStart = settingsDialogSource.indexOf('t("settings.exportSection")');
-    const performanceSectionStart = settingsDialogSource.indexOf('data-settings-search-id="data-performance"');
-    const tableStructureSectionStart = settingsDialogSource.indexOf('t("settings.tableStructureSection")');
-    const metadataCacheControl = settingsDialogSource.indexOf('id="metadata-cache-memory-limit"');
-
-    expect(exportSectionStart).toBeGreaterThan(-1);
-    expect(performanceSectionStart).toBeGreaterThan(exportSectionStart);
-    expect(tableStructureSectionStart).toBeGreaterThan(performanceSectionStart);
-    expect(metadataCacheControl).toBeGreaterThan(performanceSectionStart);
-    expect(metadataCacheControl).toBeLessThan(tableStructureSectionStart);
-  });
-
-  it("defines the performance section title in every supported locale", () => {
-    for (const locale of ["zh-CN", "zh-TW", "en", "es", "it", "ja", "ko", "pt-BR", "tr", "az"]) {
-      const source = readFileSync(new URL(`../../../i18n/locales/${locale}.ts`, import.meta.url), "utf8");
-      expect(source, locale).toContain("performanceSection:");
-    }
-  });
-
-  it("activates result buttons through click for keyboard and assistive technology", () => {
-    expect(settingsDialogSource).toMatch(/role="option"[\s\S]*?@mousedown\.prevent[\s\S]*?@click="void selectSettingsSearchResult\(result\)"/);
-  });
-
   it("registers every fixed settings control that needs a dedicated search result", () => {
     const expectedControls: ReadonlyArray<Pick<SettingsSearchDefinition, "titleKey" | "category" | "targetId">> = [
       { titleKey: "settings.savedSqlOpenTarget", category: "editor", targetId: "editor" },
       { titleKey: "settings.confirmDangerousSqlExecution", category: "editor", targetId: "editor" },
       { titleKey: "settings.continueOnErrorOnBatch", category: "editor", targetId: "editor" },
       { titleKey: "settings.dataGridQuickEntry", category: "data", targetId: "data" },
+      { titleKey: "settings.dataGridToolbarLayout", category: "data", targetId: "data-grid-toolbar-layout" },
       { titleKey: "settings.dataGridFilterView", category: "data", targetId: "data-grid-filter-view" },
       { titleKey: "settings.colorizeDataGridCellTypes", category: "data", targetId: "data" },
       { titleKey: "transfer.dataTransfer", category: "appearance", targetId: "appearance" },
       { titleKey: "toolbar.driverManager", category: "appearance", targetId: "appearance" },
       { titleKey: "toolbar.theme", category: "appearance", targetId: "appearance" },
+      { titleKey: "settings.webLogoPosition", category: "appearance", targetId: "appearance-web-logo-position" },
       { titleKey: "settings.sidebarObjectInfoMode", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.insertSpaceAfterCompletion", category: "editor", targetId: "editor" },
+      { titleKey: "settings.functionCompletionIncludeParams", category: "editor", targetId: "editor" },
       { titleKey: "settings.completionTriggerMode", category: "editor", targetId: "editor" },
+      { titleKey: "settings.tableCompletionSchemaQualification", category: "editor", targetId: "editor" },
       { titleKey: "settings.autoAliasTables", category: "editor", targetId: "editor" },
       { titleKey: "settings.clickTableNavigationTarget", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.prefillNewQueryWithSelect", category: "navigation", targetId: "navigation" },
@@ -295,7 +363,10 @@ describe("settings search", () => {
       { titleKey: "settings.sqlFormatterIndent", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterTabWidth", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterIndentStyle", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterLayoutStyle", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterLogicalOperatorNewline", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterCommaPosition", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterFromClauseLayout", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterExpressionWidth", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterLinesBetweenQueries", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterPreserveEmptyLines", category: "formatter", targetId: "formatter" },

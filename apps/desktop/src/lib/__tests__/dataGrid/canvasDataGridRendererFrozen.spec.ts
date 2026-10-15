@@ -146,6 +146,28 @@ describe("drawCanvasDataGrid with frozen columns", () => {
     expect(resolveCanvasBackingStoreMetrics({ width: 801, height: 399, pixelRatio: 5 })).toEqual({ pixelWidth: 3204, pixelHeight: 1596, scaleX: 4, scaleY: 4, measured: false });
   });
 
+  it("reports a completed draw only after obtaining a Canvas context", () => {
+    const canvas = createMockCanvas();
+    const options = createBaseOptions({ canvas, rowCount: 0, rowAt: () => undefined });
+    const fillRect = vi.fn();
+    vi.spyOn(canvas, "getContext")
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(
+        new Proxy(
+          {},
+          {
+            get: (_target, key) => (key === "fillRect" ? fillRect : key === "measureText" ? () => ({ width: 0 }) : () => {}),
+            set: () => true,
+          },
+        ) as unknown as CanvasRenderingContext2D,
+      );
+
+    expect(drawCanvasDataGrid(options)).toBe(false);
+    expect(fillRect).not.toHaveBeenCalled();
+    expect(drawCanvasDataGrid(options)).toBe(true);
+    expect(fillRect).toHaveBeenCalled();
+  });
+
   it("draws without errors when frozenColumnCount is 0", () => {
     const canvas = createMockCanvas();
     const options = createBaseOptions({ canvas, frozenColumnCount: 0 });
@@ -214,5 +236,58 @@ describe("drawCanvasDataGrid with frozen columns", () => {
       rowAt: (index: number) => (index === 0 ? createMockRow(0, 0, ["val"]) : undefined),
     });
     expect(() => drawCanvasDataGrid(options)).not.toThrow();
+  });
+
+  it("draws with zebraStriping enabled and disabled", () => {
+    const canvas = createMockCanvas();
+    const optionsWithZebra = createBaseOptions({
+      canvas,
+      zebraStriping: true,
+    });
+    expect(() => drawCanvasDataGrid(optionsWithZebra)).not.toThrow();
+
+    const optionsWithoutZebra = createBaseOptions({
+      canvas,
+      zebraStriping: false,
+    });
+    expect(() => drawCanvasDataGrid(optionsWithoutZebra)).not.toThrow();
+
+    const optionsWithCustomZebraColor = createBaseOptions({
+      canvas,
+      zebraStriping: true,
+      zebraRowBg: "#334455",
+    });
+    expect(() => drawCanvasDataGrid(optionsWithCustomZebraColor)).not.toThrow();
+  });
+
+  it("draws with duplicate and null highlight keys without error", () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 800;
+    canvas.height = 600;
+    const dupKeys = new Set<number>([0, 1]);
+    const nullKeys = new Set<number>([2]);
+
+    const options = createBaseOptions({
+      canvas,
+      duplicateHighlightKeys: dupKeys,
+      nullHighlightKeys: nullKeys,
+    });
+    expect(() => drawCanvasDataGrid(options)).not.toThrow();
+  });
+
+  it("draws with custom crosshair row and column colors", () => {
+    const canvas = createMockCanvas();
+    const optionsWithCustomCrosshairColors = createBaseOptions({
+      canvas,
+      crosshair: {
+        rowIndex: 0,
+        visibleColIdx: 0,
+        rowCrosshair: true,
+        columnCrosshair: true,
+      },
+      crosshairRowBg: "#aec3e0",
+      crosshairColBg: "#8eaad2",
+    });
+    expect(() => drawCanvasDataGrid(optionsWithCustomCrosshairColors)).not.toThrow();
   });
 });

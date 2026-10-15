@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Loader2 } from "@lucide/vue";
+import { Check, ChevronLeft, ChevronRight, ChevronsDown, ChevronsLeft, ChevronsRight, Loader2 } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
@@ -17,9 +17,15 @@ const props = withDefaults(
     selectionSummary: { cellCount: number; rowCount: number } | null;
     selectionSummarySumText: string;
     selectionSummaryAverageText: string;
+    // 拖拽选区期间聚合值只是占位符，父组件把该状态传下来，值不可复制
+    selectionSummaryPending?: boolean;
     loading: boolean;
     infiniteScrollEnabled: boolean;
     infiniteScrollAllLoaded: boolean;
+    loadAllRowsActive: boolean;
+    loadAllRowsEnabled: boolean;
+    canLoadAllRows: boolean;
+    canExport?: boolean;
     pageSize: number;
     defaultPageSize: number;
     pageSizeMenuItems: LightDropdownItem[];
@@ -29,7 +35,7 @@ const props = withDefaults(
     canGoNextPage: boolean;
     canJumpLastPage: boolean;
   }>(),
-  { paginationEnabled: true },
+  { paginationEnabled: true, loadAllRowsActive: false, loadAllRowsEnabled: true, canLoadAllRows: false, canExport: true, selectionSummaryPending: false },
 );
 
 const customPageSizeInput = defineModel<string>("customPageSizeInput", { default: "" });
@@ -49,9 +55,20 @@ const emit = defineEmits<{
   nextPage: [];
   jumpPage: [page: number];
   lastPage: [];
+  loadAllRows: [];
   selectExport: [value: string];
   applyCustomPageSizeAndSetDefault: [];
+  // 载荷是聚合值当前显示出来的文本，保证复制到的就是用户看到的那个数
+  copySelectionSummary: [text: string];
 }>();
+
+// 拖拽选区中聚合值显示为占位符 "…"，此时不给复制入口，避免复制出一个假值
+const selectionSummaryValueClass = computed(() => (props.selectionSummaryPending ? "" : "cursor-pointer transition-colors hover:text-foreground"));
+
+function copySelectionSummaryValue(text: string) {
+  if (props.selectionSummaryPending) return;
+  emit("copySelectionSummary", text);
+}
 
 watch(
   () => props.currentPage,
@@ -88,18 +105,22 @@ function handlePageInputKeydown(event: KeyboardEvent) {
 <template>
   <div class="flex min-w-max items-center justify-end gap-1">
     <div v-if="selectionSummary" class="flex shrink-0 items-center gap-3 tabular-nums">
-      <span class="shrink-0">{{ t("grid.selectionSum", { value: selectionSummarySumText }) }}</span>
-      <span class="shrink-0">{{ t("grid.selectionAverage", { value: selectionSummaryAverageText }) }}</span>
+      <button type="button" class="shrink-0 text-left" :class="selectionSummaryValueClass" :title="selectionSummaryPending ? undefined : t('grid.copyValue')" :disabled="selectionSummaryPending" data-selection-summary-sum @click="copySelectionSummaryValue(selectionSummarySumText)">
+        <span v-if="!selectionSummaryPending" class="sr-only">{{ t("grid.copyValue") }}: </span>{{ t("grid.selectionSum", { value: selectionSummarySumText }) }}
+      </button>
+      <button type="button" class="shrink-0 text-left" :class="selectionSummaryValueClass" :title="selectionSummaryPending ? undefined : t('grid.copyValue')" :disabled="selectionSummaryPending" data-selection-summary-average @click="copySelectionSummaryValue(selectionSummaryAverageText)">
+        <span v-if="!selectionSummaryPending" class="sr-only">{{ t("grid.copyValue") }}: </span>{{ t("grid.selectionAverage", { value: selectionSummaryAverageText }) }}
+      </button>
       <div class="flex shrink-0 items-center gap-1">
         <span class="shrink-0">{{ t("grid.selectionCells", { count: selectionSummary.cellCount }) }}</span>
         <span class="shrink-0">{{ t("grid.rows", { count: selectionSummary.rowCount }) }}</span>
       </div>
     </div>
     <Loader2 class="w-3 h-3 text-muted-foreground" :class="loading ? 'animate-spin' : 'invisible'" aria-hidden="true" />
-    <template v-if="paginationEnabled && infiniteScrollEnabled">
+    <template v-if="paginationEnabled && (infiniteScrollEnabled || loadAllRowsActive)">
       <span v-if="infiniteScrollAllLoaded" class="text-xs text-muted-foreground shrink-0">{{ t("grid.allLoaded") }}</span>
     </template>
-    <template v-if="paginationEnabled && !infiniteScrollEnabled">
+    <template v-if="paginationEnabled && !infiniteScrollEnabled && !loadAllRowsActive">
       <LightDropdown
         :model-value="String(pageSize)"
         :items="pageSizeMenuItems"
@@ -152,6 +173,14 @@ function handlePageInputKeydown(event: KeyboardEvent) {
       <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="loading || !canGoNextPage" @click="emit('nextPage')"><ChevronRight class="h-3 w-3" /></Button>
       <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="loading || !canJumpLastPage" @click="emit('lastPage')"><ChevronsRight class="h-3 w-3" /></Button>
     </template>
-    <DataGridExportMenu :items="exportMenuItems" :label="t('grid.export')" :on-select="(value) => emit('selectExport', value)" />
+    <Tooltip v-if="paginationEnabled && loadAllRowsEnabled">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="loading || !canLoadAllRows" :aria-label="t('grid.loadAllAndGoToLastRow')" @click="emit('loadAllRows')">
+          <ChevronsDown class="h-3 w-3" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{{ t("grid.loadAllAndGoToLastRow") }}</TooltipContent>
+    </Tooltip>
+    <DataGridExportMenu v-if="canExport" :items="exportMenuItems" :label="t('grid.export')" :on-select="(value) => emit('selectExport', value)" />
   </div>
 </template>

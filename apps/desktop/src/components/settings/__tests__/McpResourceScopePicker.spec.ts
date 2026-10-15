@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dispatch, findOne, mountComponent } from "@/components/grid/__tests__/vueHostHarness";
+import { dispatch, findAll, findOne, hostText, mountComponent } from "@/components/grid/__tests__/vueHostHarness";
 import type { ConnectionConfig, SidebarLayout } from "@/types/database";
 
 vi.mock("vue-i18n", () => ({
@@ -19,6 +19,16 @@ vi.mock("@lucide/vue", async () => {
 vi.mock("@/components/ui/badge", async () => ({ Badge: (await import("@/components/grid/__tests__/vueHostHarness")).createPassthroughStub("Badge", "span") }));
 vi.mock("@/components/ui/button", async () => ({ Button: (await import("@/components/grid/__tests__/vueHostHarness")).createPassthroughStub("Button", "button") }));
 vi.mock("@/components/ui/input", async () => ({ Input: (await import("@/components/grid/__tests__/vueHostHarness")).createPassthroughStub("Input", "input") }));
+vi.mock("@/components/ui/select", async () => {
+  const { createPassthroughStub } = await import("@/components/grid/__tests__/vueHostHarness");
+  return {
+    Select: createPassthroughStub("Select", "div"),
+    SelectContent: createPassthroughStub("SelectContent", "div"),
+    SelectItem: createPassthroughStub("SelectItem", "div"),
+    SelectTrigger: createPassthroughStub("SelectTrigger", "button"),
+    SelectValue: createPassthroughStub("SelectValue", "span"),
+  };
+});
 
 import McpResourceScopePicker from "@/components/settings/McpResourceScopePicker.vue";
 
@@ -32,6 +42,12 @@ function connection(id: string): ConnectionConfig {
     username: "test",
     password: "",
   };
+}
+
+const DML_LABEL = "settings.mcpConnectionPolicyAllowSalesforceDml";
+
+function salesforceDmlCheckboxes(root: ReturnType<typeof mountComponent>["root"]) {
+  return findAll(root, (node) => node.type === "input" && node.props["aria-label"] === DML_LABEL);
 }
 
 const layout: SidebarLayout = {
@@ -157,5 +173,183 @@ describe("McpResourceScopePicker", () => {
     dispatch(modeButton(mounted.root, "all"), "click");
 
     expect(update).not.toHaveBeenCalled();
+  });
+});
+
+describe("McpResourceScopePicker Salesforce DML opt-in", () => {
+  const sfdc = { ...connection("c2"), db_type: "salesforce" } as unknown as ConnectionConfig;
+
+  function mountWithSalesforce(props: Record<string, unknown> = {}) {
+    const setDml = vi.fn();
+    const mounted = mountComponent(McpResourceScopePicker, {
+      layout,
+      connections: [connection("c1"), sfdc],
+      allowedGroupIds: [],
+      allowedConnectionIds: ["c1", "c2"],
+      "onSet:connection-salesforce-dml": setDml,
+      ...props,
+    });
+    return { mounted, setDml };
+  }
+
+  it("offers the write opt-in only on Salesforce connections", () => {
+    const { mounted } = mountWithSalesforce();
+
+    const checkboxes = salesforceDmlCheckboxes(mounted.root);
+    expect(checkboxes).toHaveLength(1);
+    expect(checkboxes[0].props.checked).toBe(false);
+  });
+
+  it("hides the opt-in until the connection is inside the exposed scope", async () => {
+    const { mounted } = mountWithSalesforce({ allowedConnectionIds: ["c1"] });
+    expect(salesforceDmlCheckboxes(mounted.root)).toHaveLength(0);
+
+    await mounted.setProps({ allowedConnectionIds: ["c1", "c2"] });
+    expect(salesforceDmlCheckboxes(mounted.root)).toHaveLength(1);
+  });
+
+  it("emits the connection id and the requested state", () => {
+    const { mounted, setDml } = mountWithSalesforce();
+
+    dispatch(salesforceDmlCheckboxes(mounted.root)[0], "change", { target: { checked: true } });
+
+    expect(setDml).toHaveBeenCalledWith("c2", true);
+  });
+
+  it("shows a persisted opt-in as checked and a read-only rule as off", () => {
+    const optedIn = mountWithSalesforce({
+      connectionPolicies: [{ connectionId: "c2", readOnly: false, allowDangerousSql: false, allowSalesforceDml: true }],
+    });
+    expect(salesforceDmlCheckboxes(optedIn.mounted.root)[0].props.checked).toBe(true);
+
+    // Read-only is a hard ceiling server-side, so the switch must not look enabled here.
+    const readOnly = mountWithSalesforce({
+      connectionPolicies: [{ connectionId: "c2", readOnly: true, allowDangerousSql: false, allowSalesforceDml: true }],
+    });
+    expect(salesforceDmlCheckboxes(readOnly.mounted.root)[0].props.checked).toBe(false);
+  });
+
+  it("does not emit while the policy controls are disabled", () => {
+    const { mounted, setDml } = mountWithSalesforce({ disabled: true });
+
+    dispatch(salesforceDmlCheckboxes(mounted.root)[0], "change", { target: { checked: true } });
+
+    expect(setDml).not.toHaveBeenCalled();
+  });
+});
+
+describe("issue #11503 persisted execution-policy visibility", () => {
+  const policies = [{ connectionId: "c2", readOnly: false, allowDangerousSql: false, executionModeConfigured: true }];
+  function safeWriteEditors(root: ReturnType<typeof mountComponent>["root"]) {
+    return findAll(root, (node) => node.type === "div" && node.props["data-stub"] === "Select" && node.props["model-value"] === "safe_write");
+  }
+
+  it("detects the persisted editor when the connection is explicitly selected", () => {
+    const { mounted } = mountPicker({ allowedConnectionIds: ["c2"], connectionPolicies: policies });
+    expect(safeWriteEditors(mounted.root)).toHaveLength(1);
+    mounted.unmount();
+  });
+
+  it("exposes a persisted safe-write exception in all-connections scope", () => {
+    const { mounted } = mountPicker({ allowedConnectionIds: null, connectionPolicies: policies });
+    expect(safeWriteEditors(mounted.root)).toHaveLength(1);
+    mounted.unmount();
+  });
+
+  it("exposes a persisted exception after reopening and switching to custom without selecting it again", async () => {
+    const { mounted, update } = mountPicker({ allowedConnectionIds: null, connectionPolicies: policies });
+    dispatch(modeButton(mounted.root, "custom"), "click");
+    expect(update).toHaveBeenCalledWith({ allowedGroupIds: [], allowedConnectionIds: [] });
+    await mounted.setProps(update.mock.calls[0][0]);
+    expect(safeWriteEditors(mounted.root)).toHaveLength(1);
+    mounted.unmount();
+  });
+
+  it("edits and resets an exception without adding the connection to the visible scope", async () => {
+    const setPolicy = vi.fn();
+    const { mounted, update } = mountPicker({ allowedConnectionIds: [], connectionPolicies: policies, "onSet:connection-policy": setPolicy });
+    const editor = safeWriteEditors(mounted.root)[0];
+    expect(hostText(mounted.root)).toContain("settings.mcpPolicyExceptionOutsideScope");
+    editor.props["onUpdate:modelValue"]("read_only");
+    expect(setPolicy).toHaveBeenLastCalledWith("c2", "read_only");
+    editor.props["onUpdate:modelValue"]("inherit");
+    expect(setPolicy).toHaveBeenLastCalledWith("c2", "inherit");
+    expect(update).not.toHaveBeenCalled();
+    await mounted.setProps({ connectionPolicies: [] });
+    expect(hostText(mounted.root)).not.toContain("settings.mcpPolicyExceptionsTitle");
+    mounted.unmount();
+  });
+
+  it("keeps a collapsed group's connection exception visible and avoids duplicate editors after expansion", async () => {
+    const { mounted } = mountPicker({ allowedGroupIds: ["g1"], connectionPolicies: [{ ...policies[0], connectionId: "c1" }] });
+    expect(safeWriteEditors(mounted.root)).toHaveLength(1);
+    expect(hostText(mounted.root)).toContain("settings.mcpPolicyExceptionInScope");
+    const expand = findOne(mounted.root, (node) => node.type === "button" && node.props["aria-label"] === "Group 1");
+    dispatch(expand, "click");
+    await mounted.setProps({});
+    expect(safeWriteEditors(mounted.root)).toHaveLength(1);
+    expect(hostText(mounted.root)).not.toContain("settings.mcpPolicyExceptionsTitle");
+    mounted.unmount();
+  });
+
+  it("keeps exceptions discoverable when the resource search filters out their inline editor", async () => {
+    const { mounted } = mountPicker({ allowedConnectionIds: ["c2"], connectionPolicies: policies });
+    const search = findOne(mounted.root, (node) => node.type === "input" && node.props.placeholder === "settings.mcpResourceScopeSearch");
+    search.props["onUpdate:modelValue"]("no-such-resource");
+    await mounted.setProps({});
+    expect(safeWriteEditors(mounted.root)).toHaveLength(1);
+    expect(hostText(mounted.root)).toContain("settings.mcpPolicyExceptionsTitle");
+    mounted.unmount();
+  });
+
+  it("exposes and resets a nested group exception in all-connections scope", () => {
+    const setPolicy = vi.fn();
+    const { mounted, update } = mountPicker({
+      allowedConnectionIds: null,
+      layout: { groups: [...layout.groups, { id: "g2", name: "Nested", collapsed: false }], order: [{ type: "group", id: "g1", children: [{ type: "group", id: "g2", children: [{ type: "connection", id: "c1" }] }] }] },
+      groupPolicies: [{ groupId: "g2", readOnly: false, allowDangerousSql: true }],
+      "onSet:group-policy": setPolicy,
+    });
+    expect(hostText(mounted.root)).toContain("Group 1 / Nested");
+    const editor = findOne(mounted.root, (node) => node.props["data-stub"] === "Select" && node.props["model-value"] === "high_risk_write");
+    editor.props["onUpdate:modelValue"]("inherit");
+    expect(setPolicy).toHaveBeenCalledWith("g2", "inherit");
+    expect(update).not.toHaveBeenCalled();
+    mounted.unmount();
+  });
+
+  it("ignores database-scope-only and deleted-resource rules", () => {
+    const { mounted } = mountPicker({
+      allowedConnectionIds: null,
+      connectionPolicies: [
+        { ...policies[0], executionModeConfigured: false },
+        { ...policies[0], connectionId: "deleted" },
+      ],
+      groupPolicies: [{ groupId: "deleted", readOnly: false, allowDangerousSql: true }],
+    });
+    expect(hostText(mounted.root)).not.toContain("settings.mcpPolicyExceptionsTitle");
+    mounted.unmount();
+  });
+
+  it.each([{ disabled: true }, { busy: true }])("disables exception editing with %j", (props) => {
+    const { mounted } = mountPicker({ allowedConnectionIds: null, connectionPolicies: policies, ...props });
+    expect(safeWriteEditors(mounted.root)[0].props.disabled).toBe(true);
+    mounted.unmount();
+  });
+
+  it("exposes a saved Salesforce DML opt-in even without an execution-mode override", () => {
+    const setDml = vi.fn();
+    const { mounted, update } = mountPicker({
+      allowedConnectionIds: null,
+      connections: [connection("c1"), { ...connection("c2"), db_type: "salesforce" }],
+      connectionPolicies: [{ ...policies[0], executionModeConfigured: false, allowSalesforceDml: true }],
+      "onSet:connection-salesforce-dml": setDml,
+    });
+    const checkbox = salesforceDmlCheckboxes(mounted.root)[0];
+    expect(checkbox.props.checked).toBe(true);
+    dispatch(checkbox, "change", { target: { checked: false } });
+    expect(setDml).toHaveBeenCalledWith("c2", false);
+    expect(update).not.toHaveBeenCalled();
+    mounted.unmount();
   });
 });

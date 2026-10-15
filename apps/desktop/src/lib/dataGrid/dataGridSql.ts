@@ -25,6 +25,9 @@ export interface DataGridColumnInfo {
 
 export interface DataGridSaveStatementOptions {
   databaseType?: DatabaseType;
+  /** Server version reported by the connection (see `BuildTableSelectSqlOptions.serverVersion`).
+   * The saved statements must address rows the same way the grid read them. */
+  serverVersion?: string;
   identifierQuote?: string;
   tableMeta: DataGridTableMeta;
   columns: string[];
@@ -33,6 +36,8 @@ export interface DataGridSaveStatementOptions {
   dirtyRows: Array<[number, Array<[number, GridCellValue]>]>;
   deletedRows: number[];
   newRows: GridCellValue[][];
+  /** `生成 SQL 时包含数据库名`: qualify `database.table` engines in the save SQL. */
+  includeDatabaseName?: boolean;
 }
 
 export interface DataGridCopyUpdateStatementOptions {
@@ -54,8 +59,9 @@ export interface DataGridCopyInsertStatementOptions {
   columnTypes?: Array<string | null | undefined>;
   sourceColumns?: Array<string | undefined>;
   rows: GridCellValue[][];
-  excludePrimaryKeys?: boolean;
+  primaryKeyMode?: "include" | "exclude-generated" | "exclude-all";
   includeComputedColumns?: boolean;
+  includeDatabaseName?: boolean;
   insertMode?: DataGridCopyInsertMode;
 }
 
@@ -102,6 +108,7 @@ export interface DataGridColumnDistinctValuesSqlOptions {
   searchValue?: string;
   limit?: number;
   includeCounts?: boolean;
+  excludeNulls?: boolean;
 }
 
 export interface DataGridCountSqlOptions {
@@ -127,6 +134,7 @@ export interface DataGridConditionalUpdateSqlOptions {
 }
 
 export interface HiveTablePropertiesSqlOptions {
+  databaseType?: DatabaseType;
   schema?: string;
   tableName: string;
   propertyName: string;

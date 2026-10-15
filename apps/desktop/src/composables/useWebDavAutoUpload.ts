@@ -1,18 +1,42 @@
 import { onMounted, onUnmounted } from "vue";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { appendDebugLog } from "@/lib/backend/debugLog";
-import { webdavSyncUpload } from "@/lib/backend/api";
-import { readWebDavAutoUploadConfig, WEB_DAV_AUTO_UPLOAD_STORAGE_KEYS } from "@/lib/webdav/webdavAutoUploadConfig";
+import { webdavSyncSecretsStatus, webdavSyncUpload } from "@/lib/backend/api";
+import { readWebDavAutoUploadConfig, readWebDavBackupSelection, recordWebDavSyncSuccess, WEB_DAV_AUTO_UPLOAD_STORAGE_KEYS } from "@/lib/webdav/webdavAutoUploadConfig";
 
 export function useWebDavAutoUpload() {
   const settingsStore = useSettingsStore();
-  let timer: ReturnType<typeof window.setInterval> | undefined;
+  const maxTimeoutDelayMs = 2_147_000_000;
+  let timer: ReturnType<typeof window.setTimeout> | undefined;
+  let nextUploadAt = 0;
   let uploading = false;
 
   function clearTimer() {
-    if (!timer) return;
-    window.clearInterval(timer);
+    if (timer === undefined) return;
+    window.clearTimeout(timer);
     timer = undefined;
+  }
+
+  function armTimer() {
+    const remainingMs = Math.max(0, nextUploadAt - Date.now());
+    timer = window.setTimeout(
+      () => {
+        if (Date.now() < nextUploadAt) {
+          armTimer();
+          return;
+        }
+
+        void runAutoUpload();
+        const config = readWebDavAutoUploadConfig();
+        if (!config.enabled || !config.webDavConfig) {
+          clearTimer();
+          return;
+        }
+        nextUploadAt = Date.now() + config.intervalMinutes * 60_000;
+        armTimer();
+      },
+      Math.min(remainingMs, maxTimeoutDelayMs),
+    );
   }
 
   function schedule() {
@@ -20,9 +44,8 @@ export function useWebDavAutoUpload() {
     const config = readWebDavAutoUploadConfig();
     if (!config.enabled || !config.webDavConfig) return;
 
-    timer = window.setInterval(() => {
-      void runAutoUpload();
-    }, config.intervalMinutes * 60_000);
+    nextUploadAt = Date.now() + config.intervalMinutes * 60_000;
+    armTimer();
   }
 
   async function runAutoUpload() {
@@ -32,7 +55,11 @@ export function useWebDavAutoUpload() {
 
     uploading = true;
     try {
-      const summary = await webdavSyncUpload(config.webDavConfig, settingsStore.editorSettings);
+      const secretsStatus = await webdavSyncSecretsStatus();
+      const selection = readWebDavBackupSelection();
+      const includeSecrets = (selection?.includeSecrets ?? secretsStatus.enabled) && secretsStatus.enabled && secretsStatus.hasSavedPassphrase;
+      const summary = await webdavSyncUpload(config.webDavConfig, settingsStore.editorSettings, undefined, includeSecrets, selection);
+      recordWebDavSyncSuccess(config.webDavConfig);
       appendDebugLog("info", "[DBX][webdav:auto-upload:success]", {
         bytes: summary.bytes,
         remotePath: summary.remotePath,

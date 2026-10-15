@@ -6,11 +6,14 @@ import { BackendErrorException, formatError, normalizeBackendError, sanitizeBack
 import az from "@/i18n/locales/az";
 import en from "@/i18n/locales/en";
 import es from "@/i18n/locales/es";
+import id from "@/i18n/locales/id";
 import it from "@/i18n/locales/it";
 import ja from "@/i18n/locales/ja";
 import ko from "@/i18n/locales/ko";
 import ptBR from "@/i18n/locales/pt-BR";
+import ru from "@/i18n/locales/ru";
 import tr from "@/i18n/locales/tr";
+import th from "@/i18n/locales/th";
 import zhCN from "@/i18n/locales/zh-CN";
 import zhTW from "@/i18n/locales/zh-TW";
 import { PHOENIX_DRIVER_NOT_INSTALLED_ERROR, PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR } from "@/lib/database/phoenixConnection";
@@ -19,10 +22,13 @@ const LOCALES = {
   az,
   en,
   es,
+  id,
   it,
   ja,
   ko,
   "pt-BR": ptBR,
+  ru,
+  th,
   tr,
   "zh-CN": zhCN,
   "zh-TW": zhTW,
@@ -46,7 +52,7 @@ const STRUCTURED_BACKEND_ERROR_KEYS = [
   "backendErrors.unknown",
 ] as const;
 
-// Reproduces the exact string crates/dbx-core/src/agent_service.rs builds on
+// Reproduces the exact string crates/dbx-driver-agent/src/agent_service.rs builds on
 // Windows: `\` line continuations strip the newline plus the following indent.
 const WINDOWS_JRE_REMOVE_ERROR = [
   "Failed to remove the old JRE directory: C:\\dbx\\jre21",
@@ -60,6 +66,38 @@ const WINDOWS_JRE_REMOVE_ERROR = [
 // Every backend message changed away from hardcoded Chinese, paired with the
 // key and params it must resolve to.
 const CASES: { name: string; message: string; key: string; params?: Record<string, string> }[] = [
+  {
+    name: "plugin update requires closing related connections",
+    message: "Plugin update blocked by active connections: Production S3, Local storage",
+    key: "pluginPlatform.updateBlockedByConnections",
+    params: { labels: "Production S3, Local storage" },
+  },
+  {
+    name: "plugin uninstall blocked by saved plugin connections",
+    message: "Cannot uninstall plugin 'com.lwai.todo' while these connections still use it: 待办 Todo, Todo (Copy)",
+    key: "pluginPlatform.uninstallBlockedByConnections",
+    params: { plugin: "com.lwai.todo", labels: "待办 Todo, Todo (Copy)" },
+  },
+  {
+    name: "plugin update waits for active operations",
+    message: "Plugin update blocked by active operations. Please wait for them to finish.",
+    key: "pluginPlatform.updateBlockedByOperations",
+  },
+  {
+    name: "plugin update from a changed source needs confirmation",
+    message: "Plugin update source change requires confirmation: the offering repository, publisher, or signing key differs from the recorded install",
+    key: "pluginPlatform.updateSourceChangeRequired",
+  },
+  {
+    name: "plugin downgrade is rejected",
+    message: "Plugin downgrade to version 1.0.5 is not allowed (installed 1.1.0)",
+    key: "pluginPlatform.updateDowngradeRejected",
+  },
+  {
+    name: "connection admission waits for plugin update",
+    message: "Plugin update is in progress. Please try again after it finishes.",
+    key: "pluginPlatform.updateInProgress",
+  },
   {
     name: "Nacos ordinary user must configure managed namespaces when namespace discovery is forbidden",
     message: "Failed to list Nacos namespaces: NACOS_ERROR[v3ManagedNamespacesRequired]: access denied",
@@ -107,7 +145,7 @@ const CASES: { name: string; message: string; key: string; params?: Record<strin
     key: "mongo.import.legacyInsertUnsupported",
   },
   {
-    // crates/dbx-core/src/mongodb_import_export.rs attributes a batch-level failure to a row.
+    // crates/dbx-core/src/data/mongodb_import_export.rs attributes a batch-level failure to a row.
     name: "MongoDB Legacy insertMany unsupported on a located row",
     message: "row 1: MongoDB Legacy Agent does not support insertMany; upgrade or reinstall the MongoDB Legacy driver",
     key: "mongo.import.legacyInsertUnsupported",
@@ -185,6 +223,26 @@ const CASES: { name: string; message: string; key: string; params?: Record<strin
     key: "auth.rateLimited",
     params: { seconds: "42" },
   },
+  {
+    name: "dameng native dump tool missing",
+    message: "[damengToolNotFound] Dameng client tool 'dexp' was not found in 'C:\\dm8\\bin'. Configure the Dameng client bin directory in Settings > Data.",
+    key: "damengDump.errors.toolNotFound",
+  },
+  {
+    name: "dameng native dump on a non-dameng connection",
+    message: "[damengConnectionRequired] Native dexp/dimp dump is only available for Dameng connections.",
+    key: "damengDump.errors.connectionRequired",
+  },
+  {
+    name: "dameng native dump without a stored password",
+    message: "[damengPasswordMissing] The connection has no password available; reconnect and enter the password first.",
+    key: "damengDump.errors.passwordMissing",
+  },
+  {
+    name: "dameng native dump with a userid-breaking credential",
+    message: "[damengUseridInvalid] The connection's password contains '/' or '@', which the dexp/dimp USERID argument cannot encode; the task was not started.",
+    key: "damengDump.errors.useridInvalid",
+  },
 ];
 
 function translatorFor(locale: LocaleKey): BackendErrorTranslate {
@@ -256,6 +314,31 @@ describe("backend error translation", () => {
     const message = "database returned\nDBX_AGENT_ERROR_DATA:not-json";
 
     expect(sanitizeBackendErrorMessage(message)).toBe(message);
+  });
+
+  test("hides internal Agent error data that precedes appended fallback context", () => {
+    const t = translatorFor("zh-CN");
+    const message =
+      'Agent RPC error (-1): ORA-12514: TNS:listener does not currently know of service requested in connect descriptor\nDBX_AGENT_ERROR_DATA:{"category":null,"retryable":null,"sessionDisposition":null,"stage":null,"operationOutcome":null,"agentSessionId":null}\n\nFallback with alternate Oracle descriptor failed: Agent RPC error (-1): ORA-12505';
+    const expected = "Agent RPC error (-1): ORA-12514: TNS:listener does not currently know of service requested in connect descriptor\n\nFallback with alternate Oracle descriptor failed: Agent RPC error (-1): ORA-12505";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(expected);
+    expect(formatError(new Error(message))).toBe(expected);
+    expect(translateBackendError(t, message)).toBe(expected);
+  });
+
+  test("hides nested Agent error data inside fallback context", () => {
+    const message = 'native wire version error\nDBX_AGENT_ERROR_DATA:{"category":"connection"}\n\nFallback with MongoDB (Legacy) driver failed: Agent RPC error (-1): handshake rejected\nDBX_AGENT_ERROR_DATA:{"agentSessionId":"session-1"}';
+    const expected = "native wire version error\n\nFallback with MongoDB (Legacy) driver failed: Agent RPC error (-1): handshake rejected";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(expected);
+  });
+
+  test("keeps invalid internal-looking data while hiding valid payloads after it", () => {
+    const message = 'database returned\nDBX_AGENT_ERROR_DATA:not-json\n\nFallback failed: Agent RPC error (-1): closed\nDBX_AGENT_ERROR_DATA:{"agentSessionId":"session-1"}';
+    const expected = "database returned\nDBX_AGENT_ERROR_DATA:not-json\n\nFallback failed: Agent RPC error (-1): closed";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(expected);
   });
 
   test("strips the SQL error-position transport suffix from raw messages", () => {
@@ -454,6 +537,26 @@ describe("backend error translation", () => {
     expect(translateBackendError(t, error, "ClickHouse error: table analytics.events does not exist")).toBe(`${t("backendErrors.legacy")}\n\nClickHouse error: table analytics.events does not exist`);
   });
 
+  test("renders plugin signature failures without exposing the JSON error envelope", () => {
+    const detail = "Plugin package is signed by untrusted key 'dbx-store-release-2026'";
+    const error = JSON.stringify({
+      version: 1,
+      code: "DBX-LEGACY-0001",
+      messageKey: "backendErrors.legacy",
+      messageParams: {},
+      source: "legacyBackend",
+      origin: { subsystem: "backend", adapter: "legacy" },
+      operationOutcome: "unknown",
+      detail,
+    });
+
+    for (const locale of ["zh-CN", "en"] as const) {
+      const t = translatorFor(locale);
+      expect(translateBackendError(t, error)).toBe(`${t("backendErrors.legacy")}\n\n${detail}`);
+      expect(translateBackendError(t, new Error(error))).toBe(`${t("backendErrors.legacy")}\n\n${detail}`);
+    }
+  });
+
   test("does not append the generic transport fallback to a structured error", () => {
     const t = translatorFor("zh-CN");
     const error = {
@@ -566,15 +669,17 @@ describe("backend error wording is pinned to the Rust sources", () => {
   const rust = (path: string) => readFileSync(new URL(`../../../../../${path}`, import.meta.url), "utf8");
 
   test.each([
-    ["crates/dbx-core/src/query_result_export.rs", "Streaming export is unsupported for this query. Simplify it or use a supported driver."],
-    ["crates/dbx-core/src/query_result_export.rs", "Streaming export needs a result-set session, but this driver returned no session_id."],
-    ["crates/dbx-core/src/mongodb_import_export.rs", "MongoDB Legacy Agent does not support insertMany; upgrade or reinstall the MongoDB Legacy driver"],
-    ["crates/dbx-core/src/mongodb_import_export.rs", "MongoDB Legacy Agent returned an invalid find cursor"],
-    ["crates/dbx-core/src/mongo_ops.rs", "MongoDB Legacy Agent rejected "],
-    ["crates/dbx-core/src/agent_service.rs", "Failed to remove the old JRE directory: "],
-    ["crates/dbx-core/src/agent_service.rs", "is in use by drivers: "],
-    ["crates/dbx-core/src/agent_service.rs", "agent-registry.json not found in the ZIP; not a valid offline driver package."],
-    ["crates/dbx-core/src/mq/adapters/kafka.rs", "Kafka does not support unloading topics"],
+    ["crates/dbx-core/src/data/query_result_export.rs", "Streaming export is unsupported for this query. Simplify it or use a supported driver."],
+    ["crates/dbx-core/src/data/query_result_export.rs", "Streaming export needs a result-set session, but this driver returned no session_id."],
+    ["crates/dbx-core/src/data/mongodb_import_export.rs", "MongoDB Legacy Agent does not support insertMany; upgrade or reinstall the MongoDB Legacy driver"],
+    ["crates/dbx-core/src/data/mongodb_import_export.rs", "MongoDB Legacy Agent returned an invalid find cursor"],
+    ["crates/dbx-core/src/query/mongo_ops.rs", "MongoDB Legacy Agent rejected "],
+    ["crates/dbx-driver-agent/src/agent_service.rs", "Failed to remove the old JRE directory: "],
+    ["crates/dbx-driver-agent/src/agent_service.rs", "is in use by drivers: "],
+    ["crates/dbx-driver-agent/src/agent_service.rs", "agent-registry.json not found in the ZIP; not a valid offline driver package."],
+    ["crates/dbx-core/src/admin/mq/adapters/kafka.rs", "Kafka does not support unloading topics"],
+    ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin update source change requires confirmation:"],
+    ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin downgrade to version "],
     ["crates/dbx-web/src/auth.rs", "Please try again in {remaining}s"],
     ["crates/dbx-web/src/routes/agents.rs", "Close these database connections before updating drivers: "],
     ["src-tauri/src/commands/agents.rs", "Close these database connections before updating drivers: "],

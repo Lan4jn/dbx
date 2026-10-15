@@ -43,7 +43,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.13.0
+          node-version: 22.23.3
           registry-url: https://registry.npmjs.org
 
       - uses: dtolnay/rust-toolchain@stable
@@ -129,8 +129,16 @@ jobs:
             exit 1
           fi
 
+      - name: Install nextest
+        uses: taiki-e/install-action@a3324fb0eb94b8230ec968c3389c1b7929fc2f3b
+        with:
+          tool: cargo-nextest@0.9.137
+
       - name: Test Rust CLI
-        run: cargo test --locked --manifest-path plugins/sdk/cli/Cargo.toml
+        run: cargo nextest run --locked --manifest-path plugins/sdk/cli/Cargo.toml --no-fail-fast
+
+      - name: Test Rust CLI docs
+        run: cargo test --doc --locked --manifest-path plugins/sdk/cli/Cargo.toml
 
       - name: Prepare and test plugin development runtime
         run: |
@@ -321,7 +329,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.13.0
+          node-version: 22.23.3
           registry-url: https://registry.npmjs.org
 
       - name: Publish platform package
@@ -349,7 +357,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.13.0
+          node-version: 22.23.3
           registry-url: https://registry.npmjs.org
 
       - name: Prepare development runtime build dependencies
@@ -404,7 +412,7 @@ jobs:
     steps:
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.13.0
+          node-version: 22.23.3
           registry-url: https://registry.npmjs.org
 
       - uses: dtolnay/rust-toolchain@stable

@@ -379,6 +379,42 @@ test("clean saved SQL tabs persist without duplicating SQL text", async () => {
   }
 });
 
+test("clean saved SQL tabs hydrate after their tabs finish restoring", async () => {
+  const restoreStorage = installMemoryStorage();
+  const fullFile = {
+    id: "saved-startup-race",
+    connectionId: "conn-1",
+    name: "startup.sql",
+    database: "db",
+    sql: "SELECT 1;",
+    sqlLoaded: true,
+    createdAt: "2026-09-27T00:00:00.000Z",
+    updatedAt: "2026-09-27T00:00:00.000Z",
+  };
+  try {
+    setActivePinia(createPinia());
+    let store = useQueryStore();
+    store.openSavedSql(fullFile);
+    await store.flushPendingPersist();
+
+    disposePinia(getActivePinia()!);
+    setActivePinia(createPinia());
+    store = useQueryStore();
+    const savedSqlStore = useSavedSqlStore();
+    savedSqlStore.files = [fullFile];
+
+    await store.hydrateSavedSqlTabs();
+    await store.initOpenTabs();
+    await store.hydrateSavedSqlTabs();
+
+    const restored = store.tabs.find((tab) => tab.savedSqlId === fullFile.id);
+    assert.equal(restored?.sql, fullFile.sql);
+    assert.equal(restored?.originalSql, fullFile.sql);
+  } finally {
+    restoreStorage();
+  }
+});
+
 test("saved SQL opens with its saved execution target by default", async () => {
   const restoreStorage = installMemoryStorage();
   try {
@@ -4628,7 +4664,7 @@ test("closing a database flushes only that database's released tabs before resto
   }
 });
 
-test("starting a new query clears the previous result payload immediately", async () => {
+test("keeps the previous result payload visible while a new query is running", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -4672,7 +4708,7 @@ test("starting a new query clears the previous result payload immediately", asyn
 
   try {
     const execution = store.executeTabSql(tabId, "select 1");
-    assert.equal(tab.result, undefined);
+    assert.equal(tab.result?.columns[0], "old");
     assert.equal(tab.results, undefined);
     await execution;
     assert.deepEqual(tab.result?.columns, ["new"]);
@@ -4782,6 +4818,8 @@ test("data tab execution preserves pagination offset metadata", async () => {
     assert.equal(executeBody.schema, undefined);
     assert.equal(tab.resultPageLimit, 100);
     assert.equal(tab.resultPageOffset, 100);
+    assert.equal(tab.resultExecutedPageLimit, 100);
+    assert.equal(tab.resultExecutedPageOffset, 100);
     assert.deepEqual(tab.result?.rows, [[101]]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -4845,6 +4883,8 @@ test("append pagination preserves existing rows and respects the memory cap", as
     assert.equal(tab.result?.has_more, false);
     assert.equal(tab.resultPageOffset, 0, "later refreshes must restart from the logical result origin");
     assert.equal(tab.resultPageLimit, 1000, "a short appended segment must preserve the base display page size");
+    assert.equal(tab.resultExecutedPageOffset, 1, "the SQL shown for the grid describes the appended segment");
+    assert.equal(tab.resultExecutedPageLimit, 2);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -6715,6 +6755,59 @@ test("redis multi-command execution records source statements for each result", 
       ["GET user:1", "BAD", "PING"],
     );
     assert.deepEqual(tab?.results?.[1]?.columns, ["Error"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("redis execution skips comment lines and keeps results aligned with their source ranges", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const sentCommands: string[] = [];
+
+  connectionStore.addEphemeralConnection({
+    ...conn("redis-1"),
+    db_type: "redis",
+    port: 6379,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/redis/execute-command") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      sentCommands.push(body.command);
+      return new Response(JSON.stringify({ command: body.command, safety: "allowed", value: "OK" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const sql = "# warm the cache\nGET user:1\n-- then check\n  PING  ";
+    const tabId = store.createTab("redis-1", "0", "Redis", "query", sql);
+    await store.executeTabSql(tabId, sql, { sourceOffset: 0 });
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    // A note is never sent to the server as a command.
+    assert.deepEqual(sentCommands, ["GET user:1", "PING"]);
+    assert.deepEqual(
+      tab?.results?.map((result) => result.sourceStatement),
+      ["GET user:1", "PING"],
+    );
+    // Each result points at its own line, not the line of the comment above it.
+    assert.deepEqual(
+      tab?.results?.map((result) => [result.sourceFrom, result.sourceTo]),
+      [
+        [sql.indexOf("GET"), sql.indexOf("GET") + "GET user:1".length],
+        [sql.indexOf("PING"), sql.indexOf("PING") + "PING".length],
+      ],
+    );
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -9088,7 +9181,7 @@ test("query results keep readable table source labels with active database conte
   }
 });
 
-test("cursor execution uses the preceding comment from the full query draft", async () => {
+test("cursor execution uses only the immediately preceding comment from the full query draft", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -9123,6 +9216,10 @@ test("cursor execution uses the preceding comment from the full query draft", as
     await store.executeTabSql(tabId, selectedSql, { sourceOffset: tab.sql.indexOf(selectedSql) });
     assert.equal(currentSql, selectedSql);
     assert.equal(tab.result?.sourceLabel, "Orders report");
+
+    tab.sql = "-- Users report\nSELECT 1;\n\n-- Orders report\n\nSELECT 2;";
+    await store.executeTabSql(tabId, selectedSql, { sourceOffset: tab.sql.indexOf(selectedSql) });
+    assert.equal(tab.result?.sourceLabel, undefined);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();

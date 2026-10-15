@@ -33,6 +33,9 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     private boolean pooledConnectionPoisoned;
 
     @Override
+    public boolean supportsQueryTiming() { return true; }
+
+    @Override
     public final Connection getConnection() {
         return connection;
     }
@@ -185,8 +188,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
+        long prepareStarted = System.nanoTime();
         Connection conn = requireConnected();
         uncheckedVoid(() -> beforeQueryExecution(conn, options.getTimeoutSecs()));
+        QueryTiming.record("session_prepare", prepareStarted);
         return JdbcExecutor.current().execute(
             conn,
             sql,
@@ -204,8 +209,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
+        long prepareStarted = System.nanoTime();
         Connection conn = requireConnected();
         uncheckedVoid(() -> beforeQueryExecution(conn, options.getTimeoutSecs()));
+        QueryTiming.record("session_prepare", prepareStarted);
         return JdbcExecutor.current().executePage(
             conn,
             sql,
@@ -414,7 +421,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
             releasePooledConnection(true);
             return;
         }
-        if (sessionAffinity || executor.hasOpenSessions() || executor.hasActiveStatements()) {
+        if (sessionAffinity || executor.hasOpenSessions() || executor.hasActiveStatements() || hasRetainedResultResources()) {
             return;
         }
         releasePooledConnection(!preparePooledConnectionForReturn());
@@ -431,7 +438,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         if (sessionAffinity) {
             return;
         }
-        if (executor.hasOpenSessions() || executor.hasActiveStatements()) {
+        if (executor.hasOpenSessions() || executor.hasActiveStatements() || hasRetainedResultResources()) {
             return;
         }
         releasePooledConnection(!preparePooledConnectionForReturn());
@@ -595,6 +602,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     protected void beforeQueryExecution(Connection connection, int timeoutSecs) throws Exception {
     }
 
+    /** Called for each session RPC before its SQL can replace the connection's last trace ID. */
+    protected void beforeAgentMethod(String method, String querySessionId) {
+    }
+
     protected boolean advancePastUpdateCounts() {
         return false;
     }
@@ -702,7 +713,12 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         );
     }
 
+    protected boolean hasRetainedResultResources() { return false; }
+
+    protected void releaseRetainedResultResources() { }
+
     private void closeCurrentConnection() throws Exception {
+        releaseRetainedResultResources();
         if (pooledLease != null) {
             boolean evict = pooledConnectionPoisoned || sessionAffinity || !preparePooledConnectionForReturn();
             releasePooledConnection(evict);
@@ -721,7 +737,17 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
         return JdbcSchemaSwitcher.resetBeforeReturn(connection);
     }
 
+    protected final synchronized void discardConnection(Connection failedConnection) throws java.sql.SQLException {
+        if (pooledLease != null && connection == failedConnection) {
+            // Evict the checked-out lease before closing its proxy; close alone returns it to the pool.
+            releasePooledConnection(true);
+        } else {
+            failedConnection.close();
+        }
+    }
+
     private void releasePooledConnection(boolean evict) {
+        releaseRetainedResultResources();
         JdbcConnectionPoolRegistry.Lease lease = pooledLease;
         pooledLease = null;
         connection = null;

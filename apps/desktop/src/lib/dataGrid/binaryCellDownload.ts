@@ -117,6 +117,7 @@ const BINARY_STRING_TYPE_RE = /^(?:binary|varbinary)(?:\b|\()/i;
 const VARBINARY_TYPE_RE = /^varbinary(?:\b|\()/i;
 const BLOB_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob)(?:\b|\()/i;
 const MYSQL_FILE_IMPORT_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob|binary|varbinary)(?:\b|\()/i;
+const OPAQUE_AGG_STATE_TYPE_RE = /^agg_state\s*<\s*[^>\s][^>]*>$/i;
 
 function copyBytesForBlob(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   return new Uint8Array(bytes);
@@ -181,7 +182,23 @@ export function parseBinaryCellBytes(value: unknown, columnType?: string, databa
 
 export function isBinaryCellColumnType(columnType?: string): boolean {
   const type = (columnType ?? "").trim();
-  return !!type && BINARY_TYPE_RE.test(type);
+  return !!type && (BINARY_TYPE_RE.test(type) || OPAQUE_AGG_STATE_TYPE_RE.test(type));
+}
+
+export function isOpaqueAggregateStateColumnType(columnType?: string): boolean {
+  return OPAQUE_AGG_STATE_TYPE_RE.test((columnType ?? "").trim());
+}
+
+export function hasUnsafeOpaqueAggregateStatePredicate(columnTypes: readonly (string | undefined)[], row: readonly CellValue[]): boolean {
+  return columnTypes.some((columnType, index) => isOpaqueAggregateStateColumnType(columnType) && row[index] !== null);
+}
+
+export function mergeOpaqueReadonlyColumnIndexes(readonlyColumnIndexes: readonly number[] | undefined, columnTypes: readonly (string | undefined)[]): ReadonlySet<number> | undefined {
+  const merged = new Set(readonlyColumnIndexes ?? []);
+  columnTypes.forEach((columnType, index) => {
+    if (isOpaqueAggregateStateColumnType(columnType)) merged.add(index);
+  });
+  return merged.size ? merged : undefined;
 }
 
 export function isBlobCellColumnType(columnType?: string): boolean {
@@ -221,6 +238,51 @@ export function binaryCellUtf8Text(value: unknown, columnType?: string, database
   return binaryCellUtf8TextBytes(bytes, columnType);
 }
 
+/** 单元格详情里「以文本查看」可选的字符集。 */
+export type BinaryCellTextEncoding = "utf8" | "gbk";
+
+export const BINARY_CELL_TEXT_ENCODINGS: BinaryCellTextEncoding[] = ["utf8", "gbk"];
+
+/**
+ * 显式文本预览（「以文本查看」）的失败原因，调用方据此给出不同文案：
+ *
+ * - `notBinary`：值不是 binary canonical form（含 hex 已被截断、列类型非 binary 的情况）；
+ * - `incomplete`：大值预览闸门截断了原始值，bytes 不完整，继续解码会把残缺内容当成文本；
+ * - `undecodable`：bytes 完整，但严格解码失败（非法序列，或图片/压缩包等二进制的控制字符）。
+ */
+export type BinaryCellTextPreviewError = "notBinary" | "incomplete" | "undecodable";
+
+export type BinaryCellTextPreviewResult = { ok: true; text: string; encoding: BinaryCellTextEncoding; byteLength: number } | { ok: false; error: BinaryCellTextPreviewError };
+
+/**
+ * issue #9505：把 binary canonical value（`0x<hex>`）按用户显式选择的字符集解码成**只读**文本。
+ *
+ * 与「下载为 UTF-8/GBK」共用同一套 bytes primitive（{@link parseBinaryCellBytes} +
+ * `binaryPreviewBytes`），但刻意不复用 `binaryCellDownloadPayload` 的宽松 `TextDecoder`：
+ * 预览必须走严格解码（见 {@link binaryCellUtf8TextBytes} / {@link printableGbkText}），
+ * 否则图片头等真实二进制会被替换字符伪装成「正常文本」。
+ *
+ * 与 `binaryCellUtf8Text` 的区别是**不做数据库白名单**：MySQL BLOB 的自动文本预览只对 mysql
+ * 连接开启（显示/编辑语义需要一致），而这里由用户在单元格详情里显式点击，属于只读 presentation，
+ * 因此任何被 `isBinaryCellColumnType()` 识别的 binary 列（BLOB/TINYBLOB/MEDIUMBLOB/LONGBLOB、
+ * BINARY/VARBINARY、BYTEA、BYTES、IMAGE、RAW/LONG RAW…）都可查看，且不参与解码闸门之外的任何写回路径。
+ * 入口可见性完全复用 `isBinaryCellColumnType()`，本次不为未知类型名称放宽该闸门。
+ *
+ * 返回值只用于展示：原始 `0x<hex>`、`detail.value` / `rawValue`、编辑草稿和数据库 bytes 都不受影响。
+ */
+export function binaryCellTextPreview(value: unknown, encoding: BinaryCellTextEncoding, columnType?: string, databaseType?: DatabaseType, incomplete?: boolean): BinaryCellTextPreviewResult {
+  if (incomplete) return { ok: false, error: "incomplete" };
+  if (!isBinaryCellColumnType(columnType)) return { ok: false, error: "notBinary" };
+  // 大值闸门会把 `0x<hex>` 本身截成 `0x...`，此时可解析的前缀不是完整 bytes，不能拿去解码。
+  if (typeof value === "string" && TRUNCATED_HEX_VALUE_RE.test(value.trim())) return { ok: false, error: "notBinary" };
+  const bytes = parseBinaryCellBytes(value, columnType, databaseType);
+  if (!bytes) return { ok: false, error: "notBinary" };
+  const preview = binaryPreviewBytes(bytes, columnType);
+  const text = encoding === "gbk" ? printableGbkText(preview) : printableUtf8Text(preview);
+  if (text === null) return { ok: false, error: "undecodable" };
+  return { ok: true, text, encoding, byteLength: bytes.length };
+}
+
 // 复制到剪贴板时，把「文本型」MySQL VARBINARY 单元格还原成其原始字符串。
 // DBX 后端为保留任意 bytes，把该值统一序列化成 `0x<hex>`；前端只有在严格 UTF-8 解码、
 // 无控制字符且重新编码后与原 bytes 完全一致时，才把 payload（如 token）复制为文本；
@@ -244,13 +306,18 @@ export function binaryCellClipboardText(value: unknown, columnType?: string, dat
   return printableGbkText(binaryPreviewBytes(bytes, columnType));
 }
 
-// MySQL BLOB 的文本预览必须与编辑写回路径（coerceMysqlBlobTextValue，仅 mysql）走同一闸门：
+export function isBlobTextPreviewDatabase(databaseType?: DatabaseType): boolean {
+  return databaseType === "mysql" || databaseType === "oracle" || databaseType === "oceanbase-oracle";
+}
+
+// MySQL 与 Oracle（含 OceanBase-Oracle）BLOB 的文本预览必须与编辑写回路径（coerceBlobTextValue）走同一闸门：
 // SQLite/DuckDB/H2/Firebird 等库同样暴露 `blob` 列，若一律按文本预览会出现
-// “显示是文本、编辑器却是十六进制”的不一致，故 blob 文本预览仅在 mysql 连接开启。
+// “显示是文本、编辑器却是十六进制”的不一致，故 blob 文本预览仅在支持的连接开启。
 // binary/varbinary 的文本预览早于该特性存在（如 TDengine BINARY 文本），保持全库通用。
 function isBinaryCellTextPreviewColumn(columnType: string | undefined, databaseType: DatabaseType | undefined): boolean {
+  if (isOpaqueAggregateStateColumnType(columnType)) return false;
   if (BINARY_STRING_TYPE_RE.test((columnType ?? "").trim())) return true;
-  return isBlobCellColumnType(columnType) && databaseType === "mysql";
+  return isBlobCellColumnType(columnType) && isBlobTextPreviewDatabase(databaseType);
 }
 
 // 显示/复制路径的解码链：先严格 UTF-8，仅 MySQL 连接的 binary/varbinary 再回退严格
@@ -322,6 +389,7 @@ function printableText(text: string): boolean {
 }
 
 function binaryCellDisplayLabel(columnType?: string): string {
+  if (isOpaqueAggregateStateColumnType(columnType)) return "AGG_STATE";
   const base = (columnType ?? "")
     .trim()
     .split(/[(:\s]/)[0]

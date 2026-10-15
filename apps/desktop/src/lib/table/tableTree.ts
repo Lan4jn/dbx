@@ -24,6 +24,7 @@ export function buildTableTreeNodes({ nodeId, connectionId, database, schema, ta
         objectType,
         tableType: table.table_type,
         comment: table.comment,
+        valid: table.valid,
         parentSchema: table.parent_schema,
         parentName: table.parent_name,
         catalog,
@@ -53,6 +54,7 @@ function makeTableTreeEntry({
   objectType,
   tableType,
   comment,
+  valid,
   parentSchema,
   parentName,
   catalog,
@@ -66,6 +68,7 @@ function makeTableTreeEntry({
   objectType: DatabaseObjectTreeKind;
   tableType?: string;
   comment?: string | null;
+  valid?: boolean | null;
   parentSchema?: string | null;
   parentName?: string | null;
   catalog?: string;
@@ -79,10 +82,12 @@ function makeTableTreeEntry({
     type: objectType === "VIEW" ? ("view" as const) : objectType === "MATERIALIZED_VIEW" ? ("materialized_view" as const) : ("table" as const),
     tableType,
     comment,
+    valid,
     connectionId,
     database,
     schema,
     catalog,
+    ...(objectType === "TABLE" ? { tableName: name } : {}),
     isExpanded: false,
     children: [],
   };
@@ -105,6 +110,18 @@ function exactObjectIdentityKey(objectType: string, schema: string | undefined, 
 
 function foldedPartitionObjectLookupKey(objectType: string, schema: string | undefined, name: string) {
   return `${objectType}\0${(schema || "").toLowerCase()}\0${name.toLowerCase()}`;
+}
+
+/**
+ * Folded identity of one row of a paged object list. Paged loads remember the
+ * row that was expected to open the next page (the peek row the previous page
+ * fetched but did not show) so a window that shifted under concurrent DDL can be
+ * detected before an unaligned page is appended. Kept case-insensitive on
+ * purpose: an anchor must never look "changed" because the server cased a name
+ * differently between two responses.
+ */
+export function tablePageRowAnchorKey(name: string, schema?: string | null, parentName?: string | null) {
+  return `${(schema || "").toLowerCase()}\0${(parentName || "").toLowerCase()}\0${name.toLowerCase()}`;
 }
 
 type PrefixSortInfo = {
@@ -248,6 +265,9 @@ export function mergeTableInfosIntoObjects(objects: readonly ObjectInfo[], table
       if (matchingObject && table.comment && !matchingObject.comment) {
         matchingObject.comment = table.comment;
       }
+      if (matchingObject && matchingObject.valid == null && table.valid != null) {
+        matchingObject.valid = table.valid;
+      }
       continue;
     }
     seen.add(key);
@@ -257,6 +277,7 @@ export function mergeTableInfosIntoObjects(objects: readonly ObjectInfo[], table
       // downstream template strategies can distinguish special table kinds.
       object_type: table.table_type,
       schema: tableSchema,
+      valid: table.valid,
       comment: table.comment,
       created_at: undefined,
       updated_at: undefined,
@@ -541,6 +562,7 @@ function buildObjectTreeEntries({ nodeId, connectionId, database, schema, object
         objectType,
         tableType: obj.object_type,
         comment: obj.comment,
+        valid: obj.valid,
         parentSchema: obj.parent_schema,
         parentName: obj.parent_name,
       }),
@@ -658,6 +680,7 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
       objectType,
       tableType: obj.object_type,
       comment: obj.comment,
+      valid: obj.valid,
       parentSchema: obj.parent_schema,
       parentName: obj.parent_name,
     });
@@ -699,6 +722,8 @@ function simpleObjectNodeType(objectType: DatabaseObjectTreeKind): TreeNodeType 
   if (objectType === "MATERIALIZED_VIEW") return "materialized_view";
   if (objectType === "PROCEDURE") return "procedure";
   if (objectType === "FUNCTION") return "function";
+  if (objectType === "FUNCTION_INTERNAL" || objectType === "FUNCTION_UDF") return "function";
+  if (objectType === "INDEX") return "index";
   if (objectType === "TRIGGER") return "trigger";
   if (objectType === "EVENT") return "event";
   if (objectType === "SEQUENCE") return "sequence";
@@ -747,6 +772,20 @@ const groupDefs: Array<{
     childType: "function",
   },
   {
+    key: "__internal_functions",
+    label: "tree.internalFunctions",
+    objectTypes: ["FUNCTION_INTERNAL"],
+    nodeType: "group-internal-functions",
+    childType: "function",
+  },
+  {
+    key: "__udf_functions",
+    label: "tree.udfFunctions",
+    objectTypes: ["FUNCTION_UDF"],
+    nodeType: "group-udf-functions",
+    childType: "function",
+  },
+  {
     key: "__triggers",
     label: "tree.triggers",
     objectTypes: ["TRIGGER"],
@@ -766,6 +805,13 @@ const groupDefs: Array<{
     objectTypes: ["SEQUENCE"],
     nodeType: "group-sequences",
     childType: "sequence",
+  },
+  {
+    key: "__indexes",
+    label: "tree.indexes",
+    objectTypes: ["INDEX"],
+    nodeType: "group-database-indexes",
+    childType: "index",
   },
   {
     key: "__synonyms",
@@ -797,7 +843,24 @@ const groupDefs: Array<{
   },
 ];
 
-const objectGroupNodeTypes = new Set<TreeNodeType>(["group-tables", "group-dolt-system-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-triggers", "group-events", "group-sequences", "group-synonyms", "group-jobs", "group-packages", "group-types"]);
+const objectGroupNodeTypes = new Set<TreeNodeType>([
+  "group-tables",
+  "group-dolt-system-tables",
+  "group-views",
+  "group-materialized-views",
+  "group-procedures",
+  "group-functions",
+  "group-internal-functions",
+  "group-udf-functions",
+  "group-triggers",
+  "group-events",
+  "group-sequences",
+  "group-database-indexes",
+  "group-synonyms",
+  "group-jobs",
+  "group-packages",
+  "group-types",
+]);
 
 export function buildObjectGroupPlaceholderNodes({
   nodeId,
@@ -884,7 +947,7 @@ export function buildGroupedObjectTreeNodes({ nodeId, connectionId, database, sc
           const objectTypeSuffix = objectType === "PACKAGE" || objectType === "PACKAGE_BODY" || objectType === "TYPE" || objectType === "TYPE_BODY" ? `:${objectType}` : "";
           const signature = obj.signature?.trim() || "";
           const signatureIdPart = signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `:${signature}` : "";
-          const triggerParentName = objectType === "TRIGGER" && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : undefined;
+          const triggerParentName = (objectType === "TRIGGER" || objectType === "INDEX") && obj.parent_name ? normalizeDatabaseObjectName(obj.parent_name) : undefined;
           const triggerParentSchema = objectType === "TRIGGER" && obj.parent_schema ? normalizeDatabaseObjectName(obj.parent_schema) : undefined;
           return {
             id: `${nodeId}:${def.key}:${childSchema ? `${childSchema}:` : ""}${obj.name}${signatureIdPart}${triggerParentName ? `:${triggerParentName}` : ""}${objectTypeSuffix}`,
