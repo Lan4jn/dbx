@@ -3773,7 +3773,6 @@ mod tests {
         assert_eq!(request.schema.as_deref(), Some("APP"));
         assert_eq!(serde_json::to_value(request).unwrap()["schema"], "APP");
     }
-    }
 
     #[test]
     fn fuzzy_subsequence_match_matches_ordered_characters() {

@@ -9,6 +9,13 @@ const CONFIGURATION: &str = include_str!("../../../docs/dbx-gateway/configuratio
 const PACKAGE_VERIFIER: &str = include_str!("../../../scripts/verify-gateway-package.sh");
 const MAIN_SYSTEMD: &str = include_str!("../../../examples/dbx-gateway/systemd/dbx-gateway-main.service");
 const PKI_CLI: &str = include_str!("../src/bin/dbx-gateway-pki.rs");
+const ROOT_PACKAGE: &str = include_str!("../../../package.json");
+
+#[test]
+fn gateway_version_matches_the_desktop_client() {
+    let package: serde_json::Value = serde_json::from_str(ROOT_PACKAGE).unwrap();
+    assert_eq!(env!("CARGO_PKG_VERSION"), package["version"]);
+}
 
 #[test]
 fn edge_revocation_opens_the_online_edge_only_store() {
@@ -71,8 +78,9 @@ fn primary_deployment_flow_is_explicitly_same_host_unix_socket_only() {
 
 #[test]
 fn upgrade_examples_use_one_explicit_version_variable() {
-    assert!(DEPLOYMENT.contains("VERSION=0.5.83"));
-    assert!(MAIN.contains("VERSION=0.5.83"));
+    let version = format!("VERSION={}", env!("CARGO_PKG_VERSION"));
+    assert!(DEPLOYMENT.contains(&version));
+    assert!(MAIN.contains(&version));
     assert!(MAIN.contains("DBX_Gateway_${VERSION}_x64.tar.gz"));
     assert!(MAIN.contains("预期 checksum 成功、程序报告版本为 `${VERSION}`"));
     assert!(!MAIN.contains("0.5.75"));

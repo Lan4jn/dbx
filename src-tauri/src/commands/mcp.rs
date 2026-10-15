@@ -288,7 +288,10 @@ struct NodeVersion {
 #[tauri::command]
 pub async fn check_mcp_server_status(app: AppHandle) -> Result<McpServerStatus, String> {
     let default_data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
-    let data_dir = crate::data_dir::resolve_data_dir_with_mode(default_data_dir).custom_data_dir().map(path_string);
+    let config_dir = app.path().app_config_dir().ok();
+    let data_dir = crate::data_dir::resolve_data_dir_with_mode(default_data_dir, config_dir.as_deref())
+        .custom_data_dir()
+        .map(path_string);
     let local_status = tauri::async_runtime::spawn_blocking(|| {
         let native = native_installation::resolve();
         let runtime = resolve_node_runtime();

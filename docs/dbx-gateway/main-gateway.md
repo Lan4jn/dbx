@@ -170,7 +170,7 @@ curl -fsS http://127.0.0.1:9080/healthz
 在 Main 主机以 `root` 升级：
 
 ```bash
-VERSION=0.5.83
+VERSION=0.6.44
 sha256sum -c DBX_Gateway_${VERSION}_x64.tar.gz.sha256
 tar -xzf DBX_Gateway_${VERSION}_x64.tar.gz
 /usr/bin/dbx-gateway --version > /var/lib/dbx-gateway/previous-version.txt

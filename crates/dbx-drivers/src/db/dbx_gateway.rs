@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::models::connection::DbxGatewayConfig;
+use dbx_types::models::connection::DbxGatewayConfig;
 
 pub use dbx_gateway::protocol::{GatewayEdgeRoutes, GatewayRoute};
 

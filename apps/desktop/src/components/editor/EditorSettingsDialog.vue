@@ -19,7 +19,6 @@ import {
   Copy,
   Download,
   ExternalLink,
-  FolderOpen,
   Eye,
   Filter,
   FolderOpen,

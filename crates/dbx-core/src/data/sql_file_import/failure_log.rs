@@ -815,6 +815,8 @@ mod tests {
             affected_rows: 0,
             elapsed_ms: 0,
             statement_summary: String::new(),
+            bytes_processed: None,
+            current_statement: None,
             error: None,
             bytes_read: None,
             total_bytes: None,

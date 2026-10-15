@@ -466,11 +466,11 @@ async function testSelected() {
       <template v-else-if="selectedGateway">
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("settings.tunnelsGatewayMainUrl") }}</Label>
-          <Input v-model="selectedGateway.main_url" class="col-span-3" placeholder="wss://gateway.example.com/dbx" />
+          <Input v-model="selectedGateway!.main_url" class="col-span-3" placeholder="wss://gateway.example.com/dbx" />
         </div>
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("settings.tunnelsGatewayIdentity") }}</Label>
-          <Select v-model="selectedGateway.identity_id" :disabled="!isDesktop || isLoadingGatewayIdentities">
+          <Select v-model="selectedGateway!.identity_id" :disabled="!isDesktop || isLoadingGatewayIdentities">
             <SelectTrigger class="col-span-3 h-9 min-w-0">
               <SelectValue :placeholder="t('settings.tunnelsGatewayIdentityPlaceholder')" />
             </SelectTrigger>
@@ -527,7 +527,7 @@ async function testSelected() {
         <div class="grid grid-cols-4 items-start gap-4">
           <Label class="pt-2 text-xs">{{ t("settings.tunnelsGatewayServerCa") }}</Label>
           <div class="col-span-3 grid min-w-0 gap-2">
-            <textarea v-model="selectedGateway.server_ca_pem" rows="4" class="flex w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-xs shadow-sm outline-none focus-visible:ring-1 focus-visible:ring-ring" :placeholder="t('settings.tunnelsGatewayServerCaPlaceholder')" />
+            <textarea v-model="selectedGateway!.server_ca_pem" rows="4" class="flex w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-xs shadow-sm outline-none focus-visible:ring-1 focus-visible:ring-ring" :placeholder="t('settings.tunnelsGatewayServerCaPlaceholder')" />
             <Button type="button" variant="outline" size="sm" class="w-fit" :disabled="!isDesktop" @click="importGatewayCa(selectedGateway)">
               <Upload class="mr-1.5 h-3.5 w-3.5" />
               {{ t("settings.tunnelsGatewayImportCa") }}
@@ -536,11 +536,11 @@ async function testSelected() {
         </div>
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("settings.tunnelsGatewaySpkiPin") }}</Label>
-          <Input v-model="selectedGateway.server_spki_sha256" class="col-span-3 font-mono text-xs" :placeholder="t('settings.tunnelsGatewaySpkiPinPlaceholder')" />
+          <Input v-model="selectedGateway!.server_spki_sha256" class="col-span-3 font-mono text-xs" :placeholder="t('settings.tunnelsGatewaySpkiPinPlaceholder')" />
         </div>
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("settings.tunnelsGatewayTimeout") }}</Label>
-          <Input v-model.number="selectedGateway.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
+          <Input v-model.number="selectedGateway!.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
         </div>
       </template>
     </template>

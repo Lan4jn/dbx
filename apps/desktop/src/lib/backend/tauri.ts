@@ -5741,7 +5741,6 @@ export interface SqlFileProgress {
   elapsedMs: number;
   statementSummary: string;
   bytesProcessed?: number | null;
-  totalBytes?: number | null;
   currentStatement?: string | null;
   error?: string | null;
   bytesRead?: number;

@@ -274,6 +274,10 @@ fn tunnel_target(layer: &TransportLayerConfig) -> Value {
                 layer.id.clear();
                 layer.profile_id.clear();
             }
+            TransportLayerConfig::DbxGateway(layer) => {
+                layer.id.clear();
+                layer.profile_id.clear();
+            }
         }
     }
     credential_target(&config)

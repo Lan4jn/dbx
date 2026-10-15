@@ -2848,6 +2848,7 @@ impl AppState {
                         &self.tunnels,
                         &self.proxy_tunnels,
                         &self.http_tunnels,
+                        &self.dbx_gateway,
                         &self.agent_manager,
                         self.storage.data_dir(),
                         connection_id,
@@ -3763,6 +3764,7 @@ impl AppState {
                 &self.tunnels,
                 &self.proxy_tunnels,
                 &self.http_tunnels,
+                &self.dbx_gateway,
             )
             .await?;
             ("127.0.0.1".to_string(), local_port)
@@ -3799,6 +3801,7 @@ impl AppState {
                     &self.tunnels,
                     &self.proxy_tunnels,
                     &self.http_tunnels,
+                    &self.dbx_gateway,
                 )
                 .await?;
                 Ok(Some(PluginRuntimeProxy::socks5("127.0.0.1".to_string(), local_port, String::new(), String::new())))
@@ -3820,6 +3823,7 @@ impl AppState {
                         &self.tunnels,
                         &self.proxy_tunnels,
                         &self.http_tunnels,
+                        &self.dbx_gateway,
                     )
                     .await?;
                     Ok(Some(PluginRuntimeProxy::socks5(
@@ -3832,7 +3836,7 @@ impl AppState {
             }
             // HTTP-tunnel chains cannot serve arbitrary endpoints; fall back
             // to the static tunnel path (guarded below for empty endpoints).
-            TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => Ok(None),
+            TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) | TransportLayerConfig::DbxGateway(_) => Ok(None),
         }
     }
 
@@ -5577,6 +5581,15 @@ impl AppState {
         self.tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
         self.proxy_tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
         self.http_tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
+        db::transport_layer_tunnel::stop_transport_layers(
+            &sqlite_worker_prefix,
+            layer_count,
+            &self.tunnels,
+            &self.proxy_tunnels,
+            &self.http_tunnels,
+            &self.dbx_gateway,
+        )
+        .await;
         db::transport_layer_tunnel::stop_transport_layers(
             connection_id,
             layer_count,

@@ -75,7 +75,7 @@ DBX_Gateway_<版本>_arm64.tar.gz
 在每台 Linux 主机校验并解包：
 
 ```bash
-VERSION=0.5.83
+VERSION=0.6.44
 sha256sum -c DBX_Gateway_${VERSION}_x64.tar.gz.sha256
 tar -xzf DBX_Gateway_${VERSION}_x64.tar.gz
 cd DBX_Gateway_${VERSION}_x64

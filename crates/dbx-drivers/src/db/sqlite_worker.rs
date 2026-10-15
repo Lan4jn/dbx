@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_manager::{AgentManager, SQLITE_WORKER_DRIVER_KEY};
+use crate::db::dbx_gateway::DbxGatewayManager;
 use crate::db::http_tunnel::HttpTunnelManager;
 use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_prompt::{self, SshPromptAnswer, SshPromptKind, SshPromptRequest};
@@ -332,6 +333,7 @@ pub async fn connect_sqlite_worker(
     tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
     agent_manager: &AgentManager,
     data_dir: &Path,
     connection_id: &str,
@@ -369,6 +371,7 @@ pub async fn connect_sqlite_worker(
         tunnels,
         proxy_tunnels,
         http_tunnels,
+        dbx_gateway,
         connection_id,
         &route.prefix_layers,
         &route.final_ssh,
@@ -452,7 +455,10 @@ pub async fn connect_sqlite_worker(
                 remove_uploaded_session_worker(session.as_ref(), &remote_path).await;
             }
             if let Some(chain_id) = chain_id.as_deref() {
-                stop_sqlite_transport_layers(chain_id, tunnels, proxy_tunnels, http_tunnels).await;
+                stop_sqlite_transport_layers(
+                    chain_id, route.prefix_layers.len(), tunnels, proxy_tunnels, http_tunnels, dbx_gateway,
+                )
+                .await;
             }
             Err(error)
         }
@@ -549,6 +555,7 @@ async fn open_final_hop_session(
     tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
     connection_id: &str,
     prefix_layers: &[TransportLayerConfig],
     final_ssh: &SshTunnelConfig,
@@ -581,12 +588,16 @@ async fn open_final_hop_session(
         tunnels,
         proxy_tunnels,
         http_tunnels,
+        dbx_gateway,
     )
     .await
     {
         Ok(local_port) => local_port,
         Err(error) => {
-            stop_sqlite_transport_layers(&chain_id, tunnels, proxy_tunnels, http_tunnels).await;
+            stop_sqlite_transport_layers(
+                &chain_id, prefix_layers.len(), tunnels, proxy_tunnels, http_tunnels, dbx_gateway,
+            )
+            .await;
             return Err(error);
         }
     };
@@ -610,7 +621,10 @@ async fn open_final_hop_session(
     {
         Ok(session) => Ok(session),
         Err(error) => {
-            stop_sqlite_transport_layers(&chain_id, tunnels, proxy_tunnels, http_tunnels).await;
+            stop_sqlite_transport_layers(
+                &chain_id, prefix_layers.len(), tunnels, proxy_tunnels, http_tunnels, dbx_gateway,
+            )
+            .await;
             Err(error)
         }
     }
@@ -618,13 +632,19 @@ async fn open_final_hop_session(
 
 async fn stop_sqlite_transport_layers(
     chain_id: &str,
+    layer_count: usize,
     tunnels: &TunnelManager,
     proxy_tunnels: &ProxyTunnelManager,
     http_tunnels: &HttpTunnelManager,
+    dbx_gateway: &DbxGatewayManager,
 ) {
     tunnels.stop_tunnels_with_prefix(chain_id).await;
     proxy_tunnels.stop_tunnels_with_prefix(chain_id).await;
     http_tunnels.stop_tunnels_with_prefix(chain_id).await;
+    transport_layer_tunnel::stop_transport_layers(
+        chain_id, layer_count, tunnels, proxy_tunnels, http_tunnels, dbx_gateway,
+    )
+    .await;
 }
 
 async fn remote_linux_platform(session: &Handle<SshClient>) -> Result<String, String> {

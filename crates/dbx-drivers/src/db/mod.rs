@@ -46,6 +46,7 @@ pub mod ssh_tunnel;
 pub use dbx_driver_mysql::starrocks;
 pub use dbx_driver_mysql::tidb;
 pub use dbx_sql_core::tdsql_mysql;
+pub mod dbx_gateway;
 pub mod transport_layer_tunnel;
 pub mod turso_driver;
 pub mod vector_driver;

@@ -75,7 +75,8 @@ pub async fn save_background_image(app: AppHandle, source_path: String) -> Resul
     let extension = background_image_extension(&source)?;
     let file_name = source.file_name().and_then(|value| value.to_str()).unwrap_or("background image").to_string();
     let default_data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
-    let data_dir = crate::data_dir::resolve_data_dir_with_mode(default_data_dir).data_dir;
+    let config_dir = app.path().app_config_dir().ok();
+    let data_dir = crate::data_dir::resolve_data_dir_with_mode(default_data_dir, config_dir.as_deref()).data_dir;
 
     let stored_path =
         tauri::async_runtime::spawn_blocking(move || copy_background_image_into(&data_dir, &source, &extension))

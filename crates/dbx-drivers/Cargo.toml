@@ -27,11 +27,19 @@ dbx-driver-postgres = { path = "../dbx-driver-postgres" }
 dbx-driver-redis = { path = "../dbx-driver-redis" }
 dbx-driver-sqlserver = { path = "../dbx-driver-sqlserver" }
 dbx-types = { path = "../dbx-types", default-features = false }
+dbx-gateway = { path = "../dbx-gateway", default-features = false }
 dbx-sql-core = { path = "../dbx-sql-core" }
 dbx-sql-data = { path = "../dbx-sql-data" }
 dbx-sql-dialect = { path = "../dbx-sql-dialect" }
 dbx-platform = { path = "../dbx-platform", features = ["host-prompts", "downloads"] }
 dbx-sqlite-worker = { path = "../dbx-sqlite-worker", default-features = false }
+async-trait = "0.1"
+hex = "0.4"
+url = "2"
+x509-parser = "0.18"
+zeroize = { version = "1", features = ["derive"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision", "preserve_order"] }
 json5 = "0.4"

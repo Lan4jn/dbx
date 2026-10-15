@@ -1238,6 +1238,7 @@ async fn connect_sqlite_from_config_with_state(
             &state.tunnels,
             &state.proxy_tunnels,
             &state.http_tunnels,
+            &state.dbx_gateway,
             &state.agent_manager,
             state.storage.data_dir(),
             connection_id,

@@ -76,7 +76,7 @@ export function scrubConnectionForPlaintextExport(connection: ConnectionConfig):
       copy.key_passphrase = "";
     } else if (copy.type === "proxy") {
       copy.password = "";
-    } else {
+    } else if (copy.type === "http_tunnel") {
       copy.token = "";
     }
     return copy;
@@ -92,7 +92,7 @@ export function scrubTunnelProfileForPlaintextExport(profile: TunnelProfile): Tu
     scrubbed.key_passphrase = "";
   } else if (scrubbed.type === "proxy") {
     scrubbed.password = "";
-  } else {
+  } else if (scrubbed.type === "http_tunnel") {
     scrubbed.token = "";
   }
   return scrubbed;

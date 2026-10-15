@@ -391,6 +391,7 @@ pub fn describe_sync_snapshot(
                     TransportLayerConfig::Ssh(config) => &config.name,
                     TransportLayerConfig::Proxy(config) => &config.name,
                     TransportLayerConfig::HttpTunnel(config) => &config.name,
+                    TransportLayerConfig::DbxGateway(config) => &config.name,
                 };
                 SyncCatalogItem { id: profile.id().to_string(), label: label.clone() }
             })
@@ -2341,6 +2342,7 @@ fn scrub_connection_secrets(config: &mut ConnectionConfig) {
             TransportLayerConfig::HttpTunnel(http) => {
                 http.token.clear();
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
     config.redis_sentinel_password.clear();
@@ -2448,6 +2450,7 @@ fn collect_connection_secrets(
             TransportLayerConfig::HttpTunnel(http) => {
                 push_secret(secrets, &config.id, &transport_layer_http_tunnel_token_key(index, layer), &http.token);
             }
+            TransportLayerConfig::DbxGateway(_) => {}
         }
     }
     push_secret(secrets, &config.id, "redis_sentinel_password", &config.redis_sentinel_password);
